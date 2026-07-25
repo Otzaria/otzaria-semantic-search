@@ -2,7 +2,7 @@
 
 use otzaria_semantic_search::api::hybrid_search::OtzariaHybridEngine;
 use otzaria_semantic_search::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
-use otzaria_semantic_search::semantic::engine::{SemanticEngine, SemanticConfig};
+use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::types::{
     BookForIndexing, BookLine, GroupingMode, LexicalCandidate, SearchMode,
 };

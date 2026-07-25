@@ -99,16 +99,10 @@ pub enum ManifestError {
     },
 
     #[error("Dimension mismatch: manifest has {manifest_dim}, config has {config_dim}")]
-    DimensionMismatch {
-        manifest_dim: u32,
-        config_dim: u32,
-    },
+    DimensionMismatch { manifest_dim: u32, config_dim: u32 },
 
     #[error("Chunking version mismatch: manifest has {manifest_ver}, config has {config_ver}")]
-    ChunkingVersionMismatch {
-        manifest_ver: u32,
-        config_ver: u32,
-    },
+    ChunkingVersionMismatch { manifest_ver: u32, config_ver: u32 },
 
     #[error("Write failed: {reason}")]
     WriteFailed { reason: String },

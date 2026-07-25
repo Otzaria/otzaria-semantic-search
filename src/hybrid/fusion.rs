@@ -63,11 +63,7 @@ pub fn fuse_weighted(
     result
 }
 
-pub fn fuse_rrf(
-    lexical: &[(u64, f32)],
-    semantic: &[(u64, f32)],
-    k: u32,
-) -> Vec<FusedEntry> {
+pub fn fuse_rrf(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<FusedEntry> {
     let mut map: HashMap<u64, (Option<f32>, Option<f32>, f32)> = HashMap::new();
 
     for (idx, &(id, score)) in lexical.iter().enumerate() {

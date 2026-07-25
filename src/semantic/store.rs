@@ -76,12 +76,12 @@ impl VectorStore {
             .map_err(|_| VectorStoreError::InsertFailed {
                 reason: "Lock poison error".to_string(),
             })?;
-        let mut book_index = self
-            .book_index
-            .write()
-            .map_err(|_| VectorStoreError::InsertFailed {
-                reason: "Lock poison error".to_string(),
-            })?;
+        let mut book_index =
+            self.book_index
+                .write()
+                .map_err(|_| VectorStoreError::InsertFailed {
+                    reason: "Lock poison error".to_string(),
+                })?;
 
         for (meta, vec) in batch {
             if vec.len() as u32 != self.config.embedding_dim {
@@ -162,12 +162,12 @@ impl VectorStore {
 
     /// Remove all vectors associated with a given book.
     pub fn delete_book(&self, source_book_key: &str) -> Result<u32, VectorStoreError> {
-        let mut book_index = self
-            .book_index
-            .write()
-            .map_err(|_| VectorStoreError::DeleteFailed {
-                reason: "Lock poison error".to_string(),
-            })?;
+        let mut book_index =
+            self.book_index
+                .write()
+                .map_err(|_| VectorStoreError::DeleteFailed {
+                    reason: "Lock poison error".to_string(),
+                })?;
         let mut records = self
             .records
             .write()

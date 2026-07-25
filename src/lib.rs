@@ -18,6 +18,6 @@
 //! the existing lexical search.
 
 pub mod api;
-pub mod semantic;
-pub mod hybrid;
 pub mod errors;
+pub mod hybrid;
+pub mod semantic;

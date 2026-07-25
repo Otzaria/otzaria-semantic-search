@@ -8,9 +8,9 @@
 //! - Vector store (zvec persistence and retrieval)
 //! - Semantic engine (orchestration)
 
-pub mod types;
-pub mod manifest;
 pub mod chunker;
 pub mod embedding;
-pub mod store;
 pub mod engine;
+pub mod manifest;
+pub mod store;
+pub mod types;

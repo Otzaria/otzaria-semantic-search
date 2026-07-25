@@ -1,5 +1,5 @@
-use sha2::{Digest, Sha256};
 use crate::semantic::types::{BookForIndexing, SemanticChunk};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct ChunkerConfig {
@@ -49,7 +49,11 @@ impl Chunker {
 
             let truncated_text = truncate_to_chars(&embedding_text, self.config.max_chunk_chars);
             let chunk_hash = compute_chunk_hash(&truncated_text);
-            let semantic_id = compute_semantic_id(&book.source_book_key, line.line_id, self.config.chunking_version);
+            let semantic_id = compute_semantic_id(
+                &book.source_book_key,
+                line.line_id,
+                self.config.chunking_version,
+            );
 
             chunks.push(SemanticChunk {
                 semantic_id: semantic_id.clone(),
@@ -178,9 +182,15 @@ mod tests {
     #[test]
     fn long_lines_stand_alone() {
         let chunker = Chunker::new(ChunkerConfig::default());
-        let book = dummy_book(vec![(1, "This is a very long line that exceeds twenty characters.")]);
+        let book = dummy_book(vec![(
+            1,
+            "This is a very long line that exceeds twenty characters.",
+        )]);
         let chunks = chunker.chunk_book(&book);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].embedding_text, "This is a very long line that exceeds twenty characters.");
+        assert_eq!(
+            chunks[0].embedding_text,
+            "This is a very long line that exceeds twenty characters."
+        );
     }
 }

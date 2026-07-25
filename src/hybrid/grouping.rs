@@ -129,7 +129,12 @@ mod tests {
     use super::*;
     use crate::semantic::types::ResultSource;
 
-    fn mock_candidate(id: u64, section_id: u64, line_hash: u64, fused_score: f32) -> FusedCandidate {
+    fn mock_candidate(
+        id: u64,
+        section_id: u64,
+        line_hash: u64,
+        fused_score: f32,
+    ) -> FusedCandidate {
         FusedCandidate {
             line_id: id,
             title: format!("Title {id}"),

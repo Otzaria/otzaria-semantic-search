@@ -85,7 +85,7 @@ impl HybridCoordinator {
             let grouped = group_results(fused, g_mode);
             let g_count = grouped.len() as u32;
             let total = grouped.iter().map(|g| g.group_count).sum::<u32>();
-            
+
             let paginated = grouped.into_iter().skip(params.offset).take(params.limit);
 
             let items = paginated

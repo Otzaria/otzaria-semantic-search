@@ -267,26 +267,11 @@ impl SemanticManifest {
 /// Types of mismatches between manifest and current config.
 #[derive(Debug, Clone)]
 pub enum ManifestMismatch {
-    ModelId {
-        manifest: String,
-        config: String,
-    },
-    Dimensions {
-        manifest: u32,
-        config: u32,
-    },
-    Pooling {
-        manifest: String,
-        config: String,
-    },
-    ChunkingVersion {
-        manifest: u32,
-        config: u32,
-    },
-    NormalizationVersion {
-        manifest: u32,
-        config: u32,
-    },
+    ModelId { manifest: String, config: String },
+    Dimensions { manifest: u32, config: u32 },
+    Pooling { manifest: String, config: String },
+    ChunkingVersion { manifest: u32, config: u32 },
+    NormalizationVersion { manifest: u32, config: u32 },
 }
 
 impl std::fmt::Display for ManifestMismatch {

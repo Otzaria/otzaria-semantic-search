@@ -110,17 +110,17 @@ pub fn l2_normalize(vec: &mut [f32]) {
 fn compute_deterministic_text_embedding(text: &str, dim: u32) -> Vec<f32> {
     use sha2::{Digest, Sha256};
     let mut vec = vec![0.0f32; dim as usize];
-    
+
     // Feature hashing over n-grams for semantic representation
     let words: Vec<&str> = text.split_whitespace().collect();
     for (idx, word) in words.iter().enumerate() {
         let mut hasher = Sha256::new();
         hasher.update(word.as_bytes());
         let hash = hasher.finalize();
-        
+
         let bucket1 = (hash[0] as usize | ((hash[1] as usize) << 8)) % (dim as usize);
         let bucket2 = (hash[2] as usize | ((hash[3] as usize) << 8)) % (dim as usize);
-        
+
         let val1 = if hash[4] % 2 == 0 { 1.0f32 } else { -1.0f32 };
         let val2 = if hash[5] % 2 == 0 { 0.5f32 } else { -0.5f32 };
 

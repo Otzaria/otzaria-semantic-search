@@ -37,7 +37,7 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
     let has_quoted_phrase = query.contains('"');
     let tokens: Vec<&str> = query.split_whitespace().collect();
     let token_count = tokens.len();
-    
+
     let total_chars: usize = tokens.iter().map(|t| t.chars().count()).sum();
     let avg_token_length = if token_count > 0 {
         total_chars as f32 / token_count as f32
@@ -47,7 +47,7 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
 
     // Basic heuristic for exact references: containing numbers or specific format
     let has_numbers = tokens.iter().any(|t| t.chars().any(|c| c.is_ascii_digit()));
-    
+
     let estimated_type = if token_count == 0 {
         QueryType::Unknown
     } else if has_quoted_phrase {
