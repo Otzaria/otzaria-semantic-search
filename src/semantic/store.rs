@@ -212,12 +212,10 @@ impl VectorStore {
             .into_sorted_vec()
             .into_iter()
             .filter_map(|entry| {
-                records
-                    .get(&entry.semantic_id)
-                    .map(|rec| SemanticCandidate {
-                        metadata: rec.metadata.clone(),
-                        similarity_score: entry.score,
-                    })
+                records.get(&entry.semantic_id).map(|rec| SemanticCandidate {
+                    metadata: rec.metadata.clone(),
+                    similarity_score: entry.score,
+                })
             })
             .collect();
 
@@ -321,6 +319,19 @@ fn matches_filters(meta: &VectorMetadata, filters: Option<&SearchFilters>) -> bo
         }
     }
 
+    if let Some(topics) = &f.topics {
+        if !topics.is_empty() && !meta.topics.iter().any(|t| topics.contains(t)) {
+            return false;
+        }
+    }
+
+    if let Some(bases) = &f.bases {
+        match &meta.base {
+            Some(b) if bases.contains(b) => {}
+            _ => return false,
+        }
+    }
+
     true
 }
 
@@ -342,23 +353,17 @@ mod tests {
             segment: 0,
             is_pdf: false,
             title: "Test Book".to_string(),
-            topics: vec![],
-            author: None,
-            era: None,
-            base: None,
+            topics: vec!["/מקרא/תורה".to_string()],
+            author: Some("Author 1".to_string()),
+            era: Some("Rishonim".to_string()),
+            base: Some("BaseBook".to_string()),
         }
     }
 
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "otzaria_test_{name}_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+            let path = std::env::temp_dir().join(format!("otzaria_test_{name}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let _ = std::fs::create_dir_all(&path);
             Self(path)
         }
@@ -402,6 +407,32 @@ mod tests {
 
         store.delete_book("book1.txt").unwrap();
         assert_eq!(store.vector_count(), 0);
+    }
+
+    #[test]
+    fn test_filter_matching() {
+        let meta = sample_metadata("id1", "book1.txt");
+
+        // Topic filter match
+        let filters = SearchFilters {
+            topics: Some(vec!["/מקרא/תורה".to_string()]),
+            ..Default::default()
+        };
+        assert!(matches_filters(&meta, Some(&filters)));
+
+        // Topic filter mismatch
+        let filters_mismatch = SearchFilters {
+            topics: Some(vec!["/תלמוד/בבלי".to_string()]),
+            ..Default::default()
+        };
+        assert!(!matches_filters(&meta, Some(&filters_mismatch)));
+
+        // Base filter match
+        let filters_base = SearchFilters {
+            bases: Some(vec!["BaseBook".to_string()]),
+            ..Default::default()
+        };
+        assert!(matches_filters(&meta, Some(&filters_base)));
     }
 
     #[test]

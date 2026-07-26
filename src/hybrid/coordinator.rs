@@ -62,8 +62,9 @@ impl HybridCoordinator {
     ) -> Result<HybridSearchResult, SemanticSearchError> {
         let start_time = std::time::Instant::now();
 
-        let semantic_lock = self.semantic_engine.read().unwrap();
-        let (semantic_candidates, mode) = match (params.force_mode, semantic_lock.as_ref()) {
+        // Safely acquire read lock without panic on poison
+        let semantic_guard = self.semantic_engine.read().unwrap_or_else(|e| e.into_inner());
+        let (semantic_candidates, mode) = match (params.force_mode, semantic_guard.as_ref()) {
             (Some(SearchMode::LexicalOnly), _) | (_, None) => (Vec::new(), SearchMode::LexicalOnly),
             (_, Some(engine)) => {
                 match engine.search(
@@ -156,7 +157,7 @@ impl HybridCoordinator {
             total_count,
             group_count,
             search_mode: mode,
-            semantic_available: semantic_lock.is_some(),
+            semantic_available: semantic_guard.is_some(),
             latency_ms,
         })
     }
@@ -246,8 +247,8 @@ impl HybridCoordinator {
 
     /// Retrieve semantic engine status.
     pub fn status(&self) -> SemanticStatus {
-        let lock = self.semantic_engine.read().unwrap();
-        match lock.as_ref() {
+        let guard = self.semantic_engine.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
             Some(engine) => engine.status(),
             None => SemanticStatus {
                 available: false,

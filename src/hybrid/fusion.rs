@@ -11,11 +11,29 @@ pub struct FusedEntry {
 }
 
 pub fn normalize_bm25_scores(scores: &[f32], k: f32) -> Vec<f32> {
-    scores.iter().map(|&x| x / (k + x)).collect()
+    scores
+        .iter()
+        .map(|&x| {
+            if x.is_nan() || x <= 0.0 {
+                0.0
+            } else {
+                (x / (k + x)).clamp(0.0, 1.0)
+            }
+        })
+        .collect()
 }
 
 pub fn normalize_semantic_scores(scores: &[f32]) -> Vec<f32> {
-    scores.iter().map(|&x| (x + 1.0) / 2.0).collect()
+    scores
+        .iter()
+        .map(|&x| {
+            if x.is_nan() {
+                0.0
+            } else {
+                ((x + 1.0) / 2.0).clamp(0.0, 1.0)
+            }
+        })
+        .collect()
 }
 
 pub fn fuse_weighted(

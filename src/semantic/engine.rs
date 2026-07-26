@@ -131,7 +131,11 @@ impl SemanticEngine {
             return Ok(0);
         }
 
-        let runtime = self.runtime.as_ref().unwrap();
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Err(SemanticSearchError::Config(
+                "Embedding runtime model failed to initialize".to_string(),
+            ));
+        };
 
         let mut batch: Vec<(VectorMetadata, Vec<f32>)> = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
