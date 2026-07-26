@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # otzaria-semantic-search
 
 > המסמך הזה אינו README למשתמשים. מטרתו היא לתת למפתח חדש תמונה מדויקת של מצב הפרויקט, הארכיטקטורה, ההחלטות שכבר התקבלו, מה ממומש בפועל, מה עדיין mock/placeholder, ומה צריך לעשות הלאה.
@@ -1753,3 +1754,104 @@ Benchmark-driven ranking
 The most important principle remains:
 
 > **The semantic system must enhance Otzaria's existing search without taking ownership of it or becoming a single point of failure.**
+=======
+# Otzaria Semantic Search
+
+[![CI](https://github.com/Otzaria/otzaria-semantic-search/actions/workflows/ci.yml/badge.svg)](https://github.com/Otzaria/otzaria-semantic-search/actions/workflows/ci.yml)
+
+**Hybrid semantic & lexical search engine for Otzaria** — a local, offline, production-grade Rust library that merges BM25 lexical results with vector similarity search into a single ranked result set.
+
+## Architecture
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │          HybridCoordinator                  │
+                    │  ┌───────────┐    ┌──────────────────────┐  │
+  Flutter / FFI ──▶ │  │  Query    │    │  Score Fusion        │  │
+                    │  │  Analysis │──▶ │  (Weighted / RRF)    │  │
+                    │  └───────────┘    └──────────┬───────────┘  │
+                    │                              │              │
+                    │  ┌─────────────┐   ┌─────────▼───────────┐  │
+                    │  │ Lexical     │   │ Grouping & Ranking  │  │
+                    │  │ (Tantivy)   │   │ (Section / Dedup)   │  │
+                    │  │ BM25 cands  │   └─────────────────────┘  │
+                    │  └─────────────┘                            │
+                    └─────────────────────────────────────────────┘
+                                         │
+                    ┌────────────────────▼────────────────────────┐
+                    │          SemanticEngine (Sidecar)           │
+                    │  ┌──────────┐ ┌──────────┐ ┌────────────┐  │
+                    │  │ Chunker  │ │Embedding │ │VectorStore │  │
+                    │  │ (SHA256  │ │ Runtime  │ │(In-Memory  │  │
+                    │  │  anchors)│ │ (GGUF)   │ │ + zvec)    │  │
+                    │  └──────────┘ └──────────┘ └────────────┘  │
+                    │  ┌─────────────────────────────────────┐   │
+                    │  │       SemanticManifest (JSON)        │   │
+                    │  │  Per-book versioning & diff tracking │   │
+                    │  └─────────────────────────────────────┘   │
+                    └────────────────────────────────────────────┘
+```
+
+## Key Design Principles
+
+- **Non-destructive**: The semantic engine is a separate sidecar. Failures in the semantic path **never** affect the existing Tantivy/BM25 search. Graceful fallback to lexical-only mode.
+- **Offline / Local**: No cloud APIs. Runs entirely on-device using a quantized GGUF embedding model.
+- **Not RAG**: This is a **retrieval** engine, not a generation engine. It returns relevant source texts, never generated answers.
+- **Modular**: Each component (Chunker, Embedding, VectorStore, Fusion, Grouping, Coordinator) is independently testable and replaceable.
+
+## Module Overview
+
+| Module | Path | Description |
+|--------|------|-------------|
+| **Types** | `src/semantic/types.rs` | All domain types: `BookLine`, `SemanticChunk`, `FusedCandidate`, `HybridSearchResult`, etc. |
+| **Chunker** | `src/semantic/chunker.rs` | Anchored semantic chunking with context windows, SHA256 identity hashing |
+| **Embedding** | `src/semantic/embedding.rs` | GGUF model runtime interface (deterministic fallback for testing) |
+| **VectorStore** | `src/semantic/store.rs` | Pre-normalized vector storage with BinaryHeap top-k search |
+| **Manifest** | `src/semantic/manifest.rs` | Atomic JSON manifest for per-book version tracking & diff detection |
+| **Engine** | `src/semantic/engine.rs` | Orchestrates chunking → embedding → storage → manifest lifecycle |
+| **Fusion** | `src/hybrid/fusion.rs` | BM25 saturation normalization, cosine normalization, weighted & RRF fusion |
+| **Ranking** | `src/hybrid/ranking.rs` | Query analysis, dynamic alpha computation (lexical vs. semantic weight) |
+| **Grouping** | `src/hybrid/grouping.rs` | Post-fusion grouping by section or identical text (line hash dedup) |
+| **Coordinator** | `src/hybrid/coordinator.rs` | Top-level hybrid search orchestrator with fallback |
+| **API** | `src/api/hybrid_search.rs` | Clean Flutter/FFI API surface (`SearchRequest`, `OtzariaHybridEngine`) |
+| **Errors** | `src/errors.rs` | Strongly-typed `thiserror` error hierarchy per subsystem |
+
+## Building
+
+```bash
+cargo build
+```
+
+## Testing
+
+```bash
+cargo test --all-targets
+```
+
+## Linting
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
+## CI
+
+GitHub Actions CI runs on every push to `main` and on all PRs, across **3 platforms** (Ubuntu, Windows, macOS):
+
+1. Format check (`cargo fmt --check`)
+2. Type check (`cargo check --all-targets`)
+3. Lint (`cargo clippy --all-targets -- -D warnings`)
+4. Tests (`cargo test --all-targets`)
+
+## Performance Highlights
+
+- **Pre-normalized vectors**: L2 normalization at insert time → cosine similarity reduces to a single dot product at search time
+- **BinaryHeap top-k**: O(N log k) search instead of O(N log N) full-sort, with metadata cloned only for final k results
+- **Single-pass Unicode truncation**: `char_indices().nth()` instead of double iteration
+- **Pre-allocated HashMaps**: `with_capacity()` on fusion maps to avoid rehashing
+
+## License
+
+See [LICENSE](LICENSE) for details.
+>>>>>>> 55910d2 (fix(ci): resolve CI failures, optimize vector search perf & complete architecture)

@@ -29,14 +29,18 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Cargo Check
-        run: cargo check --all-targets
-
-      - name: Run Cargo Test
-        run: cargo test --all-targets
-
+      # Cheapest first: format check (no compilation)
       - name: Check Formatting
         run: cargo fmt --check
 
+      # Type check all targets
+      - name: Run Cargo Check
+        run: cargo check --all-targets
+
+      # Lint all targets
       - name: Run Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Run all tests
+      - name: Run Cargo Test
+        run: cargo test --all-targets

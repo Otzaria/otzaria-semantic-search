@@ -116,6 +116,7 @@ impl Chunker {
 }
 
 pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_version: u32) -> String {
+    use std::fmt::Write;
     let mut hasher = Sha256::new();
     hasher.update(source_book_key.as_bytes());
     hasher.update(b":");
@@ -124,26 +125,37 @@ pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_version
     hasher.update(chunking_version.to_string().as_bytes());
 
     let result = hasher.finalize();
-    result[..16].iter().map(|b| format!("{b:02x}")).collect()
+    let mut hex = String::with_capacity(32);
+    for b in &result[..16] {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 pub fn compute_chunk_hash(text: &str) -> String {
+    use std::fmt::Write;
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     let result = hasher.finalize();
-    result[..16].iter().map(|b| format!("{b:02x}")).collect()
+    let mut hex = String::with_capacity(32);
+    for b in &result[..16] {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 pub fn truncate_to_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
+    // Single-pass: find byte index of the max_chars-th character
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s.to_string(), // string is shorter than max_chars
     }
-    s.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::types::BookLine;
 
     fn dummy_book(lines: Vec<(u64, &str)>) -> BookForIndexing {
         BookForIndexing {

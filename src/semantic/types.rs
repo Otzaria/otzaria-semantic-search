@@ -247,11 +247,11 @@ pub struct SearchFilters {
 impl SearchFilters {
     /// Checks if no filters are actively set.
     pub fn is_empty(&self) -> bool {
-        self.book_paths.as_ref().map_or(true, |v| v.is_empty())
-            && self.topics.as_ref().map_or(true, |v| v.is_empty())
-            && self.authors.as_ref().map_or(true, |v| v.is_empty())
-            && self.eras.as_ref().map_or(true, |v| v.is_empty())
-            && self.bases.as_ref().map_or(true, |v| v.is_empty())
+        self.book_paths.as_ref().is_none_or(|v| v.is_empty())
+            && self.topics.as_ref().is_none_or(|v| v.is_empty())
+            && self.authors.as_ref().is_none_or(|v| v.is_empty())
+            && self.eras.as_ref().is_none_or(|v| v.is_empty())
+            && self.bases.as_ref().is_none_or(|v| v.is_empty())
             && self.include_pdf.is_none()
     }
 }

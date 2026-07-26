@@ -1,7 +1,7 @@
 //! Integration tests for Otzaria Hybrid Semantic Search Engine.
 
-use otzaria_semantic_search::api::hybrid_search::OtzariaHybridEngine;
-use otzaria_semantic_search::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
+use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
+use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::types::{
     BookForIndexing, BookLine, GroupingMode, LexicalCandidate, SearchMode,
@@ -38,11 +38,34 @@ fn create_mock_book() -> BookForIndexing {
     }
 }
 
+use std::path::PathBuf;
+
+struct TempDir(PathBuf);
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("otzaria_integration_test_{name}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&path);
+        Self(path)
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn test_semantic_engine_and_hybrid_coordinator_end_to_end() {
-    let tmp_dir = tempfile::tempdir().unwrap();
+    let tmp_dir = TempDir::new("end_to_end");
+    let model_path = tmp_dir.path().join("dummy_model.gguf");
+    std::fs::write(&model_path, b"GGUF_MOCK").unwrap();
+
     let config = SemanticConfig {
         root_dir: tmp_dir.path().to_path_buf(),
+        model_path,
         ..Default::default()
     };
 
@@ -75,17 +98,17 @@ fn test_semantic_engine_and_hybrid_coordinator_end_to_end() {
         bm25_score: 15.5,
     }];
 
-    // Perform Search
+    // Perform Search using SearchRequest
     let result = engine_api
-        .search(
-            "בריאת העולם".to_string(),
-            lexical_cands,
-            Some(10),
-            Some(0),
-            Some(GroupingMode::SameSection),
-            None,
-            None,
-        )
+        .search(SearchRequest {
+            query: "בריאת העולם".to_string(),
+            lexical_candidates: lexical_cands,
+            limit: Some(10),
+            offset: Some(0),
+            grouping: Some(GroupingMode::SameSection),
+            filters: None,
+            force_mode: None,
+        })
         .unwrap();
 
     assert!(result.total_count > 0);

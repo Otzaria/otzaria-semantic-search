@@ -394,9 +394,26 @@ mod tests {
         assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
     }
 
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("otzaria_manifest_test_{name}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = TempDir::new("roundtrip");
         let config = test_config();
         let mut manifest = SemanticManifest::new(&config);
         manifest.mark_book_indexed("book_a".to_string(), 12345, 100, 1, 1);

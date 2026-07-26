@@ -113,7 +113,7 @@ mod tests {
         let features = analyze_query("שלום עולם");
         assert_eq!(features.estimated_type, QueryType::Short);
         let alpha = compute_alpha(&features);
-        assert!(alpha >= 0.7 && alpha <= 0.9);
+        assert!((0.7..=0.9).contains(&alpha));
     }
 
     #[test]
@@ -121,7 +121,7 @@ mod tests {
         let features = analyze_query("מה המשמעות של החיים ביקום לפי הקבלה");
         assert_eq!(features.estimated_type, QueryType::Conceptual);
         let alpha = compute_alpha(&features);
-        assert!(alpha >= 0.2 && alpha <= 0.4);
+        assert!((0.2..=0.4).contains(&alpha));
     }
 
     #[test]
@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(features.estimated_type, QueryType::ExactReference);
         assert!(features.has_quoted_phrase);
         let alpha = compute_alpha(&features);
-        assert!(alpha >= 0.7 && alpha <= 0.9);
+        assert!((0.7..=0.9).contains(&alpha));
     }
 
     #[test]

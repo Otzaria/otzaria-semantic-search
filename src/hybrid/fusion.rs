@@ -23,7 +23,8 @@ pub fn fuse_weighted(
     semantic: &[(u64, f32)],
     alpha: f32,
 ) -> Vec<FusedEntry> {
-    let mut map: HashMap<u64, (Option<f32>, Option<f32>)> = HashMap::new();
+    let mut map: HashMap<u64, (Option<f32>, Option<f32>)> =
+        HashMap::with_capacity(lexical.len() + semantic.len());
 
     for &(id, score) in lexical {
         map.entry(id).or_insert((None, None)).0 = Some(score);
@@ -64,7 +65,8 @@ pub fn fuse_weighted(
 }
 
 pub fn fuse_rrf(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<FusedEntry> {
-    let mut map: HashMap<u64, (Option<f32>, Option<f32>, f32)> = HashMap::new();
+    let mut map: HashMap<u64, (Option<f32>, Option<f32>, f32)> =
+        HashMap::with_capacity(lexical.len() + semantic.len());
 
     for (idx, &(id, score)) in lexical.iter().enumerate() {
         let rank = (idx + 1) as f32;
@@ -176,7 +178,7 @@ mod tests {
         let fused = fuse_weighted(&lexical, &semantic, 0.5);
 
         assert_eq!(fused.len(), 1);
-        assert_eq!(fused[0].fused_score, 0.7);
+        assert!((fused[0].fused_score - 0.7).abs() < 1e-5);
         assert_eq!(fused[0].source, ResultSource::Both);
     }
 
