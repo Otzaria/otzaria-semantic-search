@@ -3,6 +3,8 @@ name = "otzaria-semantic-search"
 version = "0.1.0"
 edition = "2021"
 description = "Hybrid semantic search engine for Otzaria"
+license-file = "LICENSE"
+publish = false
 
 [lib]
 crate-type = ["rlib"]
