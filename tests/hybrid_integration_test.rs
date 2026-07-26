@@ -89,10 +89,13 @@ fn genesis_book() -> BookForIndexing {
         title: "בראשית".to_string(),
         content_hash: 987_654,
         is_pdf: false,
-        topics: vec!["/מקרא/תורה/בראשית".to_string()],
-        author: Some("/author/משה רבנו".to_string()),
-        era: Some("/era/תנך".to_string()),
-        base: None,
+        topics: "/מקרא/תורה/בראשית".to_string(),
+        extra_facets: vec![
+            "/author/משה רבנו".to_string(),
+            "/author/עזרא הסופר".to_string(),
+            "/era/תנך".to_string(),
+            "/base".to_string(),
+        ],
         lines: vec![
             BookLine {
                 line_id: 1,
@@ -128,10 +131,8 @@ fn berachot_book() -> BookForIndexing {
         title: "מסכת ברכות".to_string(),
         content_hash: 555_444,
         is_pdf: true,
-        topics: vec!["/תלמוד/משנה/ברכות".to_string()],
-        author: None,
-        era: Some("/era/תנאים".to_string()),
-        base: Some("/base/מסכת ברכות".to_string()),
+        topics: "/תלמוד/משנה/ברכות".to_string(),
+        extra_facets: vec!["/era/תנאים".to_string()],
         lines: vec![BookLine {
             line_id: 501,
             section_id: 900,
@@ -140,6 +141,13 @@ fn berachot_book() -> BookForIndexing {
             reference: "ברכות א:א".to_string(),
             segment: 1,
         }],
+    }
+}
+
+fn facet_filter(paths: &[&str]) -> SearchFilters {
+    SearchFilters {
+        facets: Some(paths.iter().map(|p| p.to_string()).collect()),
+        ..Default::default()
     }
 }
 
@@ -588,39 +596,41 @@ fn filters_select_the_same_documents_the_lexical_facets_would() {
 
     assert_eq!(semantic_search(None), 4, "all four indexed lines");
 
-    // A topic filter matches hierarchically, like a Tantivy facet.
+    // A category filter matches hierarchically, like a Tantivy facet.
     assert_eq!(
-        semantic_search(Some(SearchFilters {
-            topics: Some(vec!["/מקרא".to_string()]),
-            ..Default::default()
-        })),
+        semantic_search(Some(facet_filter(&["/מקרא"]))),
         3,
         "the three Genesis lines"
     );
-    assert_eq!(
-        semantic_search(Some(SearchFilters {
-            topics: Some(vec!["/תלמוד/משנה".to_string()]),
-            ..Default::default()
-        })),
-        1
-    );
+    assert_eq!(semantic_search(Some(facet_filter(&["/תלמוד/משנה"]))), 1);
 
-    // Different dimensions are AND-ed, values inside one are OR-ed.
+    // Paths in one dimension are OR-ed; different dimensions are AND-ed.
+    assert_eq!(semantic_search(Some(facet_filter(&["/מקרא", "/תלמוד"]))), 4);
     assert_eq!(
-        semantic_search(Some(SearchFilters {
-            topics: Some(vec!["/מקרא".to_string(), "/תלמוד".to_string()]),
-            ..Default::default()
-        })),
-        4
-    );
-    assert_eq!(
-        semantic_search(Some(SearchFilters {
-            topics: Some(vec!["/מקרא".to_string()]),
-            eras: Some(vec!["/era/תנאים".to_string()]),
-            ..Default::default()
-        })),
+        semantic_search(Some(facet_filter(&["/מקרא", "/era/תנאים"]))),
         0,
         "no line is both Torah and Tannaitic"
+    );
+
+    // Both of Genesis's authors select it — the case a single-valued author
+    // field could not represent.
+    for author in ["/author/משה רבנו", "/author/עזרא הסופר"] {
+        assert_eq!(
+            semantic_search(Some(facet_filter(&[author]))),
+            3,
+            "filtering by {author} must select Genesis"
+        );
+    }
+    assert_eq!(
+        semantic_search(Some(facet_filter(&["/author/מחבר שאינו קיים"]))),
+        0
+    );
+
+    // `/base` is a bare marker, not a path with a value.
+    assert_eq!(
+        semantic_search(Some(facet_filter(&["/base"]))),
+        3,
+        "only Genesis is marked as a foundational book"
     );
 
     // Book paths are exact.
@@ -665,10 +675,7 @@ fn empty_filter_lists_do_not_empty_the_result_set() {
             limit: Some(50),
             filters: Some(SearchFilters {
                 book_paths: Some(vec![]),
-                topics: Some(vec![]),
-                authors: Some(vec![]),
-                eras: Some(vec![]),
-                bases: Some(vec![]),
+                facets: Some(vec![]),
                 include_pdf: None,
             }),
             ..Default::default()

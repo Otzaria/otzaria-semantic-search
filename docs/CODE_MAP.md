@@ -106,7 +106,15 @@ otzaria-semantic-search/
 ### 4. תת-המערכת הסמנטית (`src/semantic/`)
 
 * [`src/semantic/types.rs`](../src/semantic/types.rs)
-  - `BookLine` & `BookForIndexing` — ייצוג קלט ספר מ-Tantivy.
+  - `BookLine` & `BookForIndexing` — ייצוג קלט ספר מ-Tantivy: `topics` (נתיב
+    קטגוריה אחד) ו-`extra_facets` (רשימה — ספר יכול לשאת כמה מחברים).
+  - `ContentFingerprint` — `Hash(u64)` מול `Unverifiable`. Tantivy מדווח
+    `contentHash = 0` לכל PDF, ולכן אסור להשוות אותו כ-hash.
+  - `BookForIndexing::line_fingerprint()` — חתימה שהמנוע הסמנטי מחשב מהשורות עצמן;
+    זה מה שמאפשר לזהות PDF שהשתנה.
+  - `SearchFilters` & `CompiledFilters` — רשימת facets שטוחה, מקובצת לממדים לפי
+    `FACET_DIMENSION_ROOTS` בדיוק כמו `facet_filter_query` הלקסיקלי. `compile()`
+    מקבץ פעם אחת לשאילתה, כי ההתאמה נקראת פעם לכל וקטור באחסון.
   - `SemanticChunk` — קטע טקסט מעובד המיועד ל-Embedding עם שדות Anchored context.
   - `VectorMetadata` — מטא-דאטה שנשמר לצד הוקטור ב-Vector Store.
   - `SemanticCandidate` & `LexicalCandidate` — מועמדים מכל נתיב חיפוש.
@@ -124,8 +132,9 @@ otzaria-semantic-search/
     אחד** על הקובץ (מודל של מאות MB נקרא פעם אחת בלבד).
   - `EmbeddingBackendKind` — זהות ה-backend, נשמרת ב-manifest. `is_semantic()` מחזיר
     `false` ל-stand-in, כדי שלא יתחזה למודל.
-  - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו. כל וקטור מאומת בממד
-    ובנורמה, כך שווקטור אפס אינו נכנס לאינדקס.
+  - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו.
+  - `normalize_validated()` — דוחה כל וקטור שלא ניתן להשוות: ממד שגוי, רכיב
+    לא-finite, נורמה לא-finite (כולל וקטור finite שגולש), או נורמה אפס.
   - `l2_normalize()` — נורמליזציית L2, מחזירה את הנורמה שהייתה לפני כן.
   - `mock` — ה-stand-in הדטרמיניסטי, זמין רק תחת `cfg(test)` או
     `--features mock-embedding`. **אינו מודל סמנטי.**
@@ -145,7 +154,10 @@ otzaria-semantic-search/
   - `ManifestMismatch::invalidates_vectors()` — האם הווקטורים עצמם פסולים (מודל/ממד) או שרק צריך chunking מחדש.
   - `quarantine()` — קובץ manifest לא קריא מועבר הצידה ולא נמחק, כדי שיהיה מה לחקור.
   - `clear_books()` — מחיקת רשומות הספרים תוך שמירת המטאדאטה של הקונפיגורציה.
-  - `book_needs_reindex()` — בדיקת דלתא לפי `content_hash` מול Tantivy.
+  - `book_index_need()` — `Missing` / `Changed` / `Unverifiable` / `UpToDate`.
+    ההחלטה הזמינה בזמן diff, לפני שהשורות נטענו.
+  - `BookManifestEntry.line_fingerprint` + `chunk_count = 0` כמרקר תקין —
+    `clear_books_with_vectors()` מוחק רק רשומות שמצהירות על וקטורים.
 
 * [`src/semantic/engine.rs`](../src/semantic/engine.rs)
   - `SemanticEngine` & `SemanticConfig` — המנוע הסמנטי המרכזי המאגד את ה-Chunker, ה-Runtime, ה-VectorStore וה-Manifest.
@@ -176,6 +188,20 @@ otzaria-semantic-search/
   - תהליך CI מלא ב-GitHub Actions הרץ על Ubuntu, Windows ו-macOS, **בשתי
     קונפיגורציות features**, כולל `cargo fmt --check`, clippy עם `-D warnings`,
     ואימות קישורי תיעוד (`cargo doc`).
+
+## מדידות
+
+* [`benches/vector_search.rs`](../benches/vector_search.rs) — מודד את
+  `VectorStore::search` המלא (לא רק dot-product) ומחלץ מכך את ההערכה לקנה מידה של
+  הספרייה. תוכנית רגילה עם `harness = false`: המטרה היא מדידה שניתן לשחזר, ולא כדאי
+  לגרור עץ תלויות של framework למאגר שמיועד לבנייה מובילית.
+
+  ```bash
+  cargo bench
+  cargo bench -- --vectors 1000000 --dim 256
+  ```
+
+  המספרים תלויי-מכונה: השוו ריצות על אותה מכונה, ואל תצטטו אותם כמוחלטים.
 
 ## הרצה מקומית
 

@@ -29,6 +29,17 @@ const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 /// Highest GGUF container version this crate is willing to open.
 const GGUF_MAX_VERSION: u32 = 3;
 
+/// Size of the GGUF header: magic (4) + version (4) + `tensor_count` (8) +
+/// `metadata_kv_count` (8).
+const GGUF_HEADER_BYTES: usize = 24;
+
+/// Sanity ceiling for the header's declared counts.
+///
+/// A real embedding model has hundreds of tensors and tens of metadata entries.
+/// A wildly larger count means the bytes are not a GGUF header — a truncated
+/// download, or another format that happens to start with the right four bytes.
+const GGUF_MAX_DECLARED_COUNT: u64 = 1 << 24;
+
 /// Read buffer for hashing the model file. Large enough that hashing a
 /// multi-hundred-megabyte model is bound by the hash, not by syscalls.
 const HASH_BUFFER_BYTES: usize = 1 << 20;
@@ -202,19 +213,7 @@ impl EmbeddingRuntime {
             }
 
             for mut vector in raw {
-                if vector.len() as u32 != dim {
-                    return Err(EmbeddingError::DimensionMismatch {
-                        expected: dim,
-                        actual: vector.len() as u32,
-                    });
-                }
-                if l2_normalize(&mut vector) < MIN_VECTOR_NORM {
-                    return Err(EmbeddingError::InferenceFailed {
-                        reason: "backend produced a zero-norm vector (empty or \
-                                 unrepresentable input)"
-                            .to_string(),
-                    });
-                }
+                normalize_validated(&mut vector, dim)?;
                 results.push(vector);
             }
         }
@@ -267,10 +266,65 @@ impl EmbeddingRuntime {
     }
 }
 
+/// L2-normalize a vector in place after checking it can be compared at all.
+///
+/// Rejects anything that would enter the index as an unsearchable point:
+///
+/// * **wrong dimensionality** — it could not be stored;
+/// * **a non-finite component** — `NaN` poisons its own norm, and
+///   `NaN < MIN_VECTOR_NORM` is `false`, so a norm test alone waves it through;
+/// * **a non-finite norm** — which also catches a *finite* vector whose squares
+///   overflow `f32` (components around `1e30`): the norm becomes `inf`, the
+///   reciprocal `0`, and the vector silently normalizes to all zeros;
+/// * **no direction** — a zero vector matches nothing.
+///
+/// Getting this wrong is quiet rather than loud: the book is recorded as indexed,
+/// then every one of its vectors scores `NaN` and is discarded during search. The
+/// result is an index that looks complete and returns nothing for that book.
+pub fn normalize_validated(vector: &mut [f32], expected_dim: u32) -> Result<(), EmbeddingError> {
+    if vector.len() as u32 != expected_dim {
+        return Err(EmbeddingError::DimensionMismatch {
+            expected: expected_dim,
+            actual: vector.len() as u32,
+        });
+    }
+
+    if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
+        return Err(EmbeddingError::InferenceFailed {
+            reason: format!(
+                "vector component {position} is not finite ({}); such a vector \
+                 can never be matched",
+                vector[position]
+            ),
+        });
+    }
+
+    let norm = l2_normalize(vector);
+    if !norm.is_finite() {
+        return Err(EmbeddingError::InferenceFailed {
+            reason: format!("vector norm is not finite ({norm}); the magnitudes overflowed f32"),
+        });
+    }
+    if norm < MIN_VECTOR_NORM {
+        return Err(EmbeddingError::InferenceFailed {
+            reason: "vector has no direction (zero norm) — empty or unrepresentable input"
+                .to_string(),
+        });
+    }
+
+    // Normalization only shrinks magnitudes (|x| <= norm), so this cannot fire
+    // once the input and the norm are finite. Cheap enough to keep as a backstop
+    // against a future backend normalizing on its own.
+    debug_assert!(vector.iter().all(|x| x.is_finite()));
+    Ok(())
+}
+
 /// L2-normalize in place and return the norm the vector had beforehand.
 ///
 /// A norm indistinguishable from zero leaves the vector untouched — the caller
 /// must treat the returned norm as a failure signal rather than dividing by it.
+/// Prefer [`normalize_validated`], which also rejects vectors that cannot be
+/// compared.
 pub fn l2_normalize(vec: &mut [f32]) -> f32 {
     let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > MIN_VECTOR_NORM {
@@ -285,10 +339,14 @@ pub fn l2_normalize(vec: &mut [f32]) -> f32 {
 /// Validate a GGUF container and return the file's SHA-256, reading the file
 /// exactly once.
 ///
-/// Validation is intentionally limited to the container header — full metadata
-/// and tensor parsing belongs to the real backend (roadmap P2). What it does
-/// buy is that a placeholder or truncated file is rejected instead of being
-/// accepted as a model.
+/// Checks the complete header — magic, version, and both declared counts, which
+/// have to be present and plausible. Full metadata and tensor parsing belongs to
+/// the real backend (roadmap P2); what this buys is that a placeholder, a
+/// truncated download, or another format that happens to begin with `GGUF` is
+/// rejected rather than accepted as a model.
+///
+/// One pass over the file: a multi-hundred-megabyte model is read once, not once
+/// to validate and again to hash.
 pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError> {
     use sha2::{Digest, Sha256};
 
@@ -303,7 +361,8 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
-    let mut header = Vec::with_capacity(8);
+    let mut header = Vec::with_capacity(GGUF_HEADER_BYTES);
+    let mut total_bytes = 0u64;
 
     loop {
         let read = file
@@ -314,17 +373,17 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
         if read == 0 {
             break;
         }
-        if header.len() < 8 {
-            let wanted = (8 - header.len()).min(read);
+        if header.len() < GGUF_HEADER_BYTES {
+            let wanted = (GGUF_HEADER_BYTES - header.len()).min(read);
             header.extend_from_slice(&buffer[..wanted]);
         }
         hasher.update(&buffer[..read]);
+        total_bytes += read as u64;
     }
 
-    if header.len() < 8 {
+    if header.len() < GGUF_HEADER_BYTES {
         return Err(invalid(format!(
-            "file is {} bytes; a GGUF header needs at least 8",
-            header.len()
+            "file is {total_bytes} bytes; a GGUF header needs {GGUF_HEADER_BYTES}"
         )));
     }
     if header[..4] != GGUF_MAGIC {
@@ -335,10 +394,25 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
         )));
     }
 
+    let field = |offset: usize| -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&header[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    };
+
     let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if version == 0 || version > GGUF_MAX_VERSION {
         return Err(invalid(format!(
             "unsupported GGUF version {version} (supported: 1..={GGUF_MAX_VERSION})"
+        )));
+    }
+
+    let tensor_count = field(8);
+    let metadata_kv_count = field(16);
+    if tensor_count > GGUF_MAX_DECLARED_COUNT || metadata_kv_count > GGUF_MAX_DECLARED_COUNT {
+        return Err(invalid(format!(
+            "implausible header counts (tensors: {tensor_count}, metadata: \
+             {metadata_kv_count}); the file is probably not GGUF or is corrupt"
         )));
     }
 
@@ -392,11 +466,12 @@ pub mod mock {
     /// and metadata counts) so tests exercise real container validation instead
     /// of a placeholder file.
     pub fn write_stub_gguf(path: &std::path::Path, version: u32) -> std::io::Result<()> {
-        let mut bytes = Vec::with_capacity(24);
+        let mut bytes = Vec::with_capacity(super::GGUF_HEADER_BYTES);
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&version.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
         bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+        debug_assert_eq!(bytes.len(), super::GGUF_HEADER_BYTES);
         std::fs::write(path, bytes)
     }
 }
@@ -495,7 +570,7 @@ mod tests {
         let dir = TempDir::new("magic");
 
         let wrong = dir.path().join("wrong.gguf");
-        std::fs::write(&wrong, b"NOTGGUF_and_more_bytes").unwrap();
+        std::fs::write(&wrong, b"NOTGGUF_and_more_bytes_to_fill_the_header").unwrap();
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: wrong,
             ..Default::default()
@@ -515,6 +590,78 @@ mod tests {
             rt.load(),
             Err(EmbeddingError::InvalidModelFile { .. })
         ));
+    }
+
+    /// The whole header has to be there. A file holding only the magic and a
+    /// version is 8 bytes of coincidence, not a model.
+    #[test]
+    fn load_rejects_a_header_that_stops_after_the_version() {
+        let dir = TempDir::new("partial_header");
+        let model = dir.path().join("partial.gguf");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(bytes.len(), 8);
+        std::fs::write(&model, &bytes).unwrap();
+
+        match validate_and_checksum_gguf(&model) {
+            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
+                assert!(reason.contains("header"), "unhelpful reason: {reason}");
+            }
+            other => panic!("an 8-byte file must be rejected, got {other:?}"),
+        }
+
+        // Truncated part-way through the counts, too.
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        assert_eq!(bytes.len(), GGUF_HEADER_BYTES - 4);
+        std::fs::write(&model, &bytes).unwrap();
+        assert!(matches!(
+            validate_and_checksum_gguf(&model),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+    }
+
+    /// A corrupt or misidentified file can carry the right magic and a garbage
+    /// tensor count. Real models have hundreds of tensors, not billions.
+    #[test]
+    fn load_rejects_implausible_header_counts() {
+        let dir = TempDir::new("implausible");
+        let model = dir.path().join("garbage.gguf");
+
+        for (tensors, metadata) in [(u64::MAX, 0u64), (0, u64::MAX), (1 << 40, 1 << 40)] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"GGUF");
+            bytes.extend_from_slice(&3u32.to_le_bytes());
+            bytes.extend_from_slice(&tensors.to_le_bytes());
+            bytes.extend_from_slice(&metadata.to_le_bytes());
+            std::fs::write(&model, &bytes).unwrap();
+
+            assert!(
+                matches!(
+                    validate_and_checksum_gguf(&model),
+                    Err(EmbeddingError::InvalidModelFile { .. })
+                ),
+                "tensors={tensors} metadata={metadata} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plausible_header_is_accepted() {
+        let dir = TempDir::new("plausible");
+        let model = dir.path().join("real.gguf");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&291u64.to_le_bytes()); // tensors
+        bytes.extend_from_slice(&24u64.to_le_bytes()); // metadata entries
+        bytes.extend_from_slice(&[0u8; 128]); // payload
+        std::fs::write(&model, &bytes).unwrap();
+
+        assert!(validate_and_checksum_gguf(&model).is_ok());
     }
 
     #[test]
@@ -573,10 +720,13 @@ mod tests {
         let a = dir.path().join("a.gguf");
         let b = dir.path().join("b.gguf");
 
-        // Two files identical for the first HASH_BUFFER_BYTES + 1 bytes.
+        // Two files identical for the first HASH_BUFFER_BYTES + 1 bytes, both
+        // carrying a valid header so the checksum is what is under test.
         let mut base = Vec::with_capacity(HASH_BUFFER_BYTES + 64);
         base.extend_from_slice(b"GGUF");
         base.extend_from_slice(&3u32.to_le_bytes());
+        base.extend_from_slice(&8u64.to_le_bytes()); // tensor_count
+        base.extend_from_slice(&2u64.to_le_bytes()); // metadata_kv_count
         base.resize(HASH_BUFFER_BYTES + 1, 7u8);
 
         let mut with_tail = base.clone();
@@ -655,6 +805,78 @@ mod tests {
                 "text {text:?} must not yield a vector"
             );
         }
+    }
+
+    /// A norm test alone is not enough: `NaN < MIN_VECTOR_NORM` is `false`, so a
+    /// poisoned vector would be stored and then silently dropped at search time,
+    /// leaving a book that is recorded as indexed but unsearchable.
+    #[test]
+    fn non_finite_vectors_are_rejected() {
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            ("NaN component", vec![f32::NAN, 1.0, 0.0, 0.0]),
+            ("infinite component", vec![f32::INFINITY, 1.0, 0.0, 0.0]),
+            (
+                "negative infinite component",
+                vec![f32::NEG_INFINITY, 1.0, 0.0, 0.0],
+            ),
+            ("all NaN", vec![f32::NAN; 4]),
+            // Finite components whose squares overflow f32: the norm becomes
+            // `inf`, the reciprocal `0`, and the vector normalizes to all zeros.
+            ("finite but overflowing", vec![1e30, 1e30, 1e30, 1e30]),
+        ];
+
+        for (name, mut vector) in cases {
+            let result = normalize_validated(&mut vector, 4);
+            assert!(
+                matches!(result, Err(EmbeddingError::InferenceFailed { .. })),
+                "{name} must be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_vector_is_rejected_for_having_no_direction() {
+        let mut zero = vec![0.0f32; 4];
+        assert!(matches!(
+            normalize_validated(&mut zero, 4),
+            Err(EmbeddingError::InferenceFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wrong_dimension_vector_is_rejected_before_anything_else() {
+        let mut short = vec![f32::NAN, 1.0];
+        assert!(
+            matches!(
+                normalize_validated(&mut short, 4),
+                Err(EmbeddingError::DimensionMismatch {
+                    expected: 4,
+                    actual: 2
+                })
+            ),
+            "the dimension is the more specific diagnosis"
+        );
+    }
+
+    #[test]
+    fn a_healthy_vector_is_normalized_in_place() {
+        let mut vector = vec![3.0f32, 4.0, 0.0, 0.0];
+        normalize_validated(&mut vector, 4).unwrap();
+
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!((vector[0] - 0.6).abs() < 1e-6);
+        assert!((vector[1] - 0.8).abs() < 1e-6);
+        assert!(vector.iter().all(|x| x.is_finite()));
+    }
+
+    /// A very small but representable vector still has a direction and must be
+    /// kept — the guard is against zero and non-finite, not against "small".
+    #[test]
+    fn a_tiny_but_representable_vector_is_kept() {
+        let mut vector = vec![1e-6f32, 0.0, 0.0, 0.0];
+        normalize_validated(&mut vector, 4).unwrap();
+        assert!((vector[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

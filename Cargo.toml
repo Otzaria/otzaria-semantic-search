@@ -22,6 +22,14 @@ default = []
 # serve fake vectors. In-crate `#[cfg(test)]` code enables it implicitly.
 mock-embedding = []
 
+# Plain program, not a Criterion harness: the point is a re-runnable measurement,
+# and a mobile-bound crate should not carry a benchmarking dependency tree for it.
+# Measures `VectorStore` directly, so it needs no embedding backend and runs in a
+# default build: `cargo bench`.
+[[bench]]
+name = "vector_search"
+harness = false
+
 [dependencies]
 # Error handling
 thiserror = "2.0"

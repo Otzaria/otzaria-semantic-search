@@ -166,17 +166,31 @@ impl VectorStore {
     /// Insert or replace a batch of vector records.
     ///
     /// Vectors are L2-normalized before storage. Either the whole batch is
-    /// applied or none of it: dimensions are validated up front so a rejected
+    /// applied or none of it: everything is validated up front so a rejected
     /// vector cannot leave the store half-written.
+    ///
+    /// A non-finite component is rejected here as well as at the embedding
+    /// layer. It is not redundant: whatever produces vectors, a stored `NaN`
+    /// scores `NaN`, gets skipped during search, and leaves a record that exists
+    /// but can never be retrieved. The store is the last place to catch that.
     pub fn insert_batch(
         &self,
         batch: &[(VectorMetadata, Vec<f32>)],
     ) -> Result<(), VectorStoreError> {
-        for (_, vector) in batch {
+        for (meta, vector) in batch {
             if vector.len() as u32 != self.config.embedding_dim {
                 return Err(VectorStoreError::DimensionMismatch {
                     store_dim: self.config.embedding_dim,
                     vector_dim: vector.len() as u32,
+                });
+            }
+            if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
+                return Err(VectorStoreError::InsertFailed {
+                    reason: format!(
+                        "vector for {} has a non-finite component at {position} ({}); \
+                         it could never be matched by a search",
+                        meta.semantic_id, vector[position]
+                    ),
                 });
             }
         }
@@ -245,7 +259,13 @@ impl VectorStore {
             return Ok(Vec::new());
         }
 
-        if l2_norm(query_vector) < MIN_VECTOR_NORM {
+        // A query that is not comparable yields nothing rather than scoring
+        // every record as NaN and returning an arbitrary set.
+        let norm = l2_norm(query_vector);
+        if !norm.is_finite() || norm < MIN_VECTOR_NORM {
+            return Ok(Vec::new());
+        }
+        if query_vector.iter().any(|x| !x.is_finite()) {
             return Ok(Vec::new());
         }
         let query = l2_normalize_vec(query_vector);
@@ -452,10 +472,11 @@ mod tests {
             segment: 0,
             is_pdf: false,
             title: "Test Book".to_string(),
-            topics: vec!["/מקרא/תורה".to_string()],
-            author: Some("Author 1".to_string()),
-            era: Some("Rishonim".to_string()),
-            base: Some("BaseBook".to_string()),
+            facets: vec![
+                "/מקרא/תורה".to_string(),
+                "/author/Author 1".to_string(),
+                "/era/Rishonim".to_string(),
+            ],
         }
     }
 
@@ -653,6 +674,62 @@ mod tests {
             0,
             "the valid record must not be applied when its batch is rejected"
         );
+    }
+
+    /// A stored NaN scores NaN, gets skipped at search time, and leaves a record
+    /// that exists but is unreachable — so the store refuses it outright.
+    #[test]
+    fn non_finite_vectors_are_refused_by_the_store() {
+        let dir = TempDir::new("non_finite_insert");
+        let store = store(&dir, 4);
+
+        for bad in [
+            vec![f32::NAN, 0.0, 0.0, 0.0],
+            vec![f32::INFINITY, 0.0, 0.0, 0.0],
+            vec![f32::NEG_INFINITY, 1.0, 0.0, 0.0],
+        ] {
+            let result = store.insert_batch(&[(sample_metadata("bad", "book.txt"), bad.clone())]);
+            assert!(
+                matches!(result, Err(VectorStoreError::InsertFailed { .. })),
+                "{bad:?} must be refused, got {result:?}"
+            );
+        }
+        assert_eq!(store.vector_count(), 0);
+
+        // And a rejected vector does not take its batch-mates down silently:
+        // the whole batch is refused, so nothing is half-applied.
+        let result = store.insert_batch(&[
+            (
+                sample_metadata("good", "book.txt"),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                sample_metadata("bad", "book.txt"),
+                vec![f32::NAN, 0.0, 0.0, 0.0],
+            ),
+        ]);
+        assert!(result.is_err());
+        assert_eq!(store.vector_count(), 0);
+    }
+
+    #[test]
+    fn a_non_finite_query_returns_nothing_rather_than_an_arbitrary_set() {
+        let dir = TempDir::new("non_finite_query");
+        let store = store(&dir, 4);
+        store
+            .insert_batch(&[(sample_metadata("id1", "book.txt"), vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+
+        for query in [
+            vec![f32::NAN, 0.0, 0.0, 0.0],
+            vec![f32::INFINITY, 0.0, 0.0, 0.0],
+            vec![1e30, 1e30, 1e30, 1e30],
+        ] {
+            assert!(
+                store.search(&query, 5, None).unwrap().is_empty(),
+                "query {query:?} must not return results"
+            );
+        }
     }
 
     #[test]
@@ -867,10 +944,7 @@ mod tests {
 
         let empty_everything = SearchFilters {
             book_paths: Some(vec![]),
-            topics: Some(vec![]),
-            authors: Some(vec![]),
-            eras: Some(vec![]),
-            bases: Some(vec![]),
+            facets: Some(vec![]),
             include_pdf: Some(true),
         };
         let hits = store
@@ -888,7 +962,7 @@ mod tests {
             .unwrap();
 
         let filters = SearchFilters {
-            topics: Some(vec!["/תלמוד/בבלי".to_string()]),
+            facets: Some(vec!["/תלמוד/בבלי".to_string()]),
             ..Default::default()
         };
         assert!(store

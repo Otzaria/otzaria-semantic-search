@@ -66,6 +66,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-      # Release compilation of the artifact that actually ships.
+      # Release compilation of the artifact that actually ships. `--all-targets`
+      # covers benches/, so the benchmark cannot rot unnoticed; it is compiled,
+      # not run — CI runners are too noisy for the numbers to mean anything.
       - name: Build Release
         run: cargo build --release --all-targets

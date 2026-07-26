@@ -22,8 +22,8 @@ use crate::semantic::manifest::{
 };
 use crate::semantic::store::{VectorStore, VectorStoreConfig};
 use crate::semantic::types::{
-    BookForIndexing, IndexDiff, SearchFilters, SemanticCandidate, SemanticChunk, SemanticStatus,
-    VectorMetadata,
+    BookForIndexing, ContentFingerprint, IndexDiff, SearchFilters, SemanticCandidate,
+    SemanticChunk, SemanticStatus, VectorMetadata,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -172,13 +172,21 @@ impl SemanticEngine {
                 // did not. Left alone it would claim books are indexed while
                 // every query returns nothing.
                 if !self.store.is_persistent() && self.manifest.book_count() > 0 {
-                    let dropped = self.manifest.clear_books();
-                    log::info!(
-                        "Vector backend '{}' does not persist; dropped {dropped} stale book \
-                         record(s) from the manifest so they will be re-indexed",
-                        self.store.backend_id()
-                    );
-                    self.manifest.save(&self.config.root_dir)?;
+                    // Only records that claim vectors are stale. A `chunk_count == 0`
+                    // marker describes no vectors, so nothing about it was lost —
+                    // dropping it would just make a scanned PDF get reprocessed on
+                    // every startup.
+                    let dropped = self.manifest.clear_books_with_vectors();
+                    if dropped > 0 {
+                        log::info!(
+                            "Vector backend '{}' does not persist; dropped {dropped} stale book \
+                             record(s) so they will be re-indexed, and kept {} empty-book \
+                             marker(s)",
+                            self.store.backend_id(),
+                            self.manifest.empty_book_count()
+                        );
+                        self.manifest.save(&self.config.root_dir)?;
+                    }
                 }
                 Ok(())
             }
@@ -323,6 +331,16 @@ impl SemanticEngine {
         self.ensure_index_usable()?;
 
         let chunks = self.chunker.chunk_book(book);
+        let line_fingerprint = book.line_fingerprint();
+
+        if self.book_is_already_current(book, chunks.len(), line_fingerprint) {
+            log::debug!(
+                "{} is unchanged; skipping {} chunk(s) of inference",
+                book.source_book_key,
+                chunks.len()
+            );
+            return Ok(chunks.len() as u32);
+        }
 
         // Only pay for the model when there is something to embed. A book with
         // no embeddable lines still needs its stale vectors dropped below, and
@@ -348,10 +366,18 @@ impl SemanticEngine {
         }
 
         if chunks.is_empty() {
-            // A book with no embeddable lines owns no vectors and no record.
-            // Without this, lines deleted from a book would keep their vectors.
+            // No vectors, but the book *was* processed. Recording that — rather
+            // than dropping the entry — is what stops a scanned PDF or a book of
+            // headings from being handed over again on every startup.
             self.store.commit()?;
-            self.manifest.remove_book(&book.source_book_key);
+            self.manifest.mark_book_indexed(
+                book.source_book_key.clone(),
+                book.content_hash,
+                line_fingerprint,
+                0,
+                self.config.chunking.chunking_version,
+                self.config.normalization_version,
+            );
             return Ok(0);
         }
 
@@ -372,12 +398,42 @@ impl SemanticEngine {
         self.manifest.mark_book_indexed(
             book.source_book_key.clone(),
             book.content_hash,
+            line_fingerprint,
             chunks.len() as u32,
             self.config.chunking.chunking_version,
             self.config.normalization_version,
         );
 
         Ok(chunks.len() as u32)
+    }
+
+    /// Whether this exact book is already in the index, so embedding it again
+    /// would produce identical vectors.
+    ///
+    /// Checked against the book's own lines rather than the lexical content hash,
+    /// which is why it also works for PDFs — the lexical index has no fingerprint
+    /// for them, so [`SemanticEngine::diff_against_tantivy`] has to report every
+    /// PDF as needing attention. This is what makes that cheap: re-chunking, then
+    /// no inference at all when nothing changed.
+    ///
+    /// The stored vector count is part of the comparison, so a manifest entry can
+    /// never license a skip when the vectors it describes are absent.
+    fn book_is_already_current(
+        &self,
+        book: &BookForIndexing,
+        chunk_count: usize,
+        line_fingerprint: u64,
+    ) -> bool {
+        let Some(entry) = self.manifest.book(&book.source_book_key) else {
+            return false;
+        };
+
+        entry.line_fingerprint == line_fingerprint
+            && entry.content_hash == book.content_hash
+            && entry.chunk_count as usize == chunk_count
+            && entry.chunking_version == self.config.chunking.chunking_version
+            && entry.normalization_version == self.config.normalization_version
+            && self.store.book_vector_count(&book.source_book_key) == chunk_count
     }
 
     /// Embed the chunks' texts in backend-sized batches.
@@ -464,6 +520,19 @@ impl SemanticEngine {
 
     /// Compare Tantivy's per-book content hashes against the semantic index.
     ///
+    /// `tantivy_books` maps a book key to its raw `contentHash`. A hash of `0` is
+    /// the lexical engine's "no fingerprint" marker, which it records for every
+    /// PDF because their extracted text never enters the library database.
+    /// Comparing that as a hash would make `0 == 0` mean "unchanged" and a
+    /// replaced or re-scanned PDF would never be re-indexed — so such books are
+    /// always reported as needing attention.
+    ///
+    /// That is not as expensive as it sounds: handing one back to
+    /// [`SemanticEngine::index_book`] costs re-chunking and nothing more when its
+    /// lines are unchanged. If the caller can supply a real PDF fingerprint
+    /// (extracted-text hash, or size and mtime), passing it as the content hash
+    /// removes even that.
+    ///
     /// When a configuration change invalidated the index, every known book is
     /// reported as needing work — an incremental update cannot repair a change
     /// of model or chunking.
@@ -486,17 +555,15 @@ impl SemanticEngine {
         let mut changed_books = Vec::new();
 
         for (book_key, &content_hash) in tantivy_books {
-            let known = self.manifest.books.contains_key(book_key);
-            let needs_work = full_rebuild
-                || self.manifest.book_needs_reindex(
-                    book_key,
-                    content_hash,
-                    self.config.chunking.chunking_version,
-                    self.config.normalization_version,
-                );
+            let need = self.manifest.book_index_need(
+                book_key,
+                ContentFingerprint::from_lexical_hash(content_hash),
+                self.config.chunking.chunking_version,
+                self.config.normalization_version,
+            );
 
-            if needs_work {
-                if known {
+            if full_rebuild || need.needs_work() {
+                if need.is_known() {
                     changed_books.push(book_key.clone());
                 } else {
                     new_books.push(book_key.clone());
@@ -653,10 +720,8 @@ mod tests {
             title: "ספר בדיקה".to_string(),
             content_hash,
             is_pdf: false,
-            topics: vec!["/מקרא/תורה".to_string()],
-            author: Some("מחבר".to_string()),
-            era: Some("תנך".to_string()),
-            base: None,
+            topics: "/מקרא/תורה".to_string(),
+            extra_facets: vec!["/author/מחבר".to_string(), "/era/תנך".to_string()],
             lines: lines
                 .iter()
                 .map(|&(line_id, section_id, text)| BookLine {
@@ -787,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn reindexing_a_book_that_lost_every_line_removes_it_from_the_index() {
+    fn reindexing_a_book_that_lost_every_line_drops_its_vectors_but_keeps_its_record() {
         let dir = TempDir::new("reindex_emptied");
         let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
 
@@ -798,9 +863,48 @@ mod tests {
         let status = engine.status();
         assert_eq!(status.vector_count, 0, "no orphan vectors may survive");
         assert_eq!(
-            status.indexed_book_count, 0,
-            "a book with nothing to index owns no manifest record"
+            status.indexed_book_count, 1,
+            "the book was processed; the record is what stops it being reprocessed"
         );
+
+        // And the diff agrees there is nothing left to do for it.
+        let mut tantivy = HashMap::new();
+        tantivy.insert("otzaria/tanach/genesis.txt".to_string(), 333u64);
+        assert!(engine.diff_against_tantivy(&tantivy).is_up_to_date());
+    }
+
+    /// A scanned PDF yields no text. Without a marker it would be reported as new
+    /// and reprocessed on every startup — the problem the lexical indexer solves
+    /// with its own empty-book marker.
+    #[test]
+    fn a_book_that_yields_nothing_embeddable_is_not_offered_again() {
+        let dir = TempDir::new("empty_book_marker");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+
+        // Lines too short to embed: the book is processed but produces no chunks.
+        let headings = book(
+            "headings.txt",
+            4242,
+            &[(1, 1, "א"), (2, 1, "ב"), (3, 1, "ג")],
+        );
+        assert_eq!(engine.index_book(&headings).unwrap(), 0);
+
+        let mut tantivy = HashMap::new();
+        tantivy.insert("headings.txt".to_string(), 4242u64);
+
+        let diff = engine.diff_against_tantivy(&tantivy);
+        assert!(
+            diff.is_up_to_date(),
+            "an empty book must not be reported as needing work: {diff:?}"
+        );
+        assert!(diff.new_books.is_empty());
+        assert!(diff.changed_books.is_empty());
+
+        // It survives a restart too, since it never had vectors to lose.
+        drop(engine);
+        let engine = SemanticEngine::open(config_at(&dir)).unwrap();
+        assert_eq!(engine.status().indexed_book_count, 1);
+        assert!(engine.diff_against_tantivy(&tantivy).is_up_to_date());
     }
 
     /// Cleaning up a book that has nothing left to embed must not require a
@@ -817,7 +921,105 @@ mod tests {
 
         assert_eq!(engine.index_book(&blank).unwrap(), 0);
         assert!(!engine.status().model_loaded);
-        assert_eq!(engine.status().indexed_book_count, 0);
+        assert_eq!(
+            engine.status().indexed_book_count,
+            1,
+            "the empty-book marker is written without needing a model"
+        );
+    }
+
+    /// The lexical engine records `contentHash = 0` for every PDF, because their
+    /// extracted text is not in the library database. Compared as an ordinary
+    /// hash, `0 == 0` means "unchanged" and a replaced PDF would keep its old
+    /// vectors forever.
+    #[test]
+    fn a_changed_pdf_is_reindexed_even_though_its_content_hash_never_changes() {
+        let dir = TempDir::new("pdf_reindex");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+
+        let mut scan = book(
+            "otzaria/scans/responsa.pdf",
+            0, // exactly what Tantivy reports for a PDF
+            &[
+                (1, 1, "עמוד ראשון של השאלות והתשובות הסרוקות"),
+                (2, 1, "עמוד שני של השאלות והתשובות הסרוקות"),
+            ],
+        );
+        scan.is_pdf = true;
+        engine.index_book(&scan).unwrap();
+        assert_eq!(engine.status().vector_count, 2);
+
+        // The PDF is re-scanned: different text, same contentHash of 0.
+        let mut rescanned = scan.clone();
+        rescanned.lines[1].text = "עמוד שני לאחר סריקה מחדש באיכות טובה יותר".to_string();
+        rescanned.lines.push(BookLine {
+            line_id: 3,
+            section_id: 1,
+            text: "עמוד שלישי שלא זוהה בסריקה הראשונה".to_string(),
+            line_hash: 3000,
+            reference: "עמוד 3".to_string(),
+            segment: 3,
+        });
+        assert_eq!(rescanned.content_hash, 0);
+
+        // The diff must ask for it — it cannot prove anything from a hash of 0.
+        let mut tantivy = HashMap::new();
+        tantivy.insert("otzaria/scans/responsa.pdf".to_string(), 0u64);
+        let diff = engine.diff_against_tantivy(&tantivy);
+        assert!(
+            !diff.is_up_to_date(),
+            "a book with no usable fingerprint can never be declared current"
+        );
+        assert_eq!(diff.changed_books, vec!["otzaria/scans/responsa.pdf"]);
+
+        assert_eq!(engine.index_book(&rescanned).unwrap(), 3);
+        assert_eq!(
+            engine.status().vector_count,
+            3,
+            "the re-scanned text must have replaced the old vectors"
+        );
+
+        // The new text is findable and the replaced text is not.
+        let hits = engine
+            .search("עמוד שלישי שלא זוהה בסריקה הראשונה", 5, None)
+            .unwrap();
+        assert!((hits[0].similarity_score - 1.0).abs() < 1e-5);
+        assert_eq!(hits[0].metadata.line_id, 3);
+    }
+
+    /// Reporting every PDF as "needs attention" is only acceptable because
+    /// handing one back costs re-chunking and no inference when it is unchanged.
+    #[test]
+    fn an_unchanged_book_is_skipped_without_re_embedding() {
+        let dir = TempDir::new("skip_unchanged");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+
+        let mut scan = book(
+            "otzaria/scans/unchanged.pdf",
+            0,
+            &[(1, 1, "עמוד סרוק עם מספיק תווים כדי להיות מוטמע")],
+        );
+        scan.is_pdf = true;
+        engine.index_book(&scan).unwrap();
+
+        // Drop the model: a genuine skip must not need one.
+        engine.unload_model();
+        assert_eq!(
+            engine.index_book(&scan).unwrap(),
+            1,
+            "an unchanged book must still report its chunk count"
+        );
+        assert!(
+            !engine.status().model_loaded,
+            "no inference means no model load"
+        );
+        assert_eq!(engine.status().vector_count, 1);
+
+        // Whereas a changed line does load the model and re-embed.
+        let mut changed = scan.clone();
+        changed.lines[0].text = "עמוד סרוק אחר לגמרי עם מספיק תווים להטמעה".to_string();
+        engine.index_book(&changed).unwrap();
+        assert!(engine.status().model_loaded);
     }
 
     #[test]
@@ -940,7 +1142,7 @@ mod tests {
             .is_empty());
 
         let by_topic = SearchFilters {
-            topics: Some(vec!["/מקרא".to_string()]),
+            facets: Some(vec!["/מקרא".to_string()]),
             ..Default::default()
         };
         assert_eq!(engine.search(query, 10, Some(&by_topic)).unwrap().len(), 3);

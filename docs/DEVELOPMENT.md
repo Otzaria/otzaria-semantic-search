@@ -129,7 +129,9 @@ BM25 עדיין עובד
 | zvec אמיתי                       | **לא מחובר עדיין**         |
 | In-memory vector store           | ממומש                      |
 | Cosine search                    | ממומש                      |
-| Metadata filtering               | ממומש (כולל היררכיית facets) |
+| Metadata filtering               | ממומש (facets שטוחים + חלוקת ממדים כמו במנוע הלקסיקלי) |
+| זיהוי שינוי ב-PDF                | ממומש (fingerprint משורות הספר) |
+| empty-book marker                | ממומש |
 | Hybrid coordinator               | קיים                       |
 | Fusion                           | קיים                       |
 | Dynamic weighting                | קיים                       |
@@ -175,6 +177,28 @@ BM25 עדיין עובד
    הדגל הוא החוזה שאומר "הטקסט חסר", במקום כרטיס ריק.
 7. **כל degradation נראה לקורא:** `HybridSearchResult::search_mode` הוא המצב שרץ
    בפועל, ו־`fallback_reason` אומר למה המסלול הסמנטי לא השתתף.
+8. **מודל ה-metadata תואם לאוצריא, לא דומה לה.** ספר נושא `topics: String` (נתיב
+   קטגוריה אחד) ו-`extra_facets: Vec<String>` — בדיוק מה שה-indexer הלקסיקלי מעביר
+   ל-Tantivy. זה לא ניסוח יפה יותר: לספר יכולים להיות **כמה מחברים**, וכל אחד הוא
+   facet נפרד (`BookFacetMetadataCache.extraFacetsForBook`). `author: Option<String>`
+   לא יכול לייצג את זה, וסינון לפי המחבר שלא נכנס היה מחזיר אפס תוצאות.
+   הסינון מקבל רשימת facets שטוחה ומקבץ אותה לממדים לפי `FACET_DIMENSION_ROOTS` —
+   אותו כלל בדיוק כמו `facet_filter_query`, כדי שלא יהיו שני מימושים שיכולים
+   להיפרד.
+9. **PDF שהשתנה מזוהה.** Tantivy מדווח `contentHash = 0` לכל PDF (הטקסט המחולץ אינו
+   במסד הספרייה), כך שהשוואה רגילה של `0 == 0` הופכת כל PDF ל"לא השתנה" לנצח.
+   `ContentFingerprint` מפריד בין hash אמיתי ל"אין חתימה", ה-diff מדווח על ספר כזה
+   כדורש בדיקה, ו-`BookForIndexing::line_fingerprint()` — חתימה שהמנוע הסמנטי מחשב
+   מהשורות עצמן — היא מה שמכריע. ספר שלא השתנה נחתך אחרי chunking, **בלי inference
+   בכלל**, כך שהדיווח הזהיר אינו יקר.
+10. **ספר שלא הניב chunks נשאר רשום** (`chunk_count = 0`). בלי זה כל PDF סרוק היה
+    מדווח כחדש ומעובד מחדש בכל הפעלה — בדיוק מה שאוצריא פותרת ב-empty-book marker
+    שלה. גריעת רשומות ב-backend נדיף מוחקת רק רשומות ש*מצהירות על וקטורים*; מרקר
+    ריק לא איבד כלום.
+11. **וקטור לא-finite נדחה.** `NaN` מזהם את הנורמה של עצמו, ו-`NaN < MIN` הוא
+    `false` — כך שבדיקת נורמה לבדה מכניסה אותו לאינדקס, ואז כל הציונים שלו נזרקים
+    בחיפוש והספר נראה מאונדקס אך אינו ניתן לחיפוש. גם וקטור **finite** גדול
+    (בסביבות `1e30`) גולש ל-`inf` בנורמה ומתנרמל לאפס. שתי השכבות בודקות זאת.
 
 מה שמכוון בכוונה **לא** נעשה שם, ומחכה ל־P5: כיול `BM25_SATURATION_K`, threshold
 לתוצאה סמנטית לא רלוונטית, מעבר ל־RRF, ו־`total_count` אמיתי (הוא כרגע מספר
@@ -1377,7 +1401,8 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 ### Vector Store
 
 * [ ] persistence
-* [ ] ANN
+* [ ] ANN — נמדד: ~101ms לשאילתה על 200k×1024, כלומר ~3.1s בקנה מידה של הספרייה
+  (`cargo bench`)
 * [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
 * [x] insert/update/delete
 * [x] filtering
@@ -1386,9 +1411,10 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 ### Indexing
 
 * [x] initial full index
-* [x] incremental book indexing (ברמת ספר)
-* [ ] chunk-level reuse
+* [x] incremental book indexing (ברמת ספר, כולל PDF)
+* [ ] chunk-level reuse — כרגע דילוג ברמת ספר שלם לפי fingerprint
 * [x] removed-book cleanup
+* [x] empty-book marker
 * [x] model mismatch detection (כולל SHA-256 של קובץ המודל)
 * [x] chunking mismatch detection
 
@@ -1410,9 +1436,9 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 
 ### Performance
 
-* [ ] embedding benchmark
+* [ ] embedding benchmark — חסר backend אמיתי
 * [ ] indexing benchmark
-* [ ] vector search benchmark
+* [x] vector search benchmark — [`benches/vector_search.rs`](../benches/vector_search.rs)
 * [ ] memory benchmark
 * [ ] end-to-end query latency
 
@@ -1705,7 +1731,9 @@ Only then does it make sense to benchmark the complete search system and tune hy
 
 **Persistent vector database:** 🔴 Missing
 
-**ANN retrieval:** 🔴 Missing — brute force measures ~100ms per query at 200k×1024
+**ANN retrieval:** 🔴 Missing — brute force measured at ~101ms per query over
+200k×1024 (`cargo bench`), which extrapolates linearly to ~3.1s over the
+6,058,210-line library. Load-bearing for P4, not an optimization.
 
 **Hybrid fusion:** 🟢 Implemented
 

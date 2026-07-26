@@ -47,6 +47,8 @@ impl Chunker {
 
     pub fn chunk_book(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
         let mut chunks = Vec::with_capacity(book.lines.len());
+        // Built once per book, not per line: every chunk carries the same set.
+        let facets = book.all_facets();
 
         for (i, line) in book.lines.iter().enumerate() {
             // Trimmed, so a line made of spaces or a lone newline is skipped
@@ -92,10 +94,7 @@ impl Chunker {
                 segment: line.segment,
                 is_pdf: book.is_pdf,
                 title: book.title.clone(),
-                topics: book.topics.clone(),
-                author: book.author.clone(),
-                era: book.era.clone(),
-                base: book.base.clone(),
+                facets: facets.clone(),
             });
         }
 
@@ -185,10 +184,8 @@ mod tests {
             title: "Test".to_string(),
             content_hash: 100,
             is_pdf: false,
-            topics: vec![],
-            author: None,
-            era: None,
-            base: None,
+            topics: String::new(),
+            extra_facets: vec![],
             lines: lines
                 .into_iter()
                 .enumerate()
@@ -356,16 +353,26 @@ mod tests {
         let chunker = Chunker::new(ChunkerConfig::default());
         let mut book = dummy_book(vec![(7, "שורה ארוכה דיה כדי לעמוד בפני עצמה")]);
         book.title = "ספר הבדיקה".to_string();
-        book.topics = vec!["/מקרא/תורה".to_string()];
-        book.author = Some("מחבר".to_string());
+        book.topics = "/מקרא/תורה".to_string();
+        book.extra_facets = vec![
+            "/author/מחבר ראשון".to_string(),
+            "/author/מחבר שני".to_string(),
+        ];
         book.is_pdf = true;
 
         let chunks = chunker.chunk_book(&book);
         assert_eq!(chunks.len(), 1);
         let chunk = &chunks[0];
         assert_eq!(chunk.title, "ספר הבדיקה");
-        assert_eq!(chunk.topics, vec!["/מקרא/תורה".to_string()]);
-        assert_eq!(chunk.author.as_deref(), Some("מחבר"));
+        assert_eq!(
+            chunk.facets,
+            vec![
+                "/מקרא/תורה".to_string(),
+                "/author/מחבר ראשון".to_string(),
+                "/author/מחבר שני".to_string(),
+            ],
+            "every facet of the book must reach the chunk, including both authors"
+        );
         assert!(chunk.is_pdf);
         assert_eq!(chunk.section_id, 7);
         assert_eq!(chunk.content_hash, book.content_hash);

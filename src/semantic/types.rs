@@ -1,6 +1,64 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Reserved first segments of a facet path that denote a filter *dimension*
+/// rather than a node of the category tree.
+///
+/// Mirrors the lexical engine's `FACET_DIMENSION_ROOTS`, deliberately down to the
+/// English names: library categories are Hebrew, so these cannot collide with
+/// them. Both engines must group facets identically or the same filter would
+/// select different documents on each path.
+pub const FACET_DIMENSION_ROOTS: [&str; 3] = ["author", "era", "base"];
+
+/// Number of filter dimension groups: the category tree plus one per reserved
+/// root.
+const FACET_GROUP_COUNT: usize = FACET_DIMENSION_ROOTS.len() + 1;
+
+/// A book's content fingerprint, as supplied by the lexical index.
+///
+/// Text books carry a content hash derived from their lines. **PDF books do
+/// not**: their extracted text does not live in the library database, so the
+/// lexical engine records `contentHash = 0` for them. Comparing that as an
+/// ordinary hash makes every PDF look permanently unchanged — `0 == 0` — so a
+/// re-scanned or replaced PDF would never be re-indexed.
+///
+/// This type makes the distinction impossible to overlook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentFingerprint {
+    /// The lexical index vouches for this content hash.
+    Hash(u64),
+    /// No usable fingerprint. The book has to be re-examined; whether anything
+    /// actually changed is decided from the lines themselves.
+    Unverifiable,
+}
+
+impl ContentFingerprint {
+    /// Interpret a raw `contentHash` from the lexical index.
+    ///
+    /// Zero is the engine's "no fingerprint" marker, not a hash value.
+    pub fn from_lexical_hash(content_hash: u64) -> Self {
+        if content_hash == 0 {
+            Self::Unverifiable
+        } else {
+            Self::Hash(content_hash)
+        }
+    }
+
+    /// The raw value to persist. `0` for [`Self::Unverifiable`], round-tripping
+    /// through [`Self::from_lexical_hash`].
+    pub fn as_raw(&self) -> u64 {
+        match self {
+            Self::Hash(hash) => *hash,
+            Self::Unverifiable => 0,
+        }
+    }
+
+    /// Whether this fingerprint can prove that content is unchanged.
+    pub fn is_verifiable(&self) -> bool {
+        matches!(self, Self::Hash(_))
+    }
+}
+
 /// Represents a single input line from a book.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookLine {
@@ -13,17 +71,83 @@ pub struct BookLine {
 }
 
 /// Represents a book ready for indexing, containing its lines and metadata.
+///
+/// The metadata mirrors what the lexical indexer passes to Tantivy, so both
+/// engines describe a book the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookForIndexing {
     pub source_book_key: String,
     pub title: String,
+    /// Raw `contentHash` from the lexical index; `0` means "no fingerprint"
+    /// (see [`ContentFingerprint`]).
     pub content_hash: u64,
     pub is_pdf: bool,
-    pub topics: Vec<String>,
-    pub author: Option<String>,
-    pub era: Option<String>,
-    pub base: Option<String>,
+    /// The book's category facet path, e.g. `/מקרא/תורה/בראשית`. One path per
+    /// book, as in the lexical engine's `topics` argument.
+    pub topics: String,
+    /// Additional facet paths under the reserved dimension roots, e.g.
+    /// `/author/רש״י`, `/era/ראשונים`, `/base`.
+    ///
+    /// A list, not a set of single-valued fields: a book can have several
+    /// authors, and the lexical indexer adds a facet for each. Collapsing them
+    /// to one author would make a filter on any other author of the same book
+    /// return nothing.
+    pub extra_facets: Vec<String>,
     pub lines: Vec<BookLine>,
+}
+
+impl BookForIndexing {
+    /// Every facet path describing this book: the category path plus the
+    /// dimension facets, which is exactly the set the lexical engine indexes
+    /// into its single `topics` field.
+    pub fn all_facets(&self) -> Vec<String> {
+        let mut facets = Vec::with_capacity(self.extra_facets.len() + 1);
+        if !self.topics.trim().is_empty() {
+            facets.push(self.topics.clone());
+        }
+        facets.extend(self.extra_facets.iter().cloned());
+        facets
+    }
+
+    /// This book's content fingerprint.
+    pub fn fingerprint(&self) -> ContentFingerprint {
+        ContentFingerprint::from_lexical_hash(self.content_hash)
+    }
+
+    /// A fingerprint computed from the lines themselves, for books whose
+    /// lexical `contentHash` is [`ContentFingerprint::Unverifiable`].
+    ///
+    /// Covers the identity, position and content signature of every line, so a
+    /// re-scanned PDF whose text changed produces a different value while an
+    /// unchanged one produces the same. This is what lets a PDF be skipped
+    /// without trusting a hash the lexical index never computed.
+    pub fn line_fingerprint(&self) -> u64 {
+        // FNV-1a: stable across runs and platforms, and this is the only
+        // property required of it. Not used for anything adversarial.
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET;
+        let mut feed = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        };
+
+        feed(&(self.lines.len() as u64).to_le_bytes());
+        for line in &self.lines {
+            feed(&line.line_id.to_le_bytes());
+            feed(&line.section_id.to_le_bytes());
+            feed(&line.segment.to_le_bytes());
+            feed(&line.line_hash.to_le_bytes());
+            // `line_hash` is 0 for lines the lexical engine considers too short
+            // to deduplicate, so it cannot stand in for the text on its own.
+            feed(line.text.as_bytes());
+            feed(&[0xff]); // separator, so field boundaries cannot shift
+        }
+        hash
+    }
 }
 
 /// A chunk of text derived from a book line, prepared for semantic embedding.
@@ -43,13 +167,16 @@ pub struct SemanticChunk {
     pub segment: u64,
     pub is_pdf: bool,
     pub title: String,
-    pub topics: Vec<String>,
-    pub author: Option<String>,
-    pub era: Option<String>,
-    pub base: Option<String>,
+    /// All facet paths describing the book — see [`BookForIndexing::all_facets`].
+    pub facets: Vec<String>,
 }
 
 /// Metadata stored alongside each vector in the vector database.
+///
+/// Note that the facet list is duplicated per chunk. That is a known cost of the
+/// current in-memory backend; how metadata is laid out (shared per book, or
+/// hydrated from Tantivy instead of stored at all) is decided with the
+/// persistent backend in roadmap P4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorMetadata {
     pub semantic_id: String,
@@ -64,10 +191,9 @@ pub struct VectorMetadata {
     pub segment: u64,
     pub is_pdf: bool,
     pub title: String,
-    pub topics: Vec<String>,
-    pub author: Option<String>,
-    pub era: Option<String>,
-    pub base: Option<String>,
+    /// All facet paths describing the book, categories and dimensions together,
+    /// exactly as the lexical engine indexes them into its `topics` field.
+    pub facets: Vec<String>,
 }
 
 impl From<&SemanticChunk> for VectorMetadata {
@@ -85,10 +211,7 @@ impl From<&SemanticChunk> for VectorMetadata {
             segment: chunk.segment,
             is_pdf: chunk.is_pdf,
             title: chunk.title.clone(),
-            topics: chunk.topics.clone(),
-            author: chunk.author.clone(),
-            era: chunk.era.clone(),
-            base: chunk.base.clone(),
+            facets: chunk.facets.clone(),
         }
     }
 }
@@ -281,26 +404,29 @@ pub struct HybridSearchResult {
 ///
 /// # Contract
 ///
-/// Each field is one filter *dimension*. Values inside a dimension are OR-ed,
-/// and dimensions are AND-ed together — the same semantics the lexical engine
-/// applies to its `topics` facet field, so both retrieval paths select the same
-/// documents.
+/// `facets` is a flat list of facet paths — categories and dimensions mixed —
+/// exactly the shape the lexical engine's facet filter takes. Passing the same
+/// list to both engines is what guarantees they select the same documents;
+/// re-modelling the dimensions as separate fields here would be a second
+/// implementation of the same rule, free to drift from it.
 ///
-/// * `None` **and** `Some(vec![])` both mean "this dimension does not filter".
-///   An empty list must never select zero documents; that made
-///   [`SearchFilters::is_empty`] disagree with the actual matching and silently
-///   emptied result sets.
-/// * Values match hierarchically, like Tantivy facets: the filter `/מקרא`
-///   matches the value `/מקרא/תורה`. An exact value still matches itself.
+/// * Paths sharing a dimension are OR-ed; different dimensions are AND-ed. A
+///   path's dimension is its first segment when that segment is one of
+///   [`FACET_DIMENSION_ROOTS`], and the category tree otherwise. So
+///   "ראשונים AND מסכת ברכות" works while two authors stay "either of them".
+/// * Matching is hierarchical, like Tantivy facets, which index every ancestor
+///   path as a term: the filter `/מקרא` selects `/מקרא/תורה`.
+/// * `None` **and** `Some(vec![])` both mean "does not filter". An empty list
+///   must never select zero documents; that made [`SearchFilters::is_empty`]
+///   disagree with the actual matching and silently emptied result sets.
 /// * `include_pdf`: `Some(false)` excludes PDF books; `Some(true)` and `None`
 ///   include everything. It is an exclusion switch, not a "PDFs only" switch.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchFilters {
+    /// Book keys (file paths). Exact matches, not facet paths.
     pub book_paths: Option<Vec<String>>,
-    pub topics: Option<Vec<String>>,
-    pub authors: Option<Vec<String>>,
-    pub eras: Option<Vec<String>>,
-    pub bases: Option<Vec<String>>,
+    /// Facet paths, e.g. `["/מקרא/תורה", "/author/רש״י"]`.
+    pub facets: Option<Vec<String>>,
     pub include_pdf: Option<bool>,
 }
 
@@ -310,12 +436,7 @@ impl SearchFilters {
     /// Stays in lockstep with [`SearchFilters::matches`]: whenever this returns
     /// `true`, `matches` accepts every candidate.
     pub fn is_empty(&self) -> bool {
-        active(&self.book_paths).is_none()
-            && active(&self.topics).is_none()
-            && active(&self.authors).is_none()
-            && active(&self.eras).is_none()
-            && active(&self.bases).is_none()
-            && !self.excludes_pdf()
+        active(&self.book_paths).is_none() && active(&self.facets).is_none() && !self.excludes_pdf()
     }
 
     /// Whether PDF books are filtered out. See the type-level contract.
@@ -323,59 +444,98 @@ impl SearchFilters {
         self.include_pdf == Some(false)
     }
 
-    /// Whether `meta` passes every active filter dimension.
+    /// Group the facet paths by dimension once, so per-candidate matching does no
+    /// work that is the same for every candidate.
+    ///
+    /// Returns `None` when nothing filters. Vector search calls the result once
+    /// per stored vector, so grouping inside the match would repeat this for
+    /// millions of candidates.
+    pub fn compile(&self) -> Option<CompiledFilters<'_>> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let mut facet_groups: [Vec<&str>; FACET_GROUP_COUNT] = Default::default();
+        for path in active(&self.facets).unwrap_or_default() {
+            facet_groups[facet_dimension(path)].push(path.as_str());
+        }
+
+        Some(CompiledFilters {
+            book_paths: active(&self.book_paths),
+            facet_groups,
+            excludes_pdf: self.excludes_pdf(),
+        })
+    }
+
+    /// Whether `meta` passes every active filter.
+    ///
+    /// Convenience over [`SearchFilters::compile`]; prefer compiling once when
+    /// testing many candidates.
     pub fn matches(&self, meta: &VectorMetadata) -> bool {
-        if let Some(paths) = active(&self.book_paths) {
-            if !paths.iter().any(|p| p == &meta.source_book_key) {
+        match self.compile() {
+            Some(compiled) => compiled.matches(meta),
+            None => true,
+        }
+    }
+}
+
+/// [`SearchFilters`] with its facet paths pre-grouped by dimension.
+pub struct CompiledFilters<'a> {
+    book_paths: Option<&'a [String]>,
+    /// Index 0 is the category tree; `i + 1` is `FACET_DIMENSION_ROOTS[i]`.
+    facet_groups: [Vec<&'a str>; FACET_GROUP_COUNT],
+    excludes_pdf: bool,
+}
+
+impl CompiledFilters<'_> {
+    /// Whether `meta` passes every active filter.
+    pub fn matches(&self, meta: &VectorMetadata) -> bool {
+        if let Some(paths) = self.book_paths {
+            if !paths.iter().any(|path| path == &meta.source_book_key) {
                 return false;
             }
         }
 
-        if self.excludes_pdf() && meta.is_pdf {
+        if self.excludes_pdf && meta.is_pdf {
             return false;
         }
 
-        if let Some(topics) = active(&self.topics) {
-            if !meta
-                .topics
+        // Every dimension the caller filtered on must be satisfied by at least
+        // one of the book's facets (AND across groups, OR within a group).
+        for group in &self.facet_groups {
+            if group.is_empty() {
+                continue;
+            }
+            let satisfied = meta
+                .facets
                 .iter()
-                .any(|value| topics.iter().any(|f| facet_matches(value, f)))
-            {
+                .any(|value| group.iter().any(|filter| facet_matches(value, filter)));
+            if !satisfied {
                 return false;
             }
-        }
-
-        if !matches_optional_dimension(active(&self.authors), meta.author.as_deref()) {
-            return false;
-        }
-        if !matches_optional_dimension(active(&self.eras), meta.era.as_deref()) {
-            return false;
-        }
-        if !matches_optional_dimension(active(&self.bases), meta.base.as_deref()) {
-            return false;
         }
 
         true
     }
 }
 
-/// Returns the filter values of a dimension, or `None` when it does not filter.
-fn active(dimension: &Option<Vec<String>>) -> Option<&[String]> {
-    match dimension {
-        Some(values) if !values.is_empty() => Some(values),
-        _ => None,
-    }
+/// Which filter dimension a facet path belongs to.
+///
+/// Index 0 is the category tree; `i + 1` is `FACET_DIMENSION_ROOTS[i]`. Same
+/// derivation as the lexical engine's facet filter.
+fn facet_dimension(path: &str) -> usize {
+    let root = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    FACET_DIMENSION_ROOTS
+        .iter()
+        .position(|dimension| *dimension == root)
+        .map_or(0, |index| index + 1)
 }
 
-/// Whether a single-valued metadata dimension satisfies its filter.
-///
-/// A candidate with no value for a filtered dimension is excluded: "books by
-/// רש\"י" must not return a book with no recorded author.
-fn matches_optional_dimension(filter: Option<&[String]>, value: Option<&str>) -> bool {
-    let Some(filter) = filter else { return true };
-    match value {
-        Some(value) => filter.iter().any(|f| facet_matches(value, f)),
-        None => false,
+/// Returns the values of a filter list, or `None` when it does not filter.
+fn active(values: &Option<Vec<String>>) -> Option<&[String]> {
+    match values {
+        Some(values) if !values.is_empty() => Some(values),
+        _ => None,
     }
 }
 
@@ -483,6 +643,7 @@ pub struct IndexingProgress {
 mod tests {
     use super::*;
 
+    /// A Genesis line, with the facet set the lexical indexer would build for it.
     fn meta() -> VectorMetadata {
         VectorMetadata {
             semantic_id: "id1".to_string(),
@@ -497,17 +658,221 @@ mod tests {
             segment: 0,
             is_pdf: false,
             title: "בראשית".to_string(),
-            topics: vec!["/מקרא/תורה/בראשית".to_string()],
-            author: Some("/author/משה רבנו".to_string()),
-            era: Some("/era/תנך".to_string()),
-            base: Some("/base/תורה".to_string()),
+            facets: vec![
+                "/מקרא/תורה/בראשית".to_string(),
+                "/author/משה רבנו".to_string(),
+                "/era/תנך".to_string(),
+                "/base".to_string(),
+            ],
         }
     }
+
+    fn facet_filter(paths: &[&str]) -> SearchFilters {
+        SearchFilters {
+            facets: Some(paths.iter().map(|p| p.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    // ── the content fingerprint contract ──
+
+    /// The lexical engine records `contentHash = 0` for PDFs, because their
+    /// extracted text is not in the library database. Treating that as a hash
+    /// makes every PDF permanently "unchanged".
+    #[test]
+    fn a_zero_content_hash_is_not_a_hash() {
+        assert_eq!(
+            ContentFingerprint::from_lexical_hash(0),
+            ContentFingerprint::Unverifiable
+        );
+        assert!(!ContentFingerprint::from_lexical_hash(0).is_verifiable());
+
+        assert_eq!(
+            ContentFingerprint::from_lexical_hash(42),
+            ContentFingerprint::Hash(42)
+        );
+        assert!(ContentFingerprint::from_lexical_hash(42).is_verifiable());
+    }
+
+    #[test]
+    fn a_fingerprint_round_trips_through_its_raw_value() {
+        for raw in [0u64, 1, 42, u64::MAX] {
+            let fingerprint = ContentFingerprint::from_lexical_hash(raw);
+            assert_eq!(fingerprint.as_raw(), raw);
+            assert_eq!(
+                ContentFingerprint::from_lexical_hash(fingerprint.as_raw()),
+                fingerprint
+            );
+        }
+    }
+
+    fn book_with_lines(lines: &[(u64, u64, &str, u64)]) -> BookForIndexing {
+        BookForIndexing {
+            source_book_key: "scan.pdf".to_string(),
+            title: "ספר סרוק".to_string(),
+            content_hash: 0,
+            is_pdf: true,
+            topics: "/מקרא".to_string(),
+            extra_facets: vec![],
+            lines: lines
+                .iter()
+                .map(|&(line_id, section_id, text, line_hash)| BookLine {
+                    line_id,
+                    section_id,
+                    text: text.to_string(),
+                    line_hash,
+                    reference: format!("עמוד {line_id}"),
+                    segment: line_id,
+                })
+                .collect(),
+        }
+    }
+
+    /// The fallback fingerprint for books the lexical index cannot vouch for.
+    #[test]
+    fn the_line_fingerprint_changes_with_any_line_change() {
+        let base = book_with_lines(&[(1, 1, "שורה ראשונה", 111), (2, 1, "שורה שנייה", 222)]);
+        let baseline = base.line_fingerprint();
+
+        assert_eq!(
+            baseline,
+            book_with_lines(&[(1, 1, "שורה ראשונה", 111), (2, 1, "שורה שנייה", 222)])
+                .line_fingerprint(),
+            "identical content must produce an identical fingerprint"
+        );
+
+        let variants: Vec<(&str, BookForIndexing)> = vec![
+            (
+                "changed text",
+                book_with_lines(&[(1, 1, "שורה ראשונה", 111), (2, 1, "שורה אחרת", 222)]),
+            ),
+            (
+                "removed line",
+                book_with_lines(&[(1, 1, "שורה ראשונה", 111)]),
+            ),
+            (
+                "added line",
+                book_with_lines(&[
+                    (1, 1, "שורה ראשונה", 111),
+                    (2, 1, "שורה שנייה", 222),
+                    (3, 1, "שורה שלישית", 333),
+                ]),
+            ),
+            (
+                "reordered lines",
+                book_with_lines(&[(2, 1, "שורה שנייה", 222), (1, 1, "שורה ראשונה", 111)]),
+            ),
+            (
+                "changed line id",
+                book_with_lines(&[(9, 1, "שורה ראשונה", 111), (2, 1, "שורה שנייה", 222)]),
+            ),
+            (
+                "changed section",
+                book_with_lines(&[(1, 7, "שורה ראשונה", 111), (2, 1, "שורה שנייה", 222)]),
+            ),
+        ];
+
+        for (name, variant) in variants {
+            assert_ne!(
+                baseline,
+                variant.line_fingerprint(),
+                "{name} must change the fingerprint"
+            );
+        }
+    }
+
+    /// Lines the lexical engine considers too short to deduplicate carry
+    /// `line_hash = 0`, so the text itself has to be part of the fingerprint.
+    #[test]
+    fn the_line_fingerprint_covers_text_even_without_a_line_hash() {
+        let a = book_with_lines(&[(1, 1, "אלף", 0)]);
+        let b = book_with_lines(&[(1, 1, "בית", 0)]);
+        assert_ne!(a.line_fingerprint(), b.line_fingerprint());
+    }
+
+    #[test]
+    fn an_empty_book_has_a_stable_fingerprint() {
+        assert_eq!(
+            book_with_lines(&[]).line_fingerprint(),
+            book_with_lines(&[]).line_fingerprint()
+        );
+        assert_ne!(
+            book_with_lines(&[]).line_fingerprint(),
+            book_with_lines(&[(1, 1, "שורה", 1)]).line_fingerprint()
+        );
+    }
+
+    // ── the facet model ──
+
+    /// A book can have several authors: the lexical indexer emits one
+    /// `/author/...` facet per author. A single-valued field cannot hold that,
+    /// and a filter on the author that did not fit would return nothing.
+    #[test]
+    fn a_book_can_carry_several_authors() {
+        let book = BookForIndexing {
+            source_book_key: "commentary.txt".to_string(),
+            title: "פירוש".to_string(),
+            content_hash: 1,
+            is_pdf: false,
+            topics: "/מפרשים".to_string(),
+            extra_facets: vec![
+                "/author/רבי אחד".to_string(),
+                "/author/רבי שני".to_string(),
+                "/era/ראשונים".to_string(),
+            ],
+            lines: vec![],
+        };
+
+        let facets = book.all_facets();
+        assert_eq!(facets.len(), 4, "the category path plus three dimensions");
+        assert_eq!(facets[0], "/מפרשים");
+
+        let meta = VectorMetadata { facets, ..meta() };
+
+        // Either author selects the book.
+        for author in ["/author/רבי אחד", "/author/רבי שני"] {
+            assert!(
+                facet_filter(&[author]).matches(&meta),
+                "filtering by {author} must match"
+            );
+        }
+        assert!(!facet_filter(&["/author/רבי שלישי"]).matches(&meta));
+    }
+
+    #[test]
+    fn a_book_without_a_category_path_still_carries_its_dimensions() {
+        let book = BookForIndexing {
+            source_book_key: "userbook.txt".to_string(),
+            title: "ספר משתמש".to_string(),
+            content_hash: 1,
+            is_pdf: false,
+            topics: "   ".to_string(),
+            extra_facets: vec!["/author/מחבר".to_string()],
+            lines: vec![],
+        };
+        assert_eq!(book.all_facets(), vec!["/author/מחבר".to_string()]);
+    }
+
+    #[test]
+    fn facet_dimensions_are_derived_the_way_the_lexical_engine_derives_them() {
+        // Index 0 is the category tree.
+        assert_eq!(facet_dimension("/מקרא/תורה"), 0);
+        assert_eq!(facet_dimension("מקרא/תורה"), 0);
+        // The reserved roots each get their own group.
+        assert_eq!(facet_dimension("/author/רש״י"), 1);
+        assert_eq!(facet_dimension("/era/ראשונים"), 2);
+        assert_eq!(facet_dimension("/base"), 3);
+        // A Hebrew category that merely resembles one is still a category.
+        assert_eq!(facet_dimension("/authors/רש״י"), 0);
+    }
+
+    // ── filter semantics ──
 
     #[test]
     fn no_filters_accepts_everything() {
         let filters = SearchFilters::default();
         assert!(filters.is_empty());
+        assert!(filters.compile().is_none());
         assert!(filters.matches(&meta()));
     }
 
@@ -518,10 +883,7 @@ mod tests {
     fn empty_lists_do_not_filter_anything_out() {
         let filters = SearchFilters {
             book_paths: Some(vec![]),
-            topics: Some(vec![]),
-            authors: Some(vec![]),
-            eras: Some(vec![]),
-            bases: Some(vec![]),
+            facets: Some(vec![]),
             include_pdf: None,
         };
         assert!(
@@ -535,47 +897,21 @@ mod tests {
     }
 
     #[test]
-    fn is_empty_agrees_with_matches_for_every_single_dimension() {
-        let values = vec!["nothing-matches-this".to_string()];
-        let dimensions: Vec<(&str, SearchFilters)> = vec![
+    fn is_empty_agrees_with_matches_for_every_dimension() {
+        let cases: Vec<(&str, SearchFilters)> = vec![
             (
                 "book_paths",
                 SearchFilters {
-                    book_paths: Some(values.clone()),
+                    book_paths: Some(vec!["no/such/book.txt".to_string()]),
                     ..Default::default()
                 },
             ),
-            (
-                "topics",
-                SearchFilters {
-                    topics: Some(values.clone()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "authors",
-                SearchFilters {
-                    authors: Some(values.clone()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "eras",
-                SearchFilters {
-                    eras: Some(values.clone()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "bases",
-                SearchFilters {
-                    bases: Some(values),
-                    ..Default::default()
-                },
-            ),
+            ("categories", facet_filter(&["/תלמוד"])),
+            ("authors", facet_filter(&["/author/מישהו אחר"])),
+            ("eras", facet_filter(&["/era/אחרונים"])),
         ];
 
-        for (name, filters) in dimensions {
+        for (name, filters) in cases {
             assert!(
                 !filters.is_empty(),
                 "{name} should count as an active filter"
@@ -604,64 +940,56 @@ mod tests {
     }
 
     #[test]
-    fn topic_filters_match_hierarchically_like_tantivy_facets() {
+    fn facet_filters_match_hierarchically_like_tantivy_facets() {
         for filter in ["/מקרא", "/מקרא/תורה", "/מקרא/תורה/בראשית", "/מקרא/"]
         {
-            let filters = SearchFilters {
-                topics: Some(vec![filter.to_string()]),
-                ..Default::default()
-            };
-            assert!(filters.matches(&meta()), "filter {filter} should match");
+            assert!(
+                facet_filter(&[filter]).matches(&meta()),
+                "filter {filter} should match"
+            );
         }
 
         for filter in ["/תלמוד", "/מקרא/נביאים", "/מקר"] {
-            let filters = SearchFilters {
-                topics: Some(vec![filter.to_string()]),
-                ..Default::default()
-            };
             assert!(
-                !filters.matches(&meta()),
+                !facet_filter(&[filter]).matches(&meta()),
                 "filter {filter} should not match"
             );
         }
     }
 
     #[test]
-    fn values_within_a_dimension_are_or_ed() {
-        let filters = SearchFilters {
-            topics: Some(vec!["/תלמוד".to_string(), "/מקרא".to_string()]),
-            ..Default::default()
-        };
-        assert!(filters.matches(&meta()));
+    fn paths_in_the_same_dimension_are_or_ed() {
+        assert!(facet_filter(&["/תלמוד", "/מקרא"]).matches(&meta()));
+        assert!(facet_filter(&["/author/אחר", "/author/משה רבנו"]).matches(&meta()));
     }
 
+    /// "ראשונים AND מסכת ברכות" has to work while two authors stay "either of
+    /// them" — the same rule the lexical facet filter applies.
     #[test]
-    fn dimensions_are_and_ed() {
-        let both_match = SearchFilters {
-            topics: Some(vec!["/מקרא".to_string()]),
-            eras: Some(vec!["/era/תנך".to_string()]),
-            ..Default::default()
-        };
-        assert!(both_match.matches(&meta()));
+    fn different_dimensions_are_and_ed() {
+        assert!(facet_filter(&["/מקרא", "/era/תנך"]).matches(&meta()));
+        assert!(!facet_filter(&["/מקרא", "/era/ראשונים"]).matches(&meta()));
+        assert!(!facet_filter(&["/תלמוד", "/era/תנך"]).matches(&meta()));
 
-        let one_fails = SearchFilters {
-            topics: Some(vec!["/מקרא".to_string()]),
-            eras: Some(vec!["/era/ראשונים".to_string()]),
-            ..Default::default()
-        };
-        assert!(!one_fails.matches(&meta()));
+        // Two authors OR-ed, AND-ed against a category: satisfied.
+        assert!(facet_filter(&["/author/אחר", "/author/משה רבנו", "/מקרא"]).matches(&meta()));
     }
 
     #[test]
     fn a_candidate_missing_a_filtered_dimension_is_excluded() {
         let mut without_author = meta();
-        without_author.author = None;
+        without_author.facets.retain(|f| !f.starts_with("/author/"));
+        assert!(!facet_filter(&["/author/משה רבנו"]).matches(&without_author));
+    }
 
-        let filters = SearchFilters {
-            authors: Some(vec!["/author/משה רבנו".to_string()]),
-            ..Default::default()
-        };
-        assert!(!filters.matches(&without_author));
+    /// `/base` is a bare marker in the lexical indexer, not a path with a value.
+    #[test]
+    fn the_base_marker_filters_as_its_own_dimension() {
+        assert!(facet_filter(&["/base"]).matches(&meta()));
+
+        let mut not_base = meta();
+        not_base.facets.retain(|f| f != "/base");
+        assert!(!facet_filter(&["/base"]).matches(&not_base));
     }
 
     #[test]
@@ -693,6 +1021,19 @@ mod tests {
                 filters.matches(&text),
                 "{include_pdf:?} must keep text books"
             );
+        }
+    }
+
+    #[test]
+    fn compiling_once_gives_the_same_verdict_as_matching_directly() {
+        let filters = facet_filter(&["/מקרא", "/author/משה רבנו"]);
+        let compiled = filters.compile().expect("filters are active");
+
+        let mut other = meta();
+        other.facets = vec!["/תלמוד".to_string()];
+
+        for candidate in [meta(), other] {
+            assert_eq!(compiled.matches(&candidate), filters.matches(&candidate));
         }
     }
 

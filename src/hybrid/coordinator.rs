@@ -509,10 +509,8 @@ mod tests {
             title: "בראשית".to_string(),
             content_hash: 987654,
             is_pdf: false,
-            topics: vec!["/מקרא/תורה".to_string()],
-            author: Some("משה רבנו".to_string()),
-            era: Some("תנך".to_string()),
-            base: None,
+            topics: "/מקרא/תורה".to_string(),
+            extra_facets: vec!["/author/משה רבנו".to_string(), "/era/תנך".to_string()],
             lines: vec![
                 BookLine {
                     line_id: 1,
@@ -1006,7 +1004,7 @@ mod tests {
                 &HybridSearchParams {
                     filters: Some(SearchFilters {
                         book_paths: Some(vec![]),
-                        topics: Some(vec![]),
+                        facets: Some(vec![]),
                         ..Default::default()
                     }),
                     ..Default::default()

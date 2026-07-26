@@ -19,13 +19,14 @@
 //! new one, never a half-written file.
 
 use crate::errors::ManifestError;
+use crate::semantic::types::ContentFingerprint;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Current manifest format version. Bump when the schema changes.
-const MANIFEST_FORMAT_VERSION: u32 = 2;
+const MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Manifest file name.
 const MANIFEST_FILENAME: &str = "semantic_manifest.json";
@@ -76,13 +77,29 @@ pub struct SemanticManifest {
 }
 
 /// Per-book entry in the manifest.
+///
+/// An entry with `chunk_count == 0` is meaningful, not a leftover: it records
+/// that the book *was* processed and yielded nothing embeddable — a scanned PDF
+/// with no text layer, or a book of headings only. Without it the book would be
+/// reported as new on every startup and reprocessed forever. The lexical indexer
+/// keeps an empty-book marker for exactly this reason.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookManifestEntry {
     /// Stable book identifier (file path).
     pub source_book_key: String,
     /// Content hash at the time of indexing (matches Tantivy contentHash).
+    ///
+    /// `0` means the lexical index had no fingerprint to give — see
+    /// [`ContentFingerprint`]. For those books `line_fingerprint` is what decides
+    /// whether anything changed.
     pub content_hash: u64,
-    /// Number of semantic chunks generated for this book.
+    /// Fingerprint computed by this crate from the book's own lines.
+    ///
+    /// The only way to tell whether a PDF changed, since its `content_hash` is
+    /// always `0`.
+    pub line_fingerprint: u64,
+    /// Number of semantic chunks generated for this book. `0` is a valid,
+    /// deliberate value — see the type-level note.
     pub chunk_count: u32,
     /// When this book was last indexed (Unix timestamp).
     pub indexed_at: u64,
@@ -174,9 +191,13 @@ impl SemanticManifest {
 
     /// Save the manifest to the given directory.
     ///
-    /// Atomic and durable: the payload is written to a temp file, flushed to
-    /// disk, then renamed over the target. Losing power mid-save leaves the
-    /// previous manifest intact.
+    /// Atomic and durable: the payload is written to a temp file, `fsync`ed, then
+    /// renamed over the target, and the directory entry is `fsync`ed too. A power
+    /// loss at any point leaves a readable manifest — the previous one or the new
+    /// one, never a partial file and never none.
+    ///
+    /// The `.previous` file that appears if a rename has to be retried is part of
+    /// that guarantee, not debris: see the fallback below.
     pub fn save(&mut self, dir: &Path) -> Result<(), ManifestError> {
         self.updated_at = current_unix_timestamp();
 
@@ -201,8 +222,8 @@ impl SemanticManifest {
                 .map_err(|e| ManifestError::WriteFailed {
                     reason: format!("Failed to write temp manifest: {e}"),
                 })?;
-            // Without this the rename can land before the data does, leaving an
-            // empty manifest after a power loss.
+            // Without this the rename can be durable before the data is, leaving
+            // an empty or partial manifest after a power loss.
             file.sync_all().map_err(|e| ManifestError::WriteFailed {
                 reason: format!("Failed to flush temp manifest: {e}"),
             })?;
@@ -210,16 +231,37 @@ impl SemanticManifest {
 
         if let Err(first) = std::fs::rename(&tmp, &target) {
             // `rename` replaces an existing file on both Unix and Windows, but a
-            // Windows file lock (indexer, antivirus, another handle) can still
-            // deny it. Removing the target first is less safe — it opens a
-            // window with no manifest at all — so it is only a fallback.
-            log::warn!("Atomic manifest rename failed ({first}); retrying after removing target");
-            let _ = std::fs::remove_file(&target);
-            std::fs::rename(&tmp, &target).map_err(|e| ManifestError::WriteFailed {
-                reason: format!(
-                    "Failed to rename temp manifest to final: {e} (first attempt: {first})"
-                ),
+            // Windows file lock (search indexer, antivirus, another handle) can
+            // still deny it.
+            //
+            // The retry must not simply delete the target: a crash in that window
+            // would leave no manifest at all, which is worse than either version.
+            // Moving it aside keeps a recoverable copy throughout.
+            log::warn!("Atomic manifest rename failed ({first}); retrying via a side-step");
+            let previous = dir.join(format!("{MANIFEST_FILENAME}.previous"));
+            let _ = std::fs::remove_file(&previous);
+
+            let stepped_aside = std::fs::rename(&target, &previous).is_ok();
+            std::fs::rename(&tmp, &target).map_err(|e| {
+                // Put the old manifest back rather than leaving the directory empty.
+                if stepped_aside {
+                    let _ = std::fs::rename(&previous, &target);
+                }
+                ManifestError::WriteFailed {
+                    reason: format!(
+                        "Failed to rename temp manifest to final: {e} (first attempt: {first})"
+                    ),
+                }
             })?;
+            let _ = std::fs::remove_file(&previous);
+        }
+
+        // The rename is only durable once the directory entry itself is flushed;
+        // otherwise a power loss can resurrect the old name. Best-effort: not
+        // every platform lets a directory be opened for this, and failing the save
+        // over it would be worse than the residual risk.
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
         }
 
         log::debug!("Manifest saved to {}", target.display());
@@ -350,29 +392,68 @@ impl SemanticManifest {
         }
     }
 
+    /// What, if anything, a book needs — from the lexical fingerprint alone.
+    ///
+    /// This is the decision available at diff time, before the book's lines have
+    /// been loaded. A book whose fingerprint cannot prove anything reports
+    /// [`BookIndexNeed::Unverifiable`] rather than being assumed current.
+    pub fn book_index_need(
+        &self,
+        source_book_key: &str,
+        fingerprint: ContentFingerprint,
+        chunking_version: u32,
+        normalization_version: u32,
+    ) -> BookIndexNeed {
+        let Some(entry) = self.books.get(source_book_key) else {
+            return BookIndexNeed::Missing;
+        };
+
+        if entry.chunking_version != chunking_version
+            || entry.normalization_version != normalization_version
+        {
+            return BookIndexNeed::Changed;
+        }
+
+        match fingerprint {
+            ContentFingerprint::Hash(hash) if entry.content_hash == hash => BookIndexNeed::UpToDate,
+            ContentFingerprint::Hash(_) => BookIndexNeed::Changed,
+            // The lexical index cannot vouch for this content (a PDF). Only the
+            // lines themselves can settle it.
+            ContentFingerprint::Unverifiable => BookIndexNeed::Unverifiable,
+        }
+    }
+
     /// Check if a specific book needs re-indexing.
     pub fn book_needs_reindex(
         &self,
         source_book_key: &str,
-        content_hash: u64,
+        fingerprint: ContentFingerprint,
         chunking_version: u32,
         normalization_version: u32,
     ) -> bool {
-        match self.books.get(source_book_key) {
-            None => true, // New book
-            Some(entry) => {
-                entry.content_hash != content_hash
-                    || entry.chunking_version != chunking_version
-                    || entry.normalization_version != normalization_version
-            }
-        }
+        self.book_index_need(
+            source_book_key,
+            fingerprint,
+            chunking_version,
+            normalization_version,
+        )
+        .needs_work()
+    }
+
+    /// The recorded entry for a book, if it has one.
+    pub fn book(&self, source_book_key: &str) -> Option<&BookManifestEntry> {
+        self.books.get(source_book_key)
     }
 
     /// Record that a book has been indexed.
+    ///
+    /// `chunk_count == 0` is recorded, not skipped: it is the marker that says
+    /// the book was processed and has nothing to embed.
     pub fn mark_book_indexed(
         &mut self,
         source_book_key: String,
         content_hash: u64,
+        line_fingerprint: u64,
         chunk_count: u32,
         chunking_version: u32,
         normalization_version: u32,
@@ -380,6 +461,7 @@ impl SemanticManifest {
         let entry = BookManifestEntry {
             source_book_key: source_book_key.clone(),
             content_hash,
+            line_fingerprint,
             chunk_count,
             indexed_at: current_unix_timestamp(),
             chunking_version,
@@ -395,15 +477,35 @@ impl SemanticManifest {
 
     /// Drop every per-book record, keeping the configuration metadata.
     ///
-    /// Used when the vectors those records describe are known to be gone — a
-    /// non-persistent store after a restart, or a cleared index. Returns how
-    /// many records were dropped. Keeping them would make the manifest claim
-    /// books are indexed while the store is empty, which is exactly the state
-    /// that silently disables semantic results.
+    /// For a full rebuild. Returns how many records were dropped.
     pub fn clear_books(&mut self) -> usize {
         let dropped = self.books.len();
         self.books.clear();
         dropped
+    }
+
+    /// Drop only the records that describe stored vectors, keeping the
+    /// empty-book markers.
+    ///
+    /// Used when the vectors are known to be gone — a non-persistent store after
+    /// a restart. Keeping a record that claims vectors would make the manifest
+    /// report "up to date" while every query came back empty. A `chunk_count == 0`
+    /// record describes no vectors, so nothing about it was lost and dropping it
+    /// would only force the same book to be reprocessed every session.
+    ///
+    /// Returns how many records were dropped.
+    pub fn clear_books_with_vectors(&mut self) -> usize {
+        let before = self.books.len();
+        self.books.retain(|_, entry| entry.chunk_count == 0);
+        before - self.books.len()
+    }
+
+    /// Number of books recorded as processed but holding no vectors.
+    pub fn empty_book_count(&self) -> usize {
+        self.books
+            .values()
+            .filter(|entry| entry.chunk_count == 0)
+            .count()
     }
 
     /// Get the total number of indexed books.
@@ -419,6 +521,36 @@ impl SemanticManifest {
     /// Get manifest file path for a given directory.
     pub fn file_path(dir: &Path) -> PathBuf {
         dir.join(MANIFEST_FILENAME)
+    }
+}
+
+/// What a book needs, as far as the lexical fingerprint can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookIndexNeed {
+    /// No record: the book has never been processed.
+    Missing,
+    /// The content hash or an algorithm version changed.
+    Changed,
+    /// The lexical index has no fingerprint for this book (a PDF), so it cannot
+    /// be declared current. Its lines have to be compared — see
+    /// [`BookManifestEntry::line_fingerprint`].
+    Unverifiable,
+    /// Recorded, current, and provably so.
+    UpToDate,
+}
+
+impl BookIndexNeed {
+    /// Whether the caller has to hand this book over for processing.
+    ///
+    /// `Unverifiable` counts: the book must be examined, even though the
+    /// examination often concludes that nothing changed.
+    pub fn needs_work(&self) -> bool {
+        !matches!(self, Self::UpToDate)
+    }
+
+    /// Whether this book was ever recorded.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Missing)
     }
 }
 
@@ -760,31 +892,124 @@ mod tests {
         }
     }
 
+    fn hash(value: u64) -> ContentFingerprint {
+        ContentFingerprint::Hash(value)
+    }
+
     #[test]
     fn book_tracking_lifecycle() {
         let config = test_config();
         let mut manifest = SemanticManifest::new(&config);
 
-        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
-        manifest.mark_book_indexed("book_a".to_string(), 12345, 100, 1, 1);
-        assert!(!manifest.book_needs_reindex("book_a", 12345, 1, 1));
+        assert_eq!(
+            manifest.book_index_need("book_a", hash(12345), 1, 1),
+            BookIndexNeed::Missing
+        );
+        manifest.mark_book_indexed("book_a".to_string(), 12345, 777, 100, 1, 1);
+        assert_eq!(
+            manifest.book_index_need("book_a", hash(12345), 1, 1),
+            BookIndexNeed::UpToDate
+        );
+        assert!(!manifest.book_needs_reindex("book_a", hash(12345), 1, 1));
 
         // Changed content, chunking or normalization all force a re-index.
-        assert!(manifest.book_needs_reindex("book_a", 99999, 1, 1));
-        assert!(manifest.book_needs_reindex("book_a", 12345, 2, 1));
-        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 2));
+        for (name, need) in [
+            (
+                "content",
+                manifest.book_index_need("book_a", hash(99999), 1, 1),
+            ),
+            (
+                "chunking",
+                manifest.book_index_need("book_a", hash(12345), 2, 1),
+            ),
+            (
+                "normalization",
+                manifest.book_index_need("book_a", hash(12345), 1, 2),
+            ),
+        ] {
+            assert_eq!(need, BookIndexNeed::Changed, "{name} must force a re-index");
+            assert!(need.needs_work());
+            assert!(need.is_known());
+        }
 
         assert_eq!(manifest.total_chunk_count(), 100);
+        assert_eq!(manifest.book("book_a").unwrap().line_fingerprint, 777);
         assert!(manifest.remove_book("book_a").is_some());
-        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
+        assert_eq!(
+            manifest.book_index_need("book_a", hash(12345), 1, 1),
+            BookIndexNeed::Missing
+        );
+    }
+
+    /// The lexical engine records `contentHash = 0` for PDFs. Treating it as a
+    /// hash means `0 == 0` reads as "unchanged", so a replaced PDF would never be
+    /// re-indexed. It has to report as unverifiable instead.
+    #[test]
+    fn a_book_without_a_lexical_fingerprint_is_never_declared_up_to_date() {
+        let config = test_config();
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("scan.pdf".to_string(), 0, 777, 12, 1, 1);
+
+        let need = manifest.book_index_need("scan.pdf", ContentFingerprint::Unverifiable, 1, 1);
+        assert_eq!(need, BookIndexNeed::Unverifiable);
+        assert!(
+            need.needs_work(),
+            "the caller has to hand the book over so its lines can be compared"
+        );
+        assert!(need.is_known(), "but it is not a new book");
+
+        // A version change still takes precedence: nothing about the lines can
+        // rescue an index built by different chunking.
+        assert_eq!(
+            manifest.book_index_need("scan.pdf", ContentFingerprint::Unverifiable, 2, 1),
+            BookIndexNeed::Changed
+        );
+    }
+
+    /// A book that yielded nothing embeddable must stay recorded, or every
+    /// startup reports it as new and reprocesses it.
+    #[test]
+    fn an_empty_book_record_is_a_valid_up_to_date_record() {
+        let config = test_config();
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("headings-only.txt".to_string(), 42, 777, 0, 1, 1);
+
+        assert_eq!(
+            manifest.book_index_need("headings-only.txt", hash(42), 1, 1),
+            BookIndexNeed::UpToDate
+        );
+        assert_eq!(manifest.book_count(), 1);
+        assert_eq!(manifest.empty_book_count(), 1);
+        assert_eq!(manifest.total_chunk_count(), 0);
+    }
+
+    /// When the vectors are gone, records that claimed vectors are stale — but an
+    /// empty-book marker described no vectors, so nothing about it was lost.
+    #[test]
+    fn clearing_lost_vectors_keeps_the_empty_book_markers() {
+        let config = test_config();
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("with-vectors.txt".to_string(), 1, 111, 10, 1, 1);
+        manifest.mark_book_indexed("scanned.pdf".to_string(), 0, 222, 0, 1, 1);
+
+        assert_eq!(manifest.clear_books_with_vectors(), 1);
+        assert_eq!(manifest.book_count(), 1);
+        assert!(manifest.book("scanned.pdf").is_some());
+        assert!(manifest.book("with-vectors.txt").is_none());
+
+        // The surviving marker still answers "nothing to do" for its own lines.
+        assert_eq!(
+            manifest.book_index_need("scanned.pdf", ContentFingerprint::Unverifiable, 1, 1),
+            BookIndexNeed::Unverifiable
+        );
     }
 
     #[test]
     fn clear_books_keeps_configuration_but_drops_records() {
         let config = test_config();
         let mut manifest = SemanticManifest::new(&config);
-        manifest.mark_book_indexed("a".to_string(), 1, 10, 1, 1);
-        manifest.mark_book_indexed("b".to_string(), 2, 20, 1, 1);
+        manifest.mark_book_indexed("a".to_string(), 1, 11, 10, 1, 1);
+        manifest.mark_book_indexed("b".to_string(), 2, 22, 20, 1, 1);
 
         assert_eq!(manifest.clear_books(), 2);
         assert_eq!(manifest.book_count(), 0);
@@ -803,7 +1028,7 @@ mod tests {
         config.embedding_backend = Some("mock-hash-v1".to_string());
 
         let mut manifest = SemanticManifest::new(&config);
-        manifest.mark_book_indexed("book_a".to_string(), 12345, 100, 1, 1);
+        manifest.mark_book_indexed("book_a".to_string(), 12345, 777, 100, 1, 1);
         manifest.save(dir.path()).unwrap();
 
         let loaded = SemanticManifest::load(dir.path()).unwrap();
@@ -813,7 +1038,7 @@ mod tests {
         assert_eq!(loaded.embedding_backend.as_deref(), Some("mock-hash-v1"));
         assert_eq!(loaded.vector_backend, "in-memory-v1");
         assert_eq!(loaded.books.len(), 1);
-        assert!(loaded.books.contains_key("book_a"));
+        assert_eq!(loaded.book("book_a").unwrap().line_fingerprint, 777);
         assert!(loaded.validate(&config).is_empty());
     }
 
@@ -907,11 +1132,11 @@ mod tests {
         let config = test_config();
 
         let mut first = SemanticManifest::new(&config);
-        first.mark_book_indexed("a".to_string(), 1, 10, 1, 1);
+        first.mark_book_indexed("a".to_string(), 1, 11, 10, 1, 1);
         first.save(dir.path()).unwrap();
 
         let mut second = SemanticManifest::new(&config);
-        second.mark_book_indexed("b".to_string(), 2, 20, 1, 1);
+        second.mark_book_indexed("b".to_string(), 2, 22, 20, 1, 1);
         second.save(dir.path()).unwrap();
 
         let loaded = SemanticManifest::load(dir.path()).unwrap();
@@ -923,6 +1148,41 @@ mod tests {
             !tmp.exists(),
             "the temp file must be renamed, not left behind"
         );
+    }
+
+    /// The retry path must never be a window with no manifest on disk: a crash
+    /// there would lose the index state entirely, which is worse than keeping
+    /// either version.
+    #[test]
+    fn a_readable_manifest_exists_at_every_point_of_a_rewrite() {
+        let dir = TempDir::new("always_readable");
+        let config = test_config();
+
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("a".to_string(), 1, 11, 10, 1, 1);
+        manifest.save(dir.path()).unwrap();
+
+        // Rewrite repeatedly; after each one the manifest must still parse and no
+        // temporary or side-stepped file may be left behind.
+        for round in 2..6u64 {
+            let mut next = SemanticManifest::new(&config);
+            next.mark_book_indexed(format!("book{round}"), round, round * 11, 10, 1, 1);
+            next.save(dir.path()).unwrap();
+
+            let loaded = SemanticManifest::load(dir.path()).unwrap();
+            assert_eq!(loaded.book_count(), 1);
+            assert!(loaded.book(&format!("book{round}")).is_some());
+
+            for leftover in [
+                format!("{MANIFEST_FILENAME}.tmp"),
+                format!("{MANIFEST_FILENAME}.previous"),
+            ] {
+                assert!(
+                    !dir.path().join(&leftover).exists(),
+                    "{leftover} must not survive a successful save"
+                );
+            }
+        }
     }
 
     #[test]
