@@ -1,25 +1,31 @@
 //! Semantic index manifest and versioning.
 //!
-//! The manifest tracks the exact configuration used to build the semantic index:
-//! embedding model, dimensions, chunking algorithm version, and per-book status.
+//! The manifest records the exact configuration the semantic index was built
+//! with — embedding model and its file checksum, embedding backend, vector
+//! backend, dimensions, pooling, precision, chunking and normalization versions
+//! — plus a per-book indexing record.
 //!
-//! On startup, the manifest is compared against the current configuration.
-//! Any mismatch disables the semantic search path (graceful degradation to BM25)
-//! until the index is rebuilt.
+//! On startup the manifest is compared against the current configuration. Any
+//! mismatch means the stored vectors live in a different space from the ones the
+//! current configuration would produce, so they cannot be searched or added to.
+//! [`SemanticEngine`](crate::semantic::engine::SemanticEngine) disables the
+//! semantic path in that case — queries fall back to BM25 — until the index is
+//! reset and rebuilt.
 //!
-//! # Atomic Persistence
+//! # Atomic persistence
 //!
-//! The manifest is always written atomically: write to a `.tmp` file, then
-//! rename over the target. This prevents partial/corrupt manifests if the
-//! app crashes mid-write.
+//! The manifest is written to a `.tmp` file which is `fsync`ed and then renamed
+//! over the target. A crash therefore leaves either the previous manifest or the
+//! new one, never a half-written file.
 
 use crate::errors::ManifestError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Current manifest format version. Bump when the schema changes.
-const MANIFEST_FORMAT_VERSION: u32 = 1;
+const MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// Manifest file name.
 const MANIFEST_FILENAME: &str = "semantic_manifest.json";
@@ -27,14 +33,20 @@ const MANIFEST_FILENAME: &str = "semantic_manifest.json";
 /// Full semantic index manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticManifest {
-    /// Format version of this manifest (for forward compatibility).
+    /// Format version of this manifest.
     pub format_version: u32,
 
     // ── Model metadata ──
     /// Embedding model identifier (e.g. "EMD123/Otzaria-Embedding-V1-Flash-0.6B").
     pub embedding_model_id: String,
-    /// Model file checksum (SHA256 of the GGUF file) for integrity verification.
+    /// SHA-256 of the model file, once a model has been loaded.
+    ///
+    /// Guards the case the model id alone cannot catch: same id, different
+    /// weights behind the same path.
     pub model_checksum: Option<String>,
+    /// Identifier of the inference backend that produced the vectors, once a
+    /// model has been loaded (e.g. `"mock-hash-v1"`).
+    pub embedding_backend: Option<String>,
     /// Embedding vector dimensionality (e.g. 1024).
     pub embedding_dim: u32,
     /// Pooling strategy used (e.g. "last-token").
@@ -43,6 +55,8 @@ pub struct SemanticManifest {
     pub model_quantization: String,
     /// Vector storage precision in the store (e.g. "f32", "f16").
     pub vector_precision: String,
+    /// Identifier of the vector storage backend that holds the vectors.
+    pub vector_backend: String,
 
     // ── Algorithm versions ──
     /// Chunking algorithm version. Increment when chunking logic changes.
@@ -78,14 +92,22 @@ pub struct BookManifestEntry {
     pub normalization_version: u32,
 }
 
-/// Configuration to compare against the manifest.
+/// The configuration a manifest is validated against.
+///
+/// `model_checksum` and `embedding_backend` are `Option` because they are only
+/// known once a model has actually been loaded. While they are `None`,
+/// [`SemanticManifest::validate`] leaves those dimensions unchecked instead of
+/// reporting a false mismatch; the engine re-validates after loading the model.
 #[derive(Debug, Clone)]
 pub struct ManifestConfig {
     pub embedding_model_id: String,
+    pub model_checksum: Option<String>,
+    pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
     pub pooling: String,
     pub model_quantization: String,
     pub vector_precision: String,
+    pub vector_backend: String,
     pub chunking_version: u32,
     pub normalization_version: u32,
 }
@@ -97,11 +119,13 @@ impl SemanticManifest {
         Self {
             format_version: MANIFEST_FORMAT_VERSION,
             embedding_model_id: config.embedding_model_id.clone(),
-            model_checksum: None,
+            model_checksum: config.model_checksum.clone(),
+            embedding_backend: config.embedding_backend.clone(),
             embedding_dim: config.embedding_dim,
             pooling: config.pooling.clone(),
             model_quantization: config.model_quantization.clone(),
             vector_precision: config.vector_precision.clone(),
+            vector_backend: config.vector_backend.clone(),
             chunking_version: config.chunking_version,
             normalization_version: config.normalization_version,
             created_at: now,
@@ -111,8 +135,15 @@ impl SemanticManifest {
     }
 
     /// Load a manifest from the given directory.
+    ///
+    /// Returns [`ManifestError::NotFound`] when there is nothing to load (a
+    /// first run), [`ManifestError::ParseFailed`] when the file is unreadable or
+    /// malformed, and [`ManifestError::UnsupportedFormatVersion`] when it was
+    /// written by a different schema version. The caller decides how to react;
+    /// see [`SemanticEngine::open`](crate::semantic::engine::SemanticEngine::open),
+    /// which quarantines an unusable file and starts fresh.
     pub fn load(dir: &Path) -> Result<Self, ManifestError> {
-        let path = dir.join(MANIFEST_FILENAME);
+        let path = Self::file_path(dir);
         if !path.exists() {
             return Err(ManifestError::NotFound {
                 path: path.display().to_string(),
@@ -123,47 +154,102 @@ impl SemanticManifest {
             reason: format!("Failed to read manifest: {e}"),
         })?;
 
-        let manifest: Self =
+        // Read the version before the full document, so a schema change reports
+        // a version mismatch rather than a confusing field-level parse error.
+        let probe: FormatVersionProbe =
             serde_json::from_str(&content).map_err(|e| ManifestError::ParseFailed {
                 reason: format!("Failed to parse manifest JSON: {e}"),
             })?;
+        if probe.format_version != MANIFEST_FORMAT_VERSION {
+            return Err(ManifestError::UnsupportedFormatVersion {
+                found: probe.format_version,
+                supported: MANIFEST_FORMAT_VERSION,
+            });
+        }
 
-        Ok(manifest)
+        serde_json::from_str(&content).map_err(|e| ManifestError::ParseFailed {
+            reason: format!("Failed to parse manifest JSON: {e}"),
+        })
     }
 
-    /// Save the manifest to the given directory (atomic write).
+    /// Save the manifest to the given directory.
+    ///
+    /// Atomic and durable: the payload is written to a temp file, flushed to
+    /// disk, then renamed over the target. Losing power mid-save leaves the
+    /// previous manifest intact.
     pub fn save(&mut self, dir: &Path) -> Result<(), ManifestError> {
         self.updated_at = current_unix_timestamp();
 
-        let target = dir.join(MANIFEST_FILENAME);
+        let target = Self::file_path(dir);
         let tmp = dir.join(format!("{MANIFEST_FILENAME}.tmp"));
 
-        // Ensure the directory exists
         std::fs::create_dir_all(dir).map_err(|e| ManifestError::WriteFailed {
             reason: format!("Failed to create manifest directory: {e}"),
         })?;
 
-        // Write to temp file
         let content =
             serde_json::to_string_pretty(self).map_err(|e| ManifestError::WriteFailed {
                 reason: format!("Failed to serialize manifest: {e}"),
             })?;
 
-        std::fs::write(&tmp, content.as_bytes()).map_err(|e| ManifestError::WriteFailed {
-            reason: format!("Failed to write temp manifest: {e}"),
-        })?;
-
-        // Atomic rename (remove target first if present on Windows to prevent error 183 / Access Denied)
-        if target.exists() {
-            let _ = std::fs::remove_file(&target);
+        // Scope the handle so it is closed before the rename (required on Windows).
+        {
+            let mut file = std::fs::File::create(&tmp).map_err(|e| ManifestError::WriteFailed {
+                reason: format!("Failed to create temp manifest: {e}"),
+            })?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| ManifestError::WriteFailed {
+                    reason: format!("Failed to write temp manifest: {e}"),
+                })?;
+            // Without this the rename can land before the data does, leaving an
+            // empty manifest after a power loss.
+            file.sync_all().map_err(|e| ManifestError::WriteFailed {
+                reason: format!("Failed to flush temp manifest: {e}"),
+            })?;
         }
 
-        std::fs::rename(&tmp, &target).map_err(|e| ManifestError::WriteFailed {
-            reason: format!("Failed to rename temp manifest to final: {e}"),
+        if let Err(first) = std::fs::rename(&tmp, &target) {
+            // `rename` replaces an existing file on both Unix and Windows, but a
+            // Windows file lock (indexer, antivirus, another handle) can still
+            // deny it. Removing the target first is less safe — it opens a
+            // window with no manifest at all — so it is only a fallback.
+            log::warn!("Atomic manifest rename failed ({first}); retrying after removing target");
+            let _ = std::fs::remove_file(&target);
+            std::fs::rename(&tmp, &target).map_err(|e| ManifestError::WriteFailed {
+                reason: format!(
+                    "Failed to rename temp manifest to final: {e} (first attempt: {first})"
+                ),
+            })?;
+        }
+
+        log::debug!("Manifest saved to {}", target.display());
+        Ok(())
+    }
+
+    /// Move an unusable manifest aside so a fresh one can be written without
+    /// destroying evidence, and return where it went.
+    ///
+    /// `tag` describes why (e.g. `"corrupt"`, `"incompatible"`).
+    pub fn quarantine(dir: &Path, tag: &str) -> Result<PathBuf, ManifestError> {
+        let source = Self::file_path(dir);
+        let quarantined = dir.join(format!(
+            "{MANIFEST_FILENAME}.{tag}.{}",
+            current_unix_timestamp()
+        ));
+
+        std::fs::rename(&source, &quarantined).map_err(|e| ManifestError::WriteFailed {
+            reason: format!(
+                "Failed to move {} aside to {}: {e}",
+                source.display(),
+                quarantined.display()
+            ),
         })?;
 
-        log::info!("Manifest saved to {}", target.display());
-        Ok(())
+        log::warn!(
+            "Quarantined unusable manifest ({tag}) to {}",
+            quarantined.display()
+        );
+        Ok(quarantined)
     }
 
     /// Validate this manifest against the current configuration.
@@ -178,6 +264,27 @@ impl SemanticManifest {
             });
         }
 
+        // Only compare a checksum/backend the caller actually knows. Nothing to
+        // compare on either side is not a mismatch — it is recorded on save.
+        if let (Some(manifest), Some(config)) = (&self.model_checksum, &config.model_checksum) {
+            if manifest != config {
+                mismatches.push(ManifestMismatch::ModelChecksum {
+                    manifest: manifest.clone(),
+                    config: config.clone(),
+                });
+            }
+        }
+
+        if let (Some(manifest), Some(config)) = (&self.embedding_backend, &config.embedding_backend)
+        {
+            if manifest != config {
+                mismatches.push(ManifestMismatch::EmbeddingBackend {
+                    manifest: manifest.clone(),
+                    config: config.clone(),
+                });
+            }
+        }
+
         if self.embedding_dim != config.embedding_dim {
             mismatches.push(ManifestMismatch::Dimensions {
                 manifest: self.embedding_dim,
@@ -189,6 +296,27 @@ impl SemanticManifest {
             mismatches.push(ManifestMismatch::Pooling {
                 manifest: self.pooling.clone(),
                 config: config.pooling.clone(),
+            });
+        }
+
+        if self.model_quantization != config.model_quantization {
+            mismatches.push(ManifestMismatch::ModelQuantization {
+                manifest: self.model_quantization.clone(),
+                config: config.model_quantization.clone(),
+            });
+        }
+
+        if self.vector_precision != config.vector_precision {
+            mismatches.push(ManifestMismatch::VectorPrecision {
+                manifest: self.vector_precision.clone(),
+                config: config.vector_precision.clone(),
+            });
+        }
+
+        if self.vector_backend != config.vector_backend {
+            mismatches.push(ManifestMismatch::VectorBackend {
+                manifest: self.vector_backend.clone(),
+                config: config.vector_backend.clone(),
             });
         }
 
@@ -207,6 +335,19 @@ impl SemanticManifest {
         }
 
         mismatches
+    }
+
+    /// Record the identity of the model that produced this index.
+    ///
+    /// Called once a model is loaded, so a later session can detect that the
+    /// file behind the same model id changed.
+    pub fn set_model_identity(&mut self, checksum: Option<String>, backend: Option<String>) {
+        if checksum.is_some() {
+            self.model_checksum = checksum;
+        }
+        if backend.is_some() {
+            self.embedding_backend = backend;
+        }
     }
 
     /// Check if a specific book needs re-indexing.
@@ -252,6 +393,19 @@ impl SemanticManifest {
         self.books.remove(source_book_key)
     }
 
+    /// Drop every per-book record, keeping the configuration metadata.
+    ///
+    /// Used when the vectors those records describe are known to be gone — a
+    /// non-persistent store after a restart, or a cleared index. Returns how
+    /// many records were dropped. Keeping them would make the manifest claim
+    /// books are indexed while the store is empty, which is exactly the state
+    /// that silently disables semantic results.
+    pub fn clear_books(&mut self) -> usize {
+        let dropped = self.books.len();
+        self.books.clear();
+        dropped
+    }
+
     /// Get the total number of indexed books.
     pub fn book_count(&self) -> usize {
         self.books.len()
@@ -268,14 +422,45 @@ impl SemanticManifest {
     }
 }
 
+/// Minimal view used to read `format_version` before the full document.
+#[derive(Deserialize)]
+struct FormatVersionProbe {
+    format_version: u32,
+}
+
 /// Types of mismatches between manifest and current config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestMismatch {
     ModelId { manifest: String, config: String },
+    ModelChecksum { manifest: String, config: String },
+    EmbeddingBackend { manifest: String, config: String },
     Dimensions { manifest: u32, config: u32 },
     Pooling { manifest: String, config: String },
+    ModelQuantization { manifest: String, config: String },
+    VectorPrecision { manifest: String, config: String },
+    VectorBackend { manifest: String, config: String },
     ChunkingVersion { manifest: u32, config: u32 },
     NormalizationVersion { manifest: u32, config: u32 },
+}
+
+impl ManifestMismatch {
+    /// Whether this mismatch means the vectors themselves are invalid (as
+    /// opposed to only the chunk boundaries or text preprocessing).
+    ///
+    /// Feeds [`IndexDiff::model_mismatch`](crate::semantic::types::IndexDiff).
+    pub fn invalidates_vectors(&self) -> bool {
+        matches!(
+            self,
+            Self::ModelId { .. }
+                | Self::ModelChecksum { .. }
+                | Self::EmbeddingBackend { .. }
+                | Self::Dimensions { .. }
+                | Self::Pooling { .. }
+                | Self::ModelQuantization { .. }
+                | Self::VectorPrecision { .. }
+                | Self::VectorBackend { .. }
+        )
+    }
 }
 
 impl std::fmt::Display for ManifestMismatch {
@@ -284,11 +469,41 @@ impl std::fmt::Display for ManifestMismatch {
             Self::ModelId { manifest, config } => {
                 write!(f, "Model ID: manifest='{manifest}', config='{config}'")
             }
+            Self::ModelChecksum { manifest, config } => {
+                write!(
+                    f,
+                    "Model checksum: manifest='{manifest}', config='{config}'"
+                )
+            }
+            Self::EmbeddingBackend { manifest, config } => {
+                write!(
+                    f,
+                    "Embedding backend: manifest='{manifest}', config='{config}'"
+                )
+            }
             Self::Dimensions { manifest, config } => {
                 write!(f, "Dimensions: manifest={manifest}, config={config}")
             }
             Self::Pooling { manifest, config } => {
                 write!(f, "Pooling: manifest='{manifest}', config='{config}'")
+            }
+            Self::ModelQuantization { manifest, config } => {
+                write!(
+                    f,
+                    "Model quantization: manifest='{manifest}', config='{config}'"
+                )
+            }
+            Self::VectorPrecision { manifest, config } => {
+                write!(
+                    f,
+                    "Vector precision: manifest='{manifest}', config='{config}'"
+                )
+            }
+            Self::VectorBackend { manifest, config } => {
+                write!(
+                    f,
+                    "Vector backend: manifest='{manifest}', config='{config}'"
+                )
             }
             Self::ChunkingVersion { manifest, config } => {
                 write!(f, "Chunking version: manifest={manifest}, config={config}")
@@ -301,6 +516,15 @@ impl std::fmt::Display for ManifestMismatch {
             }
         }
     }
+}
+
+/// Render a mismatch list as one human-readable line.
+pub fn describe_mismatches(mismatches: &[ManifestMismatch]) -> String {
+    mismatches
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Get current Unix timestamp in seconds.
@@ -318,84 +542,16 @@ mod tests {
     fn test_config() -> ManifestConfig {
         ManifestConfig {
             embedding_model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
+            model_checksum: None,
+            embedding_backend: None,
             embedding_dim: 1024,
             pooling: "last-token".to_string(),
             model_quantization: "Q4".to_string(),
             vector_precision: "f32".to_string(),
+            vector_backend: "in-memory-v1".to_string(),
             chunking_version: 1,
             normalization_version: 1,
         }
-    }
-
-    #[test]
-    fn new_manifest_has_correct_fields() {
-        let config = test_config();
-        let manifest = SemanticManifest::new(&config);
-
-        assert_eq!(manifest.embedding_model_id, config.embedding_model_id);
-        assert_eq!(manifest.embedding_dim, 1024);
-        assert_eq!(manifest.pooling, "last-token");
-        assert_eq!(manifest.chunking_version, 1);
-        assert!(manifest.books.is_empty());
-    }
-
-    #[test]
-    fn validate_matching_config_returns_empty() {
-        let config = test_config();
-        let manifest = SemanticManifest::new(&config);
-        let mismatches = manifest.validate(&config);
-        assert!(mismatches.is_empty());
-    }
-
-    #[test]
-    fn validate_detects_model_mismatch() {
-        let config = test_config();
-        let manifest = SemanticManifest::new(&config);
-
-        let mut changed_config = config;
-        changed_config.embedding_model_id = "different-model".to_string();
-
-        let mismatches = manifest.validate(&changed_config);
-        assert_eq!(mismatches.len(), 1);
-        assert!(matches!(mismatches[0], ManifestMismatch::ModelId { .. }));
-    }
-
-    #[test]
-    fn validate_detects_dimension_mismatch() {
-        let config = test_config();
-        let manifest = SemanticManifest::new(&config);
-
-        let mut changed_config = config;
-        changed_config.embedding_dim = 768;
-
-        let mismatches = manifest.validate(&changed_config);
-        assert_eq!(mismatches.len(), 1);
-        assert!(matches!(mismatches[0], ManifestMismatch::Dimensions { .. }));
-    }
-
-    #[test]
-    fn book_tracking_lifecycle() {
-        let config = test_config();
-        let mut manifest = SemanticManifest::new(&config);
-
-        // New book needs indexing
-        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
-
-        // Index it
-        manifest.mark_book_indexed("book_a".to_string(), 12345, 100, 1, 1);
-
-        // Same content doesn't need reindex
-        assert!(!manifest.book_needs_reindex("book_a", 12345, 1, 1));
-
-        // Changed content needs reindex
-        assert!(manifest.book_needs_reindex("book_a", 99999, 1, 1));
-
-        // Changed chunking version needs reindex
-        assert!(manifest.book_needs_reindex("book_a", 12345, 2, 1));
-
-        // Remove book
-        manifest.remove_book("book_a");
-        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
     }
 
     struct TempDir(PathBuf);
@@ -422,18 +578,360 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_roundtrip() {
-        let dir = TempDir::new("roundtrip");
+    fn new_manifest_has_correct_fields() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+
+        assert_eq!(manifest.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(manifest.embedding_model_id, config.embedding_model_id);
+        assert_eq!(manifest.embedding_dim, 1024);
+        assert_eq!(manifest.pooling, "last-token");
+        assert_eq!(manifest.chunking_version, 1);
+        assert_eq!(manifest.vector_backend, "in-memory-v1");
+        assert!(manifest.books.is_empty());
+    }
+
+    #[test]
+    fn validate_matching_config_returns_empty() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+        assert!(manifest.validate(&config).is_empty());
+    }
+
+    #[test]
+    fn validate_detects_model_mismatch() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+
+        let mut changed = config;
+        changed.embedding_model_id = "different-model".to_string();
+
+        let mismatches = manifest.validate(&changed);
+        assert_eq!(mismatches.len(), 1);
+        assert!(matches!(mismatches[0], ManifestMismatch::ModelId { .. }));
+        assert!(mismatches[0].invalidates_vectors());
+    }
+
+    #[test]
+    fn validate_detects_dimension_mismatch() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+
+        let mut changed = config;
+        changed.embedding_dim = 768;
+
+        let mismatches = manifest.validate(&changed);
+        assert_eq!(mismatches.len(), 1);
+        assert!(matches!(mismatches[0], ManifestMismatch::Dimensions { .. }));
+    }
+
+    /// These four dimensions were declared in the manifest but never actually
+    /// compared, so switching quantization, precision or storage backend left a
+    /// stale index looking valid.
+    #[test]
+    fn validate_detects_quantization_precision_and_backend_changes() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+
+        let cases: Vec<(&str, ManifestConfig)> = vec![
+            (
+                "quantization",
+                ManifestConfig {
+                    model_quantization: "Q8".to_string(),
+                    ..config.clone()
+                },
+            ),
+            (
+                "precision",
+                ManifestConfig {
+                    vector_precision: "f16".to_string(),
+                    ..config.clone()
+                },
+            ),
+            (
+                "vector backend",
+                ManifestConfig {
+                    vector_backend: "zvec-v1".to_string(),
+                    ..config.clone()
+                },
+            ),
+            (
+                "pooling",
+                ManifestConfig {
+                    pooling: "mean".to_string(),
+                    ..config.clone()
+                },
+            ),
+        ];
+
+        for (name, changed) in cases {
+            let mismatches = manifest.validate(&changed);
+            assert_eq!(mismatches.len(), 1, "{name} should produce one mismatch");
+            assert!(
+                mismatches[0].invalidates_vectors(),
+                "{name} invalidates stored vectors"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_detects_a_changed_model_file_behind_the_same_id() {
+        let mut config = test_config();
+        config.model_checksum = Some("aaaa".to_string());
+        config.embedding_backend = Some("mock-hash-v1".to_string());
+        let manifest = SemanticManifest::new(&config);
+        assert!(manifest.validate(&config).is_empty());
+
+        let mut swapped = config.clone();
+        swapped.model_checksum = Some("bbbb".to_string());
+        let mismatches = manifest.validate(&swapped);
+        assert_eq!(mismatches.len(), 1);
+        assert!(matches!(
+            mismatches[0],
+            ManifestMismatch::ModelChecksum { .. }
+        ));
+
+        let mut other_backend = config;
+        other_backend.embedding_backend = Some("gguf-candle-v1".to_string());
+        let mismatches = manifest.validate(&other_backend);
+        assert_eq!(mismatches.len(), 1);
+        assert!(matches!(
+            mismatches[0],
+            ManifestMismatch::EmbeddingBackend { .. }
+        ));
+    }
+
+    /// Before a model is loaded the checksum and backend are unknown. Unknown
+    /// must not read as "changed", or every startup would look incompatible.
+    #[test]
+    fn unknown_checksum_or_backend_is_not_a_mismatch() {
+        let mut recorded = test_config();
+        recorded.model_checksum = Some("aaaa".to_string());
+        recorded.embedding_backend = Some("mock-hash-v1".to_string());
+        let manifest = SemanticManifest::new(&recorded);
+
+        // Config side unknown (model not loaded yet).
+        assert!(manifest.validate(&test_config()).is_empty());
+
+        // Manifest side unknown (index built before a model was ever loaded).
+        let fresh = SemanticManifest::new(&test_config());
+        assert!(fresh.validate(&recorded).is_empty());
+    }
+
+    #[test]
+    fn validate_reports_every_mismatch_at_once() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+
+        let changed = ManifestConfig {
+            embedding_model_id: "other".to_string(),
+            embedding_dim: 256,
+            chunking_version: 9,
+            normalization_version: 4,
+            ..config
+        };
+
+        let mismatches = manifest.validate(&changed);
+        assert_eq!(mismatches.len(), 4);
+        assert!(!describe_mismatches(&mismatches).is_empty());
+    }
+
+    #[test]
+    fn chunking_and_normalization_changes_do_not_invalidate_the_vector_space() {
+        let config = test_config();
+        let manifest = SemanticManifest::new(&config);
+
+        for changed in [
+            ManifestConfig {
+                chunking_version: 2,
+                ..config.clone()
+            },
+            ManifestConfig {
+                normalization_version: 2,
+                ..config.clone()
+            },
+        ] {
+            let mismatches = manifest.validate(&changed);
+            assert_eq!(mismatches.len(), 1);
+            assert!(
+                !mismatches[0].invalidates_vectors(),
+                "chunking/normalization changes require re-chunking, not a new vector space"
+            );
+        }
+    }
+
+    #[test]
+    fn book_tracking_lifecycle() {
         let config = test_config();
         let mut manifest = SemanticManifest::new(&config);
+
+        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
         manifest.mark_book_indexed("book_a".to_string(), 12345, 100, 1, 1);
+        assert!(!manifest.book_needs_reindex("book_a", 12345, 1, 1));
 
+        // Changed content, chunking or normalization all force a re-index.
+        assert!(manifest.book_needs_reindex("book_a", 99999, 1, 1));
+        assert!(manifest.book_needs_reindex("book_a", 12345, 2, 1));
+        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 2));
+
+        assert_eq!(manifest.total_chunk_count(), 100);
+        assert!(manifest.remove_book("book_a").is_some());
+        assert!(manifest.book_needs_reindex("book_a", 12345, 1, 1));
+    }
+
+    #[test]
+    fn clear_books_keeps_configuration_but_drops_records() {
+        let config = test_config();
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("a".to_string(), 1, 10, 1, 1);
+        manifest.mark_book_indexed("b".to_string(), 2, 20, 1, 1);
+
+        assert_eq!(manifest.clear_books(), 2);
+        assert_eq!(manifest.book_count(), 0);
+        assert_eq!(manifest.total_chunk_count(), 0);
+        assert!(
+            manifest.validate(&config).is_empty(),
+            "configuration metadata must survive"
+        );
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = TempDir::new("roundtrip");
+        let mut config = test_config();
+        config.model_checksum = Some("deadbeef".to_string());
+        config.embedding_backend = Some("mock-hash-v1".to_string());
+
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("book_a".to_string(), 12345, 100, 1, 1);
         manifest.save(dir.path()).unwrap();
-        let loaded = SemanticManifest::load(dir.path()).unwrap();
 
+        let loaded = SemanticManifest::load(dir.path()).unwrap();
         assert_eq!(loaded.embedding_model_id, manifest.embedding_model_id);
         assert_eq!(loaded.embedding_dim, manifest.embedding_dim);
+        assert_eq!(loaded.model_checksum.as_deref(), Some("deadbeef"));
+        assert_eq!(loaded.embedding_backend.as_deref(), Some("mock-hash-v1"));
+        assert_eq!(loaded.vector_backend, "in-memory-v1");
         assert_eq!(loaded.books.len(), 1);
         assert!(loaded.books.contains_key("book_a"));
+        assert!(loaded.validate(&config).is_empty());
+    }
+
+    #[test]
+    fn load_reports_a_missing_manifest_distinctly_from_a_broken_one() {
+        let dir = TempDir::new("missing");
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_corrupt_json() {
+        let dir = TempDir::new("corrupt");
+        std::fs::write(
+            SemanticManifest::file_path(dir.path()),
+            b"{ this is not json",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::ParseFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_a_truncated_but_syntactically_valid_manifest() {
+        let dir = TempDir::new("truncated");
+        // Valid JSON, right format version, missing every other field.
+        std::fs::write(
+            SemanticManifest::file_path(dir.path()),
+            format!("{{\"format_version\": {MANIFEST_FORMAT_VERSION}}}").as_bytes(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::ParseFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_other_format_versions() {
+        let dir = TempDir::new("format_version");
+
+        for version in [1u32, MANIFEST_FORMAT_VERSION + 1] {
+            std::fs::write(
+                SemanticManifest::file_path(dir.path()),
+                format!("{{\"format_version\": {version}}}").as_bytes(),
+            )
+            .unwrap();
+
+            match SemanticManifest::load(dir.path()) {
+                Err(ManifestError::UnsupportedFormatVersion { found, supported }) => {
+                    assert_eq!(found, version);
+                    assert_eq!(supported, MANIFEST_FORMAT_VERSION);
+                }
+                other => panic!("expected a format-version error for {version}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn quarantine_moves_the_file_aside_and_preserves_its_bytes() {
+        let dir = TempDir::new("quarantine");
+        let path = SemanticManifest::file_path(dir.path());
+        std::fs::write(&path, b"{ broken").unwrap();
+
+        let moved = SemanticManifest::quarantine(dir.path(), "corrupt").unwrap();
+        assert!(!path.exists(), "the unusable manifest must be moved away");
+        assert!(moved.exists());
+        assert_eq!(std::fs::read(&moved).unwrap(), b"{ broken");
+        assert!(moved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("corrupt"));
+    }
+
+    #[test]
+    fn quarantine_of_a_missing_file_is_an_error_not_a_panic() {
+        let dir = TempDir::new("quarantine_missing");
+        assert!(SemanticManifest::quarantine(dir.path(), "corrupt").is_err());
+    }
+
+    #[test]
+    fn save_replaces_an_existing_manifest_and_leaves_no_temp_file() {
+        let dir = TempDir::new("replace");
+        let config = test_config();
+
+        let mut first = SemanticManifest::new(&config);
+        first.mark_book_indexed("a".to_string(), 1, 10, 1, 1);
+        first.save(dir.path()).unwrap();
+
+        let mut second = SemanticManifest::new(&config);
+        second.mark_book_indexed("b".to_string(), 2, 20, 1, 1);
+        second.save(dir.path()).unwrap();
+
+        let loaded = SemanticManifest::load(dir.path()).unwrap();
+        assert_eq!(loaded.books.len(), 1);
+        assert!(loaded.books.contains_key("b"));
+
+        let tmp = dir.path().join(format!("{MANIFEST_FILENAME}.tmp"));
+        assert!(
+            !tmp.exists(),
+            "the temp file must be renamed, not left behind"
+        );
+    }
+
+    #[test]
+    fn save_creates_a_missing_directory() {
+        let dir = TempDir::new("nested");
+        let nested = dir.path().join("a").join("b");
+
+        let mut manifest = SemanticManifest::new(&test_config());
+        manifest.save(&nested).unwrap();
+        assert!(SemanticManifest::load(&nested).is_ok());
     }
 }

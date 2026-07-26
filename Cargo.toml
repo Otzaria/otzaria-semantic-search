@@ -9,9 +9,21 @@ publish = false
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = []
+
+# Enables the deterministic hash-based stand-in embedding backend.
+#
+# It is NOT a semantic model — it exists only so the rest of the pipeline
+# (chunking, storage, fusion, grouping) can be developed and tested before a
+# real GGUF inference backend lands. It must never be enabled in a production
+# build: without this feature `EmbeddingRuntime::load` fails with
+# `EmbeddingError::BackendUnavailable`, so a release binary cannot silently
+# serve fake vectors. In-crate `#[cfg(test)]` code enables it implicitly.
+mock-embedding = []
+
 [dependencies]
 # Error handling
-anyhow = "1.0"
 thiserror = "2.0"
 
 # Serialization
@@ -21,11 +33,5 @@ serde_json = "1.0"
 # Logging
 log = "0.4"
 
-# Async / sync primitives
-tokio = { version = "1", default-features = false, features = ["sync"] }
-
-# Hashing
+# Hashing (semantic IDs, chunk hashes, model checksums)
 sha2 = "0.10"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

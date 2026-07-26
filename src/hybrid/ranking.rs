@@ -19,7 +19,7 @@ impl fmt::Display for QueryType {
             QueryType::Short => "Short",
             QueryType::Unknown => "Unknown",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -86,18 +86,32 @@ pub fn compute_alpha(features: &QueryFeatures) -> f32 {
     }
 }
 
-/// Configuration for bonuses and penalties during ranking
+/// Configuration for bonuses and penalties during ranking.
+///
+/// These values are unmeasured heuristics. Calibrating them — or dropping
+/// weighted fusion for RRF, where they would not apply — is roadmap P5.
 #[derive(Debug, Clone)]
 pub struct BonusConfig {
-    pub exact_match_bonus: f32,
+    /// Added to a candidate that both engines returned.
+    ///
+    /// Named for what it actually measures: agreement between the two
+    /// retrieval paths, not an exact string match. Note that it can push a
+    /// fused score above 1.0, so a fused score is a ranking key, not a
+    /// normalized confidence.
+    pub agreement_bonus: f32,
+    /// Reserved for penalizing near-duplicate results. Not applied yet —
+    /// duplicates are currently handled by grouping
+    /// ([`GroupingMode::IdenticalText`](crate::semantic::types::GroupingMode)).
     pub duplicate_penalty: f32,
+    /// Reserved for rewarding a result whose section has several hits. Not
+    /// applied yet.
     pub section_coverage_bonus: f32,
 }
 
 impl Default for BonusConfig {
     fn default() -> Self {
         Self {
-            exact_match_bonus: 0.1,
+            agreement_bonus: 0.1,
             duplicate_penalty: 0.05,
             section_coverage_bonus: 0.03,
         }
@@ -143,8 +157,48 @@ mod tests {
     #[test]
     fn test_default_bonus_config() {
         let config = BonusConfig::default();
-        assert_eq!(config.exact_match_bonus, 0.1);
+        assert_eq!(config.agreement_bonus, 0.1);
         assert_eq!(config.duplicate_penalty, 0.05);
         assert_eq!(config.section_coverage_bonus, 0.03);
+    }
+
+    #[test]
+    fn an_empty_query_is_classified_without_dividing_by_zero() {
+        let features = analyze_query("");
+        assert_eq!(features.token_count, 0);
+        assert_eq!(features.avg_token_length, 0.0);
+        assert_eq!(features.estimated_type, QueryType::Unknown);
+        assert_eq!(compute_alpha(&features), 0.5);
+    }
+
+    #[test]
+    fn every_query_type_produces_a_weight_inside_the_unit_interval() {
+        for query in [
+            "",
+            "שלום",
+            "שלום עולם",
+            "\"בראשית ברא\"",
+            "ברכות דף כ",
+            "מה המשמעות של החיים ביקום לפי הקבלה",
+        ] {
+            let alpha = compute_alpha(&analyze_query(query));
+            assert!(
+                (0.0..=1.0).contains(&alpha),
+                "query {query:?} produced alpha {alpha}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_types_render_for_logging() {
+        for query_type in [
+            QueryType::ExactReference,
+            QueryType::Conceptual,
+            QueryType::Mixed,
+            QueryType::Short,
+            QueryType::Unknown,
+        ] {
+            assert!(!query_type.to_string().is_empty());
+        }
     }
 }

@@ -121,25 +121,64 @@ BM25 עדיין עובד
 | בדיקת שינויי ספרים               | ממומש                      |
 | Embedding abstraction            | קיים                       |
 | הגדרת GGUF                       | קיימת                      |
+| אימות קונטיינר GGUF + checksum   | ממומש                      |
 | GGUF inference אמיתי             | **לא ממומש עדיין**         |
-| deterministic embedding fallback | ממומש                      |
+| deterministic embedding fallback | ממומש, **מחוץ ל־production** (feature `mock-embedding`) |
+| Batch embedding                  | ממומש (האינדוקס משתמש בו)  |
 | VectorStore abstraction          | קיים                       |
 | zvec אמיתי                       | **לא מחובר עדיין**         |
 | In-memory vector store           | ממומש                      |
 | Cosine search                    | ממומש                      |
-| Metadata filtering               | חלקי                       |
+| Metadata filtering               | ממומש (כולל היררכיית facets) |
 | Hybrid coordinator               | קיים                       |
 | Fusion                           | קיים                       |
 | Dynamic weighting                | קיים                       |
-| RRF                              | קיים                       |
-| Grouping                         | קיים                       |
+| RRF                              | קיים כ־primitive, **לא בשימוש** |
+| Grouping                         | ממומש                      |
+| שלושת מצבי החיפוש                | ממומש (כולל SemanticOnly)  |
+| זיהוי אי־תאימות אינדקס           | ממומש (משבית את המסלול הסמנטי) |
+| התאוששות מ־manifest פגום         | ממומש (quarantine + reset) |
 | Flutter/FFI API                  | קיים                       |
 | Production indexing pipeline     | **עדיין דורש integration** |
 | Production persistence           | **עדיין חסרה**             |
+| ANN retrieval                    | **חסר** (brute-force בלבד) |
 
 הנקודה החשובה ביותר למפתח חדש:
 
 > **זהו כרגע skeleton ארכיטקטוני עובד חלקית, לא מנוע semantic production-complete.**
+
+## מה השתנה ב־PR הראשון (Correctness baseline)
+
+ה־PR הראשון במפת הדרכים לא הוסיף יכולות — הוא הפך את השלד לנכון ולכן לניתן־למידה.
+מה שחשוב לדעת עליו לפני שנוגעים בקוד:
+
+1. **ה־embedding המזויף אינו זמין ב־production.** בבנייה רגילה
+   `EmbeddingRuntime::load()` נכשל ב־`BackendUnavailable`. ה־stand-in נמצא מאחורי
+   feature בשם `mock-embedding` (ונדלק אוטומטית ב־`cfg(test)` בתוך ה־crate).
+   הטסטים שדורשים backend נמצאים ב־`tests/hybrid_integration_test.rs` ורצים רק עם
+   ה־feature; `tests/production_backend_gate.rs` הוא התמונה ההופכית ומאמת שבנייה
+   רגילה באמת מסרבת. **לכן ה־CI מריץ את שתי הקונפיגורציות.**
+2. **אי־תאימות משביתה את המסלול הסמנטי, לא רק מדפיסה warning.** manifest שאינו
+   תואם לקונפיגורציה מחזיר `SemanticSearchError::IncompatibleIndex` גם בחיפוש וגם
+   באינדוקס; המסלול הלקסיקלי ממשיך לעבוד, וההתאוששות היא
+   `SemanticEngine::reset_index()`.
+3. **ה־manifest לא מצהיר על ספרים שהווקטורים שלהם נעלמו.** ה־backend הנוכחי אינו
+   persistent (`VectorStore::is_persistent() == false`), ולכן ב־open נמחקות רשומות
+   הספרים ו־`diff_against_tantivy` מבקש אינדוקס מחדש. זה מונע בדיוק את המצב שבו
+   "מאונדקס" ו"אין וקטורים" מתקיימים יחד.
+4. **re-index מוחק לפני שהוא כותב.** שורה שנמחקה מספר לא משאירה וקטור מאחור.
+5. **חוזה ה־filters אחיד:** רשימה ריקה אינה מסננת, התאמת topics היררכית כמו facet
+   ב־Tantivy, ו־`include_pdf` הוא מפסק *הוצאה* (`Some(false)` מוציא PDF;
+   `Some(true)`/`None` לא מסננים).
+6. **תוצאה סמנטית מסומנת ב־`needs_hydration`.** ה־vector store אינו משכפל את גוף
+   השורה, ולכן טקסט חייב להיטען מ־Tantivy לפי ID. עד ש־P5 יחבר את ה־hydration,
+   הדגל הוא החוזה שאומר "הטקסט חסר", במקום כרטיס ריק.
+7. **כל degradation נראה לקורא:** `HybridSearchResult::search_mode` הוא המצב שרץ
+   בפועל, ו־`fallback_reason` אומר למה המסלול הסמנטי לא השתתף.
+
+מה שמכוון בכוונה **לא** נעשה שם, ומחכה ל־P5: כיול `BM25_SATURATION_K`, threshold
+לתוצאה סמנטית לא רלוונטית, מעבר ל־RRF, ו־`total_count` אמיתי (הוא כרגע מספר
+המועמדים שנכנסו ל־fusion, ומתועד ככזה).
 
 ---
 
@@ -160,29 +199,24 @@ max tokens: 512
 batch size: 32
 ```
 
-אבל כרגע:
+אבל כרגע אין inference אמיתי.
 
-```rust
-load()
-```
-
-רק בודק שקובץ המודל קיים.
-
-לא מתבצע inference אמיתי.
-
-`embed_one()` מפעיל:
+`load()` מאמת את קונטיינר ה־GGUF (magic + version) ומחשב SHA-256 של הקובץ, ואז:
 
 ```text
-compute_deterministic_text_embedding()
+בנייה רגילה (production)      → Err(BackendUnavailable)
+--features mock-embedding      → backend "mock-hash-v1"
 ```
 
-המבוסס על SHA-256 ו־feature hashing. לאחר מכן מתבצע L2 normalization.
+ה־stand-in מבוסס SHA-256 ו־feature hashing (ואחריו L2 normalization). הוא **אינו
+זמין ב־production** — ראו "מה השתנה ב־PR הראשון" למעלה. וקטור באורך אפס נדחה
+בשגיאה במקום להיכנס לאינדקס.
 
 ### לכן:
 
 ```text
-Current:
-GGUF file exists
+Current (with the mock feature only):
+GGUF container validated + checksummed
        ↓
 fake deterministic embedding
        ↓
@@ -567,23 +601,8 @@ Manifest.mark_book_indexed()
 Manifest.save()
 ```
 
-הקוד בפועל עושה embedding אחד לכל chunk כרגע, למרות שקיימת API ל־batch.
-
-### שיפור עתידי ברור:
-
-במקום:
-
-```text
-chunk
- ↓
-embed_one()
- ↓
-chunk
- ↓
-embed_one()
-```
-
-לעבור ל:
+האינדוקס משתמש ב־`embed_batch()`: כל ה־chunks של הספר נשלחים בקבוצות בגודל
+`embedding_batch_size` (ברירת מחדל 32).
 
 ```text
 32 chunks
@@ -593,7 +612,8 @@ embed_batch()
 32 vectors
 ```
 
-ולנצל את `batch_size`.
+בנוסף, `index_books()` כותב את ה־manifest **פעם אחת** בסוף במקום פעם לכל ספר —
+serialize של כל המפה אחרי כל ספר הופך אינדוקס ספרייה שלמה ל־I/O ריבועי.
 
 ---
 
@@ -664,7 +684,9 @@ chunking mismatch
 normalization mismatch
 ```
 
-כרגע שלושת האחרונים עדיין מוחזרים כ־`false` מתוך `diff_against_tantivy()`, ולכן זה **לא feature מלא עדיין**.
+שלושת הדגלים האלה מחושבים בפועל מהשוואת ה־manifest לקונפיגורציה. כשאחד מהם דולק
+כל הספרים מדווחים כדורשי עבודה — עדכון אינקרמנטלי אינו יכול לתקן שינוי מודל או
+chunking. `IndexDiff::needs_full_rebuild()` הוא הבדיקה המרוכזת.
 
 ---
 
@@ -691,10 +713,16 @@ normalization version
 ```text
 warning
 +
-re-index recommended
+המסלול הסמנטי מושבת (IncompatibleIndex)
++
+BM25 ממשיך לעבוד
 ```
 
-המערכת כרגע לא בהכרח מבצעת rebuild אוטומטי.
+אין rebuild אוטומטי — זו החלטה של הקורא, דרך `reset_index()`. הסיבה: rebuild של
+ספרייה שלמה הוא פעולה ארוכה שדורשת את הספרים מהמאגר, ולא משהו שקורה בשקט בזמן open.
+
+manifest שאינו קריא (JSON פגום, גרסת format אחרת) אינו מפיל את ה־engine: הקובץ עובר
+`quarantine` לשם קובץ נפרד, נפתח אינדקס חדש, והסיבה נשמרת ב־`SemanticStatus::last_error`.
 
 ---
 
@@ -720,7 +748,9 @@ but
 actual GGUF = different
 ```
 
-כרגע זה עדיין לא מחובר באופן מלא ל־index lifecycle.
+זה מחובר: `load_model()` מחשב SHA-256 של קובץ ה־GGUF (במעבר אחד על הקובץ, יחד עם
+אימות הקונטיינר), משווה אותו למה שנשמר ב־manifest, ומשבית את המסלול הסמנטי
+כשהקבצים שונים. אם ה־manifest עדיין לא מכיר checksum — הוא נרשם בטעינה הראשונה.
 
 ---
 
@@ -1231,15 +1261,10 @@ HashMap
 
 ---
 
-## Priority 3: Batch Embeddings
+## Priority 3: Batch Embeddings — ✅ נעשה
 
-להשתמש באמת ב:
-
-```rust
-embed_batch()
-```
-
-ולא לקרוא ל־`embed_one()` לכל chunk.
+האינדוקס קורא ל־`embed_batch()`. מה שנשאר הוא לוודא שה־backend האמיתי (P2) באמת
+מנצל את הקבוצה, ולא מפרק אותה בחזרה ל־inference בודד.
 
 ---
 
@@ -1259,25 +1284,10 @@ chunk-level diff
 
 ---
 
-## Priority 5: Manifest Compatibility
+## Priority 5: Manifest Compatibility — ✅ נעשה
 
-להפוך:
-
-```text
-model mismatch
-chunking mismatch
-normalization mismatch
-```
-
-לבדיקות אמיתיות.
-
-בנוסף:
-
-```text
-model SHA-256
-```
-
-צריך להיות חלק מה־compatibility check.
+שלושת הדגלים הם בדיקות אמיתיות, ו־`model SHA-256` הוא חלק מה־compatibility check —
+יחד עם pooling, quantization, vector precision, embedding backend ו־vector backend.
 
 ---
 
@@ -1368,35 +1378,35 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 
 * [ ] persistence
 * [ ] ANN
-* [ ] reopen אחרי restart
-* [ ] insert/update/delete
-* [ ] filtering
-* [ ] dimension validation
+* [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
+* [x] insert/update/delete
+* [x] filtering
+* [x] dimension validation
 
 ### Indexing
 
-* [ ] initial full index
-* [ ] incremental book indexing
+* [x] initial full index
+* [x] incremental book indexing (ברמת ספר)
 * [ ] chunk-level reuse
-* [ ] removed-book cleanup
-* [ ] model mismatch detection
-* [ ] chunking mismatch detection
+* [x] removed-book cleanup
+* [x] model mismatch detection (כולל SHA-256 של קובץ המודל)
+* [x] chunking mismatch detection
 
 ### Hybrid
 
-* [ ] BM25 + semantic
-* [ ] score normalization
-* [ ] dynamic weighting
+* [x] BM25 + semantic
+* [x] score normalization
+* [x] dynamic weighting
 * [ ] RRF benchmark
-* [ ] grouping
-* [ ] provenance
+* [x] grouping
+* [x] provenance
 
 ### Reliability
 
-* [ ] semantic failure → BM25 fallback
-* [ ] corrupted semantic DB does not corrupt Tantivy
-* [ ] manifest writes atomic
-* [ ] index rebuild recoverable
+* [x] semantic failure → BM25 fallback (ומדווח ב־`fallback_reason`)
+* [x] corrupted semantic DB does not corrupt Tantivy
+* [x] manifest writes atomic (temp → fsync → rename)
+* [x] index rebuild recoverable (`reset_index()`)
 
 ### Performance
 
@@ -1636,14 +1646,15 @@ src/
 
 ### Replace the fake embedding implementation.
 
-Current:
+It is already fenced off from production (feature `mock-embedding`), which means a
+release build fails loudly instead of serving fake vectors — but it also means
+there is **no working semantic path in production at all** until a real backend
+lands. That is the next task.
+
+Current (test/dev builds only):
 
 ```rust
-let mut raw_vec =
-    compute_deterministic_text_embedding(
-        text,
-        self.config.embedding_dim
-    );
+mock::hash_embedding(text, self.config.embedding_dim)
 ```
 
 Target:
@@ -1680,23 +1691,29 @@ Only then does it make sense to benchmark the complete search system and tune hy
 
 **Chunking:** 🟢 Implemented
 
-**Manifest:** 🟢 Implemented
+**Manifest:** 🟢 Implemented — real compatibility validation + atomic writes
 
 **Incremental book detection:** 🟢 Implemented
 
+**Index-incompatibility handling:** 🟢 Implemented — disables the semantic path
+
 **Embedding abstraction:** 🟢 Ready for backend
 
-**Actual embedding inference:** 🔴 Missing
+**Actual embedding inference:** 🔴 Missing (and unavailable in production builds)
 
 **Vector abstraction:** 🟢 Ready for backend
 
 **Persistent vector database:** 🔴 Missing
 
-**ANN retrieval:** 🔴 Missing
+**ANN retrieval:** 🔴 Missing — brute force measures ~100ms per query at 200k×1024
 
 **Hybrid fusion:** 🟢 Implemented
 
-**Dynamic weighting:** 🟡 Initial heuristic
+**Search modes (lexical / hybrid / semantic):** 🟢 Implemented
+
+**Graceful degradation:** 🟢 Implemented and observable
+
+**Dynamic weighting:** 🟡 Initial heuristic, unmeasured
 
 **Grouping:** 🟢 Implemented
 

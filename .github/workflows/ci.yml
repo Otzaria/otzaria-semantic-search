@@ -33,18 +33,39 @@ jobs:
       - name: Check Formatting
         run: cargo fmt --check
 
-      # Type check all targets
-      - name: Run Cargo Check
+      # ── Default features = the shipping configuration ──
+      # No embedding backend is compiled in, so this proves a release build
+      # cannot fall back to the deterministic stand-in embedder.
+
+      - name: Cargo Check (default features)
         run: cargo check --all-targets
 
-      # Lint all targets
-      - name: Run Clippy
+      - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 
-      # Build binary / library in release mode to verify production compilation
+      # Asserts the production gate itself: tests/production_backend_gate.rs
+      # only compiles without `mock-embedding` and requires the engine to refuse
+      # to embed anything.
+      - name: Test (default features)
+        run: cargo test --all-targets
+
+      # ── With the stand-in backend = the full behavioural suite ──
+      # The end-to-end tests need *some* embedding backend. Until real GGUF
+      # inference lands (roadmap P2) that is the mock, which is why the whole
+      # suite has to run in both configurations rather than one.
+
+      - name: Clippy (mock-embedding)
+        run: cargo clippy --all-targets --features mock-embedding -- -D warnings
+
+      - name: Test (mock-embedding)
+        run: cargo test --all-targets --features mock-embedding
+
+      # Broken intra-doc links are the usual way documentation rots silently.
+      - name: Check Documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # Release compilation of the artifact that actually ships.
       - name: Build Release
         run: cargo build --release --all-targets
-
-      # Run all tests
-      - name: Run Cargo Test
-        run: cargo test --all-targets

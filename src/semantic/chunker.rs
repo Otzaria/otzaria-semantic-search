@@ -1,11 +1,25 @@
+//! Chunking: book lines → embeddable semantic chunks.
+//!
+//! One chunk per line, which is the granularity Tantivy indexes and the app
+//! displays. A line too short to carry meaning on its own borrows context from
+//! its neighbours within the same section.
+//!
+//! Whether prefixing the book title and reference helps retrieval, and whether
+//! neighbour context helps at all, is an open question measured in roadmap P3 —
+//! the current behaviour is the starting point, not a validated choice.
+
 use crate::semantic::types::{BookForIndexing, SemanticChunk};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct ChunkerConfig {
+    /// Below this length a line borrows context from its neighbours.
     pub min_meaningful_chars: usize,
+    /// How many lines on each side may be pulled in as context.
     pub context_window_lines: usize,
     pub max_chunk_chars: usize,
+    /// Below this length a line is skipped entirely. Measured after trimming, so
+    /// a line of blanks is never embedded.
     pub min_embeddable_chars: usize,
     pub chunking_version: u32,
 }
@@ -32,10 +46,14 @@ impl Chunker {
     }
 
     pub fn chunk_book(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
-        let mut chunks = Vec::new();
+        let mut chunks = Vec::with_capacity(book.lines.len());
 
         for (i, line) in book.lines.iter().enumerate() {
-            let char_count = line.text.chars().count();
+            // Trimmed, so a line made of spaces or a lone newline is skipped
+            // rather than embedded: it has no tokens, and a text with no tokens
+            // yields a zero vector, which is a direction-less point that matches
+            // nothing and pollutes the index.
+            let char_count = line.text.trim().chars().count();
 
             if char_count < self.config.min_embeddable_chars {
                 continue;
@@ -47,7 +65,11 @@ impl Chunker {
                 line.text.clone()
             };
 
-            let truncated_text = truncate_to_chars(&embedding_text, self.config.max_chunk_chars);
+            let truncated_text =
+                truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars);
+            if truncated_text.trim().is_empty() {
+                continue;
+            }
             let chunk_hash = compute_chunk_hash(&truncated_text);
             let semantic_id = compute_semantic_id(
                 &book.source_book_key,
@@ -204,5 +226,166 @@ mod tests {
             chunks[0].embedding_text,
             "This is a very long line that exceeds twenty characters."
         );
+    }
+
+    /// A line of blanks passes a raw character count but has no tokens, so it
+    /// would embed to a zero vector — a point with no direction that matches
+    /// nothing. It must never reach the model.
+    #[test]
+    fn skips_lines_that_are_only_whitespace() {
+        let chunker = Chunker::new(ChunkerConfig::default());
+        let book = dummy_book(vec![
+            (1, "          "),
+            (1, "\t\t\n  "),
+            (1, "\u{00a0}\u{00a0}\u{00a0}\u{00a0}\u{00a0}\u{00a0}"),
+            (1, "שורה אמיתית עם תוכן"),
+        ]);
+
+        let chunks = chunker.chunk_book(&book);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].line_id, 4);
+        assert!(!chunks[0].embedding_text.trim().is_empty());
+    }
+
+    /// A short line surrounded only by blank lines must not produce an empty
+    /// chunk through the context path either.
+    #[test]
+    fn a_short_line_whose_only_context_is_blank_still_embeds_its_own_text() {
+        let chunker = Chunker::new(ChunkerConfig::default());
+        let book = dummy_book(vec![(1, "     "), (1, "אמת ויציב"), (1, "     ")]);
+
+        let chunks = chunker.chunk_book(&book);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].line_id, 2);
+        assert!(chunks[0].embedding_text.contains("אמת ויציב"));
+        assert!(!chunks[0].embedding_text.trim().is_empty());
+    }
+
+    #[test]
+    fn short_lines_borrow_context_from_the_same_section_only() {
+        let chunker = Chunker::new(ChunkerConfig::default());
+        let book = dummy_book(vec![
+            (1, "סוף הסעיף הקודם עם מספיק תווים"),
+            (2, "פתיחת הסעיף החדש עם מספיק תווים"),
+            (2, "אמת ויציב"),
+            (2, "המשך הסעיף החדש עם מספיק תווים"),
+        ]);
+
+        let chunks = chunker.chunk_book(&book);
+        let short = chunks
+            .iter()
+            .find(|c| c.line_id == 3)
+            .expect("the short line is still chunked");
+
+        assert!(short.embedding_text.contains("אמת ויציב"));
+        assert!(short.embedding_text.contains("פתיחת הסעיף החדש"));
+        assert!(short.embedding_text.contains("המשך הסעיף החדש"));
+        assert!(
+            !short.embedding_text.contains("סוף הסעיף הקודם"),
+            "context must not cross a section boundary"
+        );
+        assert_eq!(
+            short.anchor_text, "אמת ויציב",
+            "the anchor stays the line itself, only the embedded text grows"
+        );
+    }
+
+    #[test]
+    fn embedding_text_is_truncated_on_character_boundaries() {
+        let chunker = Chunker::new(ChunkerConfig {
+            max_chunk_chars: 10,
+            ..Default::default()
+        });
+        // Hebrew is multi-byte: truncating by bytes would split a character.
+        let book = dummy_book(vec![(1, "אבגדהוזחטיכלמנסעפצקרשת")]);
+
+        let chunks = chunker.chunk_book(&book);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].embedding_text.chars().count(), 10);
+        assert_eq!(chunks[0].embedding_text, "אבגדהוזחטי");
+    }
+
+    #[test]
+    fn semantic_ids_are_stable_and_unique_per_line_and_version() {
+        let a = compute_semantic_id("book.txt", 1, 1);
+        assert_eq!(a, compute_semantic_id("book.txt", 1, 1), "must be stable");
+        assert_eq!(a.len(), 32);
+
+        assert_ne!(a, compute_semantic_id("book.txt", 2, 1), "line must matter");
+        assert_ne!(
+            a,
+            compute_semantic_id("other.txt", 1, 1),
+            "book must matter"
+        );
+        assert_ne!(
+            a,
+            compute_semantic_id("book.txt", 1, 2),
+            "chunking version must matter"
+        );
+    }
+
+    /// The id must not be forgeable by shifting the separator: `("a:1", 1)` and
+    /// `("a", 11)` would collide under naive concatenation.
+    #[test]
+    fn semantic_id_components_cannot_bleed_into_each_other() {
+        assert_ne!(
+            compute_semantic_id("book.txt", 11, 1),
+            compute_semantic_id("book.txt", 1, 11)
+        );
+    }
+
+    #[test]
+    fn chunk_hash_tracks_the_embedded_text_not_the_source_line() {
+        let chunker = Chunker::new(ChunkerConfig::default());
+        let book = dummy_book(vec![(1, "שורה ראשונה עם מספיק תווים כדי לעמוד לבד")]);
+        let chunks = chunker.chunk_book(&book);
+
+        assert_eq!(
+            chunks[0].chunk_hash,
+            compute_chunk_hash(&chunks[0].embedding_text)
+        );
+        assert_ne!(
+            compute_chunk_hash("א"),
+            compute_chunk_hash("ב"),
+            "different text must hash differently"
+        );
+    }
+
+    #[test]
+    fn every_chunk_carries_its_books_metadata() {
+        let chunker = Chunker::new(ChunkerConfig::default());
+        let mut book = dummy_book(vec![(7, "שורה ארוכה דיה כדי לעמוד בפני עצמה")]);
+        book.title = "ספר הבדיקה".to_string();
+        book.topics = vec!["/מקרא/תורה".to_string()];
+        book.author = Some("מחבר".to_string());
+        book.is_pdf = true;
+
+        let chunks = chunker.chunk_book(&book);
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert_eq!(chunk.title, "ספר הבדיקה");
+        assert_eq!(chunk.topics, vec!["/מקרא/תורה".to_string()]);
+        assert_eq!(chunk.author.as_deref(), Some("מחבר"));
+        assert!(chunk.is_pdf);
+        assert_eq!(chunk.section_id, 7);
+        assert_eq!(chunk.content_hash, book.content_hash);
+        assert_eq!(chunk.source_book_key, book.source_book_key);
+        assert_eq!(chunk.source_doc_key, "book1.txt:1");
+    }
+
+    #[test]
+    fn an_empty_book_yields_no_chunks() {
+        let chunker = Chunker::new(ChunkerConfig::default());
+        assert!(chunker.chunk_book(&dummy_book(vec![])).is_empty());
+    }
+
+    #[test]
+    fn truncate_to_chars_handles_boundaries() {
+        assert_eq!(truncate_to_chars("", 5), "");
+        assert_eq!(truncate_to_chars("abc", 5), "abc");
+        assert_eq!(truncate_to_chars("abcde", 5), "abcde");
+        assert_eq!(truncate_to_chars("abcdef", 5), "abcde");
+        assert_eq!(truncate_to_chars("שלום", 0), "");
+        assert_eq!(truncate_to_chars("שלום עולם", 4), "שלום");
     }
 }

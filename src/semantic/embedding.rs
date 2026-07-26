@@ -1,10 +1,40 @@
-//! GGUF embedding model runtime.
+//! Embedding model runtime.
 //!
-//! Loads quantized GGUF embedding models and computes sequence embeddings using
-//! last-token pooling and L2 normalization.
+//! # Backend status
+//!
+//! Real GGUF inference is **not implemented yet** (roadmap P2). This module
+//! provides the runtime shell around it: model-file validation, checksumming,
+//! batch API, pooling/normalization contract and backend selection.
+//!
+//! Two build configurations exist, and the difference is deliberate:
+//!
+//! | build | backend | behaviour of [`EmbeddingRuntime::load`] |
+//! |---|---|---|
+//! | default (production) | none | `Err(EmbeddingError::BackendUnavailable)` |
+//! | `--features mock-embedding` (and in-crate tests) | [`EmbeddingBackendKind::MockHash`] | `Ok` |
+//!
+//! The mock backend is a deterministic hash of the input text. It is **not a
+//! semantic model**: similarity between two of its vectors carries no meaning
+//! beyond token overlap. Gating it behind a non-default feature is what keeps a
+//! release build from silently serving fake vectors — a production binary fails
+//! loudly instead.
 
 use crate::errors::EmbeddingError;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+/// GGUF container magic, little-endian `b"GGUF"`.
+const GGUF_MAGIC: [u8; 4] = *b"GGUF";
+
+/// Highest GGUF container version this crate is willing to open.
+const GGUF_MAX_VERSION: u32 = 3;
+
+/// Read buffer for hashing the model file. Large enough that hashing a
+/// multi-hundred-megabyte model is bound by the hash, not by syscalls.
+const HASH_BUFFER_BYTES: usize = 1 << 20;
+
+/// Below this L2 norm a vector carries no direction and cannot be normalized.
+const MIN_VECTOR_NORM: f32 = 1e-12;
 
 /// Configuration for embedding runtime loading.
 #[derive(Debug, Clone)]
@@ -12,6 +42,7 @@ pub struct EmbeddingConfig {
     pub model_path: PathBuf,
     pub embedding_dim: u32,
     pub max_tokens: usize,
+    /// Number of texts handed to the backend per inference call.
     pub batch_size: usize,
     pub pooling: String,
 }
@@ -28,22 +59,59 @@ impl Default for EmbeddingConfig {
     }
 }
 
-/// Local GGUF Embedding Runtime.
-pub struct EmbeddingRuntime {
-    config: EmbeddingConfig,
-    loaded: bool,
+/// Identifies which embedding implementation a runtime has loaded.
+///
+/// Recorded in the semantic manifest so an index built by one backend is never
+/// silently queried through another — vectors from different backends live in
+/// different spaces and are not comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingBackendKind {
+    /// Deterministic hash-based stand-in. Test/development only; requires the
+    /// `mock-embedding` feature. See the module docs.
+    MockHash,
+    // A real GGUF backend is added in roadmap P2.
 }
 
-impl EmbeddingRuntime {
-    /// Initialize runtime with configuration.
-    pub fn new(config: EmbeddingConfig) -> Self {
-        Self {
-            config,
-            loaded: false,
+impl EmbeddingBackendKind {
+    /// Stable identifier persisted in the manifest.
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::MockHash => "mock-hash-v1",
         }
     }
 
-    /// Load the GGUF model from disk.
+    /// Whether vectors produced by this backend carry semantic meaning.
+    pub fn is_semantic(&self) -> bool {
+        match self {
+            Self::MockHash => false,
+        }
+    }
+}
+
+/// Local embedding runtime.
+pub struct EmbeddingRuntime {
+    config: EmbeddingConfig,
+    backend: Option<EmbeddingBackendKind>,
+    /// SHA-256 of the model file, computed by [`Self::load`].
+    model_checksum: Option<String>,
+}
+
+impl EmbeddingRuntime {
+    /// Initialize runtime with configuration. No file access happens here.
+    pub fn new(config: EmbeddingConfig) -> Self {
+        Self {
+            config,
+            backend: None,
+            model_checksum: None,
+        }
+    }
+
+    /// Load the model from disk.
+    ///
+    /// Validates the GGUF container and computes the file's SHA-256 in a single
+    /// pass, then selects a backend. Fails with
+    /// [`EmbeddingError::BackendUnavailable`] in builds that have no inference
+    /// backend compiled in.
     pub fn load(&mut self) -> Result<(), EmbeddingError> {
         if !self.config.model_path.exists() {
             return Err(EmbeddingError::ModelNotFound {
@@ -51,95 +119,572 @@ impl EmbeddingRuntime {
             });
         }
 
-        // Initialize Candle GGUF quantization backend & tokenizer
-        log::info!(
-            "Loaded GGUF embedding model from: {}",
-            self.config.model_path.display()
-        );
-        self.loaded = true;
-        Ok(())
+        let checksum = validate_and_checksum_gguf(&self.config.model_path)?;
+
+        #[cfg(any(test, feature = "mock-embedding"))]
+        {
+            log::warn!(
+                "Embedding backend = MOCK (deterministic hashing). \
+                 Vectors are NOT semantic; this build is not fit for production. \
+                 Model file: {}",
+                self.config.model_path.display()
+            );
+            self.model_checksum = Some(checksum);
+            self.backend = Some(EmbeddingBackendKind::MockHash);
+            Ok(())
+        }
+
+        #[cfg(not(any(test, feature = "mock-embedding")))]
+        {
+            let _ = checksum;
+            Err(EmbeddingError::BackendUnavailable {
+                reason: format!(
+                    "real GGUF inference is not implemented yet (roadmap P2); \
+                     model file {} validated but cannot be executed",
+                    self.config.model_path.display()
+                ),
+            })
+        }
     }
 
-    /// Check if the model is currently loaded.
+    /// Check if a backend is currently loaded.
     pub fn is_loaded(&self) -> bool {
-        self.loaded
+        self.backend.is_some()
     }
 
-    /// Embed a single text string into a normalized 1D f32 vector.
+    /// The loaded backend, or `None` before a successful [`Self::load`].
+    pub fn backend(&self) -> Option<EmbeddingBackendKind> {
+        self.backend
+    }
+
+    /// SHA-256 of the loaded model file, or `None` before a successful load.
+    pub fn model_checksum(&self) -> Option<&str> {
+        self.model_checksum.as_deref()
+    }
+
+    /// Embed a single text into an L2-normalized vector.
+    ///
+    /// Convenience wrapper over [`Self::embed_batch`]; indexing should call the
+    /// batch form directly so the backend sees whole batches.
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        if !self.loaded {
-            return Err(EmbeddingError::NotLoaded);
-        }
-
-        let mut raw_vec = compute_deterministic_text_embedding(text, self.config.embedding_dim);
-        l2_normalize(&mut raw_vec);
-        Ok(raw_vec)
+        let mut out = self.embed_batch(&[text])?;
+        out.pop().ok_or_else(|| EmbeddingError::InferenceFailed {
+            reason: "backend returned no vector for a single input".to_string(),
+        })
     }
 
-    /// Embed a batch of text strings.
+    /// Embed a batch of texts into L2-normalized vectors, one per input, in
+    /// input order.
+    ///
+    /// Inputs are split into chunks of [`EmbeddingConfig::batch_size`] before
+    /// reaching the backend. Every returned vector is verified to have the
+    /// configured dimensionality and a non-zero norm, so a degenerate vector
+    /// can never silently enter the index.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        if !self.loaded {
+        let Some(backend) = self.backend else {
             return Err(EmbeddingError::NotLoaded);
+        };
+
+        let dim = self.config.embedding_dim;
+        let mut results = Vec::with_capacity(texts.len());
+
+        for group in texts.chunks(self.batch_size()) {
+            let raw = self.infer(backend, group)?;
+
+            if raw.len() != group.len() {
+                return Err(EmbeddingError::InferenceFailed {
+                    reason: format!(
+                        "backend returned {} vectors for {} inputs",
+                        raw.len(),
+                        group.len()
+                    ),
+                });
+            }
+
+            for mut vector in raw {
+                if vector.len() as u32 != dim {
+                    return Err(EmbeddingError::DimensionMismatch {
+                        expected: dim,
+                        actual: vector.len() as u32,
+                    });
+                }
+                if l2_normalize(&mut vector) < MIN_VECTOR_NORM {
+                    return Err(EmbeddingError::InferenceFailed {
+                        reason: "backend produced a zero-norm vector (empty or \
+                                 unrepresentable input)"
+                            .to_string(),
+                    });
+                }
+                results.push(vector);
+            }
         }
 
-        let mut results = Vec::with_capacity(texts.len());
-        for text in texts {
-            results.push(self.embed_one(text)?);
-        }
         Ok(results)
+    }
+
+    /// Dispatch one already-sized batch to the loaded backend.
+    ///
+    /// Returns raw, unnormalized vectors; [`Self::embed_batch`] owns validation
+    /// and normalization so every backend gets the same treatment.
+    fn infer(
+        &self,
+        backend: EmbeddingBackendKind,
+        group: &[&str],
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        match backend {
+            EmbeddingBackendKind::MockHash => {
+                #[cfg(any(test, feature = "mock-embedding"))]
+                {
+                    Ok(group
+                        .iter()
+                        .map(|t| mock::hash_embedding(t, self.config.embedding_dim))
+                        .collect())
+                }
+                #[cfg(not(any(test, feature = "mock-embedding")))]
+                {
+                    let _ = group;
+                    Err(EmbeddingError::BackendUnavailable {
+                        reason: "mock backend is not compiled into this build".to_string(),
+                    })
+                }
+            }
+        }
     }
 
     /// Expected embedding dimensionality.
     pub fn dim(&self) -> u32 {
         self.config.embedding_dim
     }
+
+    /// Pooling strategy this runtime is configured for.
+    pub fn pooling(&self) -> &str {
+        &self.config.pooling
+    }
+
+    /// Maximum number of texts sent to the backend per inference call.
+    pub fn batch_size(&self) -> usize {
+        self.config.batch_size.max(1)
+    }
 }
 
-/// Compute L2 normalized vector.
-pub fn l2_normalize(vec: &mut [f32]) {
-    let sum_sq: f32 = vec.iter().map(|x| x * x).sum();
-    let norm = sum_sq.sqrt();
-    if norm > 1e-12 {
+/// L2-normalize in place and return the norm the vector had beforehand.
+///
+/// A norm indistinguishable from zero leaves the vector untouched — the caller
+/// must treat the returned norm as a failure signal rather than dividing by it.
+pub fn l2_normalize(vec: &mut [f32]) -> f32 {
+    let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > MIN_VECTOR_NORM {
+        let inv = 1.0 / norm;
         for val in vec.iter_mut() {
-            *val /= norm;
+            *val *= inv;
         }
     }
+    norm
 }
 
-/// Fallback deterministic feature embedding generator for offline testing.
-fn compute_deterministic_text_embedding(text: &str, dim: u32) -> Vec<f32> {
+/// Validate a GGUF container and return the file's SHA-256, reading the file
+/// exactly once.
+///
+/// Validation is intentionally limited to the container header — full metadata
+/// and tensor parsing belongs to the real backend (roadmap P2). What it does
+/// buy is that a placeholder or truncated file is rejected instead of being
+/// accepted as a model.
+pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError> {
     use sha2::{Digest, Sha256};
-    let mut vec = vec![0.0f32; dim as usize];
 
-    // Feature hashing over n-grams for semantic representation
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for (idx, word) in words.iter().enumerate() {
-        let mut hasher = Sha256::new();
-        hasher.update(word.as_bytes());
-        let hash = hasher.finalize();
+    let invalid = |reason: String| EmbeddingError::InvalidModelFile {
+        path: path.display().to_string(),
+        reason,
+    };
 
-        let bucket1 = (hash[0] as usize | ((hash[1] as usize) << 8)) % (dim as usize);
-        let bucket2 = (hash[2] as usize | ((hash[3] as usize) << 8)) % (dim as usize);
+    let mut file = std::fs::File::open(path).map_err(|e| EmbeddingError::LoadFailed {
+        reason: format!("cannot open model file {}: {e}", path.display()),
+    })?;
 
-        let val1 = if hash[4] % 2 == 0 { 1.0f32 } else { -1.0f32 };
-        let val2 = if hash[5] % 2 == 0 { 0.5f32 } else { -0.5f32 };
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    let mut header = Vec::with_capacity(8);
 
-        vec[bucket1] += val1 / (idx + 1) as f32;
-        vec[bucket2] += val2 / (idx + 1) as f32;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| EmbeddingError::LoadFailed {
+                reason: format!("cannot read model file {}: {e}", path.display()),
+            })?;
+        if read == 0 {
+            break;
+        }
+        if header.len() < 8 {
+            let wanted = (8 - header.len()).min(read);
+            header.extend_from_slice(&buffer[..wanted]);
+        }
+        hasher.update(&buffer[..read]);
     }
 
-    vec
+    if header.len() < 8 {
+        return Err(invalid(format!(
+            "file is {} bytes; a GGUF header needs at least 8",
+            header.len()
+        )));
+    }
+    if header[..4] != GGUF_MAGIC {
+        return Err(invalid(format!(
+            "expected magic {:?}, found {:?}",
+            String::from_utf8_lossy(&GGUF_MAGIC),
+            String::from_utf8_lossy(&header[..4])
+        )));
+    }
+
+    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    if version == 0 || version > GGUF_MAX_VERSION {
+        return Err(invalid(format!(
+            "unsupported GGUF version {version} (supported: 1..={GGUF_MAX_VERSION})"
+        )));
+    }
+
+    let digest = hasher.finalize();
+    Ok(hex_encode(&digest))
+}
+
+/// Lower-case hex encoding.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Deterministic stand-in embedder. See the module docs — this is not a model.
+#[cfg(any(test, feature = "mock-embedding"))]
+pub mod mock {
+    use sha2::{Digest, Sha256};
+
+    /// Feature-hash `text` into a `dim`-sized vector.
+    ///
+    /// Deterministic across runs and platforms, which is all the rest of the
+    /// pipeline needs from it. Whitespace-only input yields the zero vector;
+    /// [`super::EmbeddingRuntime::embed_batch`] rejects that rather than
+    /// storing a directionless vector.
+    pub fn hash_embedding(text: &str, dim: u32) -> Vec<f32> {
+        let dim = dim.max(1) as usize;
+        let mut vec = vec![0.0f32; dim];
+
+        for (idx, word) in text.split_whitespace().enumerate() {
+            let hash = Sha256::digest(word.as_bytes());
+
+            let bucket1 = (hash[0] as usize | ((hash[1] as usize) << 8)) % dim;
+            let bucket2 = (hash[2] as usize | ((hash[3] as usize) << 8)) % dim;
+
+            let val1 = if hash[4] % 2 == 0 { 1.0f32 } else { -1.0f32 };
+            let val2 = if hash[5] % 2 == 0 { 0.5f32 } else { -0.5f32 };
+
+            let decay = (idx + 1) as f32;
+            vec[bucket1] += val1 / decay;
+            vec[bucket2] += val2 / decay;
+        }
+
+        vec
+    }
+
+    /// Write a minimal well-formed GGUF header (magic + version + empty tensor
+    /// and metadata counts) so tests exercise real container validation instead
+    /// of a placeholder file.
+    pub fn write_stub_gguf(path: &std::path::Path, version: u32) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+        std::fs::write(path, bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "otzaria_embed_test_{name}_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn loaded_runtime(dir: &TempDir, dim: u32) -> EmbeddingRuntime {
+        let model = dir.path().join("model.gguf");
+        mock::write_stub_gguf(&model, 3).unwrap();
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model,
+            embedding_dim: dim,
+            batch_size: 4,
+            ..Default::default()
+        });
+        rt.load().unwrap();
+        rt
+    }
+
     #[test]
     fn test_embedding_normalization() {
         let mut vec = vec![3.0, 4.0];
-        l2_normalize(&mut vec);
+        let norm = l2_normalize(&mut vec);
+        assert!((norm - 5.0).abs() < 1e-5);
         assert!((vec[0] - 0.6).abs() < 1e-5);
         assert!((vec[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zero_vector_normalization_reports_zero_norm_and_does_not_divide() {
+        let mut vec = vec![0.0, 0.0];
+        assert_eq!(l2_normalize(&mut vec), 0.0);
+        assert_eq!(vec, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn load_rejects_missing_model() {
+        let dir = TempDir::new("missing");
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: dir.path().join("nope.gguf"),
+            ..Default::default()
+        });
+        assert!(matches!(
+            rt.load(),
+            Err(EmbeddingError::ModelNotFound { .. })
+        ));
+        assert!(!rt.is_loaded());
+    }
+
+    #[test]
+    fn load_rejects_placeholder_that_is_not_gguf() {
+        let dir = TempDir::new("placeholder");
+        let model = dir.path().join("fake.gguf");
+        // The exact placeholder the old integration test relied on.
+        std::fs::write(&model, b"GGUF_MOCK").unwrap();
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model,
+            ..Default::default()
+        });
+        // b"GGUF_MOCK" has the right magic but version bytes "_MOC".
+        assert!(matches!(
+            rt.load(),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+        assert!(!rt.is_loaded());
+    }
+
+    #[test]
+    fn load_rejects_wrong_magic_and_truncated_files() {
+        let dir = TempDir::new("magic");
+
+        let wrong = dir.path().join("wrong.gguf");
+        std::fs::write(&wrong, b"NOTGGUF_and_more_bytes").unwrap();
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: wrong,
+            ..Default::default()
+        });
+        assert!(matches!(
+            rt.load(),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+
+        let short = dir.path().join("short.gguf");
+        std::fs::write(&short, b"GGUF").unwrap();
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: short,
+            ..Default::default()
+        });
+        assert!(matches!(
+            rt.load(),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_unsupported_gguf_version() {
+        let dir = TempDir::new("version");
+        let model = dir.path().join("future.gguf");
+        mock::write_stub_gguf(&model, GGUF_MAX_VERSION + 1).unwrap();
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model,
+            ..Default::default()
+        });
+        assert!(matches!(
+            rt.load(),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+    }
+
+    #[test]
+    fn load_computes_model_checksum_and_detects_a_changed_file() {
+        let dir = TempDir::new("checksum");
+        let model = dir.path().join("model.gguf");
+
+        mock::write_stub_gguf(&model, 3).unwrap();
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model.clone(),
+            ..Default::default()
+        });
+        rt.load().unwrap();
+        let first = rt.model_checksum().unwrap().to_string();
+        assert_eq!(first.len(), 64, "sha256 hex is 64 chars");
+
+        // Same bytes → same checksum (stable across loads).
+        let mut again = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model.clone(),
+            ..Default::default()
+        });
+        again.load().unwrap();
+        assert_eq!(again.model_checksum().unwrap(), first);
+
+        // Different bytes behind the same path → different checksum.
+        let mut bytes = std::fs::read(&model).unwrap();
+        bytes.extend_from_slice(b"extra tensor payload");
+        std::fs::write(&model, &bytes).unwrap();
+        let mut changed = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model,
+            ..Default::default()
+        });
+        changed.load().unwrap();
+        assert_ne!(changed.model_checksum().unwrap(), first);
+    }
+
+    #[test]
+    fn checksum_is_computed_over_the_whole_file_across_buffer_boundaries() {
+        let dir = TempDir::new("big");
+        let a = dir.path().join("a.gguf");
+        let b = dir.path().join("b.gguf");
+
+        // Two files identical for the first HASH_BUFFER_BYTES + 1 bytes.
+        let mut base = Vec::with_capacity(HASH_BUFFER_BYTES + 64);
+        base.extend_from_slice(b"GGUF");
+        base.extend_from_slice(&3u32.to_le_bytes());
+        base.resize(HASH_BUFFER_BYTES + 1, 7u8);
+
+        let mut with_tail = base.clone();
+        with_tail.push(9u8);
+        std::fs::write(&a, &base).unwrap();
+        std::fs::write(&b, &with_tail).unwrap();
+
+        assert_ne!(
+            validate_and_checksum_gguf(&a).unwrap(),
+            validate_and_checksum_gguf(&b).unwrap(),
+            "a trailing byte past the read buffer must change the checksum"
+        );
+    }
+
+    #[test]
+    fn embed_before_load_fails() {
+        let rt = EmbeddingRuntime::new(EmbeddingConfig::default());
+        assert!(matches!(
+            rt.embed_one("שלום"),
+            Err(EmbeddingError::NotLoaded)
+        ));
+        assert!(matches!(
+            rt.embed_batch(&["שלום"]),
+            Err(EmbeddingError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn embeddings_are_normalized_and_have_configured_dim() {
+        let dir = TempDir::new("normalized");
+        let rt = loaded_runtime(&dir, 64);
+
+        let v = rt.embed_one("בראשית ברא אלהים את השמים ואת הארץ").unwrap();
+        assert_eq!(v.len(), 64);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm was {norm}");
+    }
+
+    #[test]
+    fn batch_and_single_paths_agree_and_preserve_order() {
+        let dir = TempDir::new("batch_order");
+        let rt = loaded_runtime(&dir, 32);
+
+        // More texts than batch_size (4) so several backend calls are made.
+        let texts = [
+            "בראשית ברא אלהים",
+            "והארץ היתה תהו ובהו",
+            "ויאמר אלהים יהי אור",
+            "ויהי אור",
+            "ויקרא אלהים לאור יום",
+            "ולחשך קרא לילה",
+        ];
+        let batched = rt.embed_batch(&texts).unwrap();
+        assert_eq!(batched.len(), texts.len());
+
+        for (i, text) in texts.iter().enumerate() {
+            let single = rt.embed_one(text).unwrap();
+            assert_eq!(
+                batched[i], single,
+                "batch element {i} must equal the single-text result"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_text_is_rejected_not_stored_as_zero_vector() {
+        let dir = TempDir::new("degenerate");
+        let rt = loaded_runtime(&dir, 16);
+
+        for text in ["", "   ", "\t\n  "] {
+            assert!(
+                matches!(
+                    rt.embed_one(text),
+                    Err(EmbeddingError::InferenceFailed { .. })
+                ),
+                "text {text:?} must not yield a vector"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_batch_is_a_no_op() {
+        let dir = TempDir::new("empty_batch");
+        let rt = loaded_runtime(&dir, 16);
+        assert!(rt.embed_batch(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn backend_is_reported_and_marked_non_semantic() {
+        let dir = TempDir::new("backend_kind");
+        let rt = loaded_runtime(&dir, 16);
+        let backend = rt.backend().expect("loaded");
+        assert_eq!(backend, EmbeddingBackendKind::MockHash);
+        assert_eq!(backend.id(), "mock-hash-v1");
+        assert!(
+            !backend.is_semantic(),
+            "the stand-in backend must never claim to be semantic"
+        );
+    }
+
+    #[test]
+    fn identical_text_embeds_identically_across_runtimes() {
+        let dir = TempDir::new("determinism");
+        let a = loaded_runtime(&dir, 48);
+        let b = loaded_runtime(&dir, 48);
+        assert_eq!(
+            a.embed_one("תלמוד תורה כנגד כולם").unwrap(),
+            b.embed_one("תלמוד תורה כנגד כולם").unwrap()
+        );
     }
 }
