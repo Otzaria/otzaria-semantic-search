@@ -41,6 +41,10 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Build binary / library in release mode to verify production compilation
+      - name: Build Release
+        run: cargo build --release --all-targets
+
       # Run all tests
       - name: Run Cargo Test
         run: cargo test --all-targets

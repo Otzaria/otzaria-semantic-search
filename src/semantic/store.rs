@@ -212,10 +212,12 @@ impl VectorStore {
             .into_sorted_vec()
             .into_iter()
             .filter_map(|entry| {
-                records.get(&entry.semantic_id).map(|rec| SemanticCandidate {
-                    metadata: rec.metadata.clone(),
-                    similarity_score: entry.score,
-                })
+                records
+                    .get(&entry.semantic_id)
+                    .map(|rec| SemanticCandidate {
+                        metadata: rec.metadata.clone(),
+                        similarity_score: entry.score,
+                    })
             })
             .collect();
 
@@ -350,7 +352,13 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("otzaria_test_{name}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let path = std::env::temp_dir().join(format!(
+                "otzaria_test_{name}_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
             let _ = std::fs::create_dir_all(&path);
             Self(path)
         }

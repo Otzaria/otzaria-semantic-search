@@ -153,7 +153,11 @@ impl SemanticManifest {
             reason: format!("Failed to write temp manifest: {e}"),
         })?;
 
-        // Atomic rename
+        // Atomic rename (remove target first if present on Windows to prevent error 183 / Access Denied)
+        if target.exists() {
+            let _ = std::fs::remove_file(&target);
+        }
+
         std::fs::rename(&tmp, &target).map_err(|e| ManifestError::WriteFailed {
             reason: format!("Failed to rename temp manifest to final: {e}"),
         })?;
@@ -397,7 +401,13 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("otzaria_manifest_test_{name}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let path = std::env::temp_dir().join(format!(
+                "otzaria_manifest_test_{name}_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
             let _ = std::fs::create_dir_all(&path);
             Self(path)
         }

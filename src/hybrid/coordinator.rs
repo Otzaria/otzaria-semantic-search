@@ -66,7 +66,11 @@ impl HybridCoordinator {
         let (semantic_candidates, mode) = match (params.force_mode, semantic_lock.as_ref()) {
             (Some(SearchMode::LexicalOnly), _) | (_, None) => (Vec::new(), SearchMode::LexicalOnly),
             (_, Some(engine)) => {
-                match engine.search(query, params.offset + params.limit * 2, params.filters.as_ref()) {
+                match engine.search(
+                    query,
+                    params.offset + params.limit * 2,
+                    params.filters.as_ref(),
+                ) {
                     Ok(cands) => (cands, SearchMode::Hybrid),
                     Err(e) => {
                         log::warn!("Semantic search path failed: {e}. Falling back to BM25.");
