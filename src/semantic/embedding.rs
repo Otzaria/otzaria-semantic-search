@@ -26,8 +26,16 @@ use std::path::{Path, PathBuf};
 /// GGUF container magic, little-endian `b"GGUF"`.
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 
-/// Highest GGUF container version this crate is willing to open.
-const GGUF_MAX_VERSION: u32 = 3;
+/// GGUF container versions this crate is willing to open.
+///
+/// v1 is excluded deliberately: it stored `tensor_count` and
+/// `metadata_kv_count` as `u32`, and the widening to `u64` came in v2 (see the
+/// GGUF spec's version history). Reading a v1 header with the v2 layout would
+/// misparse it, so claiming v1 support while parsing v2 fields would be worse
+/// than refusing it. No v1 model is in circulation for this crate's purpose;
+/// supporting it, if ever needed, means a real per-version parser in the
+/// backend (roadmap P2).
+const GGUF_SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
 
 /// Size of the GGUF header: magic (4) + version (4) + `tensor_count` (8) +
 /// `metadata_kv_count` (8).
@@ -39,6 +47,15 @@ const GGUF_HEADER_BYTES: usize = 24;
 /// A wildly larger count means the bytes are not a GGUF header — a truncated
 /// download, or another format that happens to start with the right four bytes.
 const GGUF_MAX_DECLARED_COUNT: u64 = 1 << 24;
+
+/// Smallest number of bytes a metadata key/value pair can occupy: key length
+/// (8) + at least one key byte + value type (4) + at least one value byte.
+const GGUF_MIN_METADATA_ENTRY_BYTES: u64 = 14;
+
+/// Smallest number of bytes a tensor descriptor can occupy: name length (8) +
+/// at least one name byte + dimension count (4) + one dimension (8) + type (4)
+/// + offset (8).
+const GGUF_MIN_TENSOR_INFO_BYTES: u64 = 33;
 
 /// Read buffer for hashing the model file. Large enough that hashing a
 /// multi-hundred-megabyte model is bound by the hash, not by syscalls.
@@ -401,9 +418,11 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
     };
 
     let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    if version == 0 || version > GGUF_MAX_VERSION {
+    if !GGUF_SUPPORTED_VERSIONS.contains(&version) {
         return Err(invalid(format!(
-            "unsupported GGUF version {version} (supported: 1..={GGUF_MAX_VERSION})"
+            "unsupported GGUF version {version} (supported: {}..={})",
+            GGUF_SUPPORTED_VERSIONS.start(),
+            GGUF_SUPPORTED_VERSIONS.end()
         )));
     }
 
@@ -413,6 +432,25 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
         return Err(invalid(format!(
             "implausible header counts (tensors: {tensor_count}, metadata: \
              {metadata_kv_count}); the file is probably not GGUF or is corrupt"
+        )));
+    }
+
+    // A download cut short keeps its header intact, so the header alone cannot
+    // detect truncation. What can: the header *declares* how many tensors and
+    // metadata entries follow, and each of those has a minimum size. A file
+    // smaller than that floor is provably incomplete.
+    //
+    // This is a lower bound, not a parse — the real weights dwarf it. It catches
+    // the interrupted-download case without opening the format, which is the
+    // backend's job (roadmap P2).
+    let minimum_bytes = GGUF_HEADER_BYTES as u64
+        + metadata_kv_count.saturating_mul(GGUF_MIN_METADATA_ENTRY_BYTES)
+        + tensor_count.saturating_mul(GGUF_MIN_TENSOR_INFO_BYTES);
+    if total_bytes < minimum_bytes {
+        return Err(invalid(format!(
+            "file is {total_bytes} bytes but its header declares {tensor_count} tensor(s) \
+             and {metadata_kv_count} metadata entry/entries, which need at least \
+             {minimum_bytes} bytes — the download is incomplete"
         )));
     }
 
@@ -649,35 +687,77 @@ mod tests {
     }
 
     #[test]
-    fn a_plausible_header_is_accepted() {
+    fn an_empty_but_well_formed_container_is_accepted() {
+        // Zero tensors and zero metadata entries: nothing is declared, so nothing
+        // is missing. This is what the test stubs write.
         let dir = TempDir::new("plausible");
         let model = dir.path().join("real.gguf");
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&291u64.to_le_bytes()); // tensors
-        bytes.extend_from_slice(&24u64.to_le_bytes()); // metadata entries
-        bytes.extend_from_slice(&[0u8; 128]); // payload
-        std::fs::write(&model, &bytes).unwrap();
-
+        mock::write_stub_gguf(&model, 3).unwrap();
         assert!(validate_and_checksum_gguf(&model).is_ok());
     }
 
     #[test]
-    fn load_rejects_unsupported_gguf_version() {
+    fn load_rejects_unsupported_gguf_versions() {
         let dir = TempDir::new("version");
-        let model = dir.path().join("future.gguf");
-        mock::write_stub_gguf(&model, GGUF_MAX_VERSION + 1).unwrap();
+        let model = dir.path().join("other-version.gguf");
 
-        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: model,
-            ..Default::default()
-        });
-        assert!(matches!(
-            rt.load(),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
+        // v1 stored the counts as u32; parsing it with the v2 layout would
+        // misread the header, so it is refused rather than misparsed.
+        for version in [0, 1, GGUF_SUPPORTED_VERSIONS.end() + 1] {
+            mock::write_stub_gguf(&model, version).unwrap();
+            let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+                model_path: model.clone(),
+                ..Default::default()
+            });
+            assert!(
+                matches!(rt.load(), Err(EmbeddingError::InvalidModelFile { .. })),
+                "version {version} must be refused"
+            );
+        }
+
+        for version in GGUF_SUPPORTED_VERSIONS {
+            mock::write_stub_gguf(&model, version).unwrap();
+            assert!(
+                validate_and_checksum_gguf(&model).is_ok(),
+                "version {version} must be accepted"
+            );
+        }
+    }
+
+    /// A download cut short keeps its header, so the header alone cannot detect
+    /// it. The declared counts can: each tensor and metadata entry has a minimum
+    /// size, and a file below that floor is provably incomplete.
+    #[test]
+    fn load_rejects_a_truncated_download_whose_header_survived() {
+        let dir = TempDir::new("truncated_download");
+        let model = dir.path().join("interrupted.gguf");
+
+        let header = |tensors: u64, metadata: u64| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"GGUF");
+            bytes.extend_from_slice(&3u32.to_le_bytes());
+            bytes.extend_from_slice(&tensors.to_le_bytes());
+            bytes.extend_from_slice(&metadata.to_le_bytes());
+            bytes
+        };
+
+        // A realistic embedding model header, with almost none of the body.
+        let mut interrupted = header(291, 24);
+        interrupted.extend_from_slice(&[0u8; 128]);
+        std::fs::write(&model, &interrupted).unwrap();
+
+        match validate_and_checksum_gguf(&model) {
+            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
+                assert!(reason.contains("incomplete"), "unhelpful reason: {reason}");
+            }
+            other => panic!("a truncated download must be rejected, got {other:?}"),
+        }
+
+        // The same header with a body large enough to hold what it declares.
+        let mut complete = header(291, 24);
+        complete.resize(24 + 291 * 33 + 24 * 14 + 4096, 0u8);
+        std::fs::write(&model, &complete).unwrap();
+        assert!(validate_and_checksum_gguf(&model).is_ok());
     }
 
     #[test]

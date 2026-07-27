@@ -24,8 +24,8 @@ use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::manifest::SemanticManifest;
 use otzaria_semantic_search::semantic::store::VectorStoreConfig;
 use otzaria_semantic_search::semantic::types::{
-    BookForIndexing, BookLine, GroupingMode, LexicalCandidate, ResultSource, SearchFilters,
-    SearchMode,
+    BookForIndexing, BookLine, ContentFingerprint, GroupingMode, LexicalCandidate, ResultSource,
+    SearchFilters, SearchMode,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -125,11 +125,18 @@ fn genesis_book() -> BookForIndexing {
     }
 }
 
+/// A PDF book.
+///
+/// `content_hash` carries the caller's own signature, not Tantivy's `0`. That is
+/// the integration contract: `content_hash` is whatever the caller can vouch for,
+/// and it has to be the same value later handed to the diff. Leaving it `0` is
+/// legal but means "I cannot vouch for this", and such a book is re-examined on
+/// every diff — see `a_pdf_without_a_caller_supplied_signature_is_always_offered`.
 fn berachot_book() -> BookForIndexing {
     BookForIndexing {
         source_book_key: BERACHOT.to_string(),
         title: "מסכת ברכות".to_string(),
-        content_hash: 555_444,
+        content_hash: PDF_SIGNATURE,
         is_pdf: true,
         topics: "/תלמוד/משנה/ברכות".to_string(),
         extra_facets: vec!["/era/תנאים".to_string()],
@@ -164,6 +171,29 @@ fn lexical_hit(line_id: u64, text: &str, bm25_score: f32) -> LexicalCandidate {
         file_path: GENESIS.to_string(),
         bm25_score,
     }
+}
+
+/// Stands in for a caller-computed PDF signature.
+///
+/// Berachot is a PDF, so the lexical index records `contentHash = 0` for it — its
+/// extracted text is not in the library database. A caller that tracks its own
+/// signature (Otzaria already has PDF size and mtime) uses it both when building
+/// the book and when asking for a diff, which is the only way a PDF can ever be
+/// reported as up to date.
+const PDF_SIGNATURE: u64 = 0xBEEF_CAFE;
+
+/// The fingerprint map a caller with real signatures would supply.
+fn library_fingerprints() -> HashMap<String, ContentFingerprint> {
+    HashMap::from([
+        (
+            GENESIS.to_string(),
+            ContentFingerprint::Hash(genesis_book().content_hash),
+        ),
+        (
+            BERACHOT.to_string(),
+            ContentFingerprint::Hash(PDF_SIGNATURE),
+        ),
+    ])
 }
 
 /// An API handle over a freshly indexed two-book library.
@@ -334,23 +364,22 @@ fn reopening_the_index_never_claims_books_whose_vectors_are_gone() {
     assert!(!status.vectors_persisted);
 
     // The diff therefore asks for both books rather than reporting done.
-    let mut tantivy = HashMap::new();
-    tantivy.insert(GENESIS.to_string(), 987_654u64);
-    tantivy.insert(BERACHOT.to_string(), 555_444u64);
-
-    let diff = api.get_semantic_index_diff(&tantivy).unwrap();
+    let fingerprints = library_fingerprints();
+    let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
     assert!(!diff.is_up_to_date());
     assert_eq!(diff.books_to_index(), 2);
     assert!(!diff.needs_full_rebuild(), "the configuration is unchanged");
 
     // Re-indexing restores a working index.
-    assert_eq!(
-        api.index_books(&[genesis_book(), berachot_book()]).unwrap(),
-        Some(4)
-    );
+    let summary = api
+        .index_books(&[genesis_book(), berachot_book()])
+        .unwrap()
+        .expect("the semantic path is enabled");
+    assert_eq!(summary.books_indexed, 2);
+    assert_eq!(summary.chunks_written, 4);
     assert!(api.get_semantic_status().available);
     assert!(api
-        .get_semantic_index_diff(&tantivy)
+        .get_semantic_index_diff(&fingerprints)
         .unwrap()
         .is_up_to_date());
 }
@@ -398,7 +427,9 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
     let mut shrunk = genesis_book();
     shrunk.lines.pop();
     shrunk.content_hash = 111_222;
-    assert_eq!(api.index_books(&[shrunk.clone()]).unwrap(), Some(2));
+    let summary = api.index_books(&[shrunk.clone()]).unwrap().unwrap();
+    assert_eq!(summary.books_indexed, 1);
+    assert_eq!(summary.chunks_written, 2);
 
     let status = api.get_semantic_status();
     assert_eq!(
@@ -422,11 +453,15 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
     );
 
     // And the manifest agrees the library is current.
-    let mut tantivy = HashMap::new();
-    tantivy.insert(GENESIS.to_string(), 111_222u64);
-    tantivy.insert(BERACHOT.to_string(), 555_444u64);
+    let fingerprints = HashMap::from([
+        (GENESIS.to_string(), ContentFingerprint::Hash(111_222)),
+        (
+            BERACHOT.to_string(),
+            ContentFingerprint::Hash(PDF_SIGNATURE),
+        ),
+    ]);
     assert!(api
-        .get_semantic_index_diff(&tantivy)
+        .get_semantic_index_diff(&fingerprints)
         .unwrap()
         .is_up_to_date());
 }
@@ -444,15 +479,55 @@ fn reindexing_unchanged_content_does_not_duplicate_vectors() {
     assert_eq!(api.get_semantic_status().indexed_book_count, 2);
 }
 
+/// The other side of that contract: a caller with nothing but Tantivy's hashes
+/// gets every PDF back on every diff. Honest, but it costs a text extraction each
+/// time — which is why supplying a signature is worth it.
+#[test]
+fn a_pdf_without_a_caller_supplied_signature_is_always_offered() {
+    let dir = TempDir::new("pdf_no_signature");
+    let api = indexed_api(config_at(&dir));
+
+    // Raw lexical hashes: 0 for the PDF.
+    let mut tantivy = HashMap::new();
+    tantivy.insert(GENESIS.to_string(), genesis_book().content_hash);
+    tantivy.insert(BERACHOT.to_string(), 0u64);
+
+    let diff = api
+        .get_semantic_index_diff_from_lexical_hashes(&tantivy)
+        .unwrap();
+
+    assert_eq!(
+        diff.unverifiable_books,
+        vec![BERACHOT.to_string()],
+        "a PDF with no usable fingerprint must be re-examined"
+    );
+    assert!(
+        diff.changed_books.is_empty(),
+        "it is not known to have changed, only unproven"
+    );
+    assert!(!diff.is_up_to_date());
+    assert!(!diff.needs_full_rebuild());
+
+    // Handing it back costs no inference, because its lines are unchanged.
+    let summary = api.index_books(&[berachot_book()]).unwrap().unwrap();
+    assert_eq!(
+        summary.books_skipped, 1,
+        "an unchanged book must be skipped even when the diff could not prove it"
+    );
+    assert_eq!(summary.chunks_written, 0);
+}
+
 #[test]
 fn a_book_deleted_from_the_library_is_reported_as_removed() {
     let dir = TempDir::new("removed_book");
     let api = indexed_api(config_at(&dir));
 
-    let mut tantivy = HashMap::new();
-    tantivy.insert(GENESIS.to_string(), 987_654u64);
+    let only_genesis = HashMap::from([(
+        GENESIS.to_string(),
+        ContentFingerprint::Hash(genesis_book().content_hash),
+    )]);
 
-    let diff = api.get_semantic_index_diff(&tantivy).unwrap();
+    let diff = api.get_semantic_index_diff(&only_genesis).unwrap();
     assert_eq!(diff.removed_books, vec![BERACHOT.to_string()]);
     assert!(diff.new_books.is_empty());
     assert!(diff.changed_books.is_empty());
@@ -499,7 +574,8 @@ fn a_corrupt_manifest_is_quarantined_and_the_engine_recovers() {
     assert!(kept, "the unusable manifest must be preserved, not deleted");
 
     // And the engine is immediately usable again.
-    assert_eq!(api.index_books(&[genesis_book()]).unwrap(), Some(3));
+    let summary = api.index_books(&[genesis_book()]).unwrap().unwrap();
+    assert_eq!(summary.chunks_written, 3);
     assert!(api.get_semantic_status().available);
 }
 
@@ -547,7 +623,8 @@ fn an_incompatible_configuration_disables_semantic_search_until_it_is_reset() {
     // Reset is the documented way out.
     api.reset_semantic_index().unwrap();
     assert!(api.get_semantic_status().needs_full_reindex.is_none());
-    assert_eq!(api.index_books(&[genesis_book()]).unwrap(), Some(3));
+    let summary = api.index_books(&[genesis_book()]).unwrap().unwrap();
+    assert_eq!(summary.chunks_written, 3);
     assert!(api.get_semantic_status().available);
 }
 

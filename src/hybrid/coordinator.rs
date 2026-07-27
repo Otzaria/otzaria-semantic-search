@@ -28,8 +28,8 @@ use crate::hybrid::ranking::{analyze_query, compute_alpha, BonusConfig};
 use crate::semantic::engine::SemanticEngine;
 use crate::semantic::types::{
     BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling, HybridResultItem,
-    HybridSearchResult, IndexDiff, LexicalCandidate, ResultSource, SearchFilters, SearchMode,
-    SemanticCandidate, SemanticStatus,
+    HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate, ResultSource, SearchFilters,
+    SearchMode, SemanticCandidate, SemanticStatus,
 };
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -330,17 +330,18 @@ impl HybridCoordinator {
         results
     }
 
-    /// Compare Tantivy's per-book content hashes against the semantic index.
+    /// Compare the library's per-book fingerprints against the semantic index.
     ///
     /// `None` when no semantic engine is configured — there is nothing to index.
-    pub fn semantic_index_diff(&self, tantivy_books: &HashMap<String, u64>) -> Option<IndexDiff> {
+    pub fn semantic_index_diff(
+        &self,
+        books: &HashMap<String, crate::semantic::types::ContentFingerprint>,
+    ) -> Option<IndexDiff> {
         let guard = self
             .semantic_engine
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        guard
-            .as_ref()
-            .map(|engine| engine.diff_against_tantivy(tantivy_books))
+        guard.as_ref().map(|engine| engine.diff(books))
     }
 
     /// Discard the semantic index and start over for the current configuration.
@@ -361,21 +362,53 @@ impl HybridCoordinator {
 
     /// Index books into the semantic index, replacing anything held for them.
     ///
-    /// Returns the number of chunks written, or `None` if there is no engine.
-    /// Takes the write lock for the duration, so queries run against the
-    /// pre-existing index until it returns.
+    /// Returns `None` if there is no semantic engine.
+    ///
+    /// # Searches block while a book is being indexed
+    ///
+    /// Indexing needs `&mut SemanticEngine` and searching needs `&`, so the two
+    /// cannot overlap: a query issued during indexing waits. The wait is bounded
+    /// to **one book** — the lock is taken and released per book rather than held
+    /// across the whole set — so a full-library index stays interruptible instead
+    /// of blocking search for its entire duration. It is still a stall, not
+    /// concurrency.
+    ///
+    /// Making indexing genuinely concurrent with search needs more than a lock
+    /// change: either finer-grained interior mutability inside the engine, or
+    /// building into a staging index and swapping it in atomically. That belongs
+    /// with the Otzaria integration (roadmap P6/P7), where the threading model is
+    /// decided — a long full index on the UI thread's engine is a blocker there,
+    /// and it should be solved once, properly.
     pub fn index_books(
         &self,
         books: &[BookForIndexing],
-    ) -> Result<Option<u32>, SemanticSearchError> {
-        let mut guard = self
-            .semantic_engine
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
-            Some(engine) => engine.index_books(books).map(Some),
-            None => Ok(None),
+    ) -> Result<Option<IndexingSummary>, SemanticSearchError> {
+        if books.is_empty() {
+            return Ok(self.has_semantic_engine().then(IndexingSummary::default));
         }
+
+        let mut summary = IndexingSummary::default();
+        for book in books {
+            let mut guard = self
+                .semantic_engine
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(engine) = guard.as_mut() else {
+                return Ok(None);
+            };
+            // One book per lock acquisition. `index_book` also saves the manifest,
+            // so progress is durable per book rather than only at the end.
+            summary.record(engine.index_book(book)?);
+        }
+        Ok(Some(summary))
+    }
+
+    /// Whether a semantic engine is configured at all.
+    pub fn has_semantic_engine(&self) -> bool {
+        self.semantic_engine
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Retrieve semantic engine status.
@@ -1039,6 +1072,105 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(coordinator.semantic_top_k(&nothing), 1);
+    }
+
+    /// Indexing and searching cannot overlap — indexing needs `&mut`, searching
+    /// `&` — so this pins down what must hold anyway: a search issued while
+    /// indexing runs still completes and returns a correct result, and neither
+    /// side deadlocks.
+    ///
+    /// What it deliberately does *not* assert is that searches observe the index
+    /// growing book by book. The per-book lock granularity makes that true, but
+    /// observing it depends on the reader being scheduled between two of the
+    /// writer's acquisitions, which no amount of test structure can guarantee —
+    /// on a loaded or single-core runner it would fail for reasons unrelated to
+    /// the code. Asserting it would buy a flaky test, not a stronger guarantee.
+    #[test]
+    fn searches_during_indexing_succeed_and_do_not_deadlock() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = TempDir::new("interleave");
+        let model_path = dir.path().join("model.gguf");
+        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let root = dir.path().join("semantic");
+
+        let engine = SemanticEngine::open(SemanticConfig {
+            root_dir: root.clone(),
+            model_path,
+            embedding_dim: 64,
+            store: VectorStoreConfig {
+                db_path: root.join("vectors"),
+                embedding_dim: 64,
+                collection_name: "chunks".to_string(),
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        let coordinator = Arc::new(HybridCoordinator::new(Some(engine)));
+
+        let books: Vec<BookForIndexing> = (0..40)
+            .map(|i| {
+                let mut book = mock_book();
+                book.source_book_key = format!("otzaria/book{i:02}.txt");
+                book.content_hash = i;
+                book
+            })
+            .collect();
+
+        let indexing_done = Arc::new(AtomicBool::new(false));
+        let searches = Arc::new(AtomicUsize::new(0));
+
+        let reader = {
+            let coordinator = Arc::clone(&coordinator);
+            let indexing_done = Arc::clone(&indexing_done);
+            let searches = Arc::clone(&searches);
+            std::thread::spawn(move || {
+                while !indexing_done.load(Ordering::Relaxed) {
+                    let result = coordinator
+                        .search(LINE_ONE, vec![], &HybridSearchParams::default())
+                        .expect("a search during indexing must still succeed");
+                    // Whatever it sees, it must be internally consistent: never a
+                    // result without provenance, never a NaN score.
+                    for item in &result.results {
+                        assert!(item.provenance.is_some());
+                        assert!(item.fused_score.is_finite());
+                    }
+                    searches.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let summary = coordinator.index_books(&books).unwrap().unwrap();
+        indexing_done.store(true, Ordering::Relaxed);
+        reader
+            .join()
+            .expect("the reader must not deadlock or panic");
+
+        assert_eq!(summary.books_indexed, 40);
+        assert_eq!(summary.chunks_written, 120);
+        assert!(
+            searches.load(Ordering::Relaxed) > 0,
+            "at least one search must have completed alongside indexing"
+        );
+        assert_eq!(coordinator.status().vector_count, 120);
+    }
+
+    #[test]
+    fn indexing_an_empty_book_list_is_a_no_op() {
+        let dir = TempDir::new("index_nothing");
+        let coordinator = indexed_coordinator(&dir);
+
+        let summary = coordinator.index_books(&[]).unwrap().unwrap();
+        assert_eq!(summary.books_processed(), 0);
+        assert_eq!(coordinator.status().vector_count, 3);
+
+        // And with no engine at all it reports absence rather than success.
+        assert!(HybridCoordinator::new(None)
+            .index_books(&[])
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -18,12 +18,12 @@ use crate::errors::{ManifestError, SemanticSearchError};
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
-    describe_mismatches, ManifestConfig, ManifestMismatch, SemanticManifest,
+    describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
 use crate::semantic::store::{VectorStore, VectorStoreConfig};
 use crate::semantic::types::{
-    BookForIndexing, ContentFingerprint, IndexDiff, SearchFilters, SemanticCandidate,
-    SemanticChunk, SemanticStatus, VectorMetadata,
+    BookForIndexing, ContentFingerprint, IndexDiff, IndexOutcome, IndexingSummary, SearchFilters,
+    SemanticCandidate, SemanticChunk, SemanticStatus, VectorMetadata,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -290,14 +290,21 @@ impl SemanticEngine {
 
     /// Index a book, replacing anything previously indexed for it.
     ///
-    /// Returns the number of chunks written. Saves the manifest, so a crash
-    /// afterwards cannot leave the book looking indexed when it is not — use
-    /// [`SemanticEngine::index_books`] to index many books with one manifest
-    /// write.
-    pub fn index_book(&mut self, book: &BookForIndexing) -> Result<u32, SemanticSearchError> {
-        let written = self.index_book_inner(book)?;
+    /// The returned [`IndexOutcome`] says what happened: vectors written, the book
+    /// already current and skipped, or nothing embeddable. It is deliberately not
+    /// a bare chunk count — a skipped book has chunks in the index but wrote none,
+    /// and reporting the former as the latter made "chunks written" untrue.
+    ///
+    /// Saves the manifest, so a crash afterwards cannot leave the book looking
+    /// indexed when it is not. Use [`SemanticEngine::index_books`] for many books
+    /// with one manifest write.
+    pub fn index_book(
+        &mut self,
+        book: &BookForIndexing,
+    ) -> Result<IndexOutcome, SemanticSearchError> {
+        let outcome = self.index_book_inner(book)?;
         self.manifest.save(&self.config.root_dir)?;
-        Ok(written)
+        Ok(outcome)
     }
 
     /// Index several books, writing the manifest once at the end.
@@ -306,11 +313,14 @@ impl SemanticEngine {
     /// index into quadratic I/O. On failure, everything indexed so far is still
     /// committed before the error propagates, so a retry resumes instead of
     /// restarting.
-    pub fn index_books(&mut self, books: &[BookForIndexing]) -> Result<u32, SemanticSearchError> {
-        let mut total = 0u32;
+    pub fn index_books(
+        &mut self,
+        books: &[BookForIndexing],
+    ) -> Result<IndexingSummary, SemanticSearchError> {
+        let mut summary = IndexingSummary::default();
         for book in books {
             match self.index_book_inner(book) {
-                Ok(written) => total = total.saturating_add(written),
+                Ok(outcome) => summary.record(outcome),
                 Err(e) => {
                     // Persist the progress made before giving up.
                     if let Err(save_err) = self.manifest.save(&self.config.root_dir) {
@@ -323,11 +333,14 @@ impl SemanticEngine {
             }
         }
         self.manifest.save(&self.config.root_dir)?;
-        Ok(total)
+        Ok(summary)
     }
 
     /// Index one book without saving the manifest.
-    fn index_book_inner(&mut self, book: &BookForIndexing) -> Result<u32, SemanticSearchError> {
+    fn index_book_inner(
+        &mut self,
+        book: &BookForIndexing,
+    ) -> Result<IndexOutcome, SemanticSearchError> {
         self.ensure_index_usable()?;
 
         let chunks = self.chunker.chunk_book(book);
@@ -339,7 +352,9 @@ impl SemanticEngine {
                 book.source_book_key,
                 chunks.len()
             );
-            return Ok(chunks.len() as u32);
+            return Ok(IndexOutcome::Skipped {
+                chunks: chunks.len() as u32,
+            });
         }
 
         // Only pay for the model when there is something to embed. A book with
@@ -378,7 +393,7 @@ impl SemanticEngine {
                 self.config.chunking.chunking_version,
                 self.config.normalization_version,
             );
-            return Ok(0);
+            return Ok(IndexOutcome::Empty);
         }
 
         let batch: Vec<(VectorMetadata, Vec<f32>)> = chunks
@@ -404,7 +419,9 @@ impl SemanticEngine {
             self.config.normalization_version,
         );
 
-        Ok(chunks.len() as u32)
+        Ok(IndexOutcome::Indexed {
+            chunks: chunks.len() as u32,
+        })
     }
 
     /// Whether this exact book is already in the index, so embedding it again
@@ -518,25 +535,20 @@ impl SemanticEngine {
         Ok(self.store.search(&query_vec, top_k, filters)?)
     }
 
-    /// Compare Tantivy's per-book content hashes against the semantic index.
+    /// Compare the library's per-book fingerprints against the semantic index.
     ///
-    /// `tantivy_books` maps a book key to its raw `contentHash`. A hash of `0` is
-    /// the lexical engine's "no fingerprint" marker, which it records for every
-    /// PDF because their extracted text never enters the library database.
-    /// Comparing that as a hash would make `0 == 0` mean "unchanged" and a
-    /// replaced or re-scanned PDF would never be re-indexed — so such books are
-    /// always reported as needing attention.
-    ///
-    /// That is not as expensive as it sounds: handing one back to
-    /// [`SemanticEngine::index_book`] costs re-chunking and nothing more when its
-    /// lines are unchanged. If the caller can supply a real PDF fingerprint
-    /// (extracted-text hash, or size and mtime), passing it as the content hash
-    /// removes even that.
+    /// This is the primary form: the caller decides what a book's fingerprint is.
+    /// Pass [`ContentFingerprint::Hash`] when something can vouch for the content
+    /// — the lexical `contentHash` for a text book, or the caller's own signature
+    /// (Otzaria already tracks PDF size and mtime) for anything the lexical index
+    /// cannot fingerprint. Pass [`ContentFingerprint::Unverifiable`] only when
+    /// there is genuinely nothing to compare; those books land in
+    /// [`IndexDiff::unverifiable_books`] and have to be re-examined.
     ///
     /// When a configuration change invalidated the index, every known book is
-    /// reported as needing work — an incremental update cannot repair a change
-    /// of model or chunking.
-    pub fn diff_against_tantivy(&self, tantivy_books: &HashMap<String, u64>) -> IndexDiff {
+    /// reported as changed — an incremental update cannot repair a change of model
+    /// or chunking.
+    pub fn diff(&self, books: &HashMap<String, ContentFingerprint>) -> IndexDiff {
         let model_mismatch = self
             .incompatibilities
             .iter()
@@ -553,21 +565,23 @@ impl SemanticEngine {
 
         let mut new_books = Vec::new();
         let mut changed_books = Vec::new();
+        let mut unverifiable_books = Vec::new();
 
-        for (book_key, &content_hash) in tantivy_books {
+        for (book_key, &fingerprint) in books {
             let need = self.manifest.book_index_need(
                 book_key,
-                ContentFingerprint::from_lexical_hash(content_hash),
+                fingerprint,
                 self.config.chunking.chunking_version,
                 self.config.normalization_version,
             );
 
-            if full_rebuild || need.needs_work() {
-                if need.is_known() {
-                    changed_books.push(book_key.clone());
-                } else {
-                    new_books.push(book_key.clone());
-                }
+            match need {
+                _ if full_rebuild && need.is_known() => changed_books.push(book_key.clone()),
+                _ if full_rebuild => new_books.push(book_key.clone()),
+                BookIndexNeed::Missing => new_books.push(book_key.clone()),
+                BookIndexNeed::Changed => changed_books.push(book_key.clone()),
+                BookIndexNeed::Unverifiable => unverifiable_books.push(book_key.clone()),
+                BookIndexNeed::UpToDate => {}
             }
         }
 
@@ -575,7 +589,7 @@ impl SemanticEngine {
             .manifest
             .books
             .keys()
-            .filter(|book_key| !tantivy_books.contains_key(*book_key))
+            .filter(|book_key| !books.contains_key(*book_key))
             .cloned()
             .collect();
 
@@ -583,16 +597,40 @@ impl SemanticEngine {
         // from them, and `HashMap` iteration order changes between runs.
         new_books.sort_unstable();
         changed_books.sort_unstable();
+        unverifiable_books.sort_unstable();
         removed_books.sort_unstable();
 
         IndexDiff {
             new_books,
             changed_books,
+            unverifiable_books,
             removed_books,
             model_mismatch,
             chunking_mismatch,
             normalization_mismatch,
         }
+    }
+
+    /// Convenience wrapper over [`SemanticEngine::diff`] for raw lexical hashes.
+    ///
+    /// `tantivy_books` maps a book key to its raw `contentHash`, and `0` is the
+    /// lexical engine's "no fingerprint" marker — it records that for every PDF,
+    /// because their extracted text never enters the library database. Comparing
+    /// it as a hash would make `0 == 0` mean "unchanged", so a replaced or
+    /// re-scanned PDF would never be re-indexed.
+    ///
+    /// Consequently **every PDF appears in [`IndexDiff::unverifiable_books`] on
+    /// every call**, and `is_up_to_date()` never returns `true` for a library that
+    /// contains one. That is honest rather than useful: the index genuinely cannot
+    /// tell. Producing such a book costs the caller a fresh text extraction, so a
+    /// caller that has its own PDF signature should call [`SemanticEngine::diff`]
+    /// with it and get a diff that can actually reach "nothing to do".
+    pub fn diff_against_tantivy(&self, tantivy_books: &HashMap<String, u64>) -> IndexDiff {
+        let fingerprints = tantivy_books
+            .iter()
+            .map(|(key, &hash)| (key.clone(), ContentFingerprint::from_lexical_hash(hash)))
+            .collect();
+        self.diff(&fingerprints)
     }
 
     /// Retrieve current operational status.
@@ -790,8 +828,9 @@ mod tests {
         let dir = TempDir::new("index_basic");
         let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
 
-        let written = engine.index_book(&three_line_book()).unwrap();
-        assert_eq!(written, 3);
+        let outcome = engine.index_book(&three_line_book()).unwrap();
+        assert_eq!(outcome, IndexOutcome::Indexed { chunks: 3 });
+        assert_eq!(outcome.chunks_written(), 3);
 
         let status = engine.status();
         assert_eq!(status.indexed_book_count, 1);
@@ -836,7 +875,10 @@ mod tests {
                 (2, 100, "והארץ היתה תהו ובהו וחשך על פני תהום"),
             ],
         );
-        assert_eq!(engine.index_book(&shrunk).unwrap(), 2);
+        assert_eq!(
+            engine.index_book(&shrunk).unwrap(),
+            IndexOutcome::Indexed { chunks: 2 }
+        );
 
         assert_eq!(
             engine.status().vector_count,
@@ -858,7 +900,7 @@ mod tests {
 
         engine.index_book(&three_line_book()).unwrap();
         let emptied = book("otzaria/tanach/genesis.txt", 333, &[]);
-        assert_eq!(engine.index_book(&emptied).unwrap(), 0);
+        assert_eq!(engine.index_book(&emptied).unwrap(), IndexOutcome::Empty);
 
         let status = engine.status();
         assert_eq!(status.vector_count, 0, "no orphan vectors may survive");
@@ -887,7 +929,7 @@ mod tests {
             4242,
             &[(1, 1, "א"), (2, 1, "ב"), (3, 1, "ג")],
         );
-        assert_eq!(engine.index_book(&headings).unwrap(), 0);
+        assert_eq!(engine.index_book(&headings).unwrap(), IndexOutcome::Empty);
 
         let mut tantivy = HashMap::new();
         tantivy.insert("headings.txt".to_string(), 4242u64);
@@ -919,7 +961,7 @@ mod tests {
         // Lines too short to embed at all.
         let blank = book("blank.txt", 1, &[(1, 1, "א"), (2, 1, "   ")]);
 
-        assert_eq!(engine.index_book(&blank).unwrap(), 0);
+        assert_eq!(engine.index_book(&blank).unwrap(), IndexOutcome::Empty);
         assert!(!engine.status().model_loaded);
         assert_eq!(
             engine.status().indexed_book_count,
@@ -970,9 +1012,16 @@ mod tests {
             !diff.is_up_to_date(),
             "a book with no usable fingerprint can never be declared current"
         );
-        assert_eq!(diff.changed_books, vec!["otzaria/scans/responsa.pdf"]);
+        // Reported as unverifiable, not as changed: it is not *known* to have
+        // changed, and producing it costs the caller a fresh text extraction.
+        assert_eq!(diff.unverifiable_books, vec!["otzaria/scans/responsa.pdf"]);
+        assert!(diff.changed_books.is_empty());
+        assert_eq!(diff.books_to_index(), 1);
 
-        assert_eq!(engine.index_book(&rescanned).unwrap(), 3);
+        assert_eq!(
+            engine.index_book(&rescanned).unwrap(),
+            IndexOutcome::Indexed { chunks: 3 }
+        );
         assert_eq!(
             engine.status().vector_count,
             3,
@@ -1006,8 +1055,8 @@ mod tests {
         engine.unload_model();
         assert_eq!(
             engine.index_book(&scan).unwrap(),
-            1,
-            "an unchanged book must still report its chunk count"
+            IndexOutcome::Skipped { chunks: 1 },
+            "an unchanged book reports what the index holds, and that it wrote nothing"
         );
         assert!(
             !engine.status().model_loaded,
@@ -1080,7 +1129,12 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(engine.index_books(&books).unwrap(), 10);
+        let summary = engine.index_books(&books).unwrap();
+        assert_eq!(summary.books_indexed, 5);
+        assert_eq!(summary.books_skipped, 0);
+        assert_eq!(summary.books_empty, 0);
+        assert_eq!(summary.chunks_written, 10);
+        assert_eq!(summary.books_processed(), 5);
         assert_eq!(engine.status().vector_count, 10);
         assert_eq!(engine.status().indexed_book_count, 5);
 
@@ -1364,7 +1418,10 @@ mod tests {
         // Reset is the way out.
         engine.reset_index().unwrap();
         assert!(engine.incompatibilities().is_empty());
-        assert_eq!(engine.index_book(&three_line_book()).unwrap(), 3);
+        assert_eq!(
+            engine.index_book(&three_line_book()).unwrap(),
+            IndexOutcome::Indexed { chunks: 3 }
+        );
         assert!(engine.status().available);
         assert!(engine.status().needs_full_reindex.is_none());
     }
@@ -1450,7 +1507,10 @@ mod tests {
         assert_eq!(quarantined.len(), 1, "found {quarantined:?}");
 
         // And the engine is fully usable again.
-        assert_eq!(engine.index_book(&three_line_book()).unwrap(), 3);
+        assert_eq!(
+            engine.index_book(&three_line_book()).unwrap(),
+            IndexOutcome::Indexed { chunks: 3 }
+        );
         assert!(engine.status().available);
     }
 

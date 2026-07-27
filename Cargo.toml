@@ -29,6 +29,10 @@ mock-embedding = []
 [[bench]]
 name = "vector_search"
 harness = false
+# Without this, `cargo test --all-targets` *runs* the benchmark: a `harness = false`
+# target is just a binary, and cargo executes it as a test. That meant every test
+# run silently performed the full 200k x 1024 workload in an unoptimized build.
+test = false
 
 [dependencies]
 # Error handling

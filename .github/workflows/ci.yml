@@ -43,11 +43,16 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 
+      # `--lib --tests`, never `--all-targets`: the latter explicitly selects the
+      # bench target, and an explicit selection overrides its `test = false`, so
+      # cargo would *run* the 200k x 1024 benchmark — unoptimized — as part of the
+      # test suite. Compiling benches/ is the release step's job.
+      #
       # Asserts the production gate itself: tests/production_backend_gate.rs
       # only compiles without `mock-embedding` and requires the engine to refuse
       # to embed anything.
       - name: Test (default features)
-        run: cargo test --all-targets
+        run: cargo test --lib --tests
 
       # ── With the stand-in backend = the full behavioural suite ──
       # The end-to-end tests need *some* embedding backend. Until real GGUF
@@ -58,7 +63,7 @@ jobs:
         run: cargo clippy --all-targets --features mock-embedding -- -D warnings
 
       - name: Test (mock-embedding)
-        run: cargo test --all-targets --features mock-embedding
+        run: cargo test --lib --tests --features mock-embedding
 
       # Broken intra-doc links are the usual way documentation rots silently.
       - name: Check Documentation

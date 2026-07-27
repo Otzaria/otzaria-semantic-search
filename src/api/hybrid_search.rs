@@ -14,7 +14,8 @@
 
 use crate::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
 use crate::semantic::types::{
-    BookForIndexing, HybridSearchResult, IndexDiff, LexicalCandidate, SearchFilters, SemanticStatus,
+    BookForIndexing, ContentFingerprint, HybridSearchResult, IndexDiff, IndexingSummary,
+    LexicalCandidate, SearchFilters, SemanticStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,23 +76,48 @@ impl OtzariaHybridEngine {
         self.coordinator.status()
     }
 
-    /// Diff Tantivy's per-book content hashes against the semantic index, to
-    /// determine what needs indexing.
+    /// Diff the library's per-book fingerprints against the semantic index.
+    ///
+    /// Prefer this form: the caller decides what a book's fingerprint is, which is
+    /// the only way a PDF can ever be reported as up to date. See
+    /// [`ContentFingerprint`] and [`IndexDiff::unverifiable_books`].
     ///
     /// `None` when no semantic engine is configured.
     pub fn get_semantic_index_diff(
         &self,
+        books: &HashMap<String, ContentFingerprint>,
+    ) -> Option<IndexDiff> {
+        self.coordinator.semantic_index_diff(books)
+    }
+
+    /// Diff raw lexical `contentHash` values against the semantic index.
+    ///
+    /// Convenience for a caller that has nothing but Tantivy's hashes. Every PDF
+    /// then lands in [`IndexDiff::unverifiable_books`] on every call, because the
+    /// lexical engine records `contentHash = 0` for them and that cannot prove
+    /// anything — see [`SemanticEngine::diff_against_tantivy`](crate::semantic::engine::SemanticEngine::diff_against_tantivy).
+    pub fn get_semantic_index_diff_from_lexical_hashes(
+        &self,
         tantivy_books: &HashMap<String, u64>,
     ) -> Option<IndexDiff> {
-        self.coordinator.semantic_index_diff(tantivy_books)
+        let fingerprints = tantivy_books
+            .iter()
+            .map(|(key, &hash)| (key.clone(), ContentFingerprint::from_lexical_hash(hash)))
+            .collect();
+        self.coordinator.semantic_index_diff(&fingerprints)
     }
 
     /// Index books into the semantic index, replacing anything held for them.
     ///
-    /// Returns the number of chunks written, or `None` if the semantic path is
-    /// disabled. Synchronous and potentially long-running — the caller owns
-    /// scheduling it off the UI thread until the progress API lands in P7.
-    pub fn index_books(&self, books: &[BookForIndexing]) -> Result<Option<u32>, String> {
+    /// Returns what happened per category (indexed / skipped / empty), or `None`
+    /// if the semantic path is disabled. Synchronous and potentially
+    /// long-running; searches stall for at most one book at a time — see
+    /// [`HybridCoordinator::index_books`]. Scheduling it off the UI thread is the
+    /// caller's job until the progress API lands in P7.
+    pub fn index_books(
+        &self,
+        books: &[BookForIndexing],
+    ) -> Result<Option<IndexingSummary>, String> {
         self.coordinator
             .index_books(books)
             .map_err(|e| e.to_string())

@@ -31,6 +31,13 @@ const MANIFEST_FORMAT_VERSION: u32 = 3;
 /// Manifest file name.
 const MANIFEST_FILENAME: &str = "semantic_manifest.json";
 
+/// Where the previous manifest is parked while a retried rename is in flight.
+///
+/// Only [`SemanticManifest::save`]'s fallback path creates it, and only for the
+/// duration of one rename. Its existence alongside a missing target means a crash
+/// caught that window, and [`SemanticManifest::load`] recovers from it.
+const MANIFEST_PREVIOUS_SUFFIX: &str = "previous";
+
 /// Full semantic index manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticManifest {
@@ -162,9 +169,31 @@ impl SemanticManifest {
     pub fn load(dir: &Path) -> Result<Self, ManifestError> {
         let path = Self::file_path(dir);
         if !path.exists() {
-            return Err(ManifestError::NotFound {
-                path: path.display().to_string(),
-            });
+            // A crash inside `save`'s fallback window can leave the manifest
+            // parked under `.previous` with no target. Recovering it here is what
+            // makes the "previous or new, never none" guarantee hold: without
+            // this the state would read as a first run and the whole index would
+            // be silently rebuilt.
+            let parked = Self::previous_path(dir);
+            if parked.exists() {
+                log::warn!(
+                    "No manifest at {}, but a parked copy exists at {}; a previous save was \
+                     interrupted. Recovering it.",
+                    path.display(),
+                    parked.display()
+                );
+                std::fs::rename(&parked, &path).map_err(|e| ManifestError::WriteFailed {
+                    reason: format!(
+                        "Failed to recover the parked manifest {} to {}: {e}",
+                        parked.display(),
+                        path.display()
+                    ),
+                })?;
+            } else {
+                return Err(ManifestError::NotFound {
+                    path: path.display().to_string(),
+                });
+            }
         }
 
         let content = std::fs::read_to_string(&path).map_err(|e| ManifestError::ParseFailed {
@@ -229,6 +258,7 @@ impl SemanticManifest {
             })?;
         }
 
+        let mut parked: Option<PathBuf> = None;
         if let Err(first) = std::fs::rename(&tmp, &target) {
             // `rename` replaces an existing file on both Unix and Windows, but a
             // Windows file lock (search indexer, antivirus, another handle) can
@@ -236,36 +266,73 @@ impl SemanticManifest {
             //
             // The retry must not simply delete the target: a crash in that window
             // would leave no manifest at all, which is worse than either version.
-            // Moving it aside keeps a recoverable copy throughout.
-            log::warn!("Atomic manifest rename failed ({first}); retrying via a side-step");
-            let previous = dir.join(format!("{MANIFEST_FILENAME}.previous"));
+            // Parking it under `.previous` keeps a recoverable copy throughout,
+            // and `load` recovers from it if a crash lands mid-swap.
+            log::warn!("Atomic manifest rename failed ({first}); retrying via a parked copy");
+            let previous = Self::previous_path(dir);
             let _ = std::fs::remove_file(&previous);
 
-            let stepped_aside = std::fs::rename(&target, &previous).is_ok();
-            std::fs::rename(&tmp, &target).map_err(|e| {
-                // Put the old manifest back rather than leaving the directory empty.
-                if stepped_aside {
-                    let _ = std::fs::rename(&previous, &target);
+            if std::fs::rename(&target, &previous).is_ok() {
+                parked = Some(previous.clone());
+            }
+
+            if let Err(second) = std::fs::rename(&tmp, &target) {
+                // Put the old manifest back rather than leaving the directory
+                // without one. If even that fails the parked copy stays where it
+                // is, which is exactly what `load` knows how to recover.
+                if let Some(previous) = &parked {
+                    if let Err(restore) = std::fs::rename(previous, &target) {
+                        log::error!(
+                            "Could not restore the parked manifest {} to {} ({restore}); it \
+                             stays parked and will be recovered on the next open",
+                            previous.display(),
+                            target.display()
+                        );
+                    }
                 }
-                ManifestError::WriteFailed {
+                return Err(ManifestError::WriteFailed {
                     reason: format!(
-                        "Failed to rename temp manifest to final: {e} (first attempt: {first})"
+                        "Failed to rename temp manifest to final: {second} \
+                         (first attempt: {first})"
                     ),
-                }
-            })?;
-            let _ = std::fs::remove_file(&previous);
+                });
+            }
         }
 
         // The rename is only durable once the directory entry itself is flushed;
         // otherwise a power loss can resurrect the old name. Best-effort: not
-        // every platform lets a directory be opened for this, and failing the save
-        // over it would be worse than the residual risk.
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
+        // every platform allows opening a directory for this, and failing the save
+        // over it would be worse than the residual risk — but it must happen
+        // *before* the parked copy is discarded, so a crash in between still
+        // leaves something recoverable.
+        match std::fs::File::open(dir) {
+            Ok(handle) => {
+                if let Err(e) = handle.sync_all() {
+                    log::warn!(
+                        "Could not flush the directory entry for {} ({e}); the manifest \
+                         rename may not survive a power loss",
+                        target.display()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "Could not open {} to flush its directory entry ({e}); the manifest rename \
+                 may not survive a power loss",
+                dir.display()
+            ),
+        }
+
+        if let Some(previous) = parked {
+            let _ = std::fs::remove_file(previous);
         }
 
         log::debug!("Manifest saved to {}", target.display());
         Ok(())
+    }
+
+    /// Path of the parked copy used by [`Self::save`]'s fallback.
+    pub fn previous_path(dir: &Path) -> PathBuf {
+        dir.join(format!("{MANIFEST_FILENAME}.{MANIFEST_PREVIOUS_SUFFIX}"))
     }
 
     /// Move an unusable manifest aside so a fresh one can be written without
@@ -1173,16 +1240,70 @@ mod tests {
             assert_eq!(loaded.book_count(), 1);
             assert!(loaded.book(&format!("book{round}")).is_some());
 
-            for leftover in [
-                format!("{MANIFEST_FILENAME}.tmp"),
-                format!("{MANIFEST_FILENAME}.previous"),
-            ] {
-                assert!(
-                    !dir.path().join(&leftover).exists(),
-                    "{leftover} must not survive a successful save"
-                );
-            }
+            assert!(
+                !dir.path().join(format!("{MANIFEST_FILENAME}.tmp")).exists(),
+                "the temp file must not survive a successful save"
+            );
+            assert!(
+                !SemanticManifest::previous_path(dir.path()).exists(),
+                "the parked copy must not survive a successful save"
+            );
         }
+    }
+
+    /// Simulates a crash inside `save`'s fallback window: the manifest is parked
+    /// under `.previous` and the target is gone. Without recovery this reads as a
+    /// first run and the entire index is silently rebuilt.
+    #[test]
+    fn a_manifest_parked_by_an_interrupted_save_is_recovered() {
+        let dir = TempDir::new("parked_recovery");
+        let config = test_config();
+
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("book_a".to_string(), 12345, 777, 100, 1, 1);
+        manifest.save(dir.path()).unwrap();
+
+        // Reproduce the window exactly: target parked, nothing in its place.
+        std::fs::rename(
+            SemanticManifest::file_path(dir.path()),
+            SemanticManifest::previous_path(dir.path()),
+        )
+        .unwrap();
+        assert!(!SemanticManifest::file_path(dir.path()).exists());
+
+        let recovered = SemanticManifest::load(dir.path())
+            .expect("a parked manifest must be recovered, not reported as a first run");
+        assert_eq!(recovered.book_count(), 1);
+        assert!(recovered.book("book_a").is_some());
+
+        // Recovery is a move, so the file is back in place for the next open and
+        // the parked copy is gone.
+        assert!(SemanticManifest::file_path(dir.path()).exists());
+        assert!(!SemanticManifest::previous_path(dir.path()).exists());
+        assert_eq!(SemanticManifest::load(dir.path()).unwrap().book_count(), 1);
+    }
+
+    /// With neither file present it really is a first run.
+    #[test]
+    fn no_manifest_and_no_parked_copy_is_still_a_first_run() {
+        let dir = TempDir::new("genuinely_missing");
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::NotFound { .. })
+        ));
+    }
+
+    /// A parked copy that is itself unusable must surface as a parse failure, so
+    /// the engine quarantines it instead of trusting it.
+    #[test]
+    fn a_corrupt_parked_copy_is_reported_as_corrupt() {
+        let dir = TempDir::new("parked_corrupt");
+        std::fs::write(SemanticManifest::previous_path(dir.path()), b"{ broken").unwrap();
+
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::ParseFailed { .. })
+        ));
     }
 
     #[test]

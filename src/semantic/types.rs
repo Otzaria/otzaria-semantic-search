@@ -114,18 +114,28 @@ impl BookForIndexing {
         ContentFingerprint::from_lexical_hash(self.content_hash)
     }
 
-    /// A fingerprint computed from the lines themselves, for books whose
+    /// A fingerprint this crate computes from the book itself, for books whose
     /// lexical `contentHash` is [`ContentFingerprint::Unverifiable`].
     ///
-    /// Covers the identity, position and content signature of every line, so a
-    /// re-scanned PDF whose text changed produces a different value while an
-    /// unchanged one produces the same. This is what lets a PDF be skipped
-    /// without trusting a hash the lexical index never computed.
+    /// # What it must cover
+    ///
+    /// Everything that ends up inside a [`VectorMetadata`] record, not just the
+    /// embedded text. This value gates the "nothing changed, skip it" decision,
+    /// so anything it omits can change without the index noticing — a book whose
+    /// author, category, title or references were corrected would keep serving
+    /// the old values for filtering and display. Renaming a field in
+    /// `VectorMetadata` is a reason to revisit this function.
+    ///
+    /// So: title, category path, dimension facets, the PDF flag, and per line the
+    /// id, section, segment, reference, dedup hash and text.
     pub fn line_fingerprint(&self) -> u64 {
         // FNV-1a: stable across runs and platforms, and this is the only
         // property required of it. Not used for anything adversarial.
         const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
+        /// Field separator, so a value ending where the next begins cannot be
+        /// confused with a different split of the same bytes.
+        const SEP: u8 = 0xff;
 
         let mut hash = OFFSET;
         let mut feed = |bytes: &[u8]| {
@@ -133,18 +143,30 @@ impl BookForIndexing {
                 hash ^= u64::from(*byte);
                 hash = hash.wrapping_mul(PRIME);
             }
+            hash ^= u64::from(SEP);
+            hash = hash.wrapping_mul(PRIME);
         };
 
+        // ── book-level metadata stored in every record ──
+        feed(self.title.as_bytes());
+        feed(self.topics.as_bytes());
+        feed(&(self.extra_facets.len() as u64).to_le_bytes());
+        for facet in &self.extra_facets {
+            feed(facet.as_bytes());
+        }
+        feed(&[u8::from(self.is_pdf)]);
+
+        // ── per-line identity and content ──
         feed(&(self.lines.len() as u64).to_le_bytes());
         for line in &self.lines {
             feed(&line.line_id.to_le_bytes());
             feed(&line.section_id.to_le_bytes());
             feed(&line.segment.to_le_bytes());
             feed(&line.line_hash.to_le_bytes());
+            feed(line.reference.as_bytes());
             // `line_hash` is 0 for lines the lexical engine considers too short
             // to deduplicate, so it cannot stand in for the text on its own.
             feed(line.text.as_bytes());
-            feed(&[0xff]); // separator, so field boundaries cannot shift
         }
         hash
     }
@@ -593,8 +615,22 @@ pub struct SemanticStatus {
 /// Represents the computed difference for indexing updates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDiff {
+    /// Books with no record: never processed.
     pub new_books: Vec<String>,
+    /// Books recorded, and provably changed.
     pub changed_books: Vec<String>,
+    /// Books recorded, but whose fingerprint cannot prove they are unchanged —
+    /// [`ContentFingerprint::Unverifiable`], i.e. PDFs when the caller passes raw
+    /// lexical content hashes.
+    ///
+    /// Kept separate from `changed_books` on purpose. These are not known to have
+    /// changed; producing one costs the caller real work (a PDF has to have its
+    /// text extracted again just to be compared), so it deserves its own decision
+    /// rather than being buried among the genuinely stale. A caller that can
+    /// supply its own fingerprint — Otzaria already tracks PDF size and mtime —
+    /// empties this list and gets an honestly up-to-date diff.
+    pub unverifiable_books: Vec<String>,
+    /// Books recorded here but absent from the library: their vectors should go.
     pub removed_books: Vec<String>,
     /// The embedding model, its file checksum, its backend or the vector
     /// precision changed — every existing vector is invalid.
@@ -606,10 +642,27 @@ pub struct IndexDiff {
 }
 
 impl IndexDiff {
+    /// An empty diff: nothing to index, nothing stale, nothing to remove.
+    pub fn up_to_date() -> Self {
+        Self {
+            new_books: Vec::new(),
+            changed_books: Vec::new(),
+            unverifiable_books: Vec::new(),
+            removed_books: Vec::new(),
+            model_mismatch: false,
+            chunking_mismatch: false,
+            normalization_mismatch: false,
+        }
+    }
+
     /// Checks if the index is completely up to date.
+    ///
+    /// Books that merely *cannot be proven* current count as work: the index
+    /// cannot claim to be current while it does not know.
     pub fn is_up_to_date(&self) -> bool {
         self.new_books.is_empty()
             && self.changed_books.is_empty()
+            && self.unverifiable_books.is_empty()
             && self.removed_books.is_empty()
             && !self.needs_full_rebuild()
     }
@@ -620,9 +673,90 @@ impl IndexDiff {
         self.model_mismatch || self.chunking_mismatch || self.normalization_mismatch
     }
 
-    /// Returns the total number of books that need indexing.
+    /// Returns the total number of books to hand back for processing.
     pub fn books_to_index(&self) -> usize {
-        self.new_books.len() + self.changed_books.len()
+        self.new_books.len() + self.changed_books.len() + self.unverifiable_books.len()
+    }
+
+    /// Every book to hand back, in a stable order: new, then changed, then
+    /// unverifiable.
+    pub fn books_needing_work(&self) -> impl Iterator<Item = &str> {
+        self.new_books
+            .iter()
+            .chain(self.changed_books.iter())
+            .chain(self.unverifiable_books.iter())
+            .map(String::as_str)
+    }
+}
+
+/// What indexing actually did to one book.
+///
+/// Distinguishes "wrote vectors" from "already current" — a distinction the plain
+/// chunk count erased, since a skipped book reported the count it already had as
+/// though it had just been written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexOutcome {
+    /// Vectors were written. `chunks` is how many.
+    Indexed { chunks: u32 },
+    /// Already current, nothing written. `chunks` is what the index holds for it.
+    Skipped { chunks: u32 },
+    /// Nothing embeddable; an empty-book marker was recorded so the book is not
+    /// offered again.
+    Empty,
+}
+
+impl IndexOutcome {
+    /// Chunks embedded and stored by this call. Zero for a skip.
+    pub fn chunks_written(&self) -> u32 {
+        match self {
+            Self::Indexed { chunks } => *chunks,
+            Self::Skipped { .. } | Self::Empty => 0,
+        }
+    }
+
+    /// Chunks the index holds for this book afterwards.
+    pub fn chunks_in_index(&self) -> u32 {
+        match self {
+            Self::Indexed { chunks } | Self::Skipped { chunks } => *chunks,
+            Self::Empty => 0,
+        }
+    }
+
+    /// Whether this call did any embedding work.
+    pub fn did_work(&self) -> bool {
+        matches!(self, Self::Indexed { .. } | Self::Empty)
+    }
+}
+
+/// Aggregate result of indexing several books.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexingSummary {
+    /// Books whose vectors were written.
+    pub books_indexed: u32,
+    /// Books already current, skipped without embedding.
+    pub books_skipped: u32,
+    /// Books that yielded nothing embeddable.
+    pub books_empty: u32,
+    /// Chunks actually embedded and stored.
+    pub chunks_written: u32,
+}
+
+impl IndexingSummary {
+    /// Fold one book's outcome into the summary.
+    pub fn record(&mut self, outcome: IndexOutcome) {
+        match outcome {
+            IndexOutcome::Indexed { chunks } => {
+                self.books_indexed += 1;
+                self.chunks_written = self.chunks_written.saturating_add(chunks);
+            }
+            IndexOutcome::Skipped { .. } => self.books_skipped += 1,
+            IndexOutcome::Empty => self.books_empty += 1,
+        }
+    }
+
+    /// Books processed in total, whatever the outcome.
+    pub fn books_processed(&self) -> u32 {
+        self.books_indexed + self.books_skipped + self.books_empty
     }
 }
 
@@ -783,6 +917,70 @@ mod tests {
 
     /// Lines the lexical engine considers too short to deduplicate carry
     /// `line_hash = 0`, so the text itself has to be part of the fingerprint.
+    /// The fingerprint gates the skip, so anything it omits can change behind the
+    /// index's back. Every one of these values is persisted in `VectorMetadata`
+    /// and drives filtering or display.
+    #[test]
+    fn the_fingerprint_covers_every_field_stored_in_a_vector_record() {
+        let base = book_with_lines(&[(1, 1, "שורה ראשונה", 111)]);
+        let baseline = base.line_fingerprint();
+
+        let mut retitled = base.clone();
+        retitled.title = "כותרת מתוקנת".to_string();
+
+        let mut recategorized = base.clone();
+        recategorized.topics = "/תלמוד".to_string();
+
+        let mut with_author = base.clone();
+        with_author.extra_facets = vec!["/author/מחבר".to_string()];
+
+        let mut second_author = base.clone();
+        second_author.extra_facets =
+            vec!["/author/מחבר".to_string(), "/author/מחבר נוסף".to_string()];
+
+        let mut not_pdf = base.clone();
+        not_pdf.is_pdf = false;
+
+        let mut new_reference = base.clone();
+        new_reference.lines[0].reference = "הפניה מתוקנת".to_string();
+
+        for (name, variant) in [
+            ("title", retitled),
+            ("category path", recategorized),
+            ("added author facet", with_author.clone()),
+            ("reference", new_reference),
+            ("is_pdf", not_pdf),
+        ] {
+            assert_ne!(
+                baseline,
+                variant.line_fingerprint(),
+                "changing the {name} must change the fingerprint — it is stored per vector"
+            );
+        }
+
+        // And a second author is distinguishable from one.
+        assert_ne!(
+            with_author.line_fingerprint(),
+            second_author.line_fingerprint(),
+            "adding an author must change the fingerprint"
+        );
+    }
+
+    /// Field boundaries must not be shiftable: two different books whose
+    /// concatenated bytes coincide have to hash differently.
+    #[test]
+    fn adjacent_fields_cannot_be_confused_with_each_other() {
+        let mut a = book_with_lines(&[(1, 1, "שורה", 1)]);
+        a.title = "אב".to_string();
+        a.topics = "/ג".to_string();
+
+        let mut b = a.clone();
+        b.title = "א".to_string();
+        b.topics = "ב/ג".to_string();
+
+        assert_ne!(a.line_fingerprint(), b.line_fingerprint());
+    }
+
     #[test]
     fn the_line_fingerprint_covers_text_even_without_a_line_hash() {
         let a = book_with_lines(&[(1, 1, "אלף", 0)]);
@@ -1039,14 +1237,7 @@ mod tests {
 
     #[test]
     fn index_diff_up_to_date_contract() {
-        let clean = IndexDiff {
-            new_books: vec![],
-            changed_books: vec![],
-            removed_books: vec![],
-            model_mismatch: false,
-            chunking_mismatch: false,
-            normalization_mismatch: false,
-        };
+        let clean = IndexDiff::up_to_date();
         assert!(clean.is_up_to_date());
         assert!(!clean.needs_full_rebuild());
         assert_eq!(clean.books_to_index(), 0);

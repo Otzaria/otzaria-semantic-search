@@ -169,10 +169,16 @@ impl VectorStore {
     /// applied or none of it: everything is validated up front so a rejected
     /// vector cannot leave the store half-written.
     ///
-    /// A non-finite component is rejected here as well as at the embedding
-    /// layer. It is not redundant: whatever produces vectors, a stored `NaN`
-    /// scores `NaN`, gets skipped during search, and leaves a record that exists
-    /// but can never be retrieved. The store is the last place to catch that.
+    /// The store enforces the "retrievable vector" invariant itself, not only at
+    /// the embedding layer: whatever produced it, a vector that cannot be scored
+    /// leaves a record that exists but can never be returned by a search. Three
+    /// ways that happens, all rejected here:
+    ///
+    /// * a non-finite component — scores `NaN`, which search discards;
+    /// * a zero norm — no direction, so it matches nothing;
+    /// * a *finite* vector whose squares overflow `f32` (components around
+    ///   `1e30`) — the norm becomes `inf`, the reciprocal `0`, and normalization
+    ///   silently produces the zero vector.
     pub fn insert_batch(
         &self,
         batch: &[(VectorMetadata, Vec<f32>)],
@@ -184,14 +190,28 @@ impl VectorStore {
                     vector_dim: vector.len() as u32,
                 });
             }
+
+            let reject = |reason: String| VectorStoreError::InsertFailed {
+                reason: format!(
+                    "vector for {} {reason}; it could never be matched by a search",
+                    meta.semantic_id
+                ),
+            };
+
             if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
-                return Err(VectorStoreError::InsertFailed {
-                    reason: format!(
-                        "vector for {} has a non-finite component at {position} ({}); \
-                         it could never be matched by a search",
-                        meta.semantic_id, vector[position]
-                    ),
-                });
+                return Err(reject(format!(
+                    "has a non-finite component at {position} ({})",
+                    vector[position]
+                )));
+            }
+            let norm = l2_norm(vector);
+            if !norm.is_finite() {
+                return Err(reject(format!(
+                    "has a non-finite norm ({norm}); its magnitudes overflowed f32"
+                )));
+            }
+            if norm < MIN_VECTOR_NORM {
+                return Err(reject("has no direction (zero norm)".to_string()));
             }
         }
 
@@ -270,15 +290,19 @@ impl VectorStore {
         }
         let query = l2_normalize_vec(query_vector);
 
-        // An all-empty filter set constrains nothing; skip the per-record check.
-        let filters = filters.filter(|f| !f.is_empty());
+        // Group the facet paths by dimension once for the whole scan. Calling
+        // `SearchFilters::matches` per record would recompile them for every
+        // stored vector — four allocations times the size of the index.
+        // `compile` returns `None` when nothing actually filters, which also
+        // skips the per-record check entirely.
+        let filters = filters.and_then(SearchFilters::compile);
 
         let state = self.read_state();
 
         let mut heap: BinaryHeap<ScoredEntry> = BinaryHeap::with_capacity(top_k + 1);
         for record in state.records.values() {
-            if let Some(f) = filters {
-                if !f.matches(&record.metadata) {
+            if let Some(compiled) = filters.as_ref() {
+                if !compiled.matches(&record.metadata) {
                     continue;
                 }
             }
@@ -687,6 +711,12 @@ mod tests {
             vec![f32::NAN, 0.0, 0.0, 0.0],
             vec![f32::INFINITY, 0.0, 0.0, 0.0],
             vec![f32::NEG_INFINITY, 1.0, 0.0, 0.0],
+            // No direction: matches nothing, so it can never be retrieved.
+            vec![0.0, 0.0, 0.0, 0.0],
+            // Finite, but the squares overflow f32: the norm becomes `inf` and
+            // normalization turns the whole vector into zeros.
+            vec![1e30, 1e30, 1e30, 1e30],
+            vec![f32::MAX, f32::MAX, 0.0, 0.0],
         ] {
             let result = store.insert_batch(&[(sample_metadata("bad", "book.txt"), bad.clone())]);
             assert!(
@@ -696,8 +726,8 @@ mod tests {
         }
         assert_eq!(store.vector_count(), 0);
 
-        // And a rejected vector does not take its batch-mates down silently:
-        // the whole batch is refused, so nothing is half-applied.
+        // A rejected vector does not take its batch-mates down silently: the
+        // whole batch is refused, so nothing is half-applied.
         let result = store.insert_batch(&[
             (
                 sample_metadata("good", "book.txt"),
@@ -710,6 +740,25 @@ mod tests {
         ]);
         assert!(result.is_err());
         assert_eq!(store.vector_count(), 0);
+    }
+
+    /// The guard is against vectors that cannot be retrieved, not against large
+    /// ones — a magnitude that still squares within `f32` is perfectly usable.
+    #[test]
+    fn a_large_but_representable_vector_is_accepted() {
+        let dir = TempDir::new("large_vector");
+        let store = store(&dir, 4);
+
+        store
+            .insert_batch(&[(
+                sample_metadata("large", "book.txt"),
+                vec![1e18, 0.0, 0.0, 0.0],
+            )])
+            .unwrap();
+        assert_eq!(store.vector_count(), 1);
+
+        let hits = store.search(&[1.0, 0.0, 0.0, 0.0], 5, None).unwrap();
+        assert!((hits[0].similarity_score - 1.0).abs() < 1e-5);
     }
 
     #[test]

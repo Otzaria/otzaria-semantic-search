@@ -47,7 +47,7 @@ impl Default for Options {
             vectors: 200_000,
             dim: 1024,
             top_k: 40,
-            queries: 20,
+            queries: 50,
         }
     }
 }
@@ -116,9 +116,35 @@ fn metadata(index: usize) -> VectorMetadata {
     }
 }
 
-fn median(mut durations: Vec<Duration>) -> Duration {
+/// Min, median and max of a sample.
+///
+/// All three are reported on purpose. A single number invites being quoted as
+/// *the* figure, and on a machine doing anything else the spread between these is
+/// routinely larger than the difference anyone is trying to measure. `min` is the
+/// least contaminated by scheduling noise and is what the derived throughput uses.
+struct Timings {
+    min: Duration,
+    median: Duration,
+    max: Duration,
+}
+
+fn summarize(mut durations: Vec<Duration>) -> Timings {
     durations.sort_unstable();
-    durations[durations.len() / 2]
+    Timings {
+        min: durations[0],
+        median: durations[durations.len() / 2],
+        max: durations[durations.len() - 1],
+    }
+}
+
+impl std::fmt::Display for Timings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "min {:.2?} / median {:.2?} / max {:.2?}",
+            self.min, self.median, self.max
+        )
+    }
 }
 
 fn main() {
@@ -176,10 +202,13 @@ fn main() {
         assert_eq!(hits.len(), top_k.min(vectors));
     }
 
-    let per_query = median(unfiltered);
-    let dims_per_second = (vectors * dim) as f64 / per_query.as_secs_f64();
-    println!("search (no filter): {per_query:.2?} median per query");
-    println!("  → {:.2} G dot-product dims/s", dims_per_second / 1e9);
+    let unfiltered = summarize(unfiltered);
+    let dims_per_second = (vectors * dim) as f64 / unfiltered.min.as_secs_f64();
+    println!("search (no filter):  {unfiltered}");
+    println!(
+        "  → {:.2} G dot-product dims/s (from min)",
+        dims_per_second / 1e9
+    );
 
     // The question this benchmark exists to answer.
     let full_library = Duration::from_secs_f64(
@@ -189,6 +218,9 @@ fn main() {
         "  → extrapolated to the {LIBRARY_LINE_COUNT}-line library: {full_library:.2?} per query"
     );
     println!("    (linear, single-threaded, brute force — the figure an ANN backend must beat)");
+    println!(
+        "    NB: extrapolation, not measurement, and it stops holding the moment an index exists."
+    );
 
     let filters = otzaria_semantic_search::semantic::types::SearchFilters {
         facets: Some(vec!["/era/תנך".to_string()]),
@@ -203,9 +235,16 @@ fn main() {
             .expect("filtered search");
         filtered.push(started.elapsed());
     }
+    // A filter that excludes nothing should cost only the per-record comparison.
+    // A large, *reproducible* gap here means the filter is being recompiled per
+    // candidate instead of once per query. Read it against the min/max spread
+    // above before concluding anything: at small `--vectors` the spread alone
+    // exceeds this difference.
+    let filtered = summarize(filtered);
+    println!("search (facet filter):  {filtered}");
     println!(
-        "search (facet filter matching everything): {:.2?} median per query",
-        median(filtered)
+        "  → filtering overhead vs min: {:+.1}%",
+        (filtered.min.as_secs_f64() / unfiltered.min.as_secs_f64() - 1.0) * 100.0
     );
 
     let _ = std::fs::remove_dir_all(&dir);

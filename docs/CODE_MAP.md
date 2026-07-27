@@ -114,7 +114,12 @@ otzaria-semantic-search/
     זה מה שמאפשר לזהות PDF שהשתנה.
   - `SearchFilters` & `CompiledFilters` — רשימת facets שטוחה, מקובצת לממדים לפי
     `FACET_DIMENSION_ROOTS` בדיוק כמו `facet_filter_query` הלקסיקלי. `compile()`
-    מקבץ פעם אחת לשאילתה, כי ההתאמה נקראת פעם לכל וקטור באחסון.
+    מקבץ פעם אחת לשאילתה, כי ההתאמה נקראת פעם לכל וקטור באחסון — `VectorStore::search`
+    קורא ל-`CompiledFilters::matches` ולא ל-`SearchFilters::matches`.
+  - `IndexOutcome` & `IndexingSummary` — `Indexed`/`Skipped`/`Empty` במקום ספירת
+    chunks שלא הבדילה בין "נכתב" לבין "כבר היה".
+  - `IndexDiff::unverifiable_books` — ספרים שאי אפשר להוכיח שלא השתנו, בנפרד
+    מ-`changed_books`.
   - `SemanticChunk` — קטע טקסט מעובד המיועד ל-Embedding עם שדות Anchored context.
   - `VectorMetadata` — מטא-דאטה שנשמר לצד הוקטור ב-Vector Store.
   - `SemanticCandidate` & `LexicalCandidate` — מועמדים מכל נתיב חיפוש.
@@ -201,7 +206,13 @@ otzaria-semantic-search/
   cargo bench -- --vectors 1000000 --dim 256
   ```
 
-  המספרים תלויי-מכונה: השוו ריצות על אותה מכונה, ואל תצטטו אותם כמוחלטים.
+  מדפיס min/median/max, בכוונה: מספר בודד מזמין ציטוט כ"ה"מספר, ובמכונה שעושה עוד
+  משהו הפער בין השלושה גדול מההפרש שמנסים למדוד. בקונפיגורציות קטנות הרעש שולט —
+  אל תסיקו מהן. המספרים תלויי-מכונה: השוו ריצות על אותה מכונה בלבד.
+
+  **חשוב:** ל-`[[bench]]` יש `harness = false`, ולכן `cargo test --all-targets`
+  *מריץ* אותו במקום רק לקמפל (בחירה מפורשת של target דורסת `test = false`).
+  ה-CI מריץ `cargo test --lib --tests`, וקימפול ה-benchmark נעשה ב-release build.
 
 ## הרצה מקומית
 

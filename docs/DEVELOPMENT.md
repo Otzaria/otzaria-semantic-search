@@ -200,9 +200,32 @@ BM25 עדיין עובד
     בחיפוש והספר נראה מאונדקס אך אינו ניתן לחיפוש. גם וקטור **finite** גדול
     (בסביבות `1e30`) גולש ל-`inf` בנורמה ומתנרמל לאפס. שתי השכבות בודקות זאת.
 
+12. **`content_hash` הוא מה שהקורא יכול להתחייב עליו.** ה־diff מקבל
+    `HashMap<String, ContentFingerprint>`: `Hash(u64)` = "אני ערב לתוכן הזה",
+    `Unverifiable` = "אין לי במה להשוות". ספרים מהסוג השני נכנסים לרשימה **נפרדת**
+    (`IndexDiff::unverifiable_books`) ולא ל־`changed_books` — הם לא *ידועים*
+    כמשתנים, וייצור שלהם עולה לקורא חילוץ טקסט מחדש. מי שמעביר hash גולמי של
+    Tantivy יקבל כל PDF בכל diff; מי שמעביר חתימה משלו (לאוצריא יש גודל+mtime)
+    יקבל diff שיכול להגיע ל"אין מה לעשות". **החתימה שנכנסת ל־`content_hash` בזמן
+    האינדוקס חייבת להיות אותה חתימה שמועברת ל־diff.**
+13. **ערך ההחזרה של אינדוקס מפורש:** `IndexOutcome::{Indexed, Skipped, Empty}`
+    ו־`IndexingSummary`. קודם ספר שנחתך החזיר את מספר ה־chunks שכבר היו לו, כאילו
+    נכתבו עכשיו.
+
 מה שמכוון בכוונה **לא** נעשה שם, ומחכה ל־P5: כיול `BM25_SATURATION_K`, threshold
 לתוצאה סמנטית לא רלוונטית, מעבר ל־RRF, ו־`total_count` אמיתי (הוא כרגע מספר
 המועמדים שנכנסו ל־fusion, ומתועד ככזה).
+
+## מגבלה ידועה: אינדוקס חוסם חיפוש
+
+אינדוקס דורש `&mut SemanticEngine` וחיפוש דורש `&`, ולכן הם לא יכולים לרוץ במקביל.
+`HybridCoordinator::index_books` נוטל את הנעילה **פר-ספר** ולא לכל הקבוצה, כך
+שההמתנה חסומה לספר אחד ואינדוקס ספרייה שלמה נשאר קטיע — אבל זו עדיין המתנה, לא
+מקביליות.
+
+פתרון אמיתי דורש או interior mutability עדין יותר בתוך ה־engine, או בנייה לאינדקס
+staging והחלפה אטומית. זה שייך לחיבור לאוצריא (P6/P7), שבו מוכרע מודל ה־threading —
+אינדוקס מלא ארוך שחוסם את ה־UI הוא חסם שם, וכדאי לפתור אותו פעם אחת כמו שצריך.
 
 ---
 
@@ -1401,8 +1424,8 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 ### Vector Store
 
 * [ ] persistence
-* [ ] ANN — נמדד: ~101ms לשאילתה על 200k×1024, כלומר ~3.1s בקנה מידה של הספרייה
-  (`cargo bench`)
+* [ ] ANN — נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה ריצה), כלומר
+  ~2.5–3.2s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה (`cargo bench`)
 * [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
 * [x] insert/update/delete
 * [x] filtering
@@ -1731,9 +1754,11 @@ Only then does it make sense to benchmark the complete search system and tune hy
 
 **Persistent vector database:** 🔴 Missing
 
-**ANN retrieval:** 🔴 Missing — brute force measured at ~101ms per query over
-200k×1024 (`cargo bench`), which extrapolates linearly to ~3.1s over the
-6,058,210-line library. Load-bearing for P4, not an optimization.
+**ANN retrieval:** 🔴 Missing — brute force measures 84–208ms per query over
+200k×1024 on one machine (`cargo bench` prints min/median/max; the spread is the
+machine, not the code). Extrapolated linearly, that is ~2.5–3.2s over the
+6,058,210-line library — an extrapolation, not a measurement. Load-bearing for P4,
+not an optimization.
 
 **Hybrid fusion:** 🟢 Implemented
 
