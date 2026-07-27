@@ -1,3 +1,13 @@
+//! Score normalization and fusion primitives.
+//!
+//! BM25 and cosine similarity live on different scales, so they are normalized
+//! into `[0, 1]` before being combined.
+//!
+//! Two fusion strategies exist side by side. Weighted fusion is what the
+//! coordinator uses today; [`fuse_rrf`] is rank-based and needs no score
+//! calibration at all, which may well make it the better default. Neither has
+//! been measured on Hebrew queries yet — that comparison is roadmap P5.
+
 use crate::semantic::types::ResultSource;
 use std::collections::HashMap;
 
@@ -10,6 +20,11 @@ pub struct FusedEntry {
     pub source: ResultSource,
 }
 
+/// Map BM25 scores into `[0, 1]` with a saturating curve `x / (k + x)`.
+///
+/// `k` sets where the curve bends: scores well above `k` all land near 1.0 and
+/// stop being distinguishable, so `k` should sit in the same range as the
+/// engine's typical scores. NaN and non-positive scores map to 0.
 pub fn normalize_bm25_scores(scores: &[f32], k: f32) -> Vec<f32> {
     scores
         .iter()
@@ -23,6 +38,12 @@ pub fn normalize_bm25_scores(scores: &[f32], k: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Map cosine similarities from `[-1, 1]` into `[0, 1]`.
+///
+/// Note what this implies: an orthogonal — that is, entirely unrelated — vector
+/// normalizes to 0.5, not 0. Combined with a relevance threshold's absence, a
+/// semantic path that finds nothing useful still contributes mid-range scores.
+/// Introducing a threshold is roadmap P5.
 pub fn normalize_semantic_scores(scores: &[f32]) -> Vec<f32> {
     scores
         .iter()
@@ -36,6 +57,35 @@ pub fn normalize_semantic_scores(scores: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Which retrieval paths produced a candidate.
+///
+/// Returns `None` for a candidate present in neither, which cannot happen for an
+/// entry that exists — but a library must not panic to say so.
+fn classify_source(lexical: Option<f32>, semantic: Option<f32>) -> Option<ResultSource> {
+    match (lexical, semantic) {
+        (Some(_), Some(_)) => Some(ResultSource::Both),
+        (Some(_), None) => Some(ResultSource::Lexical),
+        (None, Some(_)) => Some(ResultSource::Semantic),
+        (None, None) => None,
+    }
+}
+
+/// Sort fused entries by descending score, breaking ties on `line_id`.
+///
+/// The tie-break is what makes pagination stable: the entries come out of a
+/// `HashMap`, whose iteration order differs between runs.
+fn sort_by_score_desc(entries: &mut [FusedEntry]) {
+    entries.sort_by(|a, b| {
+        b.fused_score
+            .total_cmp(&a.fused_score)
+            .then_with(|| a.line_id.cmp(&b.line_id))
+    });
+}
+
+/// Weighted score fusion: `alpha * lexical + (1 - alpha) * semantic`.
+///
+/// Both score lists must already be normalized to a common scale. A candidate
+/// missing from one side contributes 0 for it.
 pub fn fuse_weighted(
     lexical: &[(u64, f32)],
     semantic: &[(u64, f32)],
@@ -53,50 +103,43 @@ pub fn fuse_weighted(
 
     let mut result: Vec<FusedEntry> = map
         .into_iter()
-        .map(|(id, (l_score, s_score))| {
-            let l = l_score.unwrap_or(0.0);
-            let s = s_score.unwrap_or(0.0);
-            let fused_score = alpha * l + (1.0 - alpha) * s;
-            let source = match (l_score, s_score) {
-                (Some(_), Some(_)) => ResultSource::Both,
-                (Some(_), None) => ResultSource::Lexical,
-                (None, Some(_)) => ResultSource::Semantic,
-                _ => unreachable!(),
-            };
-            FusedEntry {
+        .filter_map(|(id, (lexical_score, semantic_score))| {
+            let source = classify_source(lexical_score, semantic_score)?;
+            let l = lexical_score.unwrap_or(0.0);
+            let s = semantic_score.unwrap_or(0.0);
+            Some(FusedEntry {
                 line_id: id,
-                fused_score,
-                lexical_score: l_score,
-                semantic_score: s_score,
+                fused_score: alpha * l + (1.0 - alpha) * s,
+                lexical_score,
+                semantic_score,
                 source,
-            }
+            })
         })
         .collect();
 
-    // Sort descending by fused score
-    result.sort_by(|a, b| {
-        b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_by_score_desc(&mut result);
     result
 }
 
+/// Reciprocal Rank Fusion: each list contributes `1 / (k + rank)`.
+///
+/// Uses only the *order* of each list, so the two engines' score scales never
+/// have to be reconciled. Both inputs must already be sorted best-first —
+/// position is the signal. `k` damps the weight of the top ranks; 60 is the
+/// value from the original paper and the usual default.
 pub fn fuse_rrf(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<FusedEntry> {
     let mut map: HashMap<u64, (Option<f32>, Option<f32>, f32)> =
         HashMap::with_capacity(lexical.len() + semantic.len());
 
     for (idx, &(id, score)) in lexical.iter().enumerate() {
-        let rank = (idx + 1) as f32;
-        let rrf_score = 1.0 / (k as f32 + rank);
+        let rrf_score = 1.0 / (k as f32 + (idx + 1) as f32);
         let entry = map.entry(id).or_insert((None, None, 0.0));
         entry.0 = Some(score);
         entry.2 += rrf_score;
     }
 
     for (idx, &(id, score)) in semantic.iter().enumerate() {
-        let rank = (idx + 1) as f32;
-        let rrf_score = 1.0 / (k as f32 + rank);
+        let rrf_score = 1.0 / (k as f32 + (idx + 1) as f32);
         let entry = map.entry(id).or_insert((None, None, 0.0));
         entry.1 = Some(score);
         entry.2 += rrf_score;
@@ -104,29 +147,18 @@ pub fn fuse_rrf(lexical: &[(u64, f32)], semantic: &[(u64, f32)], k: u32) -> Vec<
 
     let mut result: Vec<FusedEntry> = map
         .into_iter()
-        .map(|(id, (l_score, s_score, fused_score))| {
-            let source = match (l_score, s_score) {
-                (Some(_), Some(_)) => ResultSource::Both,
-                (Some(_), None) => ResultSource::Lexical,
-                (None, Some(_)) => ResultSource::Semantic,
-                _ => unreachable!(),
-            };
-            FusedEntry {
+        .filter_map(|(id, (lexical_score, semantic_score, fused_score))| {
+            Some(FusedEntry {
                 line_id: id,
                 fused_score,
-                lexical_score: l_score,
-                semantic_score: s_score,
-                source,
-            }
+                lexical_score,
+                semantic_score,
+                source: classify_source(lexical_score, semantic_score)?,
+            })
         })
         .collect();
 
-    // Sort descending by fused score
-    result.sort_by(|a, b| {
-        b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_by_score_desc(&mut result);
     result
 }
 

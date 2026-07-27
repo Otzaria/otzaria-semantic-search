@@ -26,6 +26,13 @@ pub enum SemanticSearchError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// The on-disk semantic index was built with a configuration that is
+    /// incompatible with the current one (different model, dimensions,
+    /// chunking, …). The semantic path stays disabled until
+    /// `SemanticEngine::reset_index` is called and the books are re-indexed.
+    #[error("Semantic index is incompatible with the current configuration: {details}")]
+    IncompatibleIndex { details: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -44,6 +51,17 @@ pub enum EmbeddingError {
 
     #[error("Model loading failed: {reason}")]
     LoadFailed { reason: String },
+
+    /// The file exists but is not a usable GGUF container. Guards against a
+    /// truncated download or a placeholder file being accepted as a model.
+    #[error("Not a valid GGUF model file ({path}): {reason}")]
+    InvalidModelFile { path: String, reason: String },
+
+    /// No inference backend is compiled in. Returned by release builds until a
+    /// real GGUF backend lands, so a production binary can never fall back to
+    /// the hash-based stand-in embedder.
+    #[error("No embedding backend is available in this build: {reason}")]
+    BackendUnavailable { reason: String },
 
     #[error("Inference failed: {reason}")]
     InferenceFailed { reason: String },
@@ -91,6 +109,11 @@ pub enum ManifestError {
 
     #[error("Manifest parse failed: {reason}")]
     ParseFailed { reason: String },
+
+    /// The manifest was written by a different schema version. Not recoverable
+    /// by parsing — the index has to be rebuilt.
+    #[error("Unsupported manifest format version {found} (this build supports {supported})")]
+    UnsupportedFormatVersion { found: u32, supported: u32 },
 
     #[error("Model mismatch: manifest has '{manifest_model}', config has '{config_model}'")]
     ModelMismatch {

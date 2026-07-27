@@ -16,9 +16,10 @@ otzaria-semantic-search/
 │   ├── CODE_MAP.md                         # מפת קוד זו
 │   └── DEVELOPMENT.md                      # מדריך ארכיטקטורה ופיתוח מקיף
 ├── .github/workflows/
-│   └── ci.yml                              # CI/CD אוטומטי (Linux, Windows, macOS)
+│   └── ci.yml                              # CI/CD אוטומטי (Linux, Windows, macOS × 2 קונפיגורציות features)
 ├── tests/
-│   └── hybrid_integration_test.rs          # בדיקת אינטגרציה מקצה לקצה
+│   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
+│   └── production_backend_gate.rs          # מאמת שבנייה רגילה מסרבת לייצר embeddings
 └── src/
     ├── lib.rs                              # נקודת הכניסה לספריה (Module root)
     ├── errors.rs                           # מערכת השגיאות המרכזית (thiserror)
@@ -64,15 +65,35 @@ otzaria-semantic-search/
   - `OtzariaHybridEngine` — Wrapper ראשי הניתן לחשיפה ל-Flutter באמצעות `flutter_rust_bridge`.
   - `SearchRequest` — Struct המאגד את פרמטרי השאילתא והפילטרים למניעת `too_many_arguments`.
   - `get_semantic_status()` — שאילתת סטטוס זמינות המודל והאינדקס.
-  - `get_semantic_index_diff()` — בדיקת פערים בין Tantivy ל-Semantic Store.
+  - `get_semantic_index_diff()` — בדיקת פערים בין Tantivy ל-Semantic Store. הצורה
+    המועדפת: הקורא מחליט מה החתימה של ספר, וזו הדרך היחידה שבה PDF יכול להגיע
+    ל"מעודכן". `get_semantic_index_diff_from_lexical_hashes()` היא הצורה הידידותית
+    ל-FFI (`u64` גולמי), כי enum ש-Dart יכול לבנות הוא enum ש-Dart יכול לבנות שגוי.
+  - `index_books()` — אינדוקס ספרים (manifest נשמר פעם אחת בסוף, לא פר-ספר).
+  - `remove_semantic_books()` — מיישם בקבוצה את `IndexDiff::removed_books`.
+  - `reset_semantic_index()` — מסלול ההתאוששות מאינדקס לא תואם; בלעדיו
+    `needs_full_reindex` היה מבוי סתום.
+  - *לא כאן עדיין (P7):* progress stream, cancel/resume, ניהול הורדת מודל.
 
 ---
 
 ### 3. תת-המערכת ההיברידית (`src/hybrid/`)
 
 * [`src/hybrid/coordinator.rs`](../src/hybrid/coordinator.rs)
-  - `HybridCoordinator` — מתאם החיפוש הראשי. מריץ חיפוש סמנטי במקביל לקבלת מועמדי BM25, מפעיל ניתוח שאילתא, מיזוג ציונים, קיבוץ, ומבצע Fallback ל-BM25 אם ה-Semantic Engine נכשל.
+  - `HybridCoordinator` — מתאם החיפוש הראשי. מריץ חיפוש סמנטי לצד מועמדי BM25, מפעיל ניתוח שאילתא, מיזוג ציונים, קיבוץ, ומבצע Fallback ל-BM25 אם ה-Semantic Engine נכשל.
   - `HybridSearchParams` — פרמטרי חיפוש (גבולות, Offset, Grouping, Filters, Force Mode).
+  - **שלושת המצבים ממומשים**: `LexicalOnly` אינו נוגע במסלול הסמנטי, `SemanticOnly`
+    מזניח את מועמדי BM25 שהועברו, ו-`Hybrid` מתדרדר ל-`LexicalOnly` כשהסמנטי נכשל.
+    ה-`alpha` נקבע לפי המצב שרץ בפועל (1.0 / 0.0 / דינמי), כדי שציון ממנוע אחד
+    לא יוקטן במשקל של המנוע החסר.
+  - כל התדרדרות נראית: `search_mode` הוא המצב שרץ, `fallback_reason` הוא הסיבה.
+  - חלון המועמדים הסמנטיים חסום ב-`MAX_SEMANTIC_CANDIDATES` (מדווח ב-log כשנחתך).
+  - `index_books()` — נועל את ה-engine **פר-ספר** כדי שחיפושים לא ייחסמו לכל אורך
+    האינדוקס, ושומר את ה-manifest פעם אחת בסוף: כל שמירה מסריאלזת את כל הרשומות,
+    כך שגם checkpoints של מסמך מלא מוסיפים כתיבה סופר־ליניארית. ה-store הנוכחי
+    נדיף, ולכן checkpoint של manifest ממילא אינו יכול לשמר עבודה אחרי קריסה.
+    backend persistent יצטרך journal מצטבר או פורמט checkpoint דלתאי.
+    `indexing: Mutex` מסדר בתור אינדוקס, reset וגריעת ספרים.
 
 * [`src/hybrid/fusion.rs`](../src/hybrid/fusion.rs)
   - `normalize_bm25_scores()` — נורמליזציית רוויה $x / (k + x)$ לציוני BM25 לטווח $[0,1]$.
@@ -95,7 +116,29 @@ otzaria-semantic-search/
 ### 4. תת-המערכת הסמנטית (`src/semantic/`)
 
 * [`src/semantic/types.rs`](../src/semantic/types.rs)
-  - `BookLine` & `BookForIndexing` — ייצוג קלט ספר מ-Tantivy.
+  - `BookLine` & `BookForIndexing` — ייצוג קלט ספר מ-Tantivy: `topics` (נתיב
+    קטגוריה אחד) ו-`extra_facets` (רשימה — ספר יכול לשאת כמה מחברים).
+  - `ContentFingerprint` — `Canonical(NonZeroU64)` / `ContentOnly(NonZeroU64)` /
+    `Unverifiable`. שני מלכודות שקטות: `0` הוא מרקר "אין חתימה" ולא hash (Tantivy
+    מדווח אותו לכל PDF), ולכן הווריאנטים נושאים `NonZeroU64`; ולא כל חתימה מכסה
+    metadata — גודל+mtime של קובץ לא מזיז כשמתקנים מחבר, ולכן רק `Canonical` מגיע
+    ל"מעודכן". `ContentFingerprint::canonical()` דורש revision לא־אפס שמכסה את כל
+    הקלט ל־`BookForIndexing`: הטקסט המחולץ, מבנה ומזהי השורות/סעיפים, references
+    וגרסת החילוץ/OCR. גודל+mtime לבדם הם `ContentOnly`; אפס הוא `Unverifiable`.
+  - `BookForIndexing::line_fingerprint()` — חתימה שהמנוע הסמנטי מחשב מהספר עצמו:
+    שורות **וגם** כל ה-metadata שנשמר בכל וקטור. זה מה שמכריע ספר שהחתימה החיצונית
+    שלו לא הוכיחה דבר.
+  - `canonical_facets()` — כל חתימה ממיינת ומסירה כפילויות מ-facets, כמו
+    `book_fingerprint` הלקסיקלי: סדר facets אינו מידע, וחתימה שרגישה לו הייתה גורמת
+    ל-re-embedding על שינוי סדר בלבד.
+  - `SearchFilters` & `CompiledFilters` — רשימת facets שטוחה, מקובצת לממדים לפי
+    `FACET_DIMENSION_ROOTS` בדיוק כמו `facet_filter_query` הלקסיקלי. `compile()`
+    מקבץ פעם אחת לשאילתה, כי ההתאמה נקראת פעם לכל וקטור באחסון — `VectorStore::search`
+    קורא ל-`CompiledFilters::matches` ולא ל-`SearchFilters::matches`.
+  - `IndexOutcome` & `IndexingSummary` — `Indexed`/`Skipped`/`Empty` במקום ספירת
+    chunks שלא הבדילה בין "נכתב" לבין "כבר היה".
+  - `IndexDiff::unverifiable_books` — ספרים שאי אפשר להוכיח שלא השתנו, בנפרד
+    מ-`changed_books`.
   - `SemanticChunk` — קטע טקסט מעובד המיועד ל-Embedding עם שדות Anchored context.
   - `VectorMetadata` — מטא-דאטה שנשמר לצד הוקטור ב-Vector Store.
   - `SemanticCandidate` & `LexicalCandidate` — מועמדים מכל נתיב חיפוש.
@@ -109,26 +152,127 @@ otzaria-semantic-search/
 
 * [`src/semantic/embedding.rs`](../src/semantic/embedding.rs)
   - `EmbeddingRuntime` & `EmbeddingConfig` — ממשק הרצת מודל GGUF מקומי.
-  - `l2_normalize()` — נורמליזציית L2 לוקטורים.
+  - `validate_and_checksum_gguf()` — אימות קונטיינר וחישוב SHA-256 **במעבר אחד** על
+    הקובץ (מודל של מאות MB נקרא פעם אחת בלבד). ה-header נבדק אחרי 24 בייטים, לפני
+    שממשיכים; אחריו נפרסר כל אזור ה-descriptors, ומתוך ה-offsets המוצהרים נגזר חסם
+    תחתון על גודל הקובץ — ביט אחד לאיבר, נכון לכל טיפוס ggml. חסם תחתון בכוונה: טבלת
+    block sizes שגויה *דוחה מודל תקין*, וזה כשל גרוע יותר. `HashingReader` הוא מה
+    שמאפשר לפרסר ולחשב hash בלי לקרוא פעמיים.
+    קונטיינר ללא tensors, metadata type לא מוכר בגרסה נתמכת, alignment שאינו כפולה
+    של 8 או tensor offset לא מיושר — נדחים; אין fallback לקבלת descriptors שלא
+    הצלחנו לפרסר.
+  - `EmbeddingBackendKind` — זהות ה-backend, נשמרת ב-manifest. `is_semantic()` מחזיר
+    `false` ל-stand-in, כדי שלא יתחזה למודל.
+  - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו.
+  - `normalize_validated()` — דוחה כל וקטור שלא ניתן להשוות: ממד שגוי, רכיב
+    לא-finite, נורמה לא-finite (כולל וקטור finite שגולש), או נורמה `<= MIN_VECTOR_NORM`.
+  - `MIN_VECTOR_NORM` — סף אחד ל-crate כולו (`pub(crate)`), עם אותה השוואה בכל שכבה.
+    קודם היה `<` בצד אחד ו-`>` בצד השני, כך שהוקטור *בדיוק* על הסף לא נדחה ולא
+    נורמל — ונכנס לאינדקס כשהציון שלו הוא הגודל שלו ולא קוסינוס.
+  - `l2_normalize()` — נורמליזציית L2, מחזירה את הנורמה שהייתה לפני כן.
+  - `mock` — ה-stand-in הדטרמיניסטי, זמין רק תחת `cfg(test)` או
+    `--features mock-embedding`. **אינו מודל סמנטי.**
 
 * [`src/semantic/store.rs`](../src/semantic/store.rs)
   - `VectorStore` & `VectorStoreConfig` — מנגנון האחסון והשליפה הוקטורי.
   - **Pre-normalization**: נורמליזציה בוקטורים בעת ההכנסה המאפשרת חישוב דמיון קוסינוס בעזרת Dot Product בלבד ($O(dim)$).
-  - **BinaryHeap Top-K**: שליפת $k$ התוצאות המובילות בסיבוכיות $O(N \log k)$ ללא שכפול מטא-דאטה של כל המאגר.
+  - **BinaryHeap Top-K**: שליפת $k$ התוצאות המובילות בסיבוכיות $O(N \log k)$ ללא שכפול מטא-דאטה של כל המאגר. שוויון ציונים נשבר לפי `semantic_id` — בלי זה `HashMap` עם סדר איטרציה מקרי היה מחזיר top-k שונה בכל ריצה.
+  - **מנעול אחד** לשתי המפות: קודם היו שני מנעולים ש-insert ו-delete נטלו בסדר הפוך — lock-order inversion שעלול לתקוע את התהליך.
+  - `is_persistent()` / `backend_id()` — ה-backend הנוכחי אינו persistent, ומצהיר על כך; ה-engine מסתמך על זה כדי לא להאמין ל-manifest ישן.
+  - `dot_product()` — 8 מצברים במקום סכימה סדרתית אחת: ~1.4× מהיר במדידה
+    (101ms מול 145ms על 200k וקטורים בממד 1024).
 
 * [`src/semantic/manifest.rs`](../src/semantic/manifest.rs)
-  - `SemanticManifest` — ניהול גירסאות אינדקס אטומי (כתיבה לקובץ `.tmp` והחלפה אטומית).
-  - `validate()` — זיהוי אי-התאמות במודל, בממדים או בגרסאות החלוקה.
-  - `book_needs_reindex()` — בדיקת דלתא לפי `content_hash` מול Tantivy.
+  - `SemanticManifest` — ניהול גירסאות אינדקס אטומי: כתיבה ל-`.tmp`, `fsync`, ואז
+    rename. בלי ה-`fsync` הניתן להחלפה אטומית עדיין אפשר לאבד את התוכן בהפסקת חשמל.
+    `load()` משחזר מה שקריסה בתוך `save` יכולה להשאיר — קודם `.previous` (manifest
+    שהיה בשירות) ואחריו `.tmp` (מועמד שנשטף), שניהם רק אחרי פרסור מוצלח.
+    `sync_directory()` הופך כשל ב-fsync של התיקייה לשגיאת שמירה **ב-Unix**;
+    ב-Windows אין מקבילה, וזה מתועד במקום להיות שקוף.
+  - `save_count()` — מספר הכתיבות של המופע הזה (`serde(skip)`). לא סטטיסטיקה: כל
+    כתיבה מסריאלזת את כל הרשומות, ולכן "כמה פעמים" הוא תכונת נכונות של לופ האינדוקס,
+    והדרך היחידה לאמת אותה היא לספור.
+  - `failpoints` — הזרקת כשל ל-rename ול-fsync של התיקייה, thread-local. מסלול
+    ה-fallback קיים בגלל נעילת קובץ ב-Windows, מצב שאי אפשר להגיע אליו בסידור קבצים;
+    בלי הזרקה הוא היה קוד התאוששות שלא נבדק.
+  - `validate()` — זיהוי אי-התאמות בכל עשרת הממדים: model id, checksum, embedding backend, ממדים, pooling, quantization, vector precision, vector backend, chunking ו-normalization.
+  - `ManifestMismatch::invalidates_vectors()` — האם הווקטורים עצמם פסולים (מודל/ממד) או שרק צריך chunking מחדש.
+  - `quarantine()` — קובץ manifest לא קריא מועבר הצידה ולא נמחק, כדי שיהיה מה לחקור.
+  - `clear_books()` — מחיקת רשומות הספרים תוך שמירת המטאדאטה של הקונפיגורציה.
+  - `book_index_need()` — `Missing` / `Changed` / `Unverifiable` / `UpToDate`.
+    ההחלטה הזמינה בזמן diff, לפני שהשורות נטענו.
+  - `BookManifestEntry.line_fingerprint` + `chunk_count = 0` כמרקר תקין —
+    `clear_books_with_vectors()` מוחק רק רשומות שמצהירות על וקטורים.
 
 * [`src/semantic/engine.rs`](../src/semantic/engine.rs)
   - `SemanticEngine` & `SemanticConfig` — המנוע הסמנטי המרכזי המאגד את ה-Chunker, ה-Runtime, ה-VectorStore וה-Manifest.
+  - `SemanticConfig::validate()` — פוסל קונפיגורציה שלא תעבוד, ובראשה אי-התאמה בין
+    `embedding_dim` ל-`store.embedding_dim` (שקודם התגלתה רק באמצע האינדוקס).
+  - `open()` — מפייס את ה-manifest מול הקונפיגורציה: שימוש חוזר, גריעת רשומות
+    שהווקטורים שלהן לא שרדו, או quarantine והתחלה מחדש. אינו נכשל בגלל manifest פגום.
+  - `index_book()` / `index_books()` — האחרון כותב manifest פעם אחת לכל הקבוצה.
+    שניהם **מוחקים** את הווקטורים הקודמים של הספר לפני הכתיבה, ורק אחרי שה-embedding
+    הצליח — כך שכשל באמצע לא משאיר ספר בלי וקטורים עם רשומה שמצהירה שהוא מאונדקס.
+  - `index_book_deferred()` + `flush_manifest()` — הפרדת ה-mutation מהשמירה, לקורא
+    שמנהל את הלופ בעצמו (`HybridCoordinator::index_books` משחרר נעילה בין ספרים ולכן
+    חייב את זה). מי שקורא ל-`index_book_deferred` **חייב** לקרוא ל-`flush_manifest`,
+    גם במסלול השגיאה.
+  - `manifest_save_count()` — עלות, לא סטטיסטיקה. קיים כדי שמספר הכתיבות של לופ
+    האינדוקס ייבדק ולא יונח.
+  - `reset_index()` — מסלול ההתאוששות מ-`IncompatibleIndex`.
+  - `diff_against_tantivy()` — דגלי אי-התאימות אמיתיים; פלט בסדר דטרמיניסטי.
 
 ---
 
 ## 🧪 בדיקות ותשתית
 
 * [`tests/hybrid_integration_test.rs`](../tests/hybrid_integration_test.rs)
-  - בדיקת אינטגרציה מקצה לקצה: אינדוקס ספר, שליפה וקטורית, מיזוג היברידי, קיבוץ סעיפים וביצוע חיפוש דרך ה-API.
+  - בדיקות מקצה לקצה דרך ה-API הציבורי: אינדוקס ספרייה, שלושת מצבי החיפוש,
+    התדרדרות חיננית, מחזור אינדוקס→הפעלה־מחדש→חיפוש, re-index שמוחק שורות שנעלמו,
+    התאוששות מ-manifest פגום, אי-תאימות ו-reset, filters ו-paging, וחוזה החתימות של
+    PDF: תיקון מחבר בקובץ שלא השתנה מדווח כשינוי, וחתימה שמכסה תוכן בלבד לא מוכרזת
+    כמעודכנת.
+  - דורש `--features mock-embedding` (אין backend inference בבנייה רגילה).
+* [`tests/production_backend_gate.rs`](../tests/production_backend_gate.rs)
+  - התמונה ההופכית, מתקמפל **רק בלי** ה-feature: מאמת שבנייה רגילה מסרבת לטעון
+    מודל ולייצר וקטורים. זו הערובה שקוד production לא יגיש וקטורים מזויפים —
+    ולכן היא נבדקת ולא נסמכת על `#[cfg]` שיישאר במקומו.
 * [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-  - תהליך CI מלא ב-GitHub Actions הרץ על Ubuntu, Windows ו-macOS.
+  - תהליך CI מלא ב-GitHub Actions הרץ על Ubuntu, Windows ו-macOS, **בשתי
+    קונפיגורציות features**, כולל `cargo fmt --check`, clippy עם `-D warnings`,
+    ואימות קישורי תיעוד (`cargo doc`).
+
+## מדידות
+
+* [`benches/vector_search.rs`](../benches/vector_search.rs) — מודד את
+  `VectorStore::search` המלא (לא רק dot-product) ומחלץ מכך את ההערכה לקנה מידה של
+  הספרייה. תוכנית רגילה עם `harness = false`: המטרה היא מדידה שניתן לשחזר, ולא כדאי
+  לגרור עץ תלויות של framework למאגר שמיועד לבנייה מובילית.
+
+  ```bash
+  cargo bench
+  cargo bench -- --vectors 1000000 --dim 256
+  ```
+
+  מדפיס min/median/max, בכוונה: מספר בודד מזמין ציטוט כ"ה"מספר, ובמכונה שעושה עוד
+  משהו הפער בין השלושה גדול מההפרש שמנסים למדוד. בקונפיגורציות קטנות הרעש שולט —
+  אל תסיקו מהן. המספרים תלויי-מכונה: השוו ריצות על אותה מכונה בלבד.
+
+  דוגמה למה זה אומר בפועל: תקורת ה-filters נמדדה כ-`-13.2%` ו-`+1.0%` בשתי ריצות של
+  100k×512, וכ-`+22.1%`, `-0.9%`, `+15.3%` בשלוש ריצות של 20k×128. כלומר בממד מציאותי
+  התקורה בתוך רעש המדידה, ובממד קטן המכונה פשוט לא מבדילה. מה שכן ודאי הוא מבני ולא
+  נמדד: `VectorStore::search` מקמפל את המסננים **פעם אחת לשאילתה** ולא פעם לכל וקטור.
+
+  **חשוב:** ל-`[[bench]]` יש `harness = false`, ולכן `cargo test --all-targets`
+  *מריץ* אותו במקום רק לקמפל (בחירה מפורשת של target דורסת `test = false`).
+  ה-CI מריץ `cargo test --lib --tests`, וקימפול ה-benchmark נעשה ב-release build.
+
+## הרצה מקומית
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings                          # production
+cargo clippy --all-targets --features mock-embedding -- -D warnings
+cargo test --lib --tests                                           # שער ה-production
+cargo test --lib --tests --features mock-embedding                  # החבילה המלאה
+```

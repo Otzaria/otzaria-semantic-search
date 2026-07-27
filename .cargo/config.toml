@@ -1,5 +1,13 @@
+# Cross-compiling to the Windows GNU target with rust-lld rather than the GNU ld
+# that may not be installed.
+#
+# Nothing machine-specific belongs in this file. It used to set `[env] PATH` to an
+# absolute rustup path under `C:\Users\USER\...`, which is meaningless on any
+# other machine and silently wrong on the machine it came from once the toolchain
+# moves. If a GNU cross-build cannot find the self-contained linker objects, put
+# them on PATH in the shell or the CI step that needs them.
+#
+# Note that CI's Windows job uses the MSVC target, so this section is not
+# exercised there.
 [target.x86_64-pc-windows-gnu]
 linker = "rust-lld"
-
-[env]
-PATH = { value = "C:\\Users\\USER\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\bin\\self-contained", relative = false }
