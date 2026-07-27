@@ -79,8 +79,22 @@ impl OtzariaHybridEngine {
     /// Diff the library's per-book fingerprints against the semantic index.
     ///
     /// Prefer this form: the caller decides what a book's fingerprint is, which is
-    /// the only way a PDF can ever be reported as up to date. See
-    /// [`ContentFingerprint`] and [`IndexDiff::unverifiable_books`].
+    /// the only way a PDF can ever be reported as up to date.
+    ///
+    /// * text book → [`ContentFingerprint::from_lexical_hash`] of the lexical
+    ///   engine's `contentHash`, which already folds in the metadata it indexes;
+    /// * PDF → [`ContentFingerprint::canonical`], which folds the caller's own
+    ///   file signature together with the title, category path and facets. A
+    ///   signature over the file alone cannot prove the index is current — a
+    ///   corrected author changes every vector and no byte of the file — and
+    ///   [`ContentFingerprint::content_only`] is how to say so;
+    /// * nothing → [`ContentFingerprint::Unverifiable`].
+    ///
+    /// The last two land the book in [`IndexDiff::unverifiable_books`].
+    ///
+    /// Across the FFI boundary prefer
+    /// [`Self::get_semantic_index_diff_from_lexical_hashes`] or a plain
+    /// `u64` DTO: an enum Dart can construct is an enum Dart can construct wrongly.
     ///
     /// `None` when no semantic engine is configured.
     pub fn get_semantic_index_diff(
@@ -111,9 +125,10 @@ impl OtzariaHybridEngine {
     ///
     /// Returns what happened per category (indexed / skipped / empty), or `None`
     /// if the semantic path is disabled. Synchronous and potentially
-    /// long-running; searches stall for at most one book at a time — see
-    /// [`HybridCoordinator::index_books`]. Scheduling it off the UI thread is the
-    /// caller's job until the progress API lands in P7.
+    /// long-running; searches stall for at most one book at a time, the manifest
+    /// is committed at checkpoints rather than per book, and two concurrent calls
+    /// are serialized — see [`HybridCoordinator::index_books`]. Scheduling it off
+    /// the UI thread is the caller's job until the progress API lands in P7.
     pub fn index_books(
         &self,
         books: &[BookForIndexing],

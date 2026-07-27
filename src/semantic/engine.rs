@@ -296,8 +296,11 @@ impl SemanticEngine {
     /// and reporting the former as the latter made "chunks written" untrue.
     ///
     /// Saves the manifest, so a crash afterwards cannot leave the book looking
-    /// indexed when it is not. Use [`SemanticEngine::index_books`] for many books
-    /// with one manifest write.
+    /// indexed when it is not. That costs a full serialize and `fsync` per call:
+    /// for more than one book use [`SemanticEngine::index_books`], or
+    /// [`SemanticEngine::index_book_deferred`] with an explicit
+    /// [`SemanticEngine::flush_manifest`] when the caller needs to release its
+    /// lock between books.
     pub fn index_book(
         &mut self,
         book: &BookForIndexing,
@@ -305,6 +308,37 @@ impl SemanticEngine {
         let outcome = self.index_book_inner(book)?;
         self.manifest.save(&self.config.root_dir)?;
         Ok(outcome)
+    }
+
+    /// Index one book and leave the manifest unsaved.
+    ///
+    /// For a caller driving the loop itself — [`HybridCoordinator::index_books`]
+    /// does, so it can release the engine lock between books. Whoever calls this
+    /// **must** call [`SemanticEngine::flush_manifest`] afterwards, including on
+    /// the error path: until then the vectors are in the store and nothing on
+    /// disk says so.
+    ///
+    /// The alternative, saving per book, is not merely slower — it is quadratic.
+    /// The manifest holds every book, so writing it after each of `B` books moves
+    /// `O(B²)` bytes and asks for `B` `fsync`s. Over a library of thousands of
+    /// books that is the difference between seconds and hours.
+    ///
+    /// [`HybridCoordinator::index_books`]: crate::hybrid::coordinator::HybridCoordinator::index_books
+    pub fn index_book_deferred(
+        &mut self,
+        book: &BookForIndexing,
+    ) -> Result<IndexOutcome, SemanticSearchError> {
+        self.index_book_inner(book)
+    }
+
+    /// Persist the manifest.
+    ///
+    /// The commit point for [`SemanticEngine::index_book_deferred`]. Idempotent
+    /// and cheap to over-call — but not free, so a caller checkpointing a long
+    /// run should space them out rather than call it per book.
+    pub fn flush_manifest(&mut self) -> Result<(), SemanticSearchError> {
+        self.manifest.save(&self.config.root_dir)?;
+        Ok(())
     }
 
     /// Index several books, writing the manifest once at the end.
@@ -387,7 +421,7 @@ impl SemanticEngine {
             self.store.commit()?;
             self.manifest.mark_book_indexed(
                 book.source_book_key.clone(),
-                book.content_hash,
+                book.content_fingerprint,
                 line_fingerprint,
                 0,
                 self.config.chunking.chunking_version,
@@ -412,7 +446,7 @@ impl SemanticEngine {
 
         self.manifest.mark_book_indexed(
             book.source_book_key.clone(),
-            book.content_hash,
+            book.content_fingerprint,
             line_fingerprint,
             chunks.len() as u32,
             self.config.chunking.chunking_version,
@@ -446,7 +480,7 @@ impl SemanticEngine {
         };
 
         entry.line_fingerprint == line_fingerprint
-            && entry.content_hash == book.content_hash
+            && entry.content_hash == book.content_fingerprint
             && entry.chunk_count as usize == chunk_count
             && entry.chunking_version == self.config.chunking.chunking_version
             && entry.normalization_version == self.config.normalization_version
@@ -538,12 +572,20 @@ impl SemanticEngine {
     /// Compare the library's per-book fingerprints against the semantic index.
     ///
     /// This is the primary form: the caller decides what a book's fingerprint is.
-    /// Pass [`ContentFingerprint::Hash`] when something can vouch for the content
-    /// — the lexical `contentHash` for a text book, or the caller's own signature
-    /// (Otzaria already tracks PDF size and mtime) for anything the lexical index
-    /// cannot fingerprint. Pass [`ContentFingerprint::Unverifiable`] only when
-    /// there is genuinely nothing to compare; those books land in
-    /// [`IndexDiff::unverifiable_books`] and have to be re-examined.
+    ///
+    /// * A text book's lexical `contentHash` →
+    ///   [`ContentFingerprint::from_lexical_hash`]. It already covers the
+    ///   metadata the lexical engine indexes, so it can reach "nothing to do".
+    /// * A PDF → [`ContentFingerprint::canonical`], folding the caller's own file
+    ///   signature (Otzaria already tracks size and mtime) together with the
+    ///   title, category path and facets. **Without the metadata a match proves
+    ///   too little**: renaming a book or correcting its author changes what is
+    ///   stored in every one of its vectors while leaving the file untouched, so
+    ///   a file-only signature would report "up to date" over a stale index.
+    ///   [`ContentFingerprint::content_only`] says exactly that and lands the
+    ///   book in [`IndexDiff::unverifiable_books`] instead of claiming more.
+    /// * Nothing at all → [`ContentFingerprint::Unverifiable`], also
+    ///   [`IndexDiff::unverifiable_books`].
     ///
     /// When a configuration change invalidated the index, every known book is
     /// reported as changed — an incremental update cannot repair a change of model
@@ -631,6 +673,15 @@ impl SemanticEngine {
             .map(|(key, &hash)| (key.clone(), ContentFingerprint::from_lexical_hash(hash)))
             .collect();
         self.diff(&fingerprints)
+    }
+
+    /// How many times this session has written the manifest.
+    ///
+    /// A cost, not a statistic: each write serializes every book record and
+    /// `fsync`s. Exposed so the indexing loop's write count can be asserted rather
+    /// than assumed — the quadratic version of that loop passed every other test.
+    pub fn manifest_save_count(&self) -> u32 {
+        self.manifest.save_count()
     }
 
     /// Retrieve current operational status.
@@ -752,11 +803,11 @@ mod tests {
         }
     }
 
-    fn book(key: &str, content_hash: u64, lines: &[(u64, u64, &str)]) -> BookForIndexing {
+    fn book(key: &str, content_fingerprint: u64, lines: &[(u64, u64, &str)]) -> BookForIndexing {
         BookForIndexing {
             source_book_key: key.to_string(),
             title: "ספר בדיקה".to_string(),
-            content_hash,
+            content_fingerprint,
             is_pdf: false,
             topics: "/מקרא/תורה".to_string(),
             extra_facets: vec!["/author/מחבר".to_string(), "/era/תנך".to_string()],
@@ -1002,7 +1053,7 @@ mod tests {
             reference: "עמוד 3".to_string(),
             segment: 3,
         });
-        assert_eq!(rescanned.content_hash, 0);
+        assert_eq!(rescanned.content_fingerprint, 0);
 
         // The diff must ask for it — it cannot prove anything from a hash of 0.
         let mut tantivy = HashMap::new();
@@ -1034,6 +1085,145 @@ mod tests {
             .unwrap();
         assert!((hits[0].similarity_score - 1.0).abs() < 1e-5);
         assert_eq!(hits[0].metadata.line_id, 3);
+    }
+
+    /// The failure mode a file-only signature cannot catch: the PDF on disk is
+    /// byte-identical, but the library corrected its author. Every vector carries
+    /// that author, so "unchanged" would keep serving the old one.
+    #[test]
+    fn correcting_a_pdfs_metadata_is_reported_as_a_change() {
+        let dir = TempDir::new("pdf_metadata_change");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+
+        const KEY: &str = "otzaria/scans/responsa.pdf";
+        const SIGNATURE: u64 = 0xBEEF_CAFE;
+
+        // The caller folds its file signature together with the metadata.
+        let fingerprint_of = |book: &BookForIndexing| {
+            ContentFingerprint::canonical(
+                SIGNATURE,
+                &book.title,
+                &book.topics,
+                &book.extra_facets,
+                book.is_pdf,
+            )
+        };
+
+        let mut scan = book(
+            KEY,
+            0,
+            &[
+                (1, 1, "עמוד ראשון של השאלות והתשובות הסרוקות"),
+                (2, 1, "עמוד שני של השאלות והתשובות הסרוקות"),
+            ],
+        );
+        scan.is_pdf = true;
+        scan.extra_facets = vec!["/author/מחבר ראשון".to_string()];
+        scan.content_fingerprint = fingerprint_of(&scan).as_raw();
+        engine.index_book(&scan).unwrap();
+
+        // Nothing changed: the same book reports as current.
+        let current = HashMap::from([(KEY.to_string(), fingerprint_of(&scan))]);
+        assert!(
+            engine.diff(&current).is_up_to_date(),
+            "a canonical fingerprint is what lets a PDF reach 'nothing to do'"
+        );
+
+        // Same file, same signature, corrected author.
+        let mut corrected = scan.clone();
+        corrected.extra_facets = vec!["/author/מחבר מדויק".to_string()];
+        corrected.content_fingerprint = fingerprint_of(&corrected).as_raw();
+
+        let after = HashMap::from([(KEY.to_string(), fingerprint_of(&corrected))]);
+        let diff = engine.diff(&after);
+        assert_eq!(
+            diff.changed_books,
+            vec![KEY.to_string()],
+            "a metadata-only correction must be visible at diff time, before the \
+             lines are loaded"
+        );
+        assert!(diff.unverifiable_books.is_empty());
+
+        // And re-indexing really replaces the stored facets.
+        assert_eq!(
+            engine.index_book(&corrected).unwrap(),
+            IndexOutcome::Indexed { chunks: 2 }
+        );
+        let hits = engine
+            .search("עמוד ראשון של השאלות והתשובות הסרוקות", 5, None)
+            .unwrap();
+        assert!(hits[0]
+            .metadata
+            .facets
+            .contains(&"/author/מחבר מדויק".to_string()));
+        assert!(!hits[0]
+            .metadata
+            .facets
+            .contains(&"/author/מחבר ראשון".to_string()));
+    }
+
+    /// Facet order is meaningless, so reordering must not cost a re-embed.
+    #[test]
+    fn reordering_a_books_facets_does_not_trigger_re_embedding() {
+        let dir = TempDir::new("facet_order");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+
+        let mut original = book(
+            "otzaria/commentary.txt",
+            42,
+            &[(1, 1, "שורה ארוכה דיה כדי לעמוד בפני עצמה בבדיקה")],
+        );
+        original.extra_facets = vec![
+            "/author/רבי אחד".to_string(),
+            "/author/רבי שני".to_string(),
+            "/era/ראשונים".to_string(),
+        ];
+        engine.index_book(&original).unwrap();
+
+        let mut reordered = original.clone();
+        reordered.extra_facets = vec![
+            "/era/ראשונים".to_string(),
+            "/author/רבי שני".to_string(),
+            "/author/רבי אחד".to_string(),
+        ];
+        assert_eq!(
+            engine.index_book(&reordered).unwrap(),
+            IndexOutcome::Skipped { chunks: 1 },
+            "the same facets in another order describe the same book"
+        );
+    }
+
+    /// The manifest holds every book, so writing it per book moves `O(B²)` bytes.
+    /// This is the assertion that catches a loop that reverted to doing so.
+    #[test]
+    fn the_manifest_write_count_does_not_grow_with_the_number_of_books() {
+        let index_books = |count: u64, name: &str| -> u32 {
+            let dir = TempDir::new(name);
+            let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+            let books: Vec<BookForIndexing> = (0..count)
+                .map(|i| {
+                    book(
+                        &format!("otzaria/book{i}.txt"),
+                        i + 1,
+                        &[(1, 1, "שורה ארוכה דיה כדי לעמוד בפני עצמה בבדיקה")],
+                    )
+                })
+                .collect();
+            engine.index_books(&books).unwrap();
+            engine.manifest_save_count()
+        };
+
+        let few = index_books(3, "manifest_writes_few");
+        let many = index_books(30, "manifest_writes_many");
+        assert_eq!(
+            few, many,
+            "ten times the books must not cost ten times the manifest writes \
+             (measured {few} and {many})"
+        );
+        // Three, all of them one-offs: the fresh manifest written at open, the
+        // model identity recorded the first time a model loads, and the batch
+        // commit. None of them scales with the library.
+        assert!(many <= 3, "unexpectedly many manifest writes: {many}");
     }
 
     /// Reporting every PDF as "needs attention" is only acceptable because

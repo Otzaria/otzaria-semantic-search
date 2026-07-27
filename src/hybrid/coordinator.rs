@@ -32,7 +32,7 @@ use crate::semantic::types::{
     SearchMode, SemanticCandidate, SemanticStatus,
 };
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 /// Saturation constant for BM25 normalization (`score / (k + score)`).
 ///
@@ -72,9 +72,31 @@ impl Default for HybridSearchParams {
     }
 }
 
+/// Books indexed between two manifest writes during a long run.
+///
+/// The manifest is not an append-only log: every write serializes the whole
+/// thing, so writing it per book makes a full-library index quadratic. Writing it
+/// only at the very end would instead throw away hours of work on a crash. A
+/// checkpoint every `N` books bounds the loss to `N` books' worth of inference
+/// while keeping the total bytes written linear in `books / N`.
+///
+/// The vectors themselves are not yet persistent, so today a crash loses them
+/// regardless and this only bounds *manifest* loss. It becomes load-bearing with
+/// the persistent backend (roadmap P4), which is exactly when the numbers get
+/// large enough for the quadratic term to matter.
+const MANIFEST_CHECKPOINT_BOOKS: usize = 200;
+
 /// Main hybrid search coordinator.
 pub struct HybridCoordinator {
     semantic_engine: RwLock<Option<SemanticEngine>>,
+    /// Held for the whole of [`HybridCoordinator::index_books`].
+    ///
+    /// The engine lock is released between books so searches can run, which also
+    /// means two indexing runs could interleave — each dropping and re-inserting
+    /// the other's books, with the manifest committed by whichever finished last.
+    /// This serializes them instead. Distinct from the engine lock on purpose: it
+    /// excludes other *writers* without excluding readers.
+    indexing: Mutex<()>,
     bonus_config: BonusConfig,
 }
 
@@ -83,6 +105,7 @@ impl HybridCoordinator {
     pub fn new(semantic_engine: Option<SemanticEngine>) -> Self {
         Self {
             semantic_engine: RwLock::new(semantic_engine),
+            indexing: Mutex::new(()),
             bonus_config: BonusConfig::default(),
         }
     }
@@ -362,7 +385,8 @@ impl HybridCoordinator {
 
     /// Index books into the semantic index, replacing anything held for them.
     ///
-    /// Returns `None` if there is no semantic engine.
+    /// Returns `None` if there is no semantic engine. Two concurrent calls do not
+    /// interleave — the second waits for the first.
     ///
     /// # Searches block while a book is being indexed
     ///
@@ -379,6 +403,14 @@ impl HybridCoordinator {
     /// with the Otzaria integration (roadmap P6/P7), where the threading model is
     /// decided — a long full index on the UI thread's engine is a blocker there,
     /// and it should be solved once, properly.
+    ///
+    /// # The manifest is written at checkpoints, not per book
+    ///
+    /// Releasing the engine lock between books must not mean committing the
+    /// manifest between books: every write serializes every record, so per-book
+    /// saves move `O(B²)` bytes and ask for `B` `fsync`s. The manifest is written
+    /// every few hundred books and once at the end — and on the
+    /// way out of a failure, so a retry resumes instead of restarting.
     pub fn index_books(
         &self,
         books: &[BookForIndexing],
@@ -387,8 +419,12 @@ impl HybridCoordinator {
             return Ok(self.has_semantic_engine().then(IndexingSummary::default));
         }
 
+        let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
+
         let mut summary = IndexingSummary::default();
-        for book in books {
+        let mut uncommitted = 0usize;
+
+        for (position, book) in books.iter().enumerate() {
             let mut guard = self
                 .semantic_engine
                 .write()
@@ -396,10 +432,35 @@ impl HybridCoordinator {
             let Some(engine) = guard.as_mut() else {
                 return Ok(None);
             };
-            // One book per lock acquisition. `index_book` also saves the manifest,
-            // so progress is durable per book rather than only at the end.
-            summary.record(engine.index_book(book)?);
+
+            match engine.index_book_deferred(book) {
+                Ok(outcome) => {
+                    summary.record(outcome);
+                    uncommitted += 1;
+                }
+                Err(indexing_error) => {
+                    // Commit what did land. Losing the manifest here would strand
+                    // vectors the store already holds: nothing on disk would name
+                    // them, so the next run would re-embed those books and the old
+                    // vectors would sit there unreferenced.
+                    if let Err(flush_error) = engine.flush_manifest() {
+                        log::warn!(
+                            "Could not commit the manifest after an indexing failure \
+                             ({flush_error}); {uncommitted} book(s) will be re-indexed"
+                        );
+                    }
+                    return Err(indexing_error);
+                }
+            }
+
+            let last = position + 1 == books.len();
+            if last || uncommitted >= MANIFEST_CHECKPOINT_BOOKS {
+                engine.flush_manifest()?;
+                uncommitted = 0;
+            }
         }
+
+        debug_assert_eq!(uncommitted, 0, "the final book must have been committed");
         Ok(Some(summary))
     }
 
@@ -540,7 +601,7 @@ mod tests {
         BookForIndexing {
             source_book_key: "otzaria/tanach/genesis.txt".to_string(),
             title: "בראשית".to_string(),
-            content_hash: 987654,
+            content_fingerprint: 987654,
             is_pdf: false,
             topics: "/מקרא/תורה".to_string(),
             extra_facets: vec!["/author/משה רבנו".to_string(), "/era/תנך".to_string()],
@@ -575,11 +636,27 @@ mod tests {
 
     /// A coordinator over an indexed 3-line book.
     fn indexed_coordinator(dir: &TempDir) -> HybridCoordinator {
+        let coordinator = semantic_coordinator(dir);
+        coordinator.index_books(&[mock_book()]).unwrap().unwrap();
+        coordinator
+    }
+
+    /// How many times the coordinator's engine has written its manifest.
+    fn manifest_save_count(coordinator: &HybridCoordinator) -> u32 {
+        let guard = coordinator.semantic_engine.read().unwrap();
+        guard
+            .as_ref()
+            .expect("the coordinator must have an engine")
+            .manifest_save_count()
+    }
+
+    /// A coordinator over an empty but working semantic engine.
+    fn semantic_coordinator(dir: &TempDir) -> HybridCoordinator {
         let model_path = dir.path().join("model.gguf");
         mock::write_stub_gguf(&model_path, 3).unwrap();
         let root = dir.path().join("semantic");
 
-        let mut engine = SemanticEngine::open(SemanticConfig {
+        let engine = SemanticEngine::open(SemanticConfig {
             root_dir: root.clone(),
             model_path,
             embedding_dim: 64,
@@ -591,7 +668,6 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        engine.index_book(&mock_book()).unwrap();
 
         HybridCoordinator::new(Some(engine))
     }
@@ -1113,7 +1189,7 @@ mod tests {
             .map(|i| {
                 let mut book = mock_book();
                 book.source_book_key = format!("otzaria/book{i:02}.txt");
-                book.content_hash = i;
+                book.content_fingerprint = i;
                 book
             })
             .collect();
@@ -1155,6 +1231,104 @@ mod tests {
             "at least one search must have completed alongside indexing"
         );
         assert_eq!(coordinator.status().vector_count, 120);
+    }
+
+    /// Releasing the engine lock between books must not mean committing the
+    /// manifest between books. Every write serializes every record, so per-book
+    /// saves are `O(B²)` bytes and `B` `fsync`s — invisible in a three-book test
+    /// and fatal over a real library.
+    #[test]
+    fn indexing_through_the_coordinator_does_not_write_the_manifest_per_book() {
+        let count_writes = |books: u64, name: &str| -> u32 {
+            let dir = TempDir::new(name);
+            let coordinator = semantic_coordinator(&dir);
+            let library: Vec<BookForIndexing> = (0..books)
+                .map(|i| {
+                    let mut book = mock_book();
+                    book.source_book_key = format!("otzaria/book{i:03}.txt");
+                    book.content_fingerprint = i + 1;
+                    book
+                })
+                .collect();
+
+            coordinator.index_books(&library).unwrap().unwrap();
+            manifest_save_count(&coordinator)
+        };
+
+        let few = count_writes(4, "coordinator_writes_few");
+        let many = count_writes(40, "coordinator_writes_many");
+        assert_eq!(
+            few, many,
+            "ten times the books must not cost ten times the manifest writes \
+             (measured {few} and {many})"
+        );
+    }
+
+    /// A long run still checkpoints, so a crash costs at most
+    /// [`MANIFEST_CHECKPOINT_BOOKS`] books of work rather than the whole batch.
+    #[test]
+    fn a_long_indexing_run_checkpoints_the_manifest() {
+        let dir = TempDir::new("checkpointing");
+        // Warm up first: loading the model records its identity, which is a
+        // one-off write and would otherwise be counted below.
+        let coordinator = indexed_coordinator(&dir);
+
+        let library: Vec<BookForIndexing> = (1..MANIFEST_CHECKPOINT_BOOKS as u64 + 2)
+            .map(|i| {
+                let mut book = mock_book();
+                book.source_book_key = format!("otzaria/book{i:04}.txt");
+                book.content_fingerprint = i + 1;
+                book
+            })
+            .collect();
+
+        let before = manifest_save_count(&coordinator);
+        coordinator.index_books(&library).unwrap().unwrap();
+        let after = manifest_save_count(&coordinator);
+
+        assert_eq!(
+            after - before,
+            2,
+            "one checkpoint at {MANIFEST_CHECKPOINT_BOOKS} books and one final commit"
+        );
+    }
+
+    /// Two indexing runs must not interleave: they would drop and re-insert each
+    /// other's books, and whichever finished last would commit the manifest.
+    #[test]
+    fn concurrent_indexing_runs_are_serialized() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new("concurrent_indexing");
+        let coordinator = Arc::new(semantic_coordinator(&dir));
+
+        let batch = |prefix: &str, offset: u64| -> Vec<BookForIndexing> {
+            (0..20)
+                .map(|i| {
+                    let mut book = mock_book();
+                    book.source_book_key = format!("otzaria/{prefix}{i:02}.txt");
+                    book.content_fingerprint = offset + i + 1;
+                    book
+                })
+                .collect()
+        };
+
+        let first = batch("alpha", 0);
+        let second = batch("beta", 1_000);
+
+        let handle = {
+            let coordinator = Arc::clone(&coordinator);
+            std::thread::spawn(move || coordinator.index_books(&first).unwrap().unwrap())
+        };
+        let second_summary = coordinator.index_books(&second).unwrap().unwrap();
+        let first_summary = handle.join().expect("indexing must not deadlock");
+
+        assert_eq!(first_summary.books_indexed, 20);
+        assert_eq!(second_summary.books_indexed, 20);
+        // Both batches are present and complete: 40 books × 3 lines.
+        let status = coordinator.status();
+        assert_eq!(status.indexed_book_count, 40);
+        assert_eq!(status.vector_count, 120);
     }
 
     #[test]

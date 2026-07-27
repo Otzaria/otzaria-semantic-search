@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroU64;
 
 /// Reserved first segments of a facet path that denote a filter *dimension*
 /// rather than a node of the category tree.
@@ -14,48 +15,199 @@ pub const FACET_DIMENSION_ROOTS: [&str; 3] = ["author", "era", "base"];
 /// root.
 const FACET_GROUP_COUNT: usize = FACET_DIMENSION_ROOTS.len() + 1;
 
-/// A book's content fingerprint, as supplied by the lexical index.
+/// What a book's fingerprint can prove, before its lines have been loaded.
 ///
-/// Text books carry a content hash derived from their lines. **PDF books do
-/// not**: their extracted text does not live in the library database, so the
-/// lexical engine records `contentHash = 0` for them. Comparing that as an
-/// ordinary hash makes every PDF look permanently unchanged — `0 == 0` — so a
-/// re-scanned or replaced PDF would never be re-indexed.
+/// # Why this is not a bare `u64`
 ///
-/// This type makes the distinction impossible to overlook.
+/// Two separate traps live here, and both are silent.
+///
+/// **Zero is a marker, not a hash.** PDF books have no lexical content hash:
+/// their extracted text does not live in the library database, so the lexical
+/// engine records `contentHash = 0`. Compared as an ordinary hash, `0 == 0`
+/// makes every PDF look permanently unchanged and a replaced scan would never be
+/// re-indexed. The zero state therefore gets its own variant, and the hash
+/// variants carry a [`NonZeroU64`] so a caller *cannot* pass zero as a hash.
+///
+/// **Not every fingerprint covers metadata.** Title, category path and facets
+/// are stored in every vector record and drive filtering and display, but they
+/// live outside the book's text. A fingerprint over the content alone — a PDF's
+/// file size and mtime, say — does not move when an author is corrected, so
+/// matching it would declare an index current while it keeps serving the old
+/// author. Which kind of fingerprint the caller has is something only the caller
+/// knows, so it is part of the value rather than an assumption.
+///
+/// The lexical engine's `compute_book_fingerprint` is [`Self::Canonical`]: it
+/// hashes the text *and* title, category path, catalogue/generation order and
+/// its sorted, deduplicated facets. [`Self::canonical`] builds the equivalent
+/// for a book the lexical index cannot fingerprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentFingerprint {
-    /// The lexical index vouches for this content hash.
-    Hash(u64),
-    /// No usable fingerprint. The book has to be re-examined; whether anything
-    /// actually changed is decided from the lines themselves.
+    /// Covers content *and* the metadata stored in every vector record. A match
+    /// proves the index is current.
+    Canonical(NonZeroU64),
+    /// Covers content only. A match proves the *text* is unchanged and nothing
+    /// more, so the book is still re-examined — cheaply, since
+    /// [`BookForIndexing::line_fingerprint`] then settles it without inference.
+    ContentOnly(NonZeroU64),
+    /// Nothing to compare. The book has to be re-examined from its lines.
     Unverifiable,
 }
 
 impl ContentFingerprint {
     /// Interpret a raw `contentHash` from the lexical index.
     ///
-    /// Zero is the engine's "no fingerprint" marker, not a hash value.
+    /// Zero is the engine's "no fingerprint" marker, not a hash value. A nonzero
+    /// lexical hash is [`Self::Canonical`] because the lexical engine's
+    /// fingerprint already folds in the metadata it indexes.
     pub fn from_lexical_hash(content_hash: u64) -> Self {
-        if content_hash == 0 {
-            Self::Unverifiable
-        } else {
-            Self::Hash(content_hash)
+        match NonZeroU64::new(content_hash) {
+            Some(hash) => Self::Canonical(hash),
+            None => Self::Unverifiable,
         }
     }
 
-    /// The raw value to persist. `0` for [`Self::Unverifiable`], round-tripping
-    /// through [`Self::from_lexical_hash`].
+    /// Build a canonical fingerprint for a book the lexical index cannot
+    /// fingerprint — a PDF.
+    ///
+    /// `source_signature` is the caller's own proof about the content: whatever
+    /// it already tracks for the file, such as size and mtime. This folds the
+    /// searchable metadata in on top, so correcting an author or moving a book
+    /// between categories changes the fingerprint even though the file did not.
+    ///
+    /// The resulting value must be used **twice**: handed to
+    /// [`SemanticEngine::diff`](crate::semantic::engine::SemanticEngine::diff)
+    /// as this book's fingerprint, and written into
+    /// [`BookForIndexing::content_fingerprint`] when the book is indexed. The
+    /// two are compared directly, so a mismatch means the book is re-indexed on
+    /// every pass.
+    pub fn canonical(
+        source_signature: u64,
+        title: &str,
+        topics: &str,
+        extra_facets: &[String],
+        is_pdf: bool,
+    ) -> Self {
+        Self::Canonical(canonical_book_fingerprint(
+            source_signature,
+            title,
+            topics,
+            extra_facets,
+            is_pdf,
+        ))
+    }
+
+    /// A fingerprint over content alone.
+    ///
+    /// For a caller that has a file signature and no metadata to fold in.
+    /// Prefer [`Self::canonical`]: this cannot reach "nothing to do", because a
+    /// metadata-only change is invisible to it. Zero yields
+    /// [`Self::Unverifiable`].
+    pub fn content_only(source_signature: u64) -> Self {
+        match NonZeroU64::new(source_signature) {
+            Some(hash) => Self::ContentOnly(hash),
+            None => Self::Unverifiable,
+        }
+    }
+
+    /// The raw value to persist and compare. `0` for [`Self::Unverifiable`].
     pub fn as_raw(&self) -> u64 {
         match self {
-            Self::Hash(hash) => *hash,
+            Self::Canonical(hash) | Self::ContentOnly(hash) => hash.get(),
             Self::Unverifiable => 0,
         }
     }
 
-    /// Whether this fingerprint can prove that content is unchanged.
+    /// Whether a match proves the *whole* record — content and metadata — is
+    /// current. Only [`Self::Canonical`] does.
+    pub fn proves_current(&self) -> bool {
+        matches!(self, Self::Canonical(_))
+    }
+
+    /// Whether there is any hash to compare at all.
     pub fn is_verifiable(&self) -> bool {
-        matches!(self, Self::Hash(_))
+        !matches!(self, Self::Unverifiable)
+    }
+}
+
+/// Canonical book fingerprint: a source signature plus the metadata stored in
+/// every vector record.
+///
+/// Mirrors the shape of the lexical engine's `book_fingerprint` rather than its
+/// bytes (the inputs differ — there is no text here): FNV-1a over
+/// length-prefixed fields, with the facets sorted and deduplicated because their
+/// order carries no meaning in either index. Never returns zero, which is the
+/// "no fingerprint" marker.
+fn canonical_book_fingerprint(
+    source_signature: u64,
+    title: &str,
+    topics: &str,
+    extra_facets: &[String],
+    is_pdf: bool,
+) -> NonZeroU64 {
+    let mut fnv = Fnv::new();
+    fnv.feed_field(&source_signature.to_le_bytes());
+    fnv.feed_field(title.as_bytes());
+    fnv.feed_field(topics.as_bytes());
+    fnv.feed_field(&[u8::from(is_pdf)]);
+    for facet in canonical_facets(extra_facets) {
+        fnv.feed_field(facet.as_bytes());
+    }
+    fnv.finish_nonzero()
+}
+
+/// Sort and deduplicate facet paths.
+///
+/// Order and repetition of facets mean nothing to either index — Tantivy indexes
+/// each path and its ancestors, and a repeat adds no term. Leaving them raw
+/// would make two descriptions of the same book fingerprint differently and
+/// trigger a pointless re-index; the lexical engine canonicalizes for the same
+/// reason.
+fn canonical_facets(facets: &[String]) -> Vec<&str> {
+    let mut canonical: Vec<&str> = facets
+        .iter()
+        .map(|facet| facet.as_str())
+        .filter(|facet| !facet.trim().is_empty())
+        .collect();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
+}
+
+/// Accumulating FNV-1a, the basis of every fingerprint this crate computes.
+///
+/// `feed_field` length-prefixes, so concatenations of different fields cannot
+/// collide (`"ab" + "c"` against `"a" + "bc"`). Stable across runs and
+/// platforms, which is the only property required of it — nothing here is
+/// adversarial.
+struct Fnv(u64);
+
+impl Fnv {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn feed_field(&mut self, bytes: &[u8]) {
+        self.feed(&(bytes.len() as u64).to_le_bytes());
+        self.feed(bytes);
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+
+    /// Finish, mapping the one value that would be read as "no fingerprint".
+    fn finish_nonzero(self) -> NonZeroU64 {
+        NonZeroU64::new(self.0).unwrap_or(NonZeroU64::MIN)
     }
 }
 
@@ -78,9 +230,16 @@ pub struct BookLine {
 pub struct BookForIndexing {
     pub source_book_key: String,
     pub title: String,
-    /// Raw `contentHash` from the lexical index; `0` means "no fingerprint"
-    /// (see [`ContentFingerprint`]).
-    pub content_hash: u64,
+    /// The raw fingerprint the caller vouches for, `0` meaning "none".
+    ///
+    /// **It must be the raw value of the same [`ContentFingerprint`] handed to
+    /// [`SemanticEngine::diff`](crate::semantic::engine::SemanticEngine::diff)
+    /// for this book**, since that is what the skip decision compares against.
+    /// For a text book that is the lexical engine's `contentHash`; for a PDF,
+    /// [`ContentFingerprint::canonical`] builds it and `as_raw()` unwraps it.
+    /// Anything else is not wrong so much as useless: the book is re-indexed on
+    /// every pass.
+    pub content_fingerprint: u64,
     pub is_pdf: bool,
     /// The book's category facet path, e.g. `/מקרא/תורה/בראשית`. One path per
     /// book, as in the lexical engine's `topics` argument.
@@ -100,18 +259,29 @@ impl BookForIndexing {
     /// Every facet path describing this book: the category path plus the
     /// dimension facets, which is exactly the set the lexical engine indexes
     /// into its single `topics` field.
+    /// Sorted and deduplicated — the list is stored on every vector, and neither
+    /// order nor repetition means anything to a filter.
     pub fn all_facets(&self) -> Vec<String> {
         let mut facets = Vec::with_capacity(self.extra_facets.len() + 1);
+        facets.extend(self.extra_facets.iter().map(String::as_str));
         if !self.topics.trim().is_empty() {
-            facets.push(self.topics.clone());
+            facets.push(self.topics.as_str());
         }
-        facets.extend(self.extra_facets.iter().cloned());
+        let mut facets = canonical_facets_owned(&facets);
+        facets.shrink_to_fit();
         facets
     }
 
-    /// This book's content fingerprint.
+    /// This book's fingerprint as recorded by the caller.
+    ///
+    /// Read back as [`ContentFingerprint::Canonical`] when nonzero: the caller is
+    /// responsible for having put a canonical value in
+    /// [`Self::content_fingerprint`], and this crate cannot tell the difference
+    /// by looking. What it *can* do is catch the consequence anyway —
+    /// [`Self::line_fingerprint`] covers the same metadata, so a book handed over
+    /// with stale metadata is still re-embedded.
     pub fn fingerprint(&self) -> ContentFingerprint {
-        ContentFingerprint::from_lexical_hash(self.content_hash)
+        ContentFingerprint::from_lexical_hash(self.content_fingerprint)
     }
 
     /// A fingerprint this crate computes from the book itself, for books whose
@@ -129,47 +299,45 @@ impl BookForIndexing {
     /// So: title, category path, dimension facets, the PDF flag, and per line the
     /// id, section, segment, reference, dedup hash and text.
     pub fn line_fingerprint(&self) -> u64 {
-        // FNV-1a: stable across runs and platforms, and this is the only
-        // property required of it. Not used for anything adversarial.
-        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
-        /// Field separator, so a value ending where the next begins cannot be
-        /// confused with a different split of the same bytes.
-        const SEP: u8 = 0xff;
-
-        let mut hash = OFFSET;
-        let mut feed = |bytes: &[u8]| {
-            for byte in bytes {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(PRIME);
-            }
-            hash ^= u64::from(SEP);
-            hash = hash.wrapping_mul(PRIME);
-        };
+        let mut fnv = Fnv::new();
 
         // ── book-level metadata stored in every record ──
-        feed(self.title.as_bytes());
-        feed(self.topics.as_bytes());
-        feed(&(self.extra_facets.len() as u64).to_le_bytes());
-        for facet in &self.extra_facets {
-            feed(facet.as_bytes());
+        fnv.feed_field(self.title.as_bytes());
+        fnv.feed_field(self.topics.as_bytes());
+        fnv.feed_field(&[u8::from(self.is_pdf)]);
+        // Sorted and deduplicated, like everything else that hashes facets: two
+        // descriptions of the same book must agree, or the book is re-embedded
+        // because a caller happened to list its authors in a different order.
+        for facet in canonical_facets(&self.extra_facets) {
+            fnv.feed_field(facet.as_bytes());
         }
-        feed(&[u8::from(self.is_pdf)]);
 
         // ── per-line identity and content ──
-        feed(&(self.lines.len() as u64).to_le_bytes());
+        fnv.feed_field(&(self.lines.len() as u64).to_le_bytes());
         for line in &self.lines {
-            feed(&line.line_id.to_le_bytes());
-            feed(&line.section_id.to_le_bytes());
-            feed(&line.segment.to_le_bytes());
-            feed(&line.line_hash.to_le_bytes());
-            feed(line.reference.as_bytes());
+            fnv.feed_field(&line.line_id.to_le_bytes());
+            fnv.feed_field(&line.section_id.to_le_bytes());
+            fnv.feed_field(&line.segment.to_le_bytes());
+            fnv.feed_field(&line.line_hash.to_le_bytes());
+            fnv.feed_field(line.reference.as_bytes());
             // `line_hash` is 0 for lines the lexical engine considers too short
             // to deduplicate, so it cannot stand in for the text on its own.
-            feed(line.text.as_bytes());
+            fnv.feed_field(line.text.as_bytes());
         }
-        hash
+        fnv.finish()
     }
+}
+
+/// [`canonical_facets`] for a caller that needs owned strings.
+fn canonical_facets_owned(facets: &[&str]) -> Vec<String> {
+    let mut canonical: Vec<&str> = facets
+        .iter()
+        .copied()
+        .filter(|facet| !facet.trim().is_empty())
+        .collect();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical.into_iter().map(str::to_string).collect()
 }
 
 /// A chunk of text derived from a book line, prepared for semantic embedding.
@@ -823,7 +991,7 @@ mod tests {
 
         assert_eq!(
             ContentFingerprint::from_lexical_hash(42),
-            ContentFingerprint::Hash(42)
+            ContentFingerprint::Canonical(NonZeroU64::new(42).unwrap())
         );
         assert!(ContentFingerprint::from_lexical_hash(42).is_verifiable());
     }
@@ -840,11 +1008,91 @@ mod tests {
         }
     }
 
+    /// The whole point of the canonical form: a metadata-only correction moves the
+    /// fingerprint even though the file behind it did not change.
+    #[test]
+    fn metadata_changes_move_a_canonical_fingerprint() {
+        let signature = 0xBEEF_CAFE;
+        let facets = vec!["/author/רבי אחד".to_string(), "/era/ראשונים".to_string()];
+        let baseline =
+            ContentFingerprint::canonical(signature, "מסכת ברכות", "/תלמוד", &facets, true);
+
+        assert!(baseline.proves_current());
+        assert_ne!(baseline.as_raw(), 0, "zero is the no-fingerprint marker");
+
+        // Each of these is a change a size/mtime signature cannot see, and each is
+        // stored in every one of the book's vectors.
+        let variants = [
+            ContentFingerprint::canonical(signature, "ברכות", "/תלמוד", &facets, true),
+            ContentFingerprint::canonical(signature, "מסכת ברכות", "/משנה", &facets, true),
+            ContentFingerprint::canonical(
+                signature,
+                "מסכת ברכות",
+                "/תלמוד",
+                &["/author/רבי אחר".to_string(), "/era/ראשונים".to_string()],
+                true,
+            ),
+            ContentFingerprint::canonical(signature, "מסכת ברכות", "/תלמוד", &facets, false),
+            ContentFingerprint::canonical(signature + 1, "מסכת ברכות", "/תלמוד", &facets, true),
+        ];
+        for variant in variants {
+            assert_ne!(
+                variant, baseline,
+                "a change stored in the vectors must change the fingerprint"
+            );
+        }
+
+        // Same inputs, same value — otherwise every diff would report every book.
+        assert_eq!(
+            baseline,
+            ContentFingerprint::canonical(signature, "מסכת ברכות", "/תלמוד", &facets, true)
+        );
+    }
+
+    /// Facet order and repetition mean nothing to either index, so they must mean
+    /// nothing to a fingerprint. Otherwise a caller that happens to list a book's
+    /// authors in a different order forces it to be re-embedded.
+    #[test]
+    fn facet_order_and_repetition_do_not_change_a_fingerprint() {
+        let ordered = vec![
+            "/author/רבי אחד".to_string(),
+            "/author/רבי שני".to_string(),
+            "/era/ראשונים".to_string(),
+        ];
+        let shuffled_with_a_duplicate = vec![
+            "/era/ראשונים".to_string(),
+            "/author/רבי שני".to_string(),
+            "/author/רבי אחד".to_string(),
+            "/author/רבי שני".to_string(),
+        ];
+
+        assert_eq!(
+            ContentFingerprint::canonical(7, "כותרת", "/מקרא", &ordered, false),
+            ContentFingerprint::canonical(7, "כותרת", "/מקרא", &shuffled_with_a_duplicate, false)
+        );
+
+        let mut book = book_with_lines(&[(1, 1, "שורה ראשונה של הספר", 11)]);
+        book.extra_facets = ordered;
+        let mut permuted = book.clone();
+        permuted.extra_facets = shuffled_with_a_duplicate;
+
+        assert_eq!(
+            book.line_fingerprint(),
+            permuted.line_fingerprint(),
+            "the line fingerprint must be facet-order-independent too"
+        );
+        assert_eq!(
+            book.all_facets(),
+            permuted.all_facets(),
+            "and the facets stored on every vector are canonical"
+        );
+    }
+
     fn book_with_lines(lines: &[(u64, u64, &str, u64)]) -> BookForIndexing {
         BookForIndexing {
             source_book_key: "scan.pdf".to_string(),
             title: "ספר סרוק".to_string(),
-            content_hash: 0,
+            content_fingerprint: 0,
             is_pdf: true,
             topics: "/מקרא".to_string(),
             extra_facets: vec![],
@@ -1010,7 +1258,7 @@ mod tests {
         let book = BookForIndexing {
             source_book_key: "commentary.txt".to_string(),
             title: "פירוש".to_string(),
-            content_hash: 1,
+            content_fingerprint: 1,
             is_pdf: false,
             topics: "/מפרשים".to_string(),
             extra_facets: vec![
@@ -1023,7 +1271,7 @@ mod tests {
 
         let facets = book.all_facets();
         assert_eq!(facets.len(), 4, "the category path plus three dimensions");
-        assert_eq!(facets[0], "/מפרשים");
+        assert!(facets.contains(&"/מפרשים".to_string()));
 
         let meta = VectorMetadata { facets, ..meta() };
 
@@ -1042,7 +1290,7 @@ mod tests {
         let book = BookForIndexing {
             source_book_key: "userbook.txt".to_string(),
             title: "ספר משתמש".to_string(),
-            content_hash: 1,
+            content_fingerprint: 1,
             is_pdf: false,
             topics: "   ".to_string(),
             extra_facets: vec!["/author/מחבר".to_string()],

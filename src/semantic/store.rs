@@ -12,6 +12,9 @@
 //! public API here is the seam it slots into.
 
 use crate::errors::VectorStoreError;
+// One threshold for the whole crate: a boundary the store and the embedding layer
+// disagreed about is a vector one of them normalizes and the other rejects.
+use crate::semantic::embedding::MIN_VECTOR_NORM;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -21,9 +24,6 @@ use std::sync::RwLock;
 /// Identifier of this storage backend, recorded in the manifest so an index
 /// built by one backend is never read through another.
 pub const BACKEND_ID: &str = "in-memory-v1";
-
-/// Below this L2 norm a query vector has no direction to compare against.
-const MIN_VECTOR_NORM: f32 = 1e-12;
 
 /// Configuration for the vector store.
 #[derive(Debug, Clone)]
@@ -210,8 +210,13 @@ impl VectorStore {
                     "has a non-finite norm ({norm}); its magnitudes overflowed f32"
                 )));
             }
-            if norm < MIN_VECTOR_NORM {
-                return Err(reject("has no direction (zero norm)".to_string()));
+            // `<=`, so the vector exactly on the threshold is rejected rather
+            // than stored unnormalized. Same comparison in every layer.
+            if norm <= MIN_VECTOR_NORM {
+                return Err(reject(format!(
+                    "has a norm of {norm}, at or below the minimum {MIN_VECTOR_NORM}, so it \
+                     has no usable direction"
+                )));
             }
         }
 
@@ -282,7 +287,7 @@ impl VectorStore {
         // A query that is not comparable yields nothing rather than scoring
         // every record as NaN and returning an arbitrary set.
         let norm = l2_norm(query_vector);
-        if !norm.is_finite() || norm < MIN_VECTOR_NORM {
+        if !norm.is_finite() || norm <= MIN_VECTOR_NORM {
             return Ok(Vec::new());
         }
         if query_vector.iter().any(|x| !x.is_finite()) {
@@ -471,7 +476,7 @@ fn l2_norm(v: &[f32]) -> f32 {
 /// callers check the norm themselves before relying on the direction.
 fn l2_normalize_vec(v: &[f32]) -> Vec<f32> {
     let norm = l2_norm(v);
-    if norm < MIN_VECTOR_NORM {
+    if norm <= MIN_VECTOR_NORM {
         return v.to_vec();
     }
     let inv = 1.0 / norm;
@@ -717,6 +722,9 @@ mod tests {
             // normalization turns the whole vector into zeros.
             vec![1e30, 1e30, 1e30, 1e30],
             vec![f32::MAX, f32::MAX, 0.0, 0.0],
+            // Exactly on the threshold. The store and the embedding layer share
+            // one constant and one comparison, so this is refused in both.
+            vec![MIN_VECTOR_NORM, 0.0, 0.0, 0.0],
         ] {
             let result = store.insert_batch(&[(sample_metadata("bad", "book.txt"), bad.clone())]);
             assert!(

@@ -36,6 +36,7 @@ const BERACHOT: &str = "otzaria/mishna/berachot.txt";
 const LINE_ONE: &str = "בראשית ברא אלהים את השמים ואת הארץ";
 const LINE_TWO: &str = "והארץ היתה תהו ובהו וחשך על פני תהום";
 const LINE_THREE: &str = "ויאמר אלהים יהי אור ויהי אור מאיר";
+const BERACHOT_LINE: &str = "מאימתי קורין את שמע בערבית משעה שהכהנים נכנסין לאכול בתרומתן";
 
 struct TempDir(PathBuf);
 
@@ -87,7 +88,7 @@ fn genesis_book() -> BookForIndexing {
     BookForIndexing {
         source_book_key: GENESIS.to_string(),
         title: "בראשית".to_string(),
-        content_hash: 987_654,
+        content_fingerprint: 987_654,
         is_pdf: false,
         topics: "/מקרא/תורה/בראשית".to_string(),
         extra_facets: vec![
@@ -127,23 +128,46 @@ fn genesis_book() -> BookForIndexing {
 
 /// A PDF book.
 ///
-/// `content_hash` carries the caller's own signature, not Tantivy's `0`. That is
-/// the integration contract: `content_hash` is whatever the caller can vouch for,
-/// and it has to be the same value later handed to the diff. Leaving it `0` is
-/// legal but means "I cannot vouch for this", and such a book is re-examined on
-/// every diff — see `a_pdf_without_a_caller_supplied_signature_is_always_offered`.
+/// Its `content_fingerprint` is the caller's own canonical fingerprint, not
+/// Tantivy's `0`. That is the integration contract: the value is whatever the
+/// caller can vouch for, it must fold in the metadata stored in every vector, and
+/// it has to be the same value later handed to the diff. Leaving it `0` is legal
+/// but means "I cannot vouch for this", and such a book is re-examined on every
+/// diff — see `a_pdf_without_a_caller_supplied_signature_is_always_offered`.
 fn berachot_book() -> BookForIndexing {
+    let mut book = berachot_without_fingerprint();
+    book.content_fingerprint = caller_fingerprint(&book, PDF_SIGNATURE).as_raw();
+    book
+}
+
+/// The caller's canonical fingerprint for a book: its own signature for the file,
+/// folded together with the metadata that ends up inside every vector.
+///
+/// This is the whole reason a PDF can be reported as up to date. A signature over
+/// the file alone cannot: renaming the book or correcting its author changes what
+/// every one of its vectors carries while leaving the bytes on disk untouched.
+fn caller_fingerprint(book: &BookForIndexing, source_signature: u64) -> ContentFingerprint {
+    ContentFingerprint::canonical(
+        source_signature,
+        &book.title,
+        &book.topics,
+        &book.extra_facets,
+        book.is_pdf,
+    )
+}
+
+fn berachot_without_fingerprint() -> BookForIndexing {
     BookForIndexing {
         source_book_key: BERACHOT.to_string(),
         title: "מסכת ברכות".to_string(),
-        content_hash: PDF_SIGNATURE,
+        content_fingerprint: 0,
         is_pdf: true,
         topics: "/תלמוד/משנה/ברכות".to_string(),
         extra_facets: vec!["/era/תנאים".to_string()],
         lines: vec![BookLine {
             line_id: 501,
             section_id: 900,
-            text: "מאימתי קורין את שמע בערבית משעה שהכהנים נכנסין לאכול בתרומתן".to_string(),
+            text: BERACHOT_LINE.to_string(),
             line_hash: 55_555,
             reference: "ברכות א:א".to_string(),
             segment: 1,
@@ -187,11 +211,11 @@ fn library_fingerprints() -> HashMap<String, ContentFingerprint> {
     HashMap::from([
         (
             GENESIS.to_string(),
-            ContentFingerprint::Hash(genesis_book().content_hash),
+            ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
         ),
         (
             BERACHOT.to_string(),
-            ContentFingerprint::Hash(PDF_SIGNATURE),
+            caller_fingerprint(&berachot_book(), PDF_SIGNATURE),
         ),
     ])
 }
@@ -426,7 +450,7 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
     // Genesis loses its third line and its content hash changes.
     let mut shrunk = genesis_book();
     shrunk.lines.pop();
-    shrunk.content_hash = 111_222;
+    shrunk.content_fingerprint = 111_222;
     let summary = api.index_books(&[shrunk.clone()]).unwrap().unwrap();
     assert_eq!(summary.books_indexed, 1);
     assert_eq!(summary.chunks_written, 2);
@@ -454,10 +478,13 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
 
     // And the manifest agrees the library is current.
     let fingerprints = HashMap::from([
-        (GENESIS.to_string(), ContentFingerprint::Hash(111_222)),
+        (
+            GENESIS.to_string(),
+            ContentFingerprint::from_lexical_hash(111_222),
+        ),
         (
             BERACHOT.to_string(),
-            ContentFingerprint::Hash(PDF_SIGNATURE),
+            caller_fingerprint(&berachot_book(), PDF_SIGNATURE),
         ),
     ]);
     assert!(api
@@ -479,6 +506,108 @@ fn reindexing_unchanged_content_does_not_duplicate_vectors() {
     assert_eq!(api.get_semantic_status().indexed_book_count, 2);
 }
 
+/// The failure a file signature alone cannot catch: the PDF is byte-identical and
+/// the library corrected its author. Every vector carries that author and drives
+/// filtering with it, so "up to date" would mean serving the wrong one — and the
+/// book would never be handed over for its lines to be compared.
+#[test]
+fn correcting_a_pdfs_author_is_visible_at_diff_time() {
+    let dir = TempDir::new("pdf_metadata_diff");
+    let api = indexed_api(config_at(&dir));
+
+    // The same file, the same signature, one corrected author.
+    let mut corrected = berachot_without_fingerprint();
+    corrected.extra_facets = vec![
+        "/era/תנאים".to_string(),
+        "/author/רבי יהודה הנשיא".to_string(),
+    ];
+    corrected.content_fingerprint = caller_fingerprint(&corrected, PDF_SIGNATURE).as_raw();
+    assert_ne!(
+        corrected.content_fingerprint,
+        berachot_book().content_fingerprint,
+        "the metadata is part of the fingerprint, so this must differ"
+    );
+
+    let fingerprints = HashMap::from([
+        (
+            GENESIS.to_string(),
+            ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
+        ),
+        (
+            BERACHOT.to_string(),
+            caller_fingerprint(&corrected, PDF_SIGNATURE),
+        ),
+    ]);
+
+    let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
+    assert_eq!(
+        diff.changed_books,
+        vec![BERACHOT.to_string()],
+        "a metadata-only correction must be reported before the lines are loaded"
+    );
+    assert!(diff.unverifiable_books.is_empty());
+    assert!(!diff.is_up_to_date());
+
+    // Re-indexing replaces the stored facets, so filtering follows the correction.
+    api.index_books(&[corrected]).unwrap().unwrap();
+    let count_with = |facet: &str| {
+        api.search(SearchRequest {
+            query: BERACHOT_LINE.to_string(),
+            force_mode: Some(SearchMode::SemanticOnly),
+            limit: Some(20),
+            filters: Some(facet_filter(&[facet])),
+            ..Default::default()
+        })
+        .unwrap()
+        .results
+        .len()
+    };
+    assert_eq!(count_with("/author/רבי יהודה הנשיא"), 1);
+    assert_eq!(
+        count_with("/era/תנאים"),
+        1,
+        "the untouched facet must survive the re-index"
+    );
+}
+
+/// A signature over the file alone says so, and is therefore never trusted to
+/// mean "current" — the book comes back as unverifiable and its lines decide.
+#[test]
+fn a_file_only_signature_cannot_declare_a_pdf_current() {
+    let dir = TempDir::new("pdf_content_only");
+    let api = indexed_api(config_at(&dir));
+
+    // Indexed with a signature over the file and nothing else.
+    let mut file_only = berachot_without_fingerprint();
+    file_only.content_fingerprint = PDF_SIGNATURE;
+    api.index_books(&[file_only.clone()]).unwrap().unwrap();
+
+    let fingerprints = HashMap::from([
+        (
+            GENESIS.to_string(),
+            ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
+        ),
+        (
+            BERACHOT.to_string(),
+            ContentFingerprint::content_only(PDF_SIGNATURE),
+        ),
+    ]);
+
+    let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
+    assert_eq!(
+        diff.unverifiable_books,
+        vec![BERACHOT.to_string()],
+        "content-only proof leaves the metadata unproven"
+    );
+    assert!(diff.changed_books.is_empty());
+    assert!(!diff.is_up_to_date());
+
+    // Handing it back is cheap: nothing changed, so nothing is re-embedded.
+    let summary = api.index_books(&[file_only]).unwrap().unwrap();
+    assert_eq!(summary.books_skipped, 1);
+    assert_eq!(summary.chunks_written, 0);
+}
+
 /// The other side of that contract: a caller with nothing but Tantivy's hashes
 /// gets every PDF back on every diff. Honest, but it costs a text extraction each
 /// time — which is why supplying a signature is worth it.
@@ -489,7 +618,7 @@ fn a_pdf_without_a_caller_supplied_signature_is_always_offered() {
 
     // Raw lexical hashes: 0 for the PDF.
     let mut tantivy = HashMap::new();
-    tantivy.insert(GENESIS.to_string(), genesis_book().content_hash);
+    tantivy.insert(GENESIS.to_string(), genesis_book().content_fingerprint);
     tantivy.insert(BERACHOT.to_string(), 0u64);
 
     let diff = api
@@ -524,7 +653,7 @@ fn a_book_deleted_from_the_library_is_reported_as_removed() {
 
     let only_genesis = HashMap::from([(
         GENESIS.to_string(),
-        ContentFingerprint::Hash(genesis_book().content_hash),
+        ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
     )]);
 
     let diff = api.get_semantic_index_diff(&only_genesis).unwrap();

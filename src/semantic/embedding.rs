@@ -57,12 +57,34 @@ const GGUF_MIN_METADATA_ENTRY_BYTES: u64 = 14;
 /// + offset (8).
 const GGUF_MIN_TENSOR_INFO_BYTES: u64 = 33;
 
+/// How much of the file's start is read to parse the metadata and tensor
+/// descriptors.
+///
+/// The descriptor region of a real model is a few megabytes at most — the
+/// tokenizer vocabulary dominates it. This is the ceiling on believing the
+/// declared sizes: past it the structural check is *skipped*, not failed, because
+/// refusing a model this crate merely failed to parse is a worse outcome than
+/// accepting one it could not fully check.
+const GGUF_MAX_DESCRIPTOR_REGION_BYTES: u64 = 64 << 20;
+
+/// Default tensor-data alignment when the file declares none.
+///
+/// GGUF pads between the descriptors and the tensor data to `general.alignment`
+/// bytes, 32 by default.
+const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+
 /// Read buffer for hashing the model file. Large enough that hashing a
 /// multi-hundred-megabyte model is bound by the hash, not by syscalls.
 const HASH_BUFFER_BYTES: usize = 1 << 20;
 
-/// Below this L2 norm a vector carries no direction and cannot be normalized.
-const MIN_VECTOR_NORM: f32 = 1e-12;
+/// At or below this L2 norm a vector carries no direction and cannot be
+/// normalized.
+///
+/// One threshold for the whole crate, used with the same `<=` comparison at every
+/// layer — the embedding runtime, the store's own guard, and the query path.
+/// Two copies would drift, and a vector that one layer rejects while another
+/// normalizes is exactly the record that exists but can never be found.
+pub(crate) const MIN_VECTOR_NORM: f32 = 1e-12;
 
 /// Configuration for embedding runtime loading.
 #[derive(Debug, Clone)]
@@ -322,10 +344,16 @@ pub fn normalize_validated(vector: &mut [f32], expected_dim: u32) -> Result<(), 
             reason: format!("vector norm is not finite ({norm}); the magnitudes overflowed f32"),
         });
     }
-    if norm < MIN_VECTOR_NORM {
+    // `<=`, matching the `>` in `l2_normalize` and the store's own guard. At
+    // exactly the threshold a `<` test rejected nothing and `l2_normalize`
+    // normalized nothing, so the one vector on the boundary passed through
+    // unnormalized — scoring as its own magnitude rather than as a cosine.
+    if norm <= MIN_VECTOR_NORM {
         return Err(EmbeddingError::InferenceFailed {
-            reason: "vector has no direction (zero norm) — empty or unrepresentable input"
-                .to_string(),
+            reason: format!(
+                "vector norm {norm} is at or below the minimum {MIN_VECTOR_NORM}; it has no \
+                 usable direction"
+            ),
         });
     }
 
@@ -356,53 +384,69 @@ pub fn l2_normalize(vec: &mut [f32]) -> f32 {
 /// Validate a GGUF container and return the file's SHA-256, reading the file
 /// exactly once.
 ///
-/// Checks the complete header — magic, version, and both declared counts, which
-/// have to be present and plausible. Full metadata and tensor parsing belongs to
-/// the real backend (roadmap P2); what this buys is that a placeholder, a
-/// truncated download, or another format that happens to begin with `GGUF` is
-/// rejected rather than accepted as a model.
+/// # What is checked
+///
+/// 1. **The header, before anything else is read.** Magic, version, and both
+///    declared counts. A file that is not GGUF at all is rejected after 24 bytes
+///    rather than after hashing however many gigabytes it happens to be.
+/// 2. **The descriptor region is parsed**: every metadata key/value pair and
+///    every tensor descriptor, which yields where the tensor data starts and,
+///    per tensor, the offset it claims within that data.
+/// 3. **The file is long enough to hold what its own descriptors describe.** Each
+///    tensor's size is bounded below by one bit per element — true of every ggml
+///    type, including the most aggressive ternary quantizations — so this is a
+///    real lower bound rather than a guess.
+///
+/// # What is not
+///
+/// The bound is a lower bound. Deriving each tensor's *exact* length needs the
+/// ggml type table with the block size of every quantization, and getting one
+/// entry of that wrong rejects a valid model — a worse failure than accepting an
+/// invalid one, since it makes the feature unavailable rather than late-failing
+/// with a clear error. So a download cut off inside the final tensor can still
+/// pass. What cannot pass: a placeholder, another format that begins with
+/// `GGUF`, a header-only stub, or a download that stopped anywhere before the
+/// last tensor's data.
+///
+/// If the descriptors cannot be parsed — an unknown value type from a future
+/// spec revision, or a descriptor region larger than this code is willing to read
+/// — the structural check is skipped and only the coarse floor applies. Failing there would mean rejecting a model this
+/// crate merely failed to understand.
+///
+/// **This is not download verification.** A checksum computed from the file
+/// cannot attest to the file; only comparing it against a published SHA-256 can,
+/// which belongs with model distribution (roadmap P2/P9). What this checksum is
+/// for is detecting that the bytes behind a model path *changed* between
+/// sessions, which would silently invalidate every stored vector.
 ///
 /// One pass over the file: a multi-hundred-megabyte model is read once, not once
 /// to validate and again to hash.
 pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError> {
-    use sha2::{Digest, Sha256};
-
     let invalid = |reason: String| EmbeddingError::InvalidModelFile {
         path: path.display().to_string(),
         reason,
     };
+    let unreadable = |e: std::io::Error| EmbeddingError::LoadFailed {
+        reason: format!("cannot read model file {}: {e}", path.display()),
+    };
 
-    let mut file = std::fs::File::open(path).map_err(|e| EmbeddingError::LoadFailed {
+    let file = std::fs::File::open(path).map_err(|e| EmbeddingError::LoadFailed {
         reason: format!("cannot open model file {}: {e}", path.display()),
     })?;
+    let mut reader = HashingReader::new(file);
 
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
-    let mut header = Vec::with_capacity(GGUF_HEADER_BYTES);
-    let mut total_bytes = 0u64;
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|e| EmbeddingError::LoadFailed {
-                reason: format!("cannot read model file {}: {e}", path.display()),
-            })?;
-        if read == 0 {
-            break;
+    // ── 1. the header, on its own ──
+    let mut header = [0u8; GGUF_HEADER_BYTES];
+    if let Err(e) = reader.read_exact_hashed(&mut header) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(invalid(format!(
+                "file is {} bytes; a GGUF header needs {GGUF_HEADER_BYTES}",
+                reader.consumed()
+            )));
         }
-        if header.len() < GGUF_HEADER_BYTES {
-            let wanted = (GGUF_HEADER_BYTES - header.len()).min(read);
-            header.extend_from_slice(&buffer[..wanted]);
-        }
-        hasher.update(&buffer[..read]);
-        total_bytes += read as u64;
+        return Err(unreadable(e));
     }
 
-    if header.len() < GGUF_HEADER_BYTES {
-        return Err(invalid(format!(
-            "file is {total_bytes} bytes; a GGUF header needs {GGUF_HEADER_BYTES}"
-        )));
-    }
     if header[..4] != GGUF_MAGIC {
         return Err(invalid(format!(
             "expected magic {:?}, found {:?}",
@@ -410,12 +454,6 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
             String::from_utf8_lossy(&header[..4])
         )));
     }
-
-    let field = |offset: usize| -> u64 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&header[offset..offset + 8]);
-        u64::from_le_bytes(bytes)
-    };
 
     let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     if !GGUF_SUPPORTED_VERSIONS.contains(&version) {
@@ -426,36 +464,446 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
         )));
     }
 
-    let tensor_count = field(8);
-    let metadata_kv_count = field(16);
-    if tensor_count > GGUF_MAX_DECLARED_COUNT || metadata_kv_count > GGUF_MAX_DECLARED_COUNT {
+    let field = |offset: usize| -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&header[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    };
+    let header = GgufHeader {
+        tensor_count: field(8),
+        metadata_kv_count: field(16),
+    };
+    if header.tensor_count > GGUF_MAX_DECLARED_COUNT
+        || header.metadata_kv_count > GGUF_MAX_DECLARED_COUNT
+    {
         return Err(invalid(format!(
-            "implausible header counts (tensors: {tensor_count}, metadata: \
-             {metadata_kv_count}); the file is probably not GGUF or is corrupt"
+            "implausible header counts (tensors: {}, metadata: {}); the file is \
+             probably not GGUF or is corrupt",
+            header.tensor_count, header.metadata_kv_count
         )));
     }
 
-    // A download cut short keeps its header intact, so the header alone cannot
-    // detect truncation. What can: the header *declares* how many tensors and
-    // metadata entries follow, and each of those has a minimum size. A file
-    // smaller than that floor is provably incomplete.
-    //
-    // This is a lower bound, not a parse — the real weights dwarf it. It catches
-    // the interrupted-download case without opening the format, which is the
-    // backend's job (roadmap P2).
-    let minimum_bytes = GGUF_HEADER_BYTES as u64
-        + metadata_kv_count.saturating_mul(GGUF_MIN_METADATA_ENTRY_BYTES)
-        + tensor_count.saturating_mul(GGUF_MIN_TENSOR_INFO_BYTES);
-    if total_bytes < minimum_bytes {
+    // ── 2. the descriptors, hashed as they are parsed ──
+    let layout = read_gguf_layout(&mut reader, &header);
+    if let LayoutOutcome::Truncated { at, wanted } = &layout {
         return Err(invalid(format!(
-            "file is {total_bytes} bytes but its header declares {tensor_count} tensor(s) \
-             and {metadata_kv_count} metadata entry/entries, which need at least \
-             {minimum_bytes} bytes — the download is incomplete"
+            "the file ends inside its own descriptors — {wanted} at byte {at}; the \
+             download is incomplete"
         )));
     }
 
-    let digest = hasher.finalize();
-    Ok(hex_encode(&digest))
+    // ── 3. the rest of the file, hashed ──
+    let (checksum, total_bytes) = reader.finish().map_err(unreadable)?;
+
+    match &layout {
+        LayoutOutcome::Parsed(parsed) => {
+            let required = parsed.data_start.saturating_add(parsed.min_data_bytes);
+            if total_bytes < required {
+                return Err(invalid(format!(
+                    "file is {total_bytes} bytes, but its {} tensor descriptor(s) place \
+                     data up to at least byte {required} (tensor data starts at \
+                     {}) — the download is incomplete",
+                    header.tensor_count, parsed.data_start
+                )));
+            }
+        }
+        LayoutOutcome::Unparsed(reason) => {
+            log::debug!(
+                "Could not verify the tensor layout of {} ({reason}); falling back to the \
+                 coarse size floor",
+                path.display()
+            );
+            // The counts still imply a minimum: each declared entry occupies at
+            // least its smallest possible encoding.
+            let minimum_bytes = GGUF_HEADER_BYTES as u64
+                + header
+                    .metadata_kv_count
+                    .saturating_mul(GGUF_MIN_METADATA_ENTRY_BYTES)
+                + header
+                    .tensor_count
+                    .saturating_mul(GGUF_MIN_TENSOR_INFO_BYTES);
+            if total_bytes < minimum_bytes {
+                return Err(invalid(format!(
+                    "file is {total_bytes} bytes but its header declares {} tensor(s) \
+                     and {} metadata entry/entries, which need at least \
+                     {minimum_bytes} bytes — the download is incomplete",
+                    header.tensor_count, header.metadata_kv_count
+                )));
+            }
+        }
+        LayoutOutcome::Truncated { .. } => unreachable!("returned above"),
+    }
+
+    Ok(checksum)
+}
+
+/// The counts a GGUF header declares.
+struct GgufHeader {
+    tensor_count: u64,
+    metadata_kv_count: u64,
+}
+
+/// Where the descriptors say the tensor data lives.
+struct GgufLayout {
+    /// First byte of the tensor data blob, after alignment padding.
+    data_start: u64,
+    /// Highest `tensor offset + lower bound on that tensor's size`, relative to
+    /// [`Self::data_start`].
+    min_data_bytes: u64,
+}
+
+/// Result of parsing the descriptor region.
+enum LayoutOutcome {
+    Parsed(GgufLayout),
+    /// The file ended mid-descriptor: provably incomplete.
+    Truncated {
+        at: u64,
+        wanted: &'static str,
+    },
+    /// Not parseable by this code. Says nothing about the file's validity.
+    Unparsed(String),
+}
+
+/// Parse the metadata and tensor descriptors, hashing every byte on the way
+/// through.
+///
+/// Reads strictly forward and never seeks, so the caller's single pass over the
+/// file is preserved.
+fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOutcome {
+    /// Longest string this parser will skip over. Tokenizer entries are short;
+    /// anything larger means the length was misread.
+    const MAX_STRING_BYTES: u64 = 1 << 26;
+    /// GGUF tensors have at most 4 dimensions; allow a little slack.
+    const MAX_TENSOR_DIMS: u32 = 8;
+    const ALIGNMENT_KEY: &[u8] = b"general.alignment";
+
+    macro_rules! read {
+        ($call:expr, $what:literal) => {
+            match $call {
+                Ok(value) => value,
+                Err(ReadError::Eof { at }) => return LayoutOutcome::Truncated { at, wanted: $what },
+                Err(ReadError::Io(e)) => {
+                    return LayoutOutcome::Unparsed(format!("read failed: {e}"))
+                }
+            }
+        };
+    }
+
+    let mut alignment = GGUF_DEFAULT_ALIGNMENT;
+
+    for index in 0..header.metadata_kv_count {
+        if reader.consumed() > GGUF_MAX_DESCRIPTOR_REGION_BYTES {
+            return LayoutOutcome::Unparsed(format!(
+                "metadata exceeds {GGUF_MAX_DESCRIPTOR_REGION_BYTES} bytes at entry {index}"
+            ));
+        }
+
+        let key_len = read!(reader.read_u64(), "a metadata key length");
+        if key_len > MAX_STRING_BYTES {
+            return LayoutOutcome::Unparsed(format!("metadata key {index} claims {key_len} bytes"));
+        }
+        // Keys are short enough to keep; the alignment is read from one of them.
+        let key = read!(reader.read_bytes(key_len), "a metadata key");
+        let value_type = read!(reader.read_u32(), "a metadata value type");
+
+        if key == ALIGNMENT_KEY && value_type == GgufValueType::UInt32 as u32 {
+            let declared = read!(reader.read_u32(), "the declared alignment") as u64;
+            // Padding is to a power of two; anything else means a misparse, and a
+            // zero would divide by zero below.
+            if declared.is_power_of_two() {
+                alignment = declared;
+            }
+            continue;
+        }
+
+        match skip_gguf_value(reader, value_type, 0) {
+            SkipOutcome::Done => {}
+            SkipOutcome::Truncated { at, wanted } => {
+                return LayoutOutcome::Truncated { at, wanted }
+            }
+            SkipOutcome::Unparsed(reason) => return LayoutOutcome::Unparsed(reason),
+        }
+    }
+
+    let mut min_data_bytes = 0u64;
+    for index in 0..header.tensor_count {
+        if reader.consumed() > GGUF_MAX_DESCRIPTOR_REGION_BYTES {
+            return LayoutOutcome::Unparsed(format!(
+                "tensor descriptors exceed {GGUF_MAX_DESCRIPTOR_REGION_BYTES} bytes at \
+                 tensor {index}"
+            ));
+        }
+
+        let name_len = read!(reader.read_u64(), "a tensor name length");
+        if name_len > MAX_STRING_BYTES {
+            return LayoutOutcome::Unparsed(format!("tensor {index} name claims {name_len} bytes"));
+        }
+        read!(reader.skip(name_len), "a tensor name");
+
+        let dim_count = read!(reader.read_u32(), "a tensor dimension count");
+        if dim_count > MAX_TENSOR_DIMS {
+            return LayoutOutcome::Unparsed(format!(
+                "tensor {index} claims {dim_count} dimensions"
+            ));
+        }
+        let mut elements = 1u64;
+        for _ in 0..dim_count {
+            let extent = read!(reader.read_u64(), "a tensor dimension");
+            elements = elements.saturating_mul(extent.max(1));
+        }
+        let _ggml_type = read!(reader.read_u32(), "a tensor type");
+        let offset = read!(reader.read_u64(), "a tensor data offset");
+
+        // One bit per element. Every ggml type stores more than that — the most
+        // aggressive quantizations in existence sit around 1.6 bits per weight —
+        // so this cannot over-reject, whatever type table a future model uses.
+        let floor = elements.div_ceil(8).max(1);
+        min_data_bytes = min_data_bytes.max(offset.saturating_add(floor));
+    }
+
+    let descriptors_end = reader.consumed();
+    // With no tensors there is no data blob, and therefore no padding before one:
+    // the descriptors are the whole file. (A stub with zero counts is exactly
+    // this, and demanding alignment padding it has no reason to carry would
+    // reject it.)
+    let data_start = if header.tensor_count == 0 {
+        descriptors_end
+    } else {
+        descriptors_end.next_multiple_of(alignment)
+    };
+
+    LayoutOutcome::Parsed(GgufLayout {
+        data_start,
+        min_data_bytes,
+    })
+}
+
+/// GGUF metadata value types, in spec order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum GgufValueType {
+    UInt8 = 0,
+    Int8 = 1,
+    UInt16 = 2,
+    Int16 = 3,
+    UInt32 = 4,
+    Int32 = 5,
+    Float32 = 6,
+    Bool = 7,
+    String = 8,
+    Array = 9,
+    UInt64 = 10,
+    Int64 = 11,
+    Float64 = 12,
+}
+
+impl GgufValueType {
+    fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0 => Self::UInt8,
+            1 => Self::Int8,
+            2 => Self::UInt16,
+            3 => Self::Int16,
+            4 => Self::UInt32,
+            5 => Self::Int32,
+            6 => Self::Float32,
+            7 => Self::Bool,
+            8 => Self::String,
+            9 => Self::Array,
+            10 => Self::UInt64,
+            11 => Self::Int64,
+            12 => Self::Float64,
+            _ => return None,
+        })
+    }
+
+    /// Fixed encoded width, or `None` for the variable-length types.
+    fn fixed_width(self) -> Option<u64> {
+        Some(match self {
+            Self::UInt8 | Self::Int8 | Self::Bool => 1,
+            Self::UInt16 | Self::Int16 => 2,
+            Self::UInt32 | Self::Int32 | Self::Float32 => 4,
+            Self::UInt64 | Self::Int64 | Self::Float64 => 8,
+            Self::String | Self::Array => return None,
+        })
+    }
+}
+
+/// Result of skipping one metadata value.
+enum SkipOutcome {
+    Done,
+    Truncated { at: u64, wanted: &'static str },
+    Unparsed(String),
+}
+
+/// Skip one metadata value, whatever its type.
+///
+/// `depth` guards the array-of-arrays case: the spec permits nesting, and a
+/// corrupt file could describe it without end.
+fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> SkipOutcome {
+    const MAX_NESTING: u32 = 4;
+    const MAX_ARRAY_LEN: u64 = 1 << 28;
+
+    if depth > MAX_NESTING {
+        return SkipOutcome::Unparsed(format!("metadata arrays nested deeper than {MAX_NESTING}"));
+    }
+
+    let Some(value_type) = GgufValueType::from_raw(raw_type) else {
+        // A type this parser does not know. Later bytes cannot be located, so the
+        // structural check is abandoned rather than the file condemned.
+        return SkipOutcome::Unparsed(format!("unknown metadata value type {raw_type}"));
+    };
+
+    macro_rules! read {
+        ($call:expr, $what:literal) => {
+            match $call {
+                Ok(value) => value,
+                Err(ReadError::Eof { at }) => return SkipOutcome::Truncated { at, wanted: $what },
+                Err(ReadError::Io(e)) => return SkipOutcome::Unparsed(format!("read failed: {e}")),
+            }
+        };
+    }
+
+    if let Some(width) = value_type.fixed_width() {
+        read!(reader.skip(width), "a metadata value");
+        return SkipOutcome::Done;
+    }
+
+    match value_type {
+        GgufValueType::String => {
+            let len = read!(reader.read_u64(), "a metadata string length");
+            read!(reader.skip(len), "a metadata string");
+            SkipOutcome::Done
+        }
+        GgufValueType::Array => {
+            let element_type = read!(reader.read_u32(), "a metadata array element type");
+            let count = read!(reader.read_u64(), "a metadata array length");
+            if count > MAX_ARRAY_LEN {
+                return SkipOutcome::Unparsed(format!("metadata array claims {count} elements"));
+            }
+
+            // Fixed-width elements are one arithmetic skip rather than `count`
+            // round trips: a tokenizer's token-type array has ~150k entries.
+            if let Some(width) = GgufValueType::from_raw(element_type).and_then(|t| t.fixed_width())
+            {
+                read!(
+                    reader.skip(count.saturating_mul(width)),
+                    "a metadata array body"
+                );
+                return SkipOutcome::Done;
+            }
+
+            for _ in 0..count {
+                match skip_gguf_value(reader, element_type, depth + 1) {
+                    SkipOutcome::Done => {}
+                    other => return other,
+                }
+            }
+            SkipOutcome::Done
+        }
+        _ => unreachable!("every other type has a fixed width"),
+    }
+}
+
+/// A read failure, distinguishing "the file ended" from "the read failed".
+///
+/// The difference decides whether a model is rejected: hitting EOF inside a
+/// structure the file itself declared is proof of truncation, whereas an I/O
+/// error is a fact about the disk.
+enum ReadError {
+    Eof { at: u64 },
+    Io(std::io::Error),
+}
+
+/// Buffered forward reader that hashes everything it passes over.
+///
+/// The point is the single pass: validating and checksumming a model that may be
+/// hundreds of megabytes must not read it twice.
+struct HashingReader {
+    inner: std::io::BufReader<std::fs::File>,
+    hasher: sha2::Sha256,
+    consumed: u64,
+}
+
+impl HashingReader {
+    fn new(file: std::fs::File) -> Self {
+        use sha2::Digest;
+        Self {
+            inner: std::io::BufReader::with_capacity(HASH_BUFFER_BYTES, file),
+            hasher: sha2::Sha256::new(),
+            consumed: 0,
+        }
+    }
+
+    /// Bytes read — and therefore hashed — so far.
+    fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    fn read_exact_hashed(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        use sha2::Digest;
+        self.inner.read_exact(buf)?;
+        self.hasher.update(&*buf);
+        self.consumed += buf.len() as u64;
+        Ok(())
+    }
+
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
+        match self.read_exact_hashed(buf) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(ReadError::Eof { at: self.consumed })
+            }
+            Err(e) => Err(ReadError::Io(e)),
+        }
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ReadError> {
+        let mut bytes = [0u8; 4];
+        self.fill(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ReadError> {
+        let mut bytes = [0u8; 8];
+        self.fill(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Read `len` bytes and return them. For short fields only — the caller
+    /// bounds `len` first.
+    fn read_bytes(&mut self, len: u64) -> Result<Vec<u8>, ReadError> {
+        let mut bytes = vec![0u8; len as usize];
+        self.fill(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Skip `len` bytes, hashing them.
+    fn skip(&mut self, mut len: u64) -> Result<(), ReadError> {
+        const CHUNK: usize = 64 << 10;
+        let mut scratch = vec![0u8; (len.min(CHUNK as u64)) as usize];
+        while len > 0 {
+            let wanted = len.min(scratch.len() as u64) as usize;
+            self.fill(&mut scratch[..wanted])?;
+            len -= wanted as u64;
+        }
+        Ok(())
+    }
+
+    /// Hash whatever is left and return the digest with the total byte count.
+    fn finish(mut self) -> std::io::Result<(String, u64)> {
+        use sha2::Digest;
+        let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+        loop {
+            let read = self.inner.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            self.hasher.update(&buffer[..read]);
+            self.consumed += read as u64;
+        }
+        Ok((hex_encode(&self.hasher.finalize()), self.consumed))
+    }
 }
 
 /// Lower-case hex encoding.
@@ -760,6 +1208,131 @@ mod tests {
         assert!(validate_and_checksum_gguf(&model).is_ok());
     }
 
+    /// Build a structurally valid GGUF: header, three metadata entries covering
+    /// the variable-length types (a string, an array of strings, a `u32`), one
+    /// tensor descriptor, alignment padding, then `data_bytes` of tensor data.
+    ///
+    /// The point is a file that satisfies the coarse size floor while its own
+    /// descriptors say it is incomplete — which is the case a floor cannot catch.
+    fn gguf_with_one_tensor(dims: &[u64], data_bytes: usize) -> Vec<u8> {
+        fn push_string(bytes: &mut Vec<u8>, value: &str) {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&3u64.to_le_bytes()); // metadata_kv_count
+
+        // A plain string value.
+        push_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // String
+        push_string(&mut bytes, "bert");
+
+        // An array of strings — the shape a tokenizer vocabulary takes.
+        push_string(&mut bytes, "tokenizer.ggml.tokens");
+        bytes.extend_from_slice(&9u32.to_le_bytes()); // Array
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // of String
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // two of them
+        push_string(&mut bytes, "אלף");
+        push_string(&mut bytes, "בית");
+
+        // The alignment the padding below uses.
+        push_string(&mut bytes, "general.alignment");
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // UInt32
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+
+        // One tensor at offset 0 of the data blob.
+        push_string(&mut bytes, "blk.0.attn_q.weight");
+        bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for extent in dims {
+            bytes.extend_from_slice(&extent.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // ggml type
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // offset
+
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes.resize(bytes.len() + data_bytes, 0);
+        bytes
+    }
+
+    /// The case a size floor cannot see: the descriptors are all there, and the
+    /// weights they describe are not. A download interrupted after the tensor
+    /// table looks perfectly well-formed until its own numbers are checked.
+    #[test]
+    fn a_download_cut_off_inside_the_weights_is_rejected() {
+        let dir = TempDir::new("truncated_weights");
+        let model = dir.path().join("cut_short.gguf");
+
+        // 1024×1024 elements need at least 131072 bytes at one bit each. This file
+        // carries a token amount of data and would sail past any floor derived
+        // from the header counts alone (one tensor, three metadata entries).
+        std::fs::write(&model, gguf_with_one_tensor(&[1024, 1024], 1_024)).unwrap();
+        match validate_and_checksum_gguf(&model) {
+            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
+                assert!(reason.contains("incomplete"), "unhelpful reason: {reason}");
+            }
+            other => panic!("a download cut off inside the weights must be rejected: {other:?}"),
+        }
+
+        // With the data present it is accepted, so the bound is not simply
+        // rejecting everything.
+        std::fs::write(&model, gguf_with_one_tensor(&[1024, 1024], 131_072)).unwrap();
+        assert!(
+            validate_and_checksum_gguf(&model).is_ok(),
+            "a file that holds what its descriptors describe must be accepted"
+        );
+    }
+
+    /// The lower bound must be genuinely below every real quantization, or it
+    /// rejects valid models. One bit per element is; the file above carries
+    /// exactly that much and passes, and one byte less does not.
+    #[test]
+    fn the_size_bound_is_exactly_one_bit_per_element() {
+        let dir = TempDir::new("bound_boundary");
+        let model = dir.path().join("boundary.gguf");
+        let elements = 8_192u64;
+        let floor = elements as usize / 8;
+
+        std::fs::write(&model, gguf_with_one_tensor(&[elements], floor)).unwrap();
+        assert!(validate_and_checksum_gguf(&model).is_ok());
+
+        std::fs::write(&model, gguf_with_one_tensor(&[elements], floor - 1)).unwrap();
+        assert!(matches!(
+            validate_and_checksum_gguf(&model),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+    }
+
+    /// A metadata type this parser does not know is a gap in the parser, not a
+    /// fault in the file. It must fall back to the coarse floor rather than
+    /// condemn a model it merely failed to read.
+    #[test]
+    fn an_unknown_metadata_type_is_not_treated_as_corruption() {
+        let dir = TempDir::new("future_metadata");
+        let model = dir.path().join("future.gguf");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no tensors
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one metadata entry
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        bytes.extend_from_slice(b"what");
+        bytes.extend_from_slice(&9999u32.to_le_bytes()); // a type from the future
+        bytes.resize(256, 0);
+        std::fs::write(&model, &bytes).unwrap();
+
+        assert!(
+            validate_and_checksum_gguf(&model).is_ok(),
+            "an unparseable descriptor region must not reject the model"
+        );
+    }
+
     #[test]
     fn load_computes_model_checksum_and_detects_a_changed_file() {
         let dir = TempDir::new("checksum");
@@ -912,6 +1485,31 @@ mod tests {
                 "{name} must be rejected, got {result:?}"
             );
         }
+    }
+
+    /// The one vector on the boundary. With `<` on one side and `>` on the other
+    /// it was neither rejected nor normalized, and went into the index scoring as
+    /// its own magnitude instead of as a cosine.
+    #[test]
+    fn a_vector_exactly_at_the_minimum_norm_is_rejected() {
+        let mut boundary = vec![MIN_VECTOR_NORM, 0.0, 0.0, 0.0];
+        assert_eq!(
+            boundary.iter().map(|x| x * x).sum::<f32>().sqrt(),
+            MIN_VECTOR_NORM,
+            "the fixture must sit exactly on the threshold for this to mean anything"
+        );
+
+        let result = normalize_validated(&mut boundary, 4);
+        assert!(
+            matches!(result, Err(EmbeddingError::InferenceFailed { .. })),
+            "a vector at the threshold must be rejected, not stored unnormalized: \
+             {result:?}"
+        );
+
+        // Just above it, normalization happens and the result is a unit vector.
+        let mut above = vec![MIN_VECTOR_NORM * 1_000.0, 0.0, 0.0, 0.0];
+        normalize_validated(&mut above, 4).unwrap();
+        assert!((above[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

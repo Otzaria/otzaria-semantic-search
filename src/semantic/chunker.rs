@@ -89,7 +89,7 @@ impl Chunker {
                 anchor_text: line.text.clone(),
                 embedding_text: truncated_text,
                 chunk_hash,
-                content_hash: book.content_hash,
+                content_hash: book.content_fingerprint,
                 reference: line.reference.clone(),
                 segment: line.segment,
                 is_pdf: book.is_pdf,
@@ -182,7 +182,7 @@ mod tests {
         BookForIndexing {
             source_book_key: "book1.txt".to_string(),
             title: "Test".to_string(),
-            content_hash: 100,
+            content_fingerprint: 100,
             is_pdf: false,
             topics: String::new(),
             extra_facets: vec![],
@@ -364,18 +364,20 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         let chunk = &chunks[0];
         assert_eq!(chunk.title, "ספר הבדיקה");
+        // Sorted: the order of facets carries no meaning, and canonicalizing it
+        // is what keeps two descriptions of the same book fingerprinting alike.
         assert_eq!(
             chunk.facets,
             vec![
-                "/מקרא/תורה".to_string(),
                 "/author/מחבר ראשון".to_string(),
                 "/author/מחבר שני".to_string(),
+                "/מקרא/תורה".to_string(),
             ],
             "every facet of the book must reach the chunk, including both authors"
         );
         assert!(chunk.is_pdf);
         assert_eq!(chunk.section_id, 7);
-        assert_eq!(chunk.content_hash, book.content_hash);
+        assert_eq!(chunk.content_hash, book.content_fingerprint);
         assert_eq!(chunk.source_book_key, book.source_book_key);
         assert_eq!(chunk.source_doc_key, "book1.txt:1");
     }

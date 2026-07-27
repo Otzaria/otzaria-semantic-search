@@ -16,13 +16,21 @@
 //!
 //! The manifest is written to a `.tmp` file which is `fsync`ed and then renamed
 //! over the target. A crash therefore leaves either the previous manifest or the
-//! new one, never a half-written file.
+//! new one, never a half-written file — and [`SemanticManifest::load`] recovers
+//! the leftovers a crash mid-`save` can strand. Durability of the rename itself
+//! is enforced on Unix and best-effort elsewhere; [`SemanticManifest::save`]
+//! documents exactly which.
+//!
+//! Writing it is not cheap — the whole document is serialized every time — so a
+//! bulk index commits at checkpoints rather than per book. See
+//! [`SemanticEngine::index_book_deferred`](crate::semantic::engine::SemanticEngine::index_book_deferred).
 
 use crate::errors::ManifestError;
 use crate::semantic::types::ContentFingerprint;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 /// Current manifest format version. Bump when the schema changes.
@@ -81,6 +89,16 @@ pub struct SemanticManifest {
     // ── Per-book tracking ──
     /// Per-book indexing records, keyed by `source_book_key` (file path).
     pub books: HashMap<String, BookManifestEntry>,
+
+    /// How many times this instance has been written to disk.
+    ///
+    /// Not part of the format — `serde(skip)` — and not a statistic. Writing the
+    /// manifest costs a full serialize plus an `fsync`, so "how many times did
+    /// that happen" is a correctness property of the indexing loop, and the only
+    /// way to assert it is to count. See
+    /// [`SemanticManifest::save_count`].
+    #[serde(skip)]
+    saves: u32,
 }
 
 /// Per-book entry in the manifest.
@@ -94,16 +112,20 @@ pub struct SemanticManifest {
 pub struct BookManifestEntry {
     /// Stable book identifier (file path).
     pub source_book_key: String,
-    /// Content hash at the time of indexing (matches Tantivy contentHash).
+    /// The raw fingerprint the caller vouched for at indexing time — the lexical
+    /// `contentHash` for a text book, whatever
+    /// [`ContentFingerprint::canonical`] produced for a PDF.
     ///
-    /// `0` means the lexical index had no fingerprint to give — see
-    /// [`ContentFingerprint`]. For those books `line_fingerprint` is what decides
-    /// whether anything changed.
+    /// `0` means there was none, in which case `line_fingerprint` is the only
+    /// thing that can decide whether anything changed.
     pub content_hash: u64,
-    /// Fingerprint computed by this crate from the book's own lines.
+    /// Fingerprint computed by this crate from the book itself — its lines and the
+    /// metadata stored in every vector.
     ///
-    /// The only way to tell whether a PDF changed, since its `content_hash` is
-    /// always `0`.
+    /// What settles a book whose `content_hash` could not prove it was current:
+    /// one recorded as `0`, or one whose fingerprint covers the content but not
+    /// the metadata. See
+    /// [`BookForIndexing::line_fingerprint`](crate::semantic::types::BookForIndexing::line_fingerprint).
     pub line_fingerprint: u64,
     /// Number of semantic chunks generated for this book. `0` is a valid,
     /// deliberate value — see the type-level note.
@@ -155,7 +177,16 @@ impl SemanticManifest {
             created_at: now,
             updated_at: now,
             books: HashMap::new(),
+            saves: 0,
         }
+    }
+
+    /// How many times this instance has written itself to disk.
+    ///
+    /// Resets to zero when a manifest is loaded, since the counter describes this
+    /// process's writes rather than the file's history.
+    pub fn save_count(&self) -> u32 {
+        self.saves
     }
 
     /// Load a manifest from the given directory.
@@ -169,31 +200,50 @@ impl SemanticManifest {
     pub fn load(dir: &Path) -> Result<Self, ManifestError> {
         let path = Self::file_path(dir);
         if !path.exists() {
-            // A crash inside `save`'s fallback window can leave the manifest
-            // parked under `.previous` with no target. Recovering it here is what
-            // makes the "previous or new, never none" guarantee hold: without
-            // this the state would read as a first run and the whole index would
-            // be silently rebuilt.
-            let parked = Self::previous_path(dir);
-            if parked.exists() {
-                log::warn!(
-                    "No manifest at {}, but a parked copy exists at {}; a previous save was \
-                     interrupted. Recovering it.",
-                    path.display(),
-                    parked.display()
-                );
-                std::fs::rename(&parked, &path).map_err(|e| ManifestError::WriteFailed {
-                    reason: format!(
-                        "Failed to recover the parked manifest {} to {}: {e}",
-                        parked.display(),
-                        path.display()
-                    ),
-                })?;
-            } else {
+            // A crash inside `save` can leave the manifest somewhere other than
+            // its own name. Recovering it is what makes the "previous or new,
+            // never none" guarantee hold: without this the state reads as a first
+            // run and the whole index is silently rebuilt.
+            //
+            // Order matters. `.previous` is a manifest that was *already* in
+            // service, so it is preferred over `.tmp`, which was only ever a
+            // candidate. `.tmp` is still worth having: `save` `fsync`s it before
+            // renaming, so one that outlived a crash is a complete document, and a
+            // partial one fails to parse below and is discarded.
+            let candidates = [Self::previous_path(dir), Self::tmp_path(dir)];
+            let recovered = candidates
+                .iter()
+                .find(|candidate| Self::is_recoverable(candidate));
+
+            let Some(recovered) = recovered else {
+                for unusable in candidates.iter().filter(|c| c.exists()) {
+                    // Left where it is — this path deletes no evidence — but not
+                    // silently: a leftover nobody mentions is a leftover nobody
+                    // investigates.
+                    log::warn!(
+                        "Ignoring {}: it is not a readable manifest of format version \
+                         {MANIFEST_FORMAT_VERSION}",
+                        unusable.display()
+                    );
+                }
                 return Err(ManifestError::NotFound {
                     path: path.display().to_string(),
                 });
-            }
+            };
+
+            log::warn!(
+                "No manifest at {}, but a usable copy exists at {}; a previous save was \
+                 interrupted. Recovering it.",
+                path.display(),
+                recovered.display()
+            );
+            std::fs::rename(recovered, &path).map_err(|e| ManifestError::WriteFailed {
+                reason: format!(
+                    "Failed to recover the manifest {} to {}: {e}",
+                    recovered.display(),
+                    path.display()
+                ),
+            })?;
         }
 
         let content = std::fs::read_to_string(&path).map_err(|e| ManifestError::ParseFailed {
@@ -220,18 +270,30 @@ impl SemanticManifest {
 
     /// Save the manifest to the given directory.
     ///
-    /// Atomic and durable: the payload is written to a temp file, `fsync`ed, then
-    /// renamed over the target, and the directory entry is `fsync`ed too. A power
-    /// loss at any point leaves a readable manifest — the previous one or the new
-    /// one, never a partial file and never none.
+    /// Atomic: the payload is written to a temp file, `fsync`ed, then renamed over
+    /// the target. A crash at any point leaves a readable manifest — the previous
+    /// one, the new one, or a recoverable copy [`Self::load`] knows how to find —
+    /// never a partial file and never none.
+    ///
+    /// Durable, with one platform caveat. The rename itself only becomes durable
+    /// once the *directory* entry is flushed, and that is not uniformly possible:
+    ///
+    /// * On Unix the directory is opened and `fsync`ed, and a failure fails the
+    ///   save. Returning `Ok` from it would be a lie — the caller would record
+    ///   progress that a power loss can still undo.
+    /// * On other platforms (Windows has no directory `fsync`) the rename is left
+    ///   as the filesystem's own guarantee. `save` returning `Ok` there means the
+    ///   data reached the disk and the rename was issued, not that the rename
+    ///   survives a power loss.
     ///
     /// The `.previous` file that appears if a rename has to be retried is part of
-    /// that guarantee, not debris: see the fallback below.
+    /// the atomicity guarantee, not debris: see the fallback below.
     pub fn save(&mut self, dir: &Path) -> Result<(), ManifestError> {
         self.updated_at = current_unix_timestamp();
+        self.saves = self.saves.saturating_add(1);
 
         let target = Self::file_path(dir);
-        let tmp = dir.join(format!("{MANIFEST_FILENAME}.tmp"));
+        let tmp = Self::tmp_path(dir);
 
         std::fs::create_dir_all(dir).map_err(|e| ManifestError::WriteFailed {
             reason: format!("Failed to create manifest directory: {e}"),
@@ -259,7 +321,7 @@ impl SemanticManifest {
         }
 
         let mut parked: Option<PathBuf> = None;
-        if let Err(first) = std::fs::rename(&tmp, &target) {
+        if let Err(first) = rename(&tmp, &target) {
             // `rename` replaces an existing file on both Unix and Windows, but a
             // Windows file lock (search indexer, antivirus, another handle) can
             // still deny it.
@@ -272,16 +334,16 @@ impl SemanticManifest {
             let previous = Self::previous_path(dir);
             let _ = std::fs::remove_file(&previous);
 
-            if std::fs::rename(&target, &previous).is_ok() {
+            if rename(&target, &previous).is_ok() {
                 parked = Some(previous.clone());
             }
 
-            if let Err(second) = std::fs::rename(&tmp, &target) {
+            if let Err(second) = rename(&tmp, &target) {
                 // Put the old manifest back rather than leaving the directory
                 // without one. If even that fails the parked copy stays where it
                 // is, which is exactly what `load` knows how to recover.
                 if let Some(previous) = &parked {
-                    if let Err(restore) = std::fs::rename(previous, &target) {
+                    if let Err(restore) = rename(previous, &target) {
                         log::error!(
                             "Could not restore the parked manifest {} to {} ({restore}); it \
                              stays parked and will be recovered on the next open",
@@ -300,32 +362,16 @@ impl SemanticManifest {
         }
 
         // The rename is only durable once the directory entry itself is flushed;
-        // otherwise a power loss can resurrect the old name. Best-effort: not
-        // every platform allows opening a directory for this, and failing the save
-        // over it would be worse than the residual risk — but it must happen
+        // otherwise a power loss can resurrect the old name. This must happen
         // *before* the parked copy is discarded, so a crash in between still
         // leaves something recoverable.
-        match std::fs::File::open(dir) {
-            Ok(handle) => {
-                if let Err(e) = handle.sync_all() {
-                    log::warn!(
-                        "Could not flush the directory entry for {} ({e}); the manifest \
-                         rename may not survive a power loss",
-                        target.display()
-                    );
-                }
-            }
-            Err(e) => log::warn!(
-                "Could not open {} to flush its directory entry ({e}); the manifest rename \
-                 may not survive a power loss",
-                dir.display()
-            ),
-        }
+        let durable = sync_directory(dir);
 
         if let Some(previous) = parked {
             let _ = std::fs::remove_file(previous);
         }
 
+        durable?;
         log::debug!("Manifest saved to {}", target.display());
         Ok(())
     }
@@ -333,6 +379,25 @@ impl SemanticManifest {
     /// Path of the parked copy used by [`Self::save`]'s fallback.
     pub fn previous_path(dir: &Path) -> PathBuf {
         dir.join(format!("{MANIFEST_FILENAME}.{MANIFEST_PREVIOUS_SUFFIX}"))
+    }
+
+    /// Path of the temp file [`Self::save`] writes before renaming.
+    pub fn tmp_path(dir: &Path) -> PathBuf {
+        dir.join(format!("{MANIFEST_FILENAME}.tmp"))
+    }
+
+    /// Whether a leftover file is a manifest worth recovering.
+    ///
+    /// Parses it and checks the format version, so a half-written temp file or one
+    /// from another schema is passed over rather than promoted into place.
+    fn is_recoverable(candidate: &Path) -> bool {
+        let Ok(content) = std::fs::read_to_string(candidate) else {
+            return false;
+        };
+        match serde_json::from_str::<FormatVersionProbe>(&content) {
+            Ok(probe) => probe.format_version == MANIFEST_FORMAT_VERSION,
+            Err(_) => false,
+        }
     }
 
     /// Move an unusable manifest aside so a fresh one can be written without
@@ -462,8 +527,11 @@ impl SemanticManifest {
     /// What, if anything, a book needs — from the lexical fingerprint alone.
     ///
     /// This is the decision available at diff time, before the book's lines have
-    /// been loaded. A book whose fingerprint cannot prove anything reports
-    /// [`BookIndexNeed::Unverifiable`] rather than being assumed current.
+    /// been loaded. A book whose fingerprint cannot prove everything reports
+    /// [`BookIndexNeed::Unverifiable`] rather than being assumed current: only a
+    /// [`ContentFingerprint::Canonical`] match reaches
+    /// [`BookIndexNeed::UpToDate`], because only that kind of fingerprint moves
+    /// when the metadata stored in the vectors changes.
     pub fn book_index_need(
         &self,
         source_book_key: &str,
@@ -481,11 +549,28 @@ impl SemanticManifest {
             return BookIndexNeed::Changed;
         }
 
+        // A stored `0` is the "no fingerprint" marker, so it can never equal an
+        // incoming hash. Belt and braces: `ContentFingerprint` already carries a
+        // `NonZeroU64`, but this entry was deserialized from disk and the guard
+        // costs nothing.
+        let recorded = match NonZeroU64::new(entry.content_hash) {
+            Some(recorded) => recorded,
+            None => return BookIndexNeed::Unverifiable,
+        };
+
         match fingerprint {
-            ContentFingerprint::Hash(hash) if entry.content_hash == hash => BookIndexNeed::UpToDate,
-            ContentFingerprint::Hash(_) => BookIndexNeed::Changed,
-            // The lexical index cannot vouch for this content (a PDF). Only the
-            // lines themselves can settle it.
+            ContentFingerprint::Canonical(hash) if recorded == hash => BookIndexNeed::UpToDate,
+            // The text is provably unchanged, but this fingerprint says nothing
+            // about title, category or facets — all of which are stored in the
+            // vectors. The lines have to settle it.
+            ContentFingerprint::ContentOnly(hash) if recorded == hash => {
+                BookIndexNeed::Unverifiable
+            }
+            ContentFingerprint::Canonical(_) | ContentFingerprint::ContentOnly(_) => {
+                BookIndexNeed::Changed
+            }
+            // Nothing to compare (a PDF whose caller has no signature of its
+            // own). Only the lines themselves can settle it.
             ContentFingerprint::Unverifiable => BookIndexNeed::Unverifiable,
         }
     }
@@ -726,6 +811,109 @@ pub fn describe_mismatches(mismatches: &[ManifestMismatch]) -> String {
         .join("; ")
 }
 
+/// Flush the directory entry so a rename inside it survives a power loss.
+///
+/// Unix only. Windows has no equivalent — a directory cannot be opened as a file
+/// there — so the rename is left as the filesystem's own guarantee rather than
+/// pretending to a durability the platform does not offer. On Unix a failure is
+/// returned: silently downgrading to "probably durable" is what makes a crash
+/// surprising later.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> Result<(), ManifestError> {
+    #[cfg(test)]
+    if failpoints::next_dir_sync_fails() {
+        return Err(ManifestError::WriteFailed {
+            reason: format!(
+                "injected directory sync failure for {} (manifest failpoint)",
+                dir.display()
+            ),
+        });
+    }
+
+    let handle = std::fs::File::open(dir).map_err(|e| ManifestError::WriteFailed {
+        reason: format!(
+            "Failed to open {} to flush its directory entry: {e}",
+            dir.display()
+        ),
+    })?;
+    handle.sync_all().map_err(|e| ManifestError::WriteFailed {
+        reason: format!(
+            "Failed to flush the directory entry for {}: {e}",
+            dir.display()
+        ),
+    })
+}
+
+/// See the Unix implementation. Nothing to do here; documented, not silent.
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> Result<(), ManifestError> {
+    Ok(())
+}
+
+/// `std::fs::rename`, with a test-only failure injection point.
+///
+/// [`SemanticManifest::save`]'s fallback exists for a Windows file lock denying a
+/// rename, which is not a state a test can reach by arranging files on disk. The
+/// alternative to injecting it is an untested recovery path — and an untested
+/// recovery path is the one that does not work when it is finally needed.
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if failpoints::next_rename_fails() {
+        return Err(std::io::Error::other(
+            "injected rename failure (manifest failpoint)",
+        ));
+    }
+    std::fs::rename(from, to)
+}
+
+/// Failure injection for the save paths that cannot be reached otherwise.
+///
+/// A schedule rather than a count, because the interesting case is not "renames
+/// fail" but "*this* rename fails": the restore path only runs when the retry
+/// fails **after** the old manifest was parked, which is the first and third
+/// rename failing while the second succeeds.
+#[cfg(test)]
+mod failpoints {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Pending outcomes for the next renames, consumed front to back.
+        /// Thread-local, so a test using it cannot disturb tests running in
+        /// parallel.
+        static RENAME_SCHEDULE: RefCell<std::collections::VecDeque<bool>> =
+            const { RefCell::new(std::collections::VecDeque::new()) };
+        /// Pending outcomes for the next directory syncs.
+        static DIR_SYNC_SCHEDULE: RefCell<std::collections::VecDeque<bool>> =
+            const { RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    /// Schedule which of the next renames fail: `[true, false, true]` fails the
+    /// first, lets the second through, fails the third.
+    pub fn schedule_rename_failures(schedule: &[bool]) {
+        RENAME_SCHEDULE.with(|queue| *queue.borrow_mut() = schedule.iter().copied().collect());
+    }
+
+    /// Schedule which of the next directory syncs fail.
+    pub fn schedule_dir_sync_failures(schedule: &[bool]) {
+        DIR_SYNC_SCHEDULE.with(|queue| *queue.borrow_mut() = schedule.iter().copied().collect());
+    }
+
+    pub fn next_rename_fails() -> bool {
+        RENAME_SCHEDULE.with(|queue| queue.borrow_mut().pop_front().unwrap_or(false))
+    }
+
+    pub fn next_dir_sync_fails() -> bool {
+        DIR_SYNC_SCHEDULE.with(|queue| queue.borrow_mut().pop_front().unwrap_or(false))
+    }
+
+    /// Drop any unconsumed schedule, so one test cannot leak into the next on the
+    /// same thread.
+    pub fn reset() {
+        schedule_rename_failures(&[]);
+        schedule_dir_sync_failures(&[]);
+    }
+}
+
 /// Get current Unix timestamp in seconds.
 fn current_unix_timestamp() -> u64 {
     std::time::SystemTime::now()
@@ -959,8 +1147,9 @@ mod tests {
         }
     }
 
+    /// A canonical fingerprint, the kind that can reach "up to date".
     fn hash(value: u64) -> ContentFingerprint {
-        ContentFingerprint::Hash(value)
+        ContentFingerprint::from_lexical_hash(value)
     }
 
     #[test]
@@ -1031,6 +1220,70 @@ mod tests {
             manifest.book_index_need("scan.pdf", ContentFingerprint::Unverifiable, 2, 1),
             BookIndexNeed::Changed
         );
+    }
+
+    /// A fingerprint that covers the content and nothing else cannot license a
+    /// skip. Renaming a book or correcting its author changes what every one of
+    /// its vectors carries while leaving the file's bytes — and therefore a
+    /// size/mtime signature — identical.
+    #[test]
+    fn a_content_only_fingerprint_never_reaches_up_to_date() {
+        let config = test_config();
+        let mut manifest = SemanticManifest::new(&config);
+        let signature = 0xBEEF_CAFE;
+        manifest.mark_book_indexed("scan.pdf".to_string(), signature, 777, 12, 1, 1);
+
+        assert_eq!(
+            manifest.book_index_need(
+                "scan.pdf",
+                ContentFingerprint::content_only(signature),
+                1,
+                1
+            ),
+            BookIndexNeed::Unverifiable,
+            "the text is provably unchanged; the metadata is not, so the lines decide"
+        );
+
+        // A different signature is a different matter: the content really did
+        // change, and that is known rather than merely unproven.
+        assert_eq!(
+            manifest.book_index_need("scan.pdf", ContentFingerprint::content_only(999), 1, 1),
+            BookIndexNeed::Changed
+        );
+
+        // The canonical form is what reaches "nothing to do".
+        assert_eq!(
+            manifest.book_index_need(
+                "scan.pdf",
+                ContentFingerprint::from_lexical_hash(signature),
+                1,
+                1
+            ),
+            BookIndexNeed::UpToDate
+        );
+    }
+
+    /// A recorded `0` is the "no fingerprint" marker. Nothing may ever match it —
+    /// including a caller that somehow presents zero as a hash, which the type
+    /// makes impossible and this checks anyway, because the record came off disk.
+    #[test]
+    fn a_recorded_zero_fingerprint_matches_nothing() {
+        let config = test_config();
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("scan.pdf".to_string(), 0, 777, 12, 1, 1);
+
+        for fingerprint in [
+            ContentFingerprint::from_lexical_hash(0),
+            ContentFingerprint::content_only(0),
+            ContentFingerprint::from_lexical_hash(1),
+            ContentFingerprint::canonical(1, "כותרת", "/מקרא", &[], true),
+        ] {
+            assert_ne!(
+                manifest.book_index_need("scan.pdf", fingerprint, 1, 1),
+                BookIndexNeed::UpToDate,
+                "{fingerprint:?} must not match a record that has no fingerprint"
+            );
+        }
     }
 
     /// A book that yielded nothing embeddable must stay recorded, or every
@@ -1283,6 +1536,196 @@ mod tests {
         assert_eq!(SemanticManifest::load(dir.path()).unwrap().book_count(), 1);
     }
 
+    /// A `.tmp` that outlived a crash is a complete manifest: `save` `fsync`s it
+    /// before renaming. With nothing else on disk it is better than declaring a
+    /// first run and silently rebuilding the whole index.
+    #[test]
+    fn a_temp_file_left_by_an_interrupted_save_is_recovered() {
+        let dir = TempDir::new("tmp_recovery");
+        let mut manifest = SemanticManifest::new(&test_config());
+        manifest.mark_book_indexed("book_a".to_string(), 12345, 777, 100, 1, 1);
+        manifest.save(dir.path()).unwrap();
+
+        // The crash window: the payload is written and flushed, the rename never
+        // happened.
+        std::fs::rename(
+            SemanticManifest::file_path(dir.path()),
+            SemanticManifest::tmp_path(dir.path()),
+        )
+        .unwrap();
+
+        let recovered = SemanticManifest::load(dir.path())
+            .expect("a flushed temp file must be recovered, not treated as a first run");
+        assert_eq!(recovered.book_count(), 1);
+        assert!(SemanticManifest::file_path(dir.path()).exists());
+        assert!(!SemanticManifest::tmp_path(dir.path()).exists());
+    }
+
+    /// A half-written `.tmp` — the crash landed inside `write_all` — must not be
+    /// promoted. Parsing it before the rename is what separates the two cases.
+    #[test]
+    fn a_half_written_temp_file_is_not_recovered() {
+        let dir = TempDir::new("tmp_partial");
+        std::fs::write(
+            SemanticManifest::tmp_path(dir.path()),
+            br#"{"format_version": 3, "embedding_model_id": "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::NotFound { .. })
+        ));
+        assert!(!SemanticManifest::file_path(dir.path()).exists());
+    }
+
+    /// The parked copy is preferred: it was a manifest in service, while a `.tmp`
+    /// was only ever a candidate.
+    #[test]
+    fn a_parked_copy_wins_over_a_temp_file() {
+        let dir = TempDir::new("recovery_order");
+        let config = test_config();
+
+        let mut in_service = SemanticManifest::new(&config);
+        in_service.mark_book_indexed("parked_book".to_string(), 1, 1, 5, 1, 1);
+        in_service.save(dir.path()).unwrap();
+        std::fs::rename(
+            SemanticManifest::file_path(dir.path()),
+            SemanticManifest::previous_path(dir.path()),
+        )
+        .unwrap();
+
+        let mut candidate = SemanticManifest::new(&config);
+        candidate.mark_book_indexed("tmp_book".to_string(), 2, 2, 7, 1, 1);
+        candidate.save(dir.path()).unwrap();
+        std::fs::rename(
+            SemanticManifest::file_path(dir.path()),
+            SemanticManifest::tmp_path(dir.path()),
+        )
+        .unwrap();
+
+        let recovered = SemanticManifest::load(dir.path()).unwrap();
+        assert!(recovered.book("parked_book").is_some());
+        assert!(recovered.book("tmp_book").is_none());
+    }
+
+    // ── the save fallback, reached by injecting the failure it exists for ──
+
+    /// A denied rename (a Windows file lock, in practice) must still leave a
+    /// correct manifest in place, with no leftovers.
+    #[test]
+    fn a_denied_rename_is_retried_through_a_parked_copy() {
+        let dir = TempDir::new("rename_retry");
+        let config = test_config();
+        failpoints::reset();
+
+        let mut first = SemanticManifest::new(&config);
+        first.mark_book_indexed("old_book".to_string(), 1, 1, 3, 1, 1);
+        first.save(dir.path()).unwrap();
+
+        let mut second = SemanticManifest::new(&config);
+        second.mark_book_indexed("new_book".to_string(), 2, 2, 4, 1, 1);
+        // Fail the direct rename; let the park and the retry through.
+        failpoints::schedule_rename_failures(&[true]);
+        second
+            .save(dir.path())
+            .expect("the fallback exists so that a denied rename still succeeds");
+        failpoints::reset();
+
+        let loaded = SemanticManifest::load(dir.path()).unwrap();
+        assert!(
+            loaded.book("new_book").is_some(),
+            "the new manifest is live"
+        );
+        assert!(loaded.book("old_book").is_none());
+        assert!(
+            !SemanticManifest::previous_path(dir.path()).exists(),
+            "the parked copy is transient, not debris"
+        );
+        assert!(!SemanticManifest::tmp_path(dir.path()).exists());
+    }
+
+    /// When the retry fails too, the old manifest goes back. The one outcome that
+    /// is not allowed is a directory with no manifest at all.
+    #[test]
+    fn a_failed_retry_restores_the_previous_manifest() {
+        let dir = TempDir::new("rename_restore");
+        let config = test_config();
+        failpoints::reset();
+
+        let mut first = SemanticManifest::new(&config);
+        first.mark_book_indexed("old_book".to_string(), 1, 1, 3, 1, 1);
+        first.save(dir.path()).unwrap();
+
+        let mut second = SemanticManifest::new(&config);
+        second.mark_book_indexed("new_book".to_string(), 2, 2, 4, 1, 1);
+        // Fail the first rename, park successfully, fail the retry, restore.
+        failpoints::schedule_rename_failures(&[true, false, true, false]);
+        let error = second.save(dir.path());
+        failpoints::reset();
+
+        assert!(
+            matches!(error, Err(ManifestError::WriteFailed { .. })),
+            "a save that did not happen must not report success"
+        );
+        let loaded = SemanticManifest::load(dir.path())
+            .expect("the previous manifest must be back in place");
+        assert!(loaded.book("old_book").is_some());
+        assert!(loaded.book("new_book").is_none());
+    }
+
+    /// Even when every rename is denied, `load` finds a manifest. Here the park
+    /// itself fails, so the target was never moved.
+    #[test]
+    fn a_manifest_remains_readable_when_every_rename_is_denied() {
+        let dir = TempDir::new("rename_all_denied");
+        let config = test_config();
+        failpoints::reset();
+
+        let mut first = SemanticManifest::new(&config);
+        first.mark_book_indexed("old_book".to_string(), 1, 1, 3, 1, 1);
+        first.save(dir.path()).unwrap();
+
+        let mut second = SemanticManifest::new(&config);
+        second.mark_book_indexed("new_book".to_string(), 2, 2, 4, 1, 1);
+        failpoints::schedule_rename_failures(&[true, true, true, true]);
+        assert!(second.save(dir.path()).is_err());
+        failpoints::reset();
+
+        assert!(SemanticManifest::load(dir.path())
+            .unwrap()
+            .book("old_book")
+            .is_some());
+    }
+
+    /// A directory `fsync` that fails means the rename may not survive a power
+    /// loss, so on Unix the save reports failure — the caller must not record
+    /// progress it might lose. The *contents* are still correct: this is a
+    /// durability failure, not an atomicity one.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_directory_sync_fails_the_save_on_unix() {
+        let dir = TempDir::new("dir_sync_failure");
+        let config = test_config();
+        failpoints::reset();
+
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("book_a".to_string(), 1, 1, 3, 1, 1);
+        failpoints::schedule_dir_sync_failures(&[true]);
+        let error = manifest.save(dir.path());
+        failpoints::reset();
+
+        assert!(
+            matches!(error, Err(ManifestError::WriteFailed { .. })),
+            "returning Ok here would promise durability the platform did not give"
+        );
+        assert_eq!(
+            SemanticManifest::load(dir.path()).unwrap().book_count(),
+            1,
+            "the manifest itself is intact — only its durability is unproven"
+        );
+    }
+
     /// With neither file present it really is a first run.
     #[test]
     fn no_manifest_and_no_parked_copy_is_still_a_first_run() {
@@ -1293,17 +1736,27 @@ mod tests {
         ));
     }
 
-    /// A parked copy that is itself unusable must surface as a parse failure, so
-    /// the engine quarantines it instead of trusting it.
+    /// A leftover copy is parsed before it is promoted, so an unusable one is
+    /// passed over rather than renamed into place. It is also left where it is:
+    /// nothing on this path deletes evidence.
     #[test]
-    fn a_corrupt_parked_copy_is_reported_as_corrupt() {
+    fn a_corrupt_parked_copy_is_not_promoted_into_place() {
         let dir = TempDir::new("parked_corrupt");
-        std::fs::write(SemanticManifest::previous_path(dir.path()), b"{ broken").unwrap();
+        let parked = SemanticManifest::previous_path(dir.path());
+        std::fs::write(&parked, b"{ broken").unwrap();
 
-        assert!(matches!(
-            SemanticManifest::load(dir.path()),
-            Err(ManifestError::ParseFailed { .. })
-        ));
+        assert!(
+            matches!(
+                SemanticManifest::load(dir.path()),
+                Err(ManifestError::NotFound { .. })
+            ),
+            "an unusable leftover is not a manifest, so there is none"
+        );
+        assert!(parked.exists(), "the corrupt copy must be left as evidence");
+        assert!(
+            !SemanticManifest::file_path(dir.path()).exists(),
+            "it must not have been promoted to the live name"
+        );
     }
 
     #[test]
