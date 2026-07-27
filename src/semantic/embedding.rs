@@ -588,7 +588,7 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
             }
             let declared = read!(reader.read_u32(), "the declared alignment") as u64;
             // The GGUF contract requires a multiple of eight, not a power of two.
-            if declared < 8 || declared % 8 != 0 {
+            if declared < 8 || !declared.is_multiple_of(8) {
                 return LayoutOutcome::Unparsed(format!(
                     "general.alignment is {declared}, expected a multiple of 8"
                 ));

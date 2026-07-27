@@ -921,6 +921,7 @@ mod failpoints {
         RENAME_SCHEDULE.with(|queue| queue.borrow_mut().pop_front().unwrap_or(false))
     }
 
+    #[allow(dead_code)]
     pub fn next_dir_sync_fails() -> bool {
         DIR_SYNC_SCHEDULE.with(|queue| queue.borrow_mut().pop_front().unwrap_or(false))
     }
