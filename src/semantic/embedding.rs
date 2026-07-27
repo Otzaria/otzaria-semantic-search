@@ -48,23 +48,14 @@ const GGUF_HEADER_BYTES: usize = 24;
 /// download, or another format that happens to start with the right four bytes.
 const GGUF_MAX_DECLARED_COUNT: u64 = 1 << 24;
 
-/// Smallest number of bytes a metadata key/value pair can occupy: key length
-/// (8) + at least one key byte + value type (4) + at least one value byte.
-const GGUF_MIN_METADATA_ENTRY_BYTES: u64 = 14;
-
-/// Smallest number of bytes a tensor descriptor can occupy: name length (8) +
-/// at least one name byte + dimension count (4) + one dimension (8) + type (4)
-/// + offset (8).
-const GGUF_MIN_TENSOR_INFO_BYTES: u64 = 33;
-
 /// How much of the file's start is read to parse the metadata and tensor
 /// descriptors.
 ///
 /// The descriptor region of a real model is a few megabytes at most — the
 /// tokenizer vocabulary dominates it. This is the ceiling on believing the
-/// declared sizes: past it the structural check is *skipped*, not failed, because
-/// refusing a model this crate merely failed to parse is a worse outcome than
-/// accepting one it could not fully check.
+/// declared sizes: a supported GGUF whose descriptor region exceeds it is
+/// rejected. Silently accepting a file whose structure was not validated would
+/// turn the validator into a magic-byte check.
 const GGUF_MAX_DESCRIPTOR_REGION_BYTES: u64 = 64 << 20;
 
 /// Default tensor-data alignment when the file declares none.
@@ -482,56 +473,41 @@ pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError>
             header.tensor_count, header.metadata_kv_count
         )));
     }
+    if header.tensor_count == 0 {
+        return Err(invalid(
+            "the GGUF declares no tensors; it is a container header, not an embedding model"
+                .to_string(),
+        ));
+    }
 
     // ── 2. the descriptors, hashed as they are parsed ──
     let layout = read_gguf_layout(&mut reader, &header);
-    if let LayoutOutcome::Truncated { at, wanted } = &layout {
-        return Err(invalid(format!(
-            "the file ends inside its own descriptors — {wanted} at byte {at}; the \
-             download is incomplete"
-        )));
-    }
+    let parsed = match layout {
+        LayoutOutcome::Parsed(parsed) => parsed,
+        LayoutOutcome::Truncated { at, wanted } => {
+            return Err(invalid(format!(
+                "the file ends inside its own descriptors — {wanted} at byte {at}; the \
+                 download is incomplete"
+            )));
+        }
+        LayoutOutcome::Unparsed(reason) => {
+            return Err(invalid(format!(
+                "the GGUF descriptor table is invalid or unsupported: {reason}"
+            )));
+        }
+    };
 
     // ── 3. the rest of the file, hashed ──
     let (checksum, total_bytes) = reader.finish().map_err(unreadable)?;
 
-    match &layout {
-        LayoutOutcome::Parsed(parsed) => {
-            let required = parsed.data_start.saturating_add(parsed.min_data_bytes);
-            if total_bytes < required {
-                return Err(invalid(format!(
-                    "file is {total_bytes} bytes, but its {} tensor descriptor(s) place \
-                     data up to at least byte {required} (tensor data starts at \
-                     {}) — the download is incomplete",
-                    header.tensor_count, parsed.data_start
-                )));
-            }
-        }
-        LayoutOutcome::Unparsed(reason) => {
-            log::debug!(
-                "Could not verify the tensor layout of {} ({reason}); falling back to the \
-                 coarse size floor",
-                path.display()
-            );
-            // The counts still imply a minimum: each declared entry occupies at
-            // least its smallest possible encoding.
-            let minimum_bytes = GGUF_HEADER_BYTES as u64
-                + header
-                    .metadata_kv_count
-                    .saturating_mul(GGUF_MIN_METADATA_ENTRY_BYTES)
-                + header
-                    .tensor_count
-                    .saturating_mul(GGUF_MIN_TENSOR_INFO_BYTES);
-            if total_bytes < minimum_bytes {
-                return Err(invalid(format!(
-                    "file is {total_bytes} bytes but its header declares {} tensor(s) \
-                     and {} metadata entry/entries, which need at least \
-                     {minimum_bytes} bytes — the download is incomplete",
-                    header.tensor_count, header.metadata_kv_count
-                )));
-            }
-        }
-        LayoutOutcome::Truncated { .. } => unreachable!("returned above"),
+    let required = parsed.data_start.saturating_add(parsed.min_data_bytes);
+    if total_bytes < required {
+        return Err(invalid(format!(
+            "file is {total_bytes} bytes, but its {} tensor descriptor(s) place \
+             data up to at least byte {required} (tensor data starts at \
+             {}) — the download is incomplete",
+            header.tensor_count, parsed.data_start
+        )));
     }
 
     Ok(checksum)
@@ -560,7 +536,8 @@ enum LayoutOutcome {
         at: u64,
         wanted: &'static str,
     },
-    /// Not parseable by this code. Says nothing about the file's validity.
+    /// Invalid under the supported schema, or beyond this validator's explicit
+    /// resource limits. In either case the model is not safe to accept.
     Unparsed(String),
 }
 
@@ -570,11 +547,10 @@ enum LayoutOutcome {
 /// Reads strictly forward and never seeks, so the caller's single pass over the
 /// file is preserved.
 fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOutcome {
-    /// Longest string this parser will skip over. Tokenizer entries are short;
-    /// anything larger means the length was misread.
-    const MAX_STRING_BYTES: u64 = 1 << 26;
-    /// GGUF tensors have at most 4 dimensions; allow a little slack.
-    const MAX_TENSOR_DIMS: u32 = 8;
+    const MAX_METADATA_KEY_BYTES: u64 = u16::MAX as u64;
+    const MAX_TENSOR_NAME_BYTES: u64 = 64;
+    /// GGUF tensors have at most four dimensions.
+    const MAX_TENSOR_DIMS: u32 = 4;
     const ALIGNMENT_KEY: &[u8] = b"general.alignment";
 
     macro_rules! read {
@@ -599,20 +575,25 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
         }
 
         let key_len = read!(reader.read_u64(), "a metadata key length");
-        if key_len > MAX_STRING_BYTES {
+        if key_len > MAX_METADATA_KEY_BYTES {
             return LayoutOutcome::Unparsed(format!("metadata key {index} claims {key_len} bytes"));
         }
         // Keys are short enough to keep; the alignment is read from one of them.
         let key = read!(reader.read_bytes(key_len), "a metadata key");
         let value_type = read!(reader.read_u32(), "a metadata value type");
 
-        if key == ALIGNMENT_KEY && value_type == GgufValueType::UInt32 as u32 {
-            let declared = read!(reader.read_u32(), "the declared alignment") as u64;
-            // Padding is to a power of two; anything else means a misparse, and a
-            // zero would divide by zero below.
-            if declared.is_power_of_two() {
-                alignment = declared;
+        if key == ALIGNMENT_KEY {
+            if value_type != GgufValueType::UInt32 as u32 {
+                return LayoutOutcome::Unparsed("general.alignment is not a uint32".to_string());
             }
+            let declared = read!(reader.read_u32(), "the declared alignment") as u64;
+            // The GGUF contract requires a multiple of eight, not a power of two.
+            if declared < 8 || declared % 8 != 0 {
+                return LayoutOutcome::Unparsed(format!(
+                    "general.alignment is {declared}, expected a multiple of 8"
+                ));
+            }
+            alignment = declared;
             continue;
         }
 
@@ -635,13 +616,13 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
         }
 
         let name_len = read!(reader.read_u64(), "a tensor name length");
-        if name_len > MAX_STRING_BYTES {
+        if name_len > MAX_TENSOR_NAME_BYTES {
             return LayoutOutcome::Unparsed(format!("tensor {index} name claims {name_len} bytes"));
         }
         read!(reader.skip(name_len), "a tensor name");
 
         let dim_count = read!(reader.read_u32(), "a tensor dimension count");
-        if dim_count > MAX_TENSOR_DIMS {
+        if dim_count == 0 || dim_count > MAX_TENSOR_DIMS {
             return LayoutOutcome::Unparsed(format!(
                 "tensor {index} claims {dim_count} dimensions"
             ));
@@ -653,6 +634,11 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
         }
         let _ggml_type = read!(reader.read_u32(), "a tensor type");
         let offset = read!(reader.read_u64(), "a tensor data offset");
+        if offset % alignment != 0 {
+            return LayoutOutcome::Unparsed(format!(
+                "tensor {index} offset {offset} is not aligned to {alignment} bytes"
+            ));
+        }
 
         // One bit per element. Every ggml type stores more than that — the most
         // aggressive quantizations in existence sit around 1.6 bits per weight —
@@ -662,15 +648,7 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
     }
 
     let descriptors_end = reader.consumed();
-    // With no tensors there is no data blob, and therefore no padding before one:
-    // the descriptors are the whole file. (A stub with zero counts is exactly
-    // this, and demanding alignment padding it has no reason to carry would
-    // reject it.)
-    let data_start = if header.tensor_count == 0 {
-        descriptors_end
-    } else {
-        descriptors_end.next_multiple_of(alignment)
-    };
+    let data_start = descriptors_end.next_multiple_of(alignment);
 
     LayoutOutcome::Parsed(GgufLayout {
         data_start,
@@ -743,6 +721,7 @@ enum SkipOutcome {
 fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> SkipOutcome {
     const MAX_NESTING: u32 = 4;
     const MAX_ARRAY_LEN: u64 = 1 << 28;
+    const MAX_STRING_BYTES: u64 = 1 << 26;
 
     if depth > MAX_NESTING {
         return SkipOutcome::Unparsed(format!("metadata arrays nested deeper than {MAX_NESTING}"));
@@ -772,6 +751,9 @@ fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> Ski
     match value_type {
         GgufValueType::String => {
             let len = read!(reader.read_u64(), "a metadata string length");
+            if len > MAX_STRING_BYTES {
+                return SkipOutcome::Unparsed(format!("metadata string claims {len} bytes"));
+            }
             read!(reader.skip(len), "a metadata string");
             SkipOutcome::Done
         }
@@ -948,16 +930,28 @@ pub mod mock {
         vec
     }
 
-    /// Write a minimal well-formed GGUF header (magic + version + empty tensor
-    /// and metadata counts) so tests exercise real container validation instead
-    /// of a placeholder file.
+    /// Write a minimal structurally valid GGUF with one scalar F32 tensor.
+    ///
+    /// It is only a container fixture, not a usable embedding model, but it makes
+    /// tests exercise descriptor, alignment and payload validation rather than a
+    /// magic-byte placeholder.
     pub fn write_stub_gguf(path: &std::path::Path, version: u32) -> std::io::Result<()> {
-        let mut bytes = Vec::with_capacity(super::GGUF_HEADER_BYTES);
+        let mut bytes = Vec::with_capacity(68);
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&version.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
         bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
-        debug_assert_eq!(bytes.len(), super::GGUF_HEADER_BYTES);
+
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // name length
+        bytes.push(b'x');
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one dimension
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one element
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // F32
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // aligned data offset
+        while bytes.len() % super::GGUF_DEFAULT_ALIGNMENT as usize != 0 {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&0f32.to_le_bytes());
         std::fs::write(path, bytes)
     }
 }
@@ -1135,13 +1129,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_but_well_formed_container_is_accepted() {
-        // Zero tensors and zero metadata entries: nothing is declared, so nothing
-        // is missing. This is what the test stubs write.
-        let dir = TempDir::new("plausible");
-        let model = dir.path().join("real.gguf");
-        mock::write_stub_gguf(&model, 3).unwrap();
-        assert!(validate_and_checksum_gguf(&model).is_ok());
+    fn an_empty_container_is_not_an_embedding_model() {
+        let dir = TempDir::new("empty_container");
+        let model = dir.path().join("empty.gguf");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&model, bytes).unwrap();
+
+        assert!(matches!(
+            validate_and_checksum_gguf(&model),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
     }
 
     #[test]
@@ -1201,20 +1202,33 @@ mod tests {
             other => panic!("a truncated download must be rejected, got {other:?}"),
         }
 
-        // The same header with a body large enough to hold what it declares.
-        let mut complete = header(291, 24);
-        complete.resize(24 + 291 * 33 + 24 * 14 + 4096, 0u8);
-        std::fs::write(&model, &complete).unwrap();
-        assert!(validate_and_checksum_gguf(&model).is_ok());
+        // Padding arbitrary bytes until a guessed size floor is not enough:
+        // descriptors themselves must parse.
+        let mut padded_garbage = header(291, 24);
+        padded_garbage.resize(16_000, 0u8);
+        std::fs::write(&model, &padded_garbage).unwrap();
+        assert!(matches!(
+            validate_and_checksum_gguf(&model),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
     }
 
     /// Build a structurally valid GGUF: header, three metadata entries covering
     /// the variable-length types (a string, an array of strings, a `u32`), one
     /// tensor descriptor, alignment padding, then `data_bytes` of tensor data.
     ///
-    /// The point is a file that satisfies the coarse size floor while its own
-    /// descriptors say it is incomplete — which is the case a floor cannot catch.
+    /// The point is a file whose own descriptors let the validator prove whether
+    /// its payload is present.
     fn gguf_with_one_tensor(dims: &[u64], data_bytes: usize) -> Vec<u8> {
+        gguf_with_one_tensor_layout(dims, data_bytes, 32, 0)
+    }
+
+    fn gguf_with_one_tensor_layout(
+        dims: &[u64],
+        data_bytes: usize,
+        alignment: u32,
+        tensor_offset: u64,
+    ) -> Vec<u8> {
         fn push_string(bytes: &mut Vec<u8>, value: &str) {
             bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
             bytes.extend_from_slice(value.as_bytes());
@@ -1242,21 +1256,21 @@ mod tests {
         // The alignment the padding below uses.
         push_string(&mut bytes, "general.alignment");
         bytes.extend_from_slice(&4u32.to_le_bytes()); // UInt32
-        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.extend_from_slice(&alignment.to_le_bytes());
 
-        // One tensor at offset 0 of the data blob.
+        // One tensor at the requested offset in the data blob.
         push_string(&mut bytes, "blk.0.attn_q.weight");
         bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
         for extent in dims {
             bytes.extend_from_slice(&extent.to_le_bytes());
         }
         bytes.extend_from_slice(&0u32.to_le_bytes()); // ggml type
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // offset
+        bytes.extend_from_slice(&tensor_offset.to_le_bytes());
 
-        while bytes.len() % 32 != 0 {
+        while bytes.len() % alignment as usize != 0 {
             bytes.push(0);
         }
-        bytes.resize(bytes.len() + data_bytes, 0);
+        bytes.resize(bytes.len() + tensor_offset as usize + data_bytes, 0);
         bytes
     }
 
@@ -1308,18 +1322,17 @@ mod tests {
         ));
     }
 
-    /// A metadata type this parser does not know is a gap in the parser, not a
-    /// fault in the file. It must fall back to the coarse floor rather than
-    /// condemn a model it merely failed to read.
+    /// Supported GGUF versions have a closed metadata type enum. An unknown type
+    /// means the descriptor table cannot be validated and must not be accepted.
     #[test]
-    fn an_unknown_metadata_type_is_not_treated_as_corruption() {
+    fn an_unknown_metadata_type_is_rejected() {
         let dir = TempDir::new("future_metadata");
         let model = dir.path().join("future.gguf");
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // no tensors
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one tensor
         bytes.extend_from_slice(&1u64.to_le_bytes()); // one metadata entry
         bytes.extend_from_slice(&4u64.to_le_bytes());
         bytes.extend_from_slice(b"what");
@@ -1327,10 +1340,29 @@ mod tests {
         bytes.resize(256, 0);
         std::fs::write(&model, &bytes).unwrap();
 
-        assert!(
-            validate_and_checksum_gguf(&model).is_ok(),
-            "an unparseable descriptor region must not reject the model"
-        );
+        assert!(matches!(
+            validate_and_checksum_gguf(&model),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+    }
+
+    #[test]
+    fn alignment_may_be_any_multiple_of_eight() {
+        let dir = TempDir::new("non_power_of_two_alignment");
+        let model = dir.path().join("alignment24.gguf");
+        std::fs::write(&model, gguf_with_one_tensor_layout(&[8], 1, 24, 0)).unwrap();
+        assert!(validate_and_checksum_gguf(&model).is_ok());
+    }
+
+    #[test]
+    fn tensor_offsets_must_honor_the_declared_alignment() {
+        let dir = TempDir::new("misaligned_tensor_offset");
+        let model = dir.path().join("misaligned.gguf");
+        std::fs::write(&model, gguf_with_one_tensor_layout(&[8], 1, 24, 8)).unwrap();
+        assert!(matches!(
+            validate_and_checksum_gguf(&model),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
     }
 
     #[test]
@@ -1373,13 +1405,11 @@ mod tests {
         let a = dir.path().join("a.gguf");
         let b = dir.path().join("b.gguf");
 
-        // Two files identical for the first HASH_BUFFER_BYTES + 1 bytes, both
-        // carrying a valid header so the checksum is what is under test.
-        let mut base = Vec::with_capacity(HASH_BUFFER_BYTES + 64);
-        base.extend_from_slice(b"GGUF");
-        base.extend_from_slice(&3u32.to_le_bytes());
-        base.extend_from_slice(&8u64.to_le_bytes()); // tensor_count
-        base.extend_from_slice(&2u64.to_le_bytes()); // metadata_kv_count
+        // Two structurally valid files identical for the first
+        // HASH_BUFFER_BYTES + 1 bytes, so only whole-file hashing can distinguish
+        // the extra trailing byte.
+        mock::write_stub_gguf(&a, 3).unwrap();
+        let mut base = std::fs::read(&a).unwrap();
         base.resize(HASH_BUFFER_BYTES + 1, 7u8);
 
         let mut with_tail = base.clone();

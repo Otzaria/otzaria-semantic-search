@@ -84,8 +84,10 @@ impl OtzariaHybridEngine {
     /// * text book → [`ContentFingerprint::from_lexical_hash`] of the lexical
     ///   engine's `contentHash`, which already folds in the metadata it indexes;
     /// * PDF → [`ContentFingerprint::canonical`], which folds the caller's own
-    ///   file signature together with the title, category path and facets. A
-    ///   signature over the file alone cannot prove the index is current — a
+    ///   authoritative source revision together with the title, category path
+    ///   and facets. It must cover extracted text, line/section structure and
+    ///   extraction/OCR version. A size/mtime signature alone cannot prove the
+    ///   index is current — a
     ///   corrected author changes every vector and no byte of the file — and
     ///   [`ContentFingerprint::content_only`] is how to say so;
     /// * nothing → [`ContentFingerprint::Unverifiable`].
@@ -126,7 +128,7 @@ impl OtzariaHybridEngine {
     /// Returns what happened per category (indexed / skipped / empty), or `None`
     /// if the semantic path is disabled. Synchronous and potentially
     /// long-running; searches stall for at most one book at a time, the manifest
-    /// is committed at checkpoints rather than per book, and two concurrent calls
+    /// is committed once rather than per book, and two concurrent calls
     /// are serialized — see [`HybridCoordinator::index_books`]. Scheduling it off
     /// the UI thread is the caller's job until the progress API lands in P7.
     pub fn index_books(
@@ -135,6 +137,19 @@ impl OtzariaHybridEngine {
     ) -> Result<Option<IndexingSummary>, String> {
         self.coordinator
             .index_books(books)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove books reported by [`IndexDiff::removed_books`].
+    ///
+    /// Returns the number of semantic vectors removed, or `None` when the
+    /// semantic path is disabled.
+    pub fn remove_semantic_books(
+        &self,
+        source_book_keys: &[String],
+    ) -> Result<Option<u32>, String> {
+        self.coordinator
+            .remove_semantic_books(source_book_keys)
             .map_err(|e| e.to_string())
     }
 

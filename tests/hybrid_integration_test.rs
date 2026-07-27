@@ -197,13 +197,13 @@ fn lexical_hit(line_id: u64, text: &str, bm25_score: f32) -> LexicalCandidate {
     }
 }
 
-/// Stands in for a caller-computed PDF signature.
+/// Stands in for a caller-computed authoritative PDF extraction revision.
 ///
 /// Berachot is a PDF, so the lexical index records `contentHash = 0` for it — its
 /// extracted text is not in the library database. A caller that tracks its own
-/// signature (Otzaria already has PDF size and mtime) uses it both when building
-/// the book and when asking for a diff, which is the only way a PDF can ever be
-/// reported as up to date.
+/// revision over extracted text, line/section structure and extraction/OCR
+/// version uses it both when building the book and when asking for a diff. File
+/// size and mtime alone are not enough for this canonical contract.
 const PDF_SIGNATURE: u64 = 0xBEEF_CAFE;
 
 /// The fingerprint map a caller with real signatures would supply.
@@ -661,6 +661,43 @@ fn a_book_deleted_from_the_library_is_reported_as_removed() {
     assert!(diff.new_books.is_empty());
     assert!(diff.changed_books.is_empty());
     assert!(!diff.is_up_to_date());
+}
+
+#[test]
+fn removed_books_can_be_applied_through_the_public_api() {
+    let dir = TempDir::new("apply_removed_book");
+    let api = indexed_api(config_at(&dir));
+    let only_genesis = HashMap::from([(
+        GENESIS.to_string(),
+        ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
+    )]);
+    let diff = api.get_semantic_index_diff(&only_genesis).unwrap();
+
+    assert_eq!(
+        api.remove_semantic_books(&diff.removed_books).unwrap(),
+        Some(1)
+    );
+    let status = api.get_semantic_status();
+    assert_eq!(status.indexed_book_count, 1);
+    assert_eq!(status.vector_count, 3);
+    assert!(
+        api.get_semantic_index_diff(&only_genesis)
+            .unwrap()
+            .is_up_to_date(),
+        "applying removed_books must make the diff converge"
+    );
+
+    let result = api
+        .search(SearchRequest {
+            query: BERACHOT_LINE.to_string(),
+            force_mode: Some(SearchMode::SemanticOnly),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        result.results.iter().all(|item| item.id != 501),
+        "deleted vectors must not remain searchable"
+    );
 }
 
 // ───────────────────────── manifest ─────────────────────────

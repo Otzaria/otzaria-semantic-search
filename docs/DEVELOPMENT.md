@@ -130,7 +130,7 @@ BM25 עדיין עובד
 | In-memory vector store           | ממומש                      |
 | Cosine search                    | ממומש                      |
 | Metadata filtering               | ממומש (facets שטוחים + חלוקת ממדים כמו במנוע הלקסיקלי) |
-| זיהוי שינוי ב-PDF                | ממומש (חתימה קנונית: קובץ + metadata, ואחריה fingerprint משורות הספר) |
+| זיהוי שינוי ב-PDF                | ממומש כאשר הקורא מספק source revision סמכותי + metadata; גודל+mtime לבדם אינם קנוניים |
 | empty-book marker                | ממומש |
 | Hybrid coordinator               | קיים                       |
 | Fusion                           | קיים                       |
@@ -141,8 +141,8 @@ BM25 עדיין עובד
 | זיהוי אי־תאימות אינדקס           | ממומש (משבית את המסלול הסמנטי) |
 | התאוששות מ־manifest פגום         | ממומש (quarantine + reset) |
 | עמידות ה-manifest                | אטומי בכל פלטפורמה; durable ב-Unix, best-effort ב-Windows |
-| כתיבת manifest באינדוקס מלא      | checkpoints (לא פר-ספר) |
-| Flutter/FFI API                  | קיים                       |
+| כתיבת manifest באינדוקס מלא      | פעם אחת בסוף (לא פר-ספר) |
+| Rust API seam ל-Flutter/FFI      | קיים; bindings אמיתיים טרם נוצרו |
 | Production indexing pipeline     | **עדיין דורש integration** |
 | Production persistence           | **עדיין חסרה**             |
 | ANN retrieval                    | **חסר** (brute-force בלבד) |
@@ -213,8 +213,10 @@ BM25 עדיין עובד
     * `Unverifiable` — אין במה להשוות.
 
     לספר שאוצריא לא יכולה לתת לו חתימה לקסיקלית יש
-    `ContentFingerprint::canonical(source_signature, title, topics, facets, is_pdf)`,
-    שמערבב את חתימת הקובץ עם ה-metadata; זה מה שמאפשר ל-PDF להגיע ל"אין מה לעשות".
+    `ContentFingerprint::canonical(source_revision, title, topics, facets, is_pdf)`.
+    ה־revision חייב להיות לא־אפס ולכסות טקסט מחולץ, מבנה ומזהי שורות/סעיפים,
+    references וגרסת חילוץ/OCR; גודל+mtime בלבד הם `ContentOnly`. הפונקציה מערבבת
+    את ה־revision עם ה-metadata; אפס נשאר `Unverifiable`.
     שני המצבים האחרונים נכנסים לרשימה **נפרדת** (`IndexDiff::unverifiable_books`)
     ולא ל־`changed_books` — הם לא *ידועים* כמשתנים, וייצור שלהם עולה לקורא חילוץ
     טקסט מחדש. **אותו ערך בדיוק חייב להיכנס ל־`BookForIndexing::content_fingerprint`
@@ -226,13 +228,13 @@ BM25 עדיין עובד
 14. **סדר facets אינו מידע.** כל חתימה ממיינת ומסירה כפילויות מ-`extra_facets`,
     כמו `book_fingerprint` הלקסיקלי, וגם `all_facets()` מחזיר רשימה קנונית. בלי זה
     קורא שמפרט את מחברי הספר בסדר אחר היה גורם ל-re-embedding מלא.
-15. **ה־manifest נשמר ב-checkpoints, לא פר-ספר.** כל שמירה מסריאלזת את כל הרשומות,
-    ולכן שמירה לכל ספר היא `O(B²)` בייטים ו-`B` פעולות `fsync`. הלופ הציבורי משתמש
-    ב-`index_book_deferred` + `flush_manifest`, שומר כל 200 ספרים ובסוף, וגם ביציאה
-    בשגיאה. יש טסט שסופר את השמירות בפועל (`manifest_save_count`) ומאמת שהמספר אינו
-    גדל עם מספר הספרים — הגרסה הריבועית עברה כל טסט אחר.
-16. **שני אינדוקסים במקביל מסודרים בתור** (`indexing: Mutex<()>`). בלי זה כל אחד
-    היה מוחק ומכניס מחדש את הספרים של השני, וה-manifest היה נקבע לפי מי שסיים אחרון.
+15. **ה־manifest נשמר פעם אחת בסוף, לא פר-ספר ולא ב־checkpoints מלאים.** כל שמירה
+    מסריאלזת את כל הרשומות, ולכן שמירה לכל ספר היא `O(B²)` וגם checkpoints חוזרים
+    מוסיפים כתיבה סופר־ליניארית. ה־store הנוכחי אינו persistent, ולכן manifest
+    ביניים אינו משמר שום עבודת inference אחרי restart. backend persistent יצטרך
+    journal append-only או checkpoint דלתאי לפני שיוכל להבטיח resume מקריסה.
+16. **פעולות lifecycle כותבות מסודרות בתור** (`indexing: Mutex<()>`). אינדוקס,
+    reset וגריעת `removed_books` אינם יכולים להשתלב זה בזה באמצע batch.
 
 מה שמכוון בכוונה **לא** נעשה שם, ומחכה ל־P5: כיול `BM25_SATURATION_K`, threshold
 לתוצאה סמנטית לא רלוונטית, מעבר ל־RRF, ו־`total_count` אמיתי (הוא כרגע מספר
@@ -257,6 +259,8 @@ staging והחלפה אטומית. זה שייך לחיבור לאוצריא (P6
    הקובץ — קובץ שאינו GGUF נדחה אחרי 24 בייטים, לא אחרי hash של גיגה-בייטים.
 2. מפרסרת את כל אזור ה-descriptors: metadata KV (כולל מערכים ומחרוזות) ותיאורי
    tensor, וכך יודעת איפה מתחיל אזור הנתונים ומה ה-offset שכל tensor מצהיר עליו.
+   metadata type לא מוכר בגרסה נתמכת נדחה; גם קונטיינר בלי tensors, alignment שאינו
+   כפולה של 8 ו-offset שאינו מכבד אותו נדחים.
 3. דורשת שהקובץ יהיה גדול דיו כדי להחזיק את מה שהוא עצמו מתאר, בחסם של **ביט אחד
    לאיבר** — נכון לכל טיפוס ggml, כולל הקוונטיזציות הטרנריות האגרסיביות ביותר.
 
@@ -720,8 +724,10 @@ serialize של כל המפה אחרי כל ספר הופך אינדוקס ספר
 
 הלופ הציבורי (`HybridCoordinator::index_books`) חייב לשחרר את נעילת ה־engine בין
 ספרים כדי שחיפושים יוכלו לרוץ, ולכן הוא לא יכול להשתמש ב־`index_books()` של ה־engine.
-במקומו הוא קורא ל־`index_book_deferred()` פר-ספר ול־`flush_manifest()` כל 200 ספרים
-ובסוף — כך שהוויתור על נעילה אחת ארוכה לא מחזיר את ה־I/O הריבועי מהדלת האחורית.
+במקומו הוא קורא ל־`index_book_deferred()` פר-ספר ול־`flush_manifest()` פעם אחת
+בסוף (או במסלול שגיאה). מאחר שה־store כרגע נדיף, checkpoint ביניים של manifest
+אינו מאפשר resume אחרי restart; כשה־store יהפוך persistent יידרש journal או
+checkpoint דלתאי, לא סריאליזציה חוזרת של כל המפה.
 
 ---
 
@@ -1684,7 +1690,13 @@ Tantivy/BM25
 
 # 44. Current State in One Paragraph
 
-הפרויקט כבר מחזיק את השלד הארכיטקטוני של Semantic Search מלא: semantic sidecar עצמאי, chunking, stable IDs, manifest, incremental book diff, embedding abstraction, vector-store abstraction, semantic retrieval, hybrid fusion, dynamic weighting, RRF, grouping ו־FFI API. אבל שני החלקים הקריטיים ביותר עדיין אינם production implementations: `EmbeddingRuntime` עדיין משתמש ב־deterministic feature hashing במקום inference אמיתי של מודל GGUF, ו־`VectorStore` עדיין משתמש ב־in-memory `HashMap` במקום backend persistent/ANN אמיתי.
+הפרויקט כבר מחזיק שלד ארכיטקטוני רחב של Semantic Search: semantic sidecar עצמאי,
+chunking, stable IDs, manifest, incremental book diff, embedding abstraction,
+vector-store abstraction, semantic retrieval, hybrid fusion, dynamic weighting,
+RRF primitive, grouping ו־Rust API seam ל־FFI. הוא עדיין אינו מנוע production:
+בבנייה רגילה אין backend inference בכלל; deterministic feature hashing זמין רק
+כ־mock מפורש לבדיקות. ה־`VectorStore` הוא `HashMap` בזיכרון ולא backend
+persistent/ANN, וטרם נוצרו bindings או חיבור לאפליקציית אוצריא.
 
 ---
 

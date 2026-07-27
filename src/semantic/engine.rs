@@ -306,7 +306,9 @@ impl SemanticEngine {
         book: &BookForIndexing,
     ) -> Result<IndexOutcome, SemanticSearchError> {
         let outcome = self.index_book_inner(book)?;
-        self.manifest.save(&self.config.root_dir)?;
+        if outcome.did_work() {
+            self.manifest.save(&self.config.root_dir)?;
+        }
         Ok(outcome)
     }
 
@@ -334,8 +336,8 @@ impl SemanticEngine {
     /// Persist the manifest.
     ///
     /// The commit point for [`SemanticEngine::index_book_deferred`]. Idempotent
-    /// and cheap to over-call — but not free, so a caller checkpointing a long
-    /// run should space them out rather than call it per book.
+    /// and cheap to over-call — but not free, so a caller should batch changes
+    /// rather than call it per book.
     pub fn flush_manifest(&mut self) -> Result<(), SemanticSearchError> {
         self.manifest.save(&self.config.root_dir)?;
         Ok(())
@@ -352,11 +354,17 @@ impl SemanticEngine {
         books: &[BookForIndexing],
     ) -> Result<IndexingSummary, SemanticSearchError> {
         let mut summary = IndexingSummary::default();
+        let mut dirty = false;
         for book in books {
             match self.index_book_inner(book) {
-                Ok(outcome) => summary.record(outcome),
+                Ok(outcome) => {
+                    dirty |= outcome.did_work();
+                    summary.record(outcome);
+                }
                 Err(e) => {
-                    // Persist the progress made before giving up.
+                    // The failing call can also have removed a stale manifest
+                    // entry before its store insertion failed, so flush even
+                    // when every earlier outcome was a skip.
                     if let Err(save_err) = self.manifest.save(&self.config.root_dir) {
                         log::warn!(
                             "Could not save the manifest after an indexing failure: {save_err}"
@@ -366,7 +374,9 @@ impl SemanticEngine {
                 }
             }
         }
-        self.manifest.save(&self.config.root_dir)?;
+        if dirty {
+            self.manifest.save(&self.config.root_dir)?;
+        }
         Ok(summary)
     }
 
@@ -514,11 +524,33 @@ impl SemanticEngine {
 
     /// Remove a book from the semantic index. Returns how many vectors went.
     pub fn remove_book(&mut self, source_book_key: &str) -> Result<u32, SemanticSearchError> {
-        let count = self.store.delete_book(source_book_key)?;
-        self.store.commit()?;
-        self.manifest.remove_book(source_book_key);
-        self.manifest.save(&self.config.root_dir)?;
-        Ok(count)
+        self.remove_books(&[source_book_key.to_owned()])
+    }
+
+    /// Remove several books, committing the store and manifest once.
+    ///
+    /// This is the application path for [`IndexDiff::removed_books`]. Keeping it
+    /// batched avoids rewriting the whole manifest for every deleted library
+    /// book.
+    pub fn remove_books(
+        &mut self,
+        source_book_keys: &[String],
+    ) -> Result<u32, SemanticSearchError> {
+        let mut removed_vectors = 0u32;
+        let mut dirty = false;
+
+        for source_book_key in source_book_keys {
+            let count = self.store.delete_book(source_book_key)?;
+            removed_vectors = removed_vectors.saturating_add(count);
+            let removed_record = self.manifest.remove_book(source_book_key).is_some();
+            dirty |= count > 0 || removed_record;
+        }
+
+        if dirty {
+            self.store.commit()?;
+            self.manifest.save(&self.config.root_dir)?;
+        }
+        Ok(removed_vectors)
     }
 
     /// Drop the whole index and start a fresh manifest for the current
@@ -576,12 +608,14 @@ impl SemanticEngine {
     /// * A text book's lexical `contentHash` →
     ///   [`ContentFingerprint::from_lexical_hash`]. It already covers the
     ///   metadata the lexical engine indexes, so it can reach "nothing to do".
-    /// * A PDF → [`ContentFingerprint::canonical`], folding the caller's own file
-    ///   signature (Otzaria already tracks size and mtime) together with the
-    ///   title, category path and facets. **Without the metadata a match proves
+    /// * A PDF → [`ContentFingerprint::canonical`], folding the caller's
+    ///   authoritative source revision (including extracted text structure and
+    ///   extraction/OCR version) together with the title, category path and
+    ///   facets. **Without the metadata a match proves
     ///   too little**: renaming a book or correcting its author changes what is
     ///   stored in every one of its vectors while leaving the file untouched, so
     ///   a file-only signature would report "up to date" over a stale index.
+    ///   A size/mtime signature is not authoritative;
     ///   [`ContentFingerprint::content_only`] says exactly that and lands the
     ///   book in [`IndexDiff::unverifiable_books`] instead of claiming more.
     /// * Nothing at all → [`ContentFingerprint::Unverifiable`], also
@@ -1098,7 +1132,8 @@ mod tests {
         const KEY: &str = "otzaria/scans/responsa.pdf";
         const SIGNATURE: u64 = 0xBEEF_CAFE;
 
-        // The caller folds its file signature together with the metadata.
+        // The caller folds its authoritative extraction revision together with
+        // the metadata.
         let fingerprint_of = |book: &BookForIndexing| {
             ContentFingerprint::canonical(
                 SIGNATURE,
@@ -1129,7 +1164,7 @@ mod tests {
             "a canonical fingerprint is what lets a PDF reach 'nothing to do'"
         );
 
-        // Same file, same signature, corrected author.
+        // Same extracted source revision, corrected author.
         let mut corrected = scan.clone();
         corrected.extra_facets = vec!["/author/מחבר מדויק".to_string()];
         corrected.content_fingerprint = fingerprint_of(&corrected).as_raw();

@@ -5,9 +5,15 @@
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
 [![Platform Support](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-blue.svg)](#ci-pipeline)
 
-**Otzaria Hybrid Semantic Search** is a high-performance, local, offline, production-grade Rust library designed to bring semantic vector search capabilities to **Otzaria** — the open rabbinic digital library.
+**Otzaria Hybrid Semantic Search** is a correctness-focused Rust prototype for
+bringing local semantic search to **Otzaria**, the open rabbinic digital library.
+It is not production-ready yet.
 
-It seamlessly combines traditional lexical search results (**Tantivy / BM25**) with dense vector similarity search (**quantized GGUF embedding models**) into a unified, dynamically ranked, and deduplicated result set.
+The current crate implements chunking, lifecycle contracts, brute-force vector
+search, result fusion and a Rust API seam. Real GGUF inference, a persistent ANN
+store, generated FFI bindings, Tantivy hydration and application integration are
+still roadmap work. Tests can enable a deterministic mock embedder; normal builds
+refuse to produce fake semantic vectors.
 
 ---
 
@@ -15,9 +21,9 @@ It seamlessly combines traditional lexical search results (**Tantivy / BM25**) w
 
 1. **Non-Destructive Sidecar Architecture**: The semantic engine operates as an independent sidecar database (`semantic_db`). It **never** mutates, alters, or replaces Otzaria's existing Tantivy lexical database.
 2. **Graceful Fallback & Resilience**: If the semantic path fails (e.g. model missing, disk I/O error), the coordinator automatically falls back to lexical-only mode without crashing the app.
-3. **100% Offline & Private**: Runs entirely on-device with quantized GGUF models. Zero network calls, zero telemetry, zero privacy leaks.
+3. **Offline & Private Target**: The intended production design runs entirely on-device. The present crate performs no model download or telemetry, but the real inference backend is not implemented.
 4. **Source Retrieval (Not RAG)**: Designed strictly for accurate source and text retrieval within Jewish literature. It returns verifiable textual sources, never hallucinated AI responses.
-5. **Zero-Panic Guarantee**: Poisoned locks (`RwLock`) and edge-case errors are handled safely via error propagation and graceful fallbacks.
+5. **Defensive Error Handling**: Known poisoned-lock and input edge cases use error propagation or graceful fallback; this is not an absolute panic-freedom guarantee.
 
 ---
 
@@ -27,7 +33,7 @@ It seamlessly combines traditional lexical search results (**Tantivy / BM25**) w
                                ┌─────────────────────────────────────────┐
                                │           Otzaria App (Flutter)         │
                                └────────────────────┬────────────────────┘
-                                                    │ FFI (flutter_rust_bridge)
+                                                    │ planned FFI (flutter_rust_bridge)
                                                     ▼
                                ┌─────────────────────────────────────────┐
                                │          OtzariaHybridEngine            │
@@ -42,7 +48,7 @@ It seamlessly combines traditional lexical search results (**Tantivy / BM25**) w
 │   │   (Exact/Conceptual)   │───────▶ │     (BM25 + Cosine)    │───────▶ │   (SameSection / Identical)│   │
 │   └────────────────────────┘         └────────────────────────┘         └──────────────┬─────────────┘   │
 │                                                   ▲                                    │                 │
-│                                                   │ Fusion (Weighted / RRF)            ▼                 │
+│                                                   │ Weighted fusion (current)           ▼                 │
 │   ┌────────────────────────┐                      │                     ┌────────────────────────────┐   │
 │   │   Lexical Candidates   │──────────────────────┴────────────────────▶│    HybridSearchResult      │   │
 │   │    (Tantivy BM25)      │                                            │  (Paginated & Fused Items) │   │
@@ -54,9 +60,9 @@ It seamlessly combines traditional lexical search results (**Tantivy / BM25**) w
 │                                       SemanticEngine (Sidecar)                                           │
 │                                                                                                          │
 │   ┌────────────────────────┐         ┌────────────────────────┐         ┌────────────────────────────┐   │
-│   │    Anchored Chunker    │         │    Embedding Runtime   │         │     VectorStore DB         │   │
-│   │  (Context Windowing +  │───────▶ │   (GGUF Model + L2     │───────▶ │  (Pre-normalized Vectors + │   │
-│   │   SHA256 Anchor IDs)   │         │     Normalization)     │         │   BinaryHeap Top-K Search) │   │
+│   │    Anchored Chunker    │         │    Runtime Interface   │         │  In-memory Vector Store    │   │
+│   │ (same-section context │───────▶ │ (GGUF validation; real │───────▶ │  (Pre-normalized Vectors + │   │
+│   │   + SHA256 Anchor IDs) │         │    inference pending)  │         │   BinaryHeap Top-K Search) │   │
 │   └────────────────────────┘         └────────────────────────┘         └────────────────────────────┘   │
 │                                                                                        ▲                 │
 │   ┌────────────────────────────────────────────────────────────────────────────────────┴─────────────┐   │
@@ -116,12 +122,12 @@ otzaria-semantic-search/
 | **Query Ranking** | [`src/hybrid/ranking.rs`](src/hybrid/ranking.rs) | `analyze_query`, `compute_alpha`, `QueryFeatures` | Dynamic $\alpha$ computation (short/exact $\to 0.7\text{--}0.9$, conceptual $\to 0.2\text{--}0.4$) |
 | **Result Grouping** | [`src/hybrid/grouping.rs`](src/hybrid/grouping.rs) | `group_by_section`, `group_by_identical_text` | Section-level grouping and identical text line hash deduplication |
 | **Domain Models** | [`src/semantic/types.rs`](src/semantic/types.rs) | `BookLine`, `SemanticChunk`, `FusedCandidate`, `HybridSearchResult` | All data transfer objects, candidate models, and filter definitions |
-| **Text Chunker** | [`src/semantic/chunker.rs`](src/semantic/chunker.rs) | `Chunker`, `ChunkerConfig`, `compute_semantic_id` | Anchored chunking algorithm expanding context across section boundaries |
-| **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | GGUF quantized model loader and feature vector generator |
+| **Text Chunker** | [`src/semantic/chunker.rs`](src/semantic/chunker.rs) | `Chunker`, `ChunkerConfig`, `compute_semantic_id` | Anchored chunking with context constrained to the anchor's section |
+| **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | GGUF structure/checksum validation and runtime interface; real inference pending |
 | **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K |
 | **Index Manifest** | [`src/semantic/manifest.rs`](src/semantic/manifest.rs) | `SemanticManifest`, `BookManifestEntry`, `validate` | Atomic JSON tracking (`.tmp` write + rename) & Tantivy incremental diffing |
 | **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Master sidecar engine orchestrating chunking, embedding & storage |
-| **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | `test_semantic_engine_and_hybrid_coordinator_end_to_end` | End-to-end integration test suite |
+| **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | feature-gated integration tests | End-to-end public-API suite using the explicit mock backend |
 | **CI Workflow** | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | `check-and-test` | Multi-platform GitHub Actions CI workflow (Linux, Windows, macOS) |
 
 ---
@@ -134,8 +140,8 @@ otzaria-semantic-search/
 ├──────────────────────────────────────────────────────────────────────────────────┤
 │ [✔] Phase 1: Core Architecture, Subsystem Isolation & Error Taxonomy            │
 │ [✔] Phase 2: Anchored Chunker, Manifest Version Tracker & In-Memory Vector Store  │
-│ [✔] Phase 3: High-Performance Vector Search (Pre-norm Dot Product + Min-Heap)  │
-│ [✔] Phase 4: Strict Code Quality Audit, Poison-Proof Locking & Filter Complete   │
+│ [✔] Phase 3: Correct brute-force baseline (Pre-norm Dot Product + Min-Heap)      │
+│ [✔] Phase 4: Correctness baseline, lifecycle contracts & complete filters        │
 ├──────────────────────────────────────────────────────────────────────────────────┤
 │ [ ] Phase 5: Native GGUF Model Runtime Integration (Candle / GGUF Tensor)        │
 │ [ ] Phase 6: Persistent Disk Vector Store (zvec / HNSW Index on Disk)            │
@@ -184,8 +190,9 @@ otzaria-semantic-search/
 # Build release library
 cargo build --release
 
-# Run unit and integration tests across all targets
-cargo test --all-targets
+# Run unit and integration tests (does not execute the benchmark target)
+cargo test --lib --tests
+cargo test --lib --tests --features mock-embedding
 
 # Verify formatting
 cargo fmt --check
@@ -198,16 +205,16 @@ cargo clippy --all-targets -- -D warnings
 
 ## 🤖 CI Pipeline
 
-GitHub Actions CI runs automatically on every commit and pull request across **three operating systems**:
+GitHub Actions runs for pushes to `main` and pull requests targeting `main`
+across **three operating systems**:
 - `ubuntu-latest`
 - `windows-latest`
 - `macos-latest`
 
-Workflow steps:
-1. `cargo fmt --check` (Fast formatting check)
-2. `cargo check --all-targets` (Type compilation check)
-3. `cargo clippy --all-targets -- -D warnings` (Strict lint check)
-4. `cargo test --all-targets` (Full test suite execution)
+The matrix checks formatting; default-feature check, Clippy and tests; mock-feature
+Clippy and tests; rustdoc links; and a release build of all targets. Tests use
+`--lib --tests`: `--all-targets` would execute the large benchmark rather than
+merely compile it.
 
 ---
 

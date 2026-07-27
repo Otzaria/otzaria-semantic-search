@@ -69,10 +69,17 @@ impl ContentFingerprint {
     /// Build a canonical fingerprint for a book the lexical index cannot
     /// fingerprint — a PDF.
     ///
-    /// `source_signature` is the caller's own proof about the content: whatever
-    /// it already tracks for the file, such as size and mtime. This folds the
-    /// searchable metadata in on top, so correcting an author or moving a book
-    /// between categories changes the fingerprint even though the file did not.
+    /// `source_signature` must be the caller's nonzero, authoritative revision
+    /// of every source input that determines [`BookForIndexing`]: extracted text,
+    /// line/section boundaries and identifiers, references, and the extraction or
+    /// OCR version. File size and mtime alone are only a heuristic and belong in
+    /// [`Self::content_only`], not here. This method folds the searchable book
+    /// metadata in on top, so correcting an author or moving a book between
+    /// categories changes the fingerprint even though the file did not.
+    ///
+    /// Zero means that no authoritative source revision is available and yields
+    /// [`Self::Unverifiable`]. Hashing that marker together with metadata would
+    /// otherwise turn "unknown" into a seemingly canonical fingerprint.
     ///
     /// The resulting value must be used **twice**: handed to
     /// [`SemanticEngine::diff`](crate::semantic::engine::SemanticEngine::diff)
@@ -87,6 +94,9 @@ impl ContentFingerprint {
         extra_facets: &[String],
         is_pdf: bool,
     ) -> Self {
+        let Some(source_signature) = NonZeroU64::new(source_signature) else {
+            return Self::Unverifiable;
+        };
         Self::Canonical(canonical_book_fingerprint(
             source_signature,
             title,
@@ -138,14 +148,14 @@ impl ContentFingerprint {
 /// order carries no meaning in either index. Never returns zero, which is the
 /// "no fingerprint" marker.
 fn canonical_book_fingerprint(
-    source_signature: u64,
+    source_signature: NonZeroU64,
     title: &str,
     topics: &str,
     extra_facets: &[String],
     is_pdf: bool,
 ) -> NonZeroU64 {
     let mut fnv = Fnv::new();
-    fnv.feed_field(&source_signature.to_le_bytes());
+    fnv.feed_field(&source_signature.get().to_le_bytes());
     fnv.feed_field(title.as_bytes());
     fnv.feed_field(topics.as_bytes());
     fnv.feed_field(&[u8::from(is_pdf)]);
@@ -795,8 +805,8 @@ pub struct IndexDiff {
     /// changed; producing one costs the caller real work (a PDF has to have its
     /// text extracted again just to be compared), so it deserves its own decision
     /// rather than being buried among the genuinely stale. A caller that can
-    /// supply its own fingerprint — Otzaria already tracks PDF size and mtime —
-    /// empties this list and gets an honestly up-to-date diff.
+    /// supply an authoritative revision covering the extracted text and its
+    /// structure empties this list and gets an honestly up-to-date diff.
     pub unverifiable_books: Vec<String>,
     /// Books recorded here but absent from the library: their vectors should go.
     pub removed_books: Vec<String>,
@@ -994,6 +1004,20 @@ mod tests {
             ContentFingerprint::Canonical(NonZeroU64::new(42).unwrap())
         );
         assert!(ContentFingerprint::from_lexical_hash(42).is_verifiable());
+    }
+
+    #[test]
+    fn a_zero_source_revision_cannot_become_canonical() {
+        assert_eq!(
+            ContentFingerprint::canonical(
+                0,
+                "מסכת ברכות",
+                "/תלמוד/בבלי",
+                &["/author/חז״ל".to_string()],
+                true,
+            ),
+            ContentFingerprint::Unverifiable
+        );
     }
 
     #[test]

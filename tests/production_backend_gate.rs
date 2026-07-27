@@ -42,14 +42,24 @@ impl Drop for TempDir {
     }
 }
 
-/// A structurally valid, empty GGUF container, so a failure is about the missing
-/// backend rather than about the file.
+/// A minimal structurally valid GGUF with one scalar tensor, so a failure is
+/// about the missing backend rather than about the file.
 fn write_valid_gguf(path: &Path) {
-    let mut bytes = Vec::with_capacity(24);
+    let mut bytes = Vec::with_capacity(68);
     bytes.extend_from_slice(b"GGUF");
     bytes.extend_from_slice(&3u32.to_le_bytes());
-    bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
     bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor name length
+    bytes.push(b'x');
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // dimension count
+    bytes.extend_from_slice(&1u64.to_le_bytes()); // one element
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // F32
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // aligned data offset
+    while bytes.len() % 32 != 0 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&0f32.to_le_bytes());
     std::fs::write(path, bytes).unwrap();
 }
 

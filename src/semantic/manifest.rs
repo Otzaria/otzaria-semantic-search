@@ -22,7 +22,8 @@
 //! documents exactly which.
 //!
 //! Writing it is not cheap — the whole document is serialized every time — so a
-//! bulk index commits at checkpoints rather than per book. See
+//! bulk index commits once rather than per book. With the current volatile vector
+//! store, intermediate checkpoints cannot preserve work across a restart. See
 //! [`SemanticEngine::index_book_deferred`](crate::semantic::engine::SemanticEngine::index_book_deferred).
 
 use crate::errors::ManifestError;
@@ -244,6 +245,10 @@ impl SemanticManifest {
                     path.display()
                 ),
             })?;
+            // Recovery changes a directory entry just like `save` does. Without
+            // flushing the directory, reporting a successful recovery would not
+            // mean the live name survives a power loss.
+            sync_directory(dir)?;
         }
 
         let content = std::fs::read_to_string(&path).map_err(|e| ManifestError::ParseFailed {
@@ -290,7 +295,6 @@ impl SemanticManifest {
     /// the atomicity guarantee, not debris: see the fallback below.
     pub fn save(&mut self, dir: &Path) -> Result<(), ManifestError> {
         self.updated_at = current_unix_timestamp();
-        self.saves = self.saves.saturating_add(1);
 
         let target = Self::file_path(dir);
         let tmp = Self::tmp_path(dir);
@@ -365,13 +369,28 @@ impl SemanticManifest {
         // otherwise a power loss can resurrect the old name. This must happen
         // *before* the parked copy is discarded, so a crash in between still
         // leaves something recoverable.
-        let durable = sync_directory(dir);
+        sync_directory(dir)?;
 
         if let Some(previous) = parked {
-            let _ = std::fs::remove_file(previous);
+            match std::fs::remove_file(&previous) {
+                Ok(()) => {
+                    // Persist the cleanup too. A resurrected `.previous` is
+                    // harmless while the live target exists, but leaving the
+                    // operation half-durable makes later recovery ambiguous.
+                    sync_directory(dir)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::warn!(
+                        "The new manifest is durable, but its parked predecessor {} \
+                         could not be removed: {e}",
+                        previous.display()
+                    );
+                }
+            }
         }
 
-        durable?;
+        self.saves = self.saves.saturating_add(1);
         log::debug!("Manifest saved to {}", target.display());
         Ok(())
     }
@@ -394,8 +413,8 @@ impl SemanticManifest {
         let Ok(content) = std::fs::read_to_string(candidate) else {
             return false;
         };
-        match serde_json::from_str::<FormatVersionProbe>(&content) {
-            Ok(probe) => probe.format_version == MANIFEST_FORMAT_VERSION,
+        match serde_json::from_str::<Self>(&content) {
+            Ok(manifest) => manifest.format_version == MANIFEST_FORMAT_VERSION,
             Err(_) => false,
         }
     }
@@ -1609,6 +1628,34 @@ mod tests {
         assert!(recovered.book("tmp_book").is_none());
     }
 
+    /// A file that contains only a matching version probe is not recoverable.
+    /// Recovery must validate the whole schema before preferring `.previous`
+    /// over a complete `.tmp`.
+    #[test]
+    fn an_incomplete_parked_copy_does_not_hide_a_complete_temp_file() {
+        let dir = TempDir::new("recovery_requires_full_schema");
+        std::fs::write(
+            SemanticManifest::previous_path(dir.path()),
+            format!("{{\"format_version\": {MANIFEST_FORMAT_VERSION}}}"),
+        )
+        .unwrap();
+
+        let mut candidate = SemanticManifest::new(&test_config());
+        candidate.mark_book_indexed("tmp_book".to_string(), 2, 2, 7, 1, 1);
+        std::fs::write(
+            SemanticManifest::tmp_path(dir.path()),
+            serde_json::to_vec_pretty(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        let recovered = SemanticManifest::load(dir.path()).unwrap();
+        assert!(recovered.book("tmp_book").is_some());
+        assert!(
+            SemanticManifest::previous_path(dir.path()).exists(),
+            "the rejected copy is evidence and must not be deleted"
+        );
+    }
+
     // ── the save fallback, reached by injecting the failure it exists for ──
 
     /// A denied rename (a Windows file lock, in practice) must still leave a
@@ -1720,10 +1767,45 @@ mod tests {
             "returning Ok here would promise durability the platform did not give"
         );
         assert_eq!(
+            manifest.save_count(),
+            0,
+            "a failed durability step is not a successful save"
+        );
+        assert_eq!(
             SemanticManifest::load(dir.path()).unwrap().book_count(),
             1,
             "the manifest itself is intact — only its durability is unproven"
         );
+    }
+
+    /// If fallback parked the old manifest, it cannot be deleted until the new
+    /// live name is durable. That copy is the recovery guarantee for this exact
+    /// failure window.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_sync_failure_keeps_the_parked_manifest() {
+        let dir = TempDir::new("fallback_dir_sync_failure");
+        let config = test_config();
+        failpoints::reset();
+
+        let mut first = SemanticManifest::new(&config);
+        first.mark_book_indexed("old_book".to_string(), 1, 1, 3, 1, 1);
+        first.save(dir.path()).unwrap();
+
+        let mut second = SemanticManifest::new(&config);
+        second.mark_book_indexed("new_book".to_string(), 2, 2, 4, 1, 1);
+        failpoints::schedule_rename_failures(&[true]);
+        failpoints::schedule_dir_sync_failures(&[true]);
+        let error = second.save(dir.path());
+        failpoints::reset();
+
+        assert!(matches!(error, Err(ManifestError::WriteFailed { .. })));
+        assert_eq!(second.save_count(), 0);
+        let parked = SemanticManifest::previous_path(dir.path());
+        assert!(parked.exists(), "the durable old copy must be retained");
+        let old: SemanticManifest =
+            serde_json::from_slice(&std::fs::read(parked).unwrap()).unwrap();
+        assert!(old.book("old_book").is_some());
     }
 
     /// With neither file present it really is a first run.

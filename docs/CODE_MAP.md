@@ -69,7 +69,8 @@ otzaria-semantic-search/
     המועדפת: הקורא מחליט מה החתימה של ספר, וזו הדרך היחידה שבה PDF יכול להגיע
     ל"מעודכן". `get_semantic_index_diff_from_lexical_hashes()` היא הצורה הידידותית
     ל-FFI (`u64` גולמי), כי enum ש-Dart יכול לבנות הוא enum ש-Dart יכול לבנות שגוי.
-  - `index_books()` — אינדוקס ספרים (manifest נשמר ב-checkpoints, לא פר-ספר).
+  - `index_books()` — אינדוקס ספרים (manifest נשמר פעם אחת בסוף, לא פר-ספר).
+  - `remove_semantic_books()` — מיישם בקבוצה את `IndexDiff::removed_books`.
   - `reset_semantic_index()` — מסלול ההתאוששות מאינדקס לא תואם; בלעדיו
     `needs_full_reindex` היה מבוי סתום.
   - *לא כאן עדיין (P7):* progress stream, cancel/resume, ניהול הורדת מודל.
@@ -87,10 +88,12 @@ otzaria-semantic-search/
     לא יוקטן במשקל של המנוע החסר.
   - כל התדרדרות נראית: `search_mode` הוא המצב שרץ, `fallback_reason` הוא הסיבה.
   - חלון המועמדים הסמנטיים חסום ב-`MAX_SEMANTIC_CANDIDATES` (מדווח ב-log כשנחתך).
-  - `index_books()` — נועל **פר-ספר** כדי שחיפושים לא ייחסמו לכל אורך האינדוקס, ולכן
-    שומר את ה-manifest ב-checkpoints (`MANIFEST_CHECKPOINT_BOOKS`) ולא פר-ספר: כל
-    שמירה מסריאלזת את כל הרשומות, כך ששמירה לכל ספר היא `O(B²)`. ה-`indexing: Mutex`
-    מונע משני אינדוקסים להשתלב זה בזה ולמחוק אחד את הספרים של השני.
+  - `index_books()` — נועל את ה-engine **פר-ספר** כדי שחיפושים לא ייחסמו לכל אורך
+    האינדוקס, ושומר את ה-manifest פעם אחת בסוף: כל שמירה מסריאלזת את כל הרשומות,
+    כך שגם checkpoints של מסמך מלא מוסיפים כתיבה סופר־ליניארית. ה-store הנוכחי
+    נדיף, ולכן checkpoint של manifest ממילא אינו יכול לשמר עבודה אחרי קריסה.
+    backend persistent יצטרך journal מצטבר או פורמט checkpoint דלתאי.
+    `indexing: Mutex` מסדר בתור אינדוקס, reset וגריעת ספרים.
 
 * [`src/hybrid/fusion.rs`](../src/hybrid/fusion.rs)
   - `normalize_bm25_scores()` — נורמליזציית רוויה $x / (k + x)$ לציוני BM25 לטווח $[0,1]$.
@@ -119,8 +122,9 @@ otzaria-semantic-search/
     `Unverifiable`. שני מלכודות שקטות: `0` הוא מרקר "אין חתימה" ולא hash (Tantivy
     מדווח אותו לכל PDF), ולכן הווריאנטים נושאים `NonZeroU64`; ולא כל חתימה מכסה
     metadata — גודל+mtime של קובץ לא מזיז כשמתקנים מחבר, ולכן רק `Canonical` מגיע
-    ל"מעודכן". `ContentFingerprint::canonical()` בונה חתימה כזו לספר שלמנוע
-    הלקסיקלי אין עליו חתימה.
+    ל"מעודכן". `ContentFingerprint::canonical()` דורש revision לא־אפס שמכסה את כל
+    הקלט ל־`BookForIndexing`: הטקסט המחולץ, מבנה ומזהי השורות/סעיפים, references
+    וגרסת החילוץ/OCR. גודל+mtime לבדם הם `ContentOnly`; אפס הוא `Unverifiable`.
   - `BookForIndexing::line_fingerprint()` — חתימה שהמנוע הסמנטי מחשב מהספר עצמו:
     שורות **וגם** כל ה-metadata שנשמר בכל וקטור. זה מה שמכריע ספר שהחתימה החיצונית
     שלו לא הוכיחה דבר.
@@ -154,6 +158,9 @@ otzaria-semantic-search/
     תחתון על גודל הקובץ — ביט אחד לאיבר, נכון לכל טיפוס ggml. חסם תחתון בכוונה: טבלת
     block sizes שגויה *דוחה מודל תקין*, וזה כשל גרוע יותר. `HashingReader` הוא מה
     שמאפשר לפרסר ולחשב hash בלי לקרוא פעמיים.
+    קונטיינר ללא tensors, metadata type לא מוכר בגרסה נתמכת, alignment שאינו כפולה
+    של 8 או tensor offset לא מיושר — נדחים; אין fallback לקבלת descriptors שלא
+    הצלחנו לפרסר.
   - `EmbeddingBackendKind` — זהות ה-backend, נשמרת ב-manifest. `is_semantic()` מחזיר
     `false` ל-stand-in, כדי שלא יתחזה למודל.
   - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו.
@@ -266,6 +273,6 @@ otzaria-semantic-search/
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings                          # production
 cargo clippy --all-targets --features mock-embedding -- -D warnings
-cargo test  --all-targets                                          # שער ה-production
-cargo test  --all-targets --features mock-embedding                 # החבילה המלאה
+cargo test --lib --tests                                           # שער ה-production
+cargo test --lib --tests --features mock-embedding                  # החבילה המלאה
 ```

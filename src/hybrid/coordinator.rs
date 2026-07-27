@@ -72,20 +72,6 @@ impl Default for HybridSearchParams {
     }
 }
 
-/// Books indexed between two manifest writes during a long run.
-///
-/// The manifest is not an append-only log: every write serializes the whole
-/// thing, so writing it per book makes a full-library index quadratic. Writing it
-/// only at the very end would instead throw away hours of work on a crash. A
-/// checkpoint every `N` books bounds the loss to `N` books' worth of inference
-/// while keeping the total bytes written linear in `books / N`.
-///
-/// The vectors themselves are not yet persistent, so today a crash loses them
-/// regardless and this only bounds *manifest* loss. It becomes load-bearing with
-/// the persistent backend (roadmap P4), which is exactly when the numbers get
-/// large enough for the quadratic term to matter.
-const MANIFEST_CHECKPOINT_BOOKS: usize = 200;
-
 /// Main hybrid search coordinator.
 pub struct HybridCoordinator {
     semantic_engine: RwLock<Option<SemanticEngine>>,
@@ -373,12 +359,33 @@ impl HybridCoordinator {
     /// without it a status reporting `needs_full_reindex` would be a dead end.
     /// Returns the number of vectors discarded, or `None` if there is no engine.
     pub fn reset_semantic_index(&self) -> Result<Option<u32>, SemanticSearchError> {
+        let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self
             .semantic_engine
             .write()
             .unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(engine) => engine.reset_index().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Remove books that disappeared from the library.
+    ///
+    /// This consumes the keys reported by [`IndexDiff::removed_books`]. It shares
+    /// the indexing mutex with indexing and reset, so destructive lifecycle
+    /// operations cannot land between two books of an active batch.
+    pub fn remove_semantic_books(
+        &self,
+        source_book_keys: &[String],
+    ) -> Result<Option<u32>, SemanticSearchError> {
+        let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .semantic_engine
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(engine) => engine.remove_books(source_book_keys).map(Some),
             None => Ok(None),
         }
     }
@@ -404,13 +411,16 @@ impl HybridCoordinator {
     /// decided — a long full index on the UI thread's engine is a blocker there,
     /// and it should be solved once, properly.
     ///
-    /// # The manifest is written at checkpoints, not per book
+    /// # The manifest is written once, not per book
     ///
     /// Releasing the engine lock between books must not mean committing the
     /// manifest between books: every write serializes every record, so per-book
-    /// saves move `O(B²)` bytes and ask for `B` `fsync`s. The manifest is written
-    /// every few hundred books and once at the end — and on the
-    /// way out of a failure, so a retry resumes instead of restarting.
+    /// saves move `O(B²)` bytes and ask for `B` `fsync`s. The current vector store
+    /// is volatile, so a mid-run manifest checkpoint cannot preserve useful work:
+    /// its vectors disappear on restart. The manifest is therefore written once
+    /// at the end, and once on an error path to keep in-process state coherent.
+    /// A persistent store must add an append-only journal or incremental
+    /// checkpoint format before claiming crash-resumable indexing.
     pub fn index_books(
         &self,
         books: &[BookForIndexing],
@@ -422,9 +432,9 @@ impl HybridCoordinator {
         let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut summary = IndexingSummary::default();
-        let mut uncommitted = 0usize;
+        let mut dirty = false;
 
-        for (position, book) in books.iter().enumerate() {
+        for book in books {
             let mut guard = self
                 .semantic_engine
                 .write()
@@ -435,8 +445,8 @@ impl HybridCoordinator {
 
             match engine.index_book_deferred(book) {
                 Ok(outcome) => {
+                    dirty |= outcome.did_work();
                     summary.record(outcome);
-                    uncommitted += 1;
                 }
                 Err(indexing_error) => {
                     // Commit what did land. Losing the manifest here would strand
@@ -446,21 +456,24 @@ impl HybridCoordinator {
                     if let Err(flush_error) = engine.flush_manifest() {
                         log::warn!(
                             "Could not commit the manifest after an indexing failure \
-                             ({flush_error}); {uncommitted} book(s) will be re-indexed"
+                             ({flush_error}); completed changes may be re-indexed"
                         );
                     }
                     return Err(indexing_error);
                 }
             }
-
-            let last = position + 1 == books.len();
-            if last || uncommitted >= MANIFEST_CHECKPOINT_BOOKS {
-                engine.flush_manifest()?;
-                uncommitted = 0;
-            }
         }
 
-        debug_assert_eq!(uncommitted, 0, "the final book must have been committed");
+        if dirty {
+            let mut guard = self
+                .semantic_engine
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(engine) = guard.as_mut() else {
+                return Ok(None);
+            };
+            engine.flush_manifest()?;
+        }
         Ok(Some(summary))
     }
 
@@ -1264,16 +1277,17 @@ mod tests {
         );
     }
 
-    /// A long run still checkpoints, so a crash costs at most
-    /// [`MANIFEST_CHECKPOINT_BOOKS`] books of work rather than the whole batch.
+    /// The volatile store makes intermediate manifest checkpoints actively
+    /// misleading: after a crash their vectors are gone anyway. Even a long run
+    /// therefore has one final manifest commit.
     #[test]
-    fn a_long_indexing_run_checkpoints_the_manifest() {
-        let dir = TempDir::new("checkpointing");
+    fn a_long_indexing_run_writes_one_final_manifest() {
+        let dir = TempDir::new("single_final_manifest");
         // Warm up first: loading the model records its identity, which is a
         // one-off write and would otherwise be counted below.
         let coordinator = indexed_coordinator(&dir);
 
-        let library: Vec<BookForIndexing> = (1..MANIFEST_CHECKPOINT_BOOKS as u64 + 2)
+        let library: Vec<BookForIndexing> = (1..=225)
             .map(|i| {
                 let mut book = mock_book();
                 book.source_book_key = format!("otzaria/book{i:04}.txt");
@@ -1288,9 +1302,24 @@ mod tests {
 
         assert_eq!(
             after - before,
-            2,
-            "one checkpoint at {MANIFEST_CHECKPOINT_BOOKS} books and one final commit"
+            1,
+            "a whole-manifest checkpoint inside the batch would reintroduce superlinear I/O"
         );
+    }
+
+    #[test]
+    fn a_batch_of_skipped_books_does_not_rewrite_the_manifest() {
+        let dir = TempDir::new("skip_without_manifest_write");
+        let coordinator = indexed_coordinator(&dir);
+        let before = manifest_save_count(&coordinator);
+
+        let summary = coordinator
+            .index_books(&[mock_book(), mock_book()])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.books_skipped, 2);
+        assert_eq!(manifest_save_count(&coordinator), before);
     }
 
     /// Two indexing runs must not interleave: they would drop and re-insert each
@@ -1329,6 +1358,45 @@ mod tests {
         let status = coordinator.status();
         assert_eq!(status.indexed_book_count, 40);
         assert_eq!(status.vector_count, 120);
+    }
+
+    #[test]
+    fn reset_waits_for_an_active_indexing_lifecycle() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let dir = TempDir::new("reset_serialization");
+        let coordinator = Arc::new(indexed_coordinator(&dir));
+        let indexing_guard = coordinator
+            .indexing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let resetter = {
+            let coordinator = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = coordinator.reset_semantic_index();
+                done_tx.send(result).unwrap();
+            })
+        };
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "reset must wait on the same lifecycle mutex as indexing"
+        );
+        drop(indexing_guard);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reset should continue after indexing releases the mutex")
+                .unwrap(),
+            Some(3)
+        );
+        resetter.join().unwrap();
     }
 
     #[test]
