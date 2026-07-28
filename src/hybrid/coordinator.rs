@@ -1215,7 +1215,7 @@ mod tests {
             let indexing_done = Arc::clone(&indexing_done);
             let searches = Arc::clone(&searches);
             std::thread::spawn(move || {
-                while !indexing_done.load(Ordering::Relaxed) {
+                loop {
                     let result = coordinator
                         .search(LINE_ONE, vec![], &HybridSearchParams::default())
                         .expect("a search during indexing must still succeed");
@@ -1226,6 +1226,9 @@ mod tests {
                         assert!(item.fused_score.is_finite());
                     }
                     searches.fetch_add(1, Ordering::Relaxed);
+                    if indexing_done.load(Ordering::Relaxed) {
+                        break;
+                    }
                     std::thread::yield_now();
                 }
             })
