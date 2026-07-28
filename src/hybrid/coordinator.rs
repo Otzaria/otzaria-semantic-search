@@ -981,6 +981,32 @@ mod tests {
     }
 
     #[test]
+    fn semantic_only_mode_discards_lexical_candidates_and_honors_mode() {
+        let dir = TempDir::new("semantic_only_mode");
+        let coordinator = indexed_coordinator(&dir);
+
+        let result = coordinator
+            .search(
+                LINE_ONE,
+                vec![lexical(999, "תורה, בראשית א, א", 100.0)],
+                &HybridSearchParams {
+                    force_mode: Some(SearchMode::SemanticOnly),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.search_mode, SearchMode::SemanticOnly);
+        assert!(result.semantic_available);
+        // The supplied lexical candidate (id 999) must be discarded in SemanticOnly mode.
+        assert!(result.results.iter().all(|r| r.id != 999));
+        assert!(result
+            .results
+            .iter()
+            .all(|r| r.source == ResultSource::Semantic));
+    }
+
+    #[test]
     fn a_search_with_no_candidates_at_all_returns_an_empty_result_not_an_error() {
         let coordinator = HybridCoordinator::new(None);
         let result = coordinator
