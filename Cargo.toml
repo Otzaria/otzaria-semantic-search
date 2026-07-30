@@ -24,6 +24,12 @@ mock-embedding = []
 
 # Real GGUF inference. Non-default because it compiles llama.cpp and ggml through
 # cmake in every downstream build.
+#
+# Its crates are declared under `cfg(not(target_arch = "arm"))`: a 0.6B model at
+# Q4 is unusable on 32-bit ARM, and `llama-cpp-sys-2`'s build script panics there
+# anyway — it `.expect()`s `CARGO_CFG_TARGET_FEATURE`, which cargo omits for
+# `armv7-linux-androideabi` (zero target features). The feature can therefore be
+# on with no backend behind it; `semantic::backend` gates on the same condition.
 llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 
 [[bench]]
@@ -75,7 +81,7 @@ sha2 = "0.10"
 # `n_gpu_layers = 0` keeps the weights on the CPU, not the backend out of the graph.
 # Consequence: CPU-versus-Metal agreement is cosine 0.99491, so this platform and a
 # CPU-only Android build may not produce identical vectors.
-[dependencies.llama-cpp-2]
+[target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-2]
 version = "=0.1.153"
 default-features = false
 features = ["android-shared-stdcxx"]
@@ -87,7 +93,7 @@ optional = true
 #
 # Version-locked to `llama-cpp-2` so cargo unifies both on one build of llama.cpp;
 # a mismatch would compile ggml twice and hand the tokenizer a foreign vocabulary.
-[dependencies.llama-cpp-sys-2]
+[target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-sys-2]
 version = "=0.1.153"
 default-features = false
 optional = true

@@ -298,7 +298,10 @@ pub fn select_backend(
 /// containers, and a real backend ahead of the stand-in in [`CANDIDATES`] would
 /// fail on every one of them. Integration tests link the library without
 /// `cfg(test)` and so see the real table.
-#[cfg(all(feature = "llama-backend", not(test)))]
+///
+/// `not(target_arch = "arm")` because the llama crates are not dependencies
+/// there; such a build takes the `None` arm below.
+#[cfg(all(feature = "llama-backend", not(target_arch = "arm"), not(test)))]
 fn llama_cpp_backend(config: &EmbeddingConfig) -> Constructed {
     use crate::semantic::llama_backend::{LlamaBackendConfig, LlamaCppBackend};
 
@@ -310,9 +313,9 @@ fn llama_cpp_backend(config: &EmbeddingConfig) -> Constructed {
     }))
 }
 
-/// `None`, not `Some(Err(_))`: without the feature there is no such
-/// implementation at all.
-#[cfg(not(all(feature = "llama-backend", not(test))))]
+/// `None`, not `Some(Err(_))`: without the feature — or on a target the backend
+/// is not built for — there is no such implementation at all.
+#[cfg(not(all(feature = "llama-backend", not(target_arch = "arm"), not(test))))]
 fn llama_cpp_backend(_config: &EmbeddingConfig) -> Constructed {
     None
 }

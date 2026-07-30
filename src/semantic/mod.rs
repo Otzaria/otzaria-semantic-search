@@ -19,12 +19,14 @@ pub mod engine;
 // llama.cpp and ggml through cmake on every `cargo build`. Which backend a build
 // actually gets is decided in `backend`, not here.
 //
+// The `target_arch` half mirrors the dependency declarations in `Cargo.toml`.
+//
 // A plain comment rather than a doc comment on purpose: an outer `///` here would
 // be concatenated with the module's own `//!` header, and rustdoc then resolves
 // that whole text's intra-doc links in *this* module's scope instead of the
 // module's own — turning every correct link in `llama_backend` into an unresolved
 // one under `RUSTDOCFLAGS="-D warnings"`.
-#[cfg(feature = "llama-backend")]
+#[cfg(all(feature = "llama-backend", not(target_arch = "arm")))]
 pub mod llama_backend;
 pub mod manifest;
 pub mod store;
