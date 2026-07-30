@@ -1,30 +1,20 @@
 //! Semantic index manifest and versioning.
 //!
-//! The manifest records the exact configuration the semantic index was built
-//! with — embedding model and its file checksum, embedding backend, vector
-//! backend, dimensions, pooling, precision, chunking and normalization versions
-//! — plus a per-book indexing record.
-//!
-//! On startup the manifest is compared against the current configuration. Any
-//! mismatch means the stored vectors live in a different space from the ones the
-//! current configuration would produce, so they cannot be searched or added to.
-//! [`SemanticEngine`](crate::semantic::engine::SemanticEngine) disables the
-//! semantic path in that case — queries fall back to BM25 — until the index is
-//! reset and rebuilt.
+//! Records the configuration the semantic index was built with — model and its file
+//! checksum, embedding and vector backends, dimensions, pooling, precision, chunking
+//! and normalization versions — plus a per-book indexing record. On startup it is
+//! compared against the current configuration; any mismatch means the stored vectors
+//! live in a different space, so
+//! [`SemanticEngine`](crate::semantic::engine::SemanticEngine) disables the semantic
+//! path until the index is reset and rebuilt.
 //!
 //! # Atomic persistence
 //!
-//! The manifest is written to a `.tmp` file which is `fsync`ed and then renamed
-//! over the target. A crash therefore leaves either the previous manifest or the
-//! new one, never a half-written file — and [`SemanticManifest::load`] recovers
-//! the leftovers a crash mid-`save` can strand. Durability of the rename itself
-//! is enforced on Unix and best-effort elsewhere; [`SemanticManifest::save`]
-//! documents exactly which.
-//!
-//! Writing it is not cheap — the whole document is serialized every time — so a
-//! bulk index commits once rather than per book. With the current volatile vector
-//! store, intermediate checkpoints cannot preserve work across a restart. See
-//! [`SemanticEngine::index_book_deferred`](crate::semantic::engine::SemanticEngine::index_book_deferred).
+//! The manifest is written to a `.tmp` file, `fsync`ed, then renamed over the
+//! target, so a crash leaves either the previous manifest or the new one, never a
+//! half-written file; [`SemanticManifest::load`] recovers the leftovers a crash
+//! mid-`save` can strand. Writing it serializes the whole document, so a bulk index
+//! commits once rather than per book.
 
 use crate::errors::ManifestError;
 use crate::semantic::types::ContentFingerprint;
@@ -34,45 +24,43 @@ use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-/// Current manifest format version. Bump when the schema changes.
-const MANIFEST_FORMAT_VERSION: u32 = 3;
+/// Current manifest format version; bump when the schema changes. An older manifest
+/// is refused by [`SemanticManifest::load`] rather than upgraded: filling in a field
+/// it never recorded would be a guess that reads as agreement.
+const MANIFEST_FORMAT_VERSION: u32 = 4;
 
-/// Manifest file name.
 const MANIFEST_FILENAME: &str = "semantic_manifest.json";
 
-/// Where the previous manifest is parked while a retried rename is in flight.
-///
-/// Only [`SemanticManifest::save`]'s fallback path creates it, and only for the
-/// duration of one rename. Its existence alongside a missing target means a crash
-/// caught that window, and [`SemanticManifest::load`] recovers from it.
+/// Where the previous manifest is parked while a retried rename is in flight; its
+/// existence alongside a missing target means a crash caught that window, and
+/// [`SemanticManifest::load`] recovers from it.
 const MANIFEST_PREVIOUS_SUFFIX: &str = "previous";
 
-/// Full semantic index manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticManifest {
-    /// Format version of this manifest.
     pub format_version: u32,
 
     // ── Model metadata ──
-    /// Embedding model identifier (e.g. "EMD123/Otzaria-Embedding-V1-Flash-0.6B").
     pub embedding_model_id: String,
-    /// SHA-256 of the model file, once a model has been loaded.
-    ///
-    /// Guards the case the model id alone cannot catch: same id, different
-    /// weights behind the same path.
+    /// SHA-256 of the model file, once a model has been loaded. Guards what the model
+    /// id alone cannot: same id, different weights behind the same path.
     pub model_checksum: Option<String>,
-    /// Identifier of the inference backend that produced the vectors, once a
-    /// model has been loaded (e.g. `"mock-hash-v1"`).
+    /// Backend that produced the vectors, once a model is loaded (`"mock-hash-v1"`).
     pub embedding_backend: Option<String>,
-    /// Embedding vector dimensionality (e.g. 1024).
     pub embedding_dim: u32,
-    /// Pooling strategy used (e.g. "last-token").
     pub pooling: String,
+    /// Token cap the texts behind these vectors were embedded under (e.g. 512).
+    ///
+    /// Part of the index's identity: the cap decides how much of a long line reaches
+    /// the model at all, so changing it changes the vectors. The *requested* cap is
+    /// what is recorded — the manifest is written at `open`, before any backend can
+    /// clamp it — which errs towards a needless re-index rather than leaving vectors
+    /// from two different caps in one index.
+    pub embedding_max_tokens: usize,
     /// Model quantization level (e.g. "Q4").
     pub model_quantization: String,
     /// Vector storage precision in the store (e.g. "f32", "f16").
     pub vector_precision: String,
-    /// Identifier of the vector storage backend that holds the vectors.
     pub vector_backend: String,
 
     // ── Algorithm versions ──
@@ -91,60 +79,42 @@ pub struct SemanticManifest {
     /// Per-book indexing records, keyed by `source_book_key` (file path).
     pub books: HashMap<String, BookManifestEntry>,
 
-    /// How many times this instance has been written to disk.
-    ///
-    /// Not part of the format — `serde(skip)` — and not a statistic. Writing the
-    /// manifest costs a full serialize plus an `fsync`, so "how many times did
-    /// that happen" is a correctness property of the indexing loop, and the only
-    /// way to assert it is to count. See
-    /// [`SemanticManifest::save_count`].
+    /// How many times this instance has been written to disk. Not part of the format
+    /// (`serde(skip)`): a write costs a full serialize plus an `fsync`, so the count
+    /// is a correctness property of the indexing loop that has to be asserted.
     #[serde(skip)]
     saves: u32,
 }
 
-/// Per-book entry in the manifest.
-///
-/// An entry with `chunk_count == 0` is meaningful, not a leftover: it records
-/// that the book *was* processed and yielded nothing embeddable — a scanned PDF
-/// with no text layer, or a book of headings only. Without it the book would be
-/// reported as new on every startup and reprocessed forever. The lexical indexer
-/// keeps an empty-book marker for exactly this reason.
+/// An entry with `chunk_count == 0` is meaningful, not a leftover: it records that
+/// the book *was* processed and yielded nothing embeddable — a scanned PDF, a book of
+/// headings. Without it the book would be reported as new on every startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookManifestEntry {
-    /// Stable book identifier (file path).
     pub source_book_key: String,
     /// The raw fingerprint the caller vouched for at indexing time — the lexical
-    /// `contentHash` for a text book, whatever
-    /// [`ContentFingerprint::canonical`] produced for a PDF.
-    ///
-    /// `0` means there was none, in which case `line_fingerprint` is the only
-    /// thing that can decide whether anything changed.
+    /// `contentHash` for a text book, whatever [`ContentFingerprint::canonical`]
+    /// produced for a PDF. `0` means there was none, leaving `line_fingerprint` as
+    /// the only thing that can decide whether anything changed.
     pub content_hash: u64,
-    /// Fingerprint computed by this crate from the book itself — its lines and the
-    /// metadata stored in every vector.
-    ///
-    /// What settles a book whose `content_hash` could not prove it was current:
-    /// one recorded as `0`, or one whose fingerprint covers the content but not
-    /// the metadata. See
+    /// Fingerprint computed by this crate from the book's own lines and the metadata
+    /// stored in every vector. What settles a book whose `content_hash` could not
+    /// prove it current — one recorded as `0`, or one covering content but not
+    /// metadata. See
     /// [`BookForIndexing::line_fingerprint`](crate::semantic::types::BookForIndexing::line_fingerprint).
     pub line_fingerprint: u64,
-    /// Number of semantic chunks generated for this book. `0` is a valid,
-    /// deliberate value — see the type-level note.
+    /// Number of semantic chunks generated. `0` is deliberate — see the type note.
     pub chunk_count: u32,
     /// When this book was last indexed (Unix timestamp).
     pub indexed_at: u64,
-    /// Chunking version used for this specific book.
     pub chunking_version: u32,
-    /// Normalization version used for this specific book.
     pub normalization_version: u32,
 }
 
-/// The configuration a manifest is validated against.
-///
-/// `model_checksum` and `embedding_backend` are `Option` because they are only
-/// known once a model has actually been loaded. While they are `None`,
-/// [`SemanticManifest::validate`] leaves those dimensions unchecked instead of
-/// reporting a false mismatch; the engine re-validates after loading the model.
+/// The configuration a manifest is validated against. `model_checksum` and
+/// `embedding_backend` are `Option` because they are known only once a model has been
+/// loaded; while `None`, [`SemanticManifest::validate`] leaves those dimensions
+/// unchecked rather than reporting a false mismatch.
 #[derive(Debug, Clone)]
 pub struct ManifestConfig {
     pub embedding_model_id: String,
@@ -152,6 +122,9 @@ pub struct ManifestConfig {
     pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
     pub pooling: String,
+    /// The requested cap, compared verbatim — see
+    /// [`SemanticManifest::embedding_max_tokens`].
+    pub embedding_max_tokens: usize,
     pub model_quantization: String,
     pub vector_precision: String,
     pub vector_backend: String,
@@ -160,7 +133,6 @@ pub struct ManifestConfig {
 }
 
 impl SemanticManifest {
-    /// Create a new manifest from the given configuration.
     pub fn new(config: &ManifestConfig) -> Self {
         let now = current_unix_timestamp();
         Self {
@@ -170,6 +142,7 @@ impl SemanticManifest {
             embedding_backend: config.embedding_backend.clone(),
             embedding_dim: config.embedding_dim,
             pooling: config.pooling.clone(),
+            embedding_max_tokens: config.embedding_max_tokens,
             model_quantization: config.model_quantization.clone(),
             vector_precision: config.vector_precision.clone(),
             vector_backend: config.vector_backend.clone(),
@@ -182,35 +155,24 @@ impl SemanticManifest {
         }
     }
 
-    /// How many times this instance has written itself to disk.
-    ///
-    /// Resets to zero when a manifest is loaded, since the counter describes this
-    /// process's writes rather than the file's history.
+    /// How many times this instance has written itself to disk. Resets on load: the
+    /// counter describes this process's writes, not the file's history.
     pub fn save_count(&self) -> u32 {
         self.saves
     }
 
-    /// Load a manifest from the given directory.
-    ///
-    /// Returns [`ManifestError::NotFound`] when there is nothing to load (a
-    /// first run), [`ManifestError::ParseFailed`] when the file is unreadable or
-    /// malformed, and [`ManifestError::UnsupportedFormatVersion`] when it was
-    /// written by a different schema version. The caller decides how to react;
-    /// see [`SemanticEngine::open`](crate::semantic::engine::SemanticEngine::open),
+    /// [`ManifestError::NotFound`] means a first run, [`ManifestError::ParseFailed`]
+    /// an unreadable or malformed file, [`ManifestError::UnsupportedFormatVersion`]
+    /// another schema. See
+    /// [`SemanticEngine::open`](crate::semantic::engine::SemanticEngine::open),
     /// which quarantines an unusable file and starts fresh.
     pub fn load(dir: &Path) -> Result<Self, ManifestError> {
         let path = Self::file_path(dir);
         if !path.exists() {
-            // A crash inside `save` can leave the manifest somewhere other than
-            // its own name. Recovering it is what makes the "previous or new,
-            // never none" guarantee hold: without this the state reads as a first
-            // run and the whole index is silently rebuilt.
-            //
-            // Order matters. `.previous` is a manifest that was *already* in
-            // service, so it is preferred over `.tmp`, which was only ever a
-            // candidate. `.tmp` is still worth having: `save` `fsync`s it before
-            // renaming, so one that outlived a crash is a complete document, and a
-            // partial one fails to parse below and is discarded.
+            // A crash inside `save` can leave the manifest under another name;
+            // unrecovered, that reads as a first run and the index is silently rebuilt.
+            // `.previous` is preferred because it was already in service, while `.tmp`
+            // was only a candidate — a complete one, being `fsync`ed before the rename.
             let candidates = [Self::previous_path(dir), Self::tmp_path(dir)];
             let recovered = candidates
                 .iter()
@@ -218,9 +180,7 @@ impl SemanticManifest {
 
             let Some(recovered) = recovered else {
                 for unusable in candidates.iter().filter(|c| c.exists()) {
-                    // Left where it is — this path deletes no evidence — but not
-                    // silently: a leftover nobody mentions is a leftover nobody
-                    // investigates.
+                    // Left where it is — evidence — but not silently.
                     log::warn!(
                         "Ignoring {}: it is not a readable manifest of format version \
                          {MANIFEST_FORMAT_VERSION}",
@@ -245,9 +205,8 @@ impl SemanticManifest {
                     path.display()
                 ),
             })?;
-            // Recovery changes a directory entry just like `save` does. Without
-            // flushing the directory, reporting a successful recovery would not
-            // mean the live name survives a power loss.
+            // Recovery changes a directory entry just as `save` does; unflushed, a
+            // successful recovery would not survive a power loss.
             sync_directory(dir)?;
         }
 
@@ -255,8 +214,8 @@ impl SemanticManifest {
             reason: format!("Failed to read manifest: {e}"),
         })?;
 
-        // Read the version before the full document, so a schema change reports
-        // a version mismatch rather than a confusing field-level parse error.
+        // Version before the full document, so a schema change reports a version
+        // mismatch rather than a confusing field-level parse error.
         let probe: FormatVersionProbe =
             serde_json::from_str(&content).map_err(|e| ManifestError::ParseFailed {
                 reason: format!("Failed to parse manifest JSON: {e}"),
@@ -273,26 +232,15 @@ impl SemanticManifest {
         })
     }
 
-    /// Save the manifest to the given directory.
+    /// Save atomically: the payload is written to a temp file, `fsync`ed, then renamed
+    /// over the target. A crash at any point leaves a readable manifest — the previous
+    /// one, the new one, or a copy [`Self::load`] knows how to find — never a partial
+    /// file and never none.
     ///
-    /// Atomic: the payload is written to a temp file, `fsync`ed, then renamed over
-    /// the target. A crash at any point leaves a readable manifest — the previous
-    /// one, the new one, or a recoverable copy [`Self::load`] knows how to find —
-    /// never a partial file and never none.
-    ///
-    /// Durable, with one platform caveat. The rename itself only becomes durable
-    /// once the *directory* entry is flushed, and that is not uniformly possible:
-    ///
-    /// * On Unix the directory is opened and `fsync`ed, and a failure fails the
-    ///   save. Returning `Ok` from it would be a lie — the caller would record
-    ///   progress that a power loss can still undo.
-    /// * On other platforms (Windows has no directory `fsync`) the rename is left
-    ///   as the filesystem's own guarantee. `save` returning `Ok` there means the
-    ///   data reached the disk and the rename was issued, not that the rename
-    ///   survives a power loss.
-    ///
-    /// The `.previous` file that appears if a rename has to be retried is part of
-    /// the atomicity guarantee, not debris: see the fallback below.
+    /// The rename only becomes durable once the *directory* entry is flushed. On Unix
+    /// that is done and a failure fails the save, since returning `Ok` would let the
+    /// caller record progress a power loss can undo; elsewhere (Windows has no
+    /// directory `fsync`) the rename is left as the filesystem's own guarantee.
     pub fn save(&mut self, dir: &Path) -> Result<(), ManifestError> {
         self.updated_at = current_unix_timestamp();
 
@@ -317,8 +265,7 @@ impl SemanticManifest {
                 .map_err(|e| ManifestError::WriteFailed {
                     reason: format!("Failed to write temp manifest: {e}"),
                 })?;
-            // Without this the rename can be durable before the data is, leaving
-            // an empty or partial manifest after a power loss.
+            // Otherwise the rename can be durable before the data is.
             file.sync_all().map_err(|e| ManifestError::WriteFailed {
                 reason: format!("Failed to flush temp manifest: {e}"),
             })?;
@@ -326,14 +273,10 @@ impl SemanticManifest {
 
         let mut parked: Option<PathBuf> = None;
         if let Err(first) = rename(&tmp, &target) {
-            // `rename` replaces an existing file on both Unix and Windows, but a
-            // Windows file lock (search indexer, antivirus, another handle) can
-            // still deny it.
-            //
-            // The retry must not simply delete the target: a crash in that window
-            // would leave no manifest at all, which is worse than either version.
-            // Parking it under `.previous` keeps a recoverable copy throughout,
-            // and `load` recovers from it if a crash lands mid-swap.
+            // A Windows file lock (indexer, antivirus, another handle) can deny a
+            // rename that would otherwise replace the target. The retry must not
+            // delete the target — a crash in that window would leave no manifest at
+            // all — so the old one is parked under `.previous`, which `load` recovers.
             log::warn!("Atomic manifest rename failed ({first}); retrying via a parked copy");
             let previous = Self::previous_path(dir);
             let _ = std::fs::remove_file(&previous);
@@ -343,9 +286,8 @@ impl SemanticManifest {
             }
 
             if let Err(second) = rename(&tmp, &target) {
-                // Put the old manifest back rather than leaving the directory
-                // without one. If even that fails the parked copy stays where it
-                // is, which is exactly what `load` knows how to recover.
+                // Put the old manifest back. If even that fails, the parked copy
+                // stays where it is, which is what `load` recovers.
                 if let Some(previous) = &parked {
                     if let Err(restore) = rename(previous, &target) {
                         log::error!(
@@ -365,18 +307,15 @@ impl SemanticManifest {
             }
         }
 
-        // The rename is only durable once the directory entry itself is flushed;
-        // otherwise a power loss can resurrect the old name. This must happen
-        // *before* the parked copy is discarded, so a crash in between still
-        // leaves something recoverable.
+        // Only durable once the directory entry is flushed, and this must happen
+        // *before* the parked copy is discarded, so a crash in between still leaves
+        // something recoverable.
         sync_directory(dir)?;
 
         if let Some(previous) = parked {
             match std::fs::remove_file(&previous) {
                 Ok(()) => {
-                    // Persist the cleanup too. A resurrected `.previous` is
-                    // harmless while the live target exists, but leaving the
-                    // operation half-durable makes later recovery ambiguous.
+                    // Persist the cleanup too, or later recovery is ambiguous.
                     sync_directory(dir)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -405,10 +344,9 @@ impl SemanticManifest {
         dir.join(format!("{MANIFEST_FILENAME}.tmp"))
     }
 
-    /// Whether a leftover file is a manifest worth recovering.
-    ///
-    /// Parses it and checks the format version, so a half-written temp file or one
-    /// from another schema is passed over rather than promoted into place.
+    /// Whether a leftover file is a manifest worth recovering: parsed and
+    /// version-checked, so a half-written or foreign-schema file is passed over
+    /// rather than promoted into place.
     fn is_recoverable(candidate: &Path) -> bool {
         let Ok(content) = std::fs::read_to_string(candidate) else {
             return false;
@@ -420,9 +358,7 @@ impl SemanticManifest {
     }
 
     /// Move an unusable manifest aside so a fresh one can be written without
-    /// destroying evidence, and return where it went.
-    ///
-    /// `tag` describes why (e.g. `"corrupt"`, `"incompatible"`).
+    /// destroying evidence, and return where it went. `tag` describes why.
     pub fn quarantine(dir: &Path, tag: &str) -> Result<PathBuf, ManifestError> {
         let source = Self::file_path(dir);
         let quarantined = dir.join(format!(
@@ -445,8 +381,7 @@ impl SemanticManifest {
         Ok(quarantined)
     }
 
-    /// Validate this manifest against the current configuration.
-    /// Returns a list of mismatches (empty = everything matches).
+    /// Validate against the current configuration; empty means everything matches.
     pub fn validate(&self, config: &ManifestConfig) -> Vec<ManifestMismatch> {
         let mut mismatches = Vec::new();
 
@@ -457,8 +392,8 @@ impl SemanticManifest {
             });
         }
 
-        // Only compare a checksum/backend the caller actually knows. Nothing to
-        // compare on either side is not a mismatch — it is recorded on save.
+        // Only compare a checksum/backend the caller knows; unknown is not a
+        // mismatch — it is recorded on save.
         if let (Some(manifest), Some(config)) = (&self.model_checksum, &config.model_checksum) {
             if manifest != config {
                 mismatches.push(ManifestMismatch::ModelChecksum {
@@ -489,6 +424,13 @@ impl SemanticManifest {
             mismatches.push(ManifestMismatch::Pooling {
                 manifest: self.pooling.clone(),
                 config: config.pooling.clone(),
+            });
+        }
+
+        if self.embedding_max_tokens != config.embedding_max_tokens {
+            mismatches.push(ManifestMismatch::MaxTokens {
+                manifest: self.embedding_max_tokens,
+                config: config.embedding_max_tokens,
             });
         }
 
@@ -530,10 +472,8 @@ impl SemanticManifest {
         mismatches
     }
 
-    /// Record the identity of the model that produced this index.
-    ///
-    /// Called once a model is loaded, so a later session can detect that the
-    /// file behind the same model id changed.
+    /// Record the identity of the model that produced this index, once one is loaded,
+    /// so a later session can detect that the file behind the same id changed.
     pub fn set_model_identity(&mut self, checksum: Option<String>, backend: Option<String>) {
         if checksum.is_some() {
             self.model_checksum = checksum;
@@ -543,14 +483,11 @@ impl SemanticManifest {
         }
     }
 
-    /// What, if anything, a book needs — from the lexical fingerprint alone.
-    ///
-    /// This is the decision available at diff time, before the book's lines have
-    /// been loaded. A book whose fingerprint cannot prove everything reports
-    /// [`BookIndexNeed::Unverifiable`] rather than being assumed current: only a
-    /// [`ContentFingerprint::Canonical`] match reaches
-    /// [`BookIndexNeed::UpToDate`], because only that kind of fingerprint moves
-    /// when the metadata stored in the vectors changes.
+    /// What, if anything, a book needs — from the fingerprint alone, i.e. at diff time,
+    /// before its lines are loaded. A fingerprint that cannot prove everything reports
+    /// [`BookIndexNeed::Unverifiable`] rather than being assumed current: only
+    /// [`ContentFingerprint::Canonical`] moves when the metadata stored in the vectors
+    /// changes.
     pub fn book_index_need(
         &self,
         source_book_key: &str,
@@ -568,10 +505,8 @@ impl SemanticManifest {
             return BookIndexNeed::Changed;
         }
 
-        // A stored `0` is the "no fingerprint" marker, so it can never equal an
-        // incoming hash. Belt and braces: `ContentFingerprint` already carries a
-        // `NonZeroU64`, but this entry was deserialized from disk and the guard
-        // costs nothing.
+        // A stored `0` is the "no fingerprint" marker and can never match. The type
+        // already guarantees non-zero, but this entry came off disk.
         let recorded = match NonZeroU64::new(entry.content_hash) {
             Some(recorded) => recorded,
             None => return BookIndexNeed::Unverifiable,
@@ -579,22 +514,19 @@ impl SemanticManifest {
 
         match fingerprint {
             ContentFingerprint::Canonical(hash) if recorded == hash => BookIndexNeed::UpToDate,
-            // The text is provably unchanged, but this fingerprint says nothing
-            // about title, category or facets — all of which are stored in the
-            // vectors. The lines have to settle it.
+            // Provably unchanged text, but this says nothing about the title,
+            // category or facets stored in the vectors. The lines settle it.
             ContentFingerprint::ContentOnly(hash) if recorded == hash => {
                 BookIndexNeed::Unverifiable
             }
             ContentFingerprint::Canonical(_) | ContentFingerprint::ContentOnly(_) => {
                 BookIndexNeed::Changed
             }
-            // Nothing to compare (a PDF whose caller has no signature of its
-            // own). Only the lines themselves can settle it.
+            // Nothing to compare; only the lines can settle it.
             ContentFingerprint::Unverifiable => BookIndexNeed::Unverifiable,
         }
     }
 
-    /// Check if a specific book needs re-indexing.
     pub fn book_needs_reindex(
         &self,
         source_book_key: &str,
@@ -611,15 +543,12 @@ impl SemanticManifest {
         .needs_work()
     }
 
-    /// The recorded entry for a book, if it has one.
     pub fn book(&self, source_book_key: &str) -> Option<&BookManifestEntry> {
         self.books.get(source_book_key)
     }
 
-    /// Record that a book has been indexed.
-    ///
-    /// `chunk_count == 0` is recorded, not skipped: it is the marker that says
-    /// the book was processed and has nothing to embed.
+    /// Record that a book has been indexed. `chunk_count == 0` is recorded, not
+    /// skipped: it marks a book processed with nothing to embed.
     pub fn mark_book_indexed(
         &mut self,
         source_book_key: String,
@@ -641,30 +570,23 @@ impl SemanticManifest {
         self.books.insert(source_book_key, entry);
     }
 
-    /// Remove a book from the manifest.
     pub fn remove_book(&mut self, source_book_key: &str) -> Option<BookManifestEntry> {
         self.books.remove(source_book_key)
     }
 
-    /// Drop every per-book record, keeping the configuration metadata.
-    ///
-    /// For a full rebuild. Returns how many records were dropped.
+    /// Drop every per-book record for a full rebuild, keeping the configuration
+    /// metadata, and return how many went.
     pub fn clear_books(&mut self) -> usize {
         let dropped = self.books.len();
         self.books.clear();
         dropped
     }
 
-    /// Drop only the records that describe stored vectors, keeping the
-    /// empty-book markers.
-    ///
-    /// Used when the vectors are known to be gone — a non-persistent store after
-    /// a restart. Keeping a record that claims vectors would make the manifest
-    /// report "up to date" while every query came back empty. A `chunk_count == 0`
-    /// record describes no vectors, so nothing about it was lost and dropping it
-    /// would only force the same book to be reprocessed every session.
-    ///
-    /// Returns how many records were dropped.
+    /// Drop only the records that describe stored vectors, keeping the empty-book
+    /// markers, and return how many went — for when the vectors are known to be gone
+    /// (a non-persistent store after a restart). A record claiming vectors would report
+    /// "up to date" over an empty index, whereas a `chunk_count == 0` record lost
+    /// nothing and dropping it would only force a reprocess every session.
     pub fn clear_books_with_vectors(&mut self) -> usize {
         let before = self.books.len();
         self.books.retain(|_, entry| entry.chunk_count == 0);
@@ -679,17 +601,14 @@ impl SemanticManifest {
             .count()
     }
 
-    /// Get the total number of indexed books.
     pub fn book_count(&self) -> usize {
         self.books.len()
     }
 
-    /// Get the total number of chunks across all books.
     pub fn total_chunk_count(&self) -> u32 {
         self.books.values().map(|b| b.chunk_count).sum()
     }
 
-    /// Get manifest file path for a given directory.
     pub fn file_path(dir: &Path) -> PathBuf {
         dir.join(MANIFEST_FILENAME)
     }
@@ -702,19 +621,16 @@ pub enum BookIndexNeed {
     Missing,
     /// The content hash or an algorithm version changed.
     Changed,
-    /// The lexical index has no fingerprint for this book (a PDF), so it cannot
-    /// be declared current. Its lines have to be compared — see
-    /// [`BookManifestEntry::line_fingerprint`].
+    /// No fingerprint for this book (a PDF), so it cannot be declared current; its
+    /// lines have to be compared — see [`BookManifestEntry::line_fingerprint`].
     Unverifiable,
     /// Recorded, current, and provably so.
     UpToDate,
 }
 
 impl BookIndexNeed {
-    /// Whether the caller has to hand this book over for processing.
-    ///
-    /// `Unverifiable` counts: the book must be examined, even though the
-    /// examination often concludes that nothing changed.
+    /// Whether the caller has to hand this book over. `Unverifiable` counts: it must
+    /// be examined, even though the examination often concludes nothing changed.
     pub fn needs_work(&self) -> bool {
         !matches!(self, Self::UpToDate)
     }
@@ -739,6 +655,7 @@ pub enum ManifestMismatch {
     EmbeddingBackend { manifest: String, config: String },
     Dimensions { manifest: u32, config: u32 },
     Pooling { manifest: String, config: String },
+    MaxTokens { manifest: usize, config: usize },
     ModelQuantization { manifest: String, config: String },
     VectorPrecision { manifest: String, config: String },
     VectorBackend { manifest: String, config: String },
@@ -747,10 +664,12 @@ pub enum ManifestMismatch {
 }
 
 impl ManifestMismatch {
-    /// Whether this mismatch means the vectors themselves are invalid (as
-    /// opposed to only the chunk boundaries or text preprocessing).
-    ///
-    /// Feeds [`IndexDiff::model_mismatch`](crate::semantic::types::IndexDiff).
+    /// Whether this mismatch invalidates the vectors themselves, as opposed to only
+    /// the chunk boundaries or text preprocessing. Feeds
+    /// [`IndexDiff::model_mismatch`](crate::semantic::types::IndexDiff).
+    /// [`Self::MaxTokens`] belongs here rather than with the chunking versions:
+    /// re-chunking cannot repair a cap change, because the cap changes what the
+    /// *model* was shown.
     pub fn invalidates_vectors(&self) -> bool {
         matches!(
             self,
@@ -759,6 +678,7 @@ impl ManifestMismatch {
                 | Self::EmbeddingBackend { .. }
                 | Self::Dimensions { .. }
                 | Self::Pooling { .. }
+                | Self::MaxTokens { .. }
                 | Self::ModelQuantization { .. }
                 | Self::VectorPrecision { .. }
                 | Self::VectorBackend { .. }
@@ -789,6 +709,9 @@ impl std::fmt::Display for ManifestMismatch {
             }
             Self::Pooling { manifest, config } => {
                 write!(f, "Pooling: manifest='{manifest}', config='{config}'")
+            }
+            Self::MaxTokens { manifest, config } => {
+                write!(f, "Max tokens: manifest={manifest}, config={config}")
             }
             Self::ModelQuantization { manifest, config } => {
                 write!(
@@ -832,11 +755,9 @@ pub fn describe_mismatches(mismatches: &[ManifestMismatch]) -> String {
 
 /// Flush the directory entry so a rename inside it survives a power loss.
 ///
-/// Unix only. Windows has no equivalent — a directory cannot be opened as a file
-/// there — so the rename is left as the filesystem's own guarantee rather than
-/// pretending to a durability the platform does not offer. On Unix a failure is
-/// returned: silently downgrading to "probably durable" is what makes a crash
-/// surprising later.
+/// Unix only — Windows cannot open a directory as a file, so there the rename is left
+/// as the filesystem's own guarantee. On Unix a failure is returned rather than
+/// silently downgraded to "probably durable".
 #[cfg(unix)]
 fn sync_directory(dir: &Path) -> Result<(), ManifestError> {
     #[cfg(test)]
@@ -872,9 +793,8 @@ fn sync_directory(_dir: &Path) -> Result<(), ManifestError> {
 /// `std::fs::rename`, with a test-only failure injection point.
 ///
 /// [`SemanticManifest::save`]'s fallback exists for a Windows file lock denying a
-/// rename, which is not a state a test can reach by arranging files on disk. The
-/// alternative to injecting it is an untested recovery path — and an untested
-/// recovery path is the one that does not work when it is finally needed.
+/// rename, which no arrangement of files on disk can produce — and an untested
+/// recovery path is the one that fails when it is finally needed.
 fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if failpoints::next_rename_fails() {
@@ -887,18 +807,15 @@ fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Failure injection for the save paths that cannot be reached otherwise.
 ///
-/// A schedule rather than a count, because the interesting case is not "renames
-/// fail" but "*this* rename fails": the restore path only runs when the retry
-/// fails **after** the old manifest was parked, which is the first and third
-/// rename failing while the second succeeds.
+/// A schedule rather than a count, because the interesting case is "*this* rename
+/// fails": the restore path only runs when the first and third rename fail while the
+/// second — parking the old manifest — succeeds.
 #[cfg(test)]
 mod failpoints {
     use std::cell::RefCell;
 
     thread_local! {
         /// Pending outcomes for the next renames, consumed front to back.
-        /// Thread-local, so a test using it cannot disturb tests running in
-        /// parallel.
         static RENAME_SCHEDULE: RefCell<std::collections::VecDeque<bool>> =
             const { RefCell::new(std::collections::VecDeque::new()) };
         /// Pending outcomes for the next directory syncs.
@@ -906,8 +823,7 @@ mod failpoints {
             const { RefCell::new(std::collections::VecDeque::new()) };
     }
 
-    /// Schedule which of the next renames fail: `[true, false, true]` fails the
-    /// first, lets the second through, fails the third.
+    /// `[true, false, true]` fails the first rename, passes the second, fails the third.
     pub fn schedule_rename_failures(schedule: &[bool]) {
         RENAME_SCHEDULE.with(|queue| *queue.borrow_mut() = schedule.iter().copied().collect());
     }
@@ -926,15 +842,13 @@ mod failpoints {
         DIR_SYNC_SCHEDULE.with(|queue| queue.borrow_mut().pop_front().unwrap_or(false))
     }
 
-    /// Drop any unconsumed schedule, so one test cannot leak into the next on the
-    /// same thread.
+    /// Drop any unconsumed schedule so one test cannot leak into the next.
     pub fn reset() {
         schedule_rename_failures(&[]);
         schedule_dir_sync_failures(&[]);
     }
 }
 
-/// Get current Unix timestamp in seconds.
 fn current_unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -953,6 +867,7 @@ mod tests {
             embedding_backend: None,
             embedding_dim: 1024,
             pooling: "last-token".to_string(),
+            embedding_max_tokens: 512,
             model_quantization: "Q4".to_string(),
             vector_precision: "f32".to_string(),
             vector_backend: "in-memory-v1".to_string(),
@@ -993,6 +908,7 @@ mod tests {
         assert_eq!(manifest.embedding_model_id, config.embedding_model_id);
         assert_eq!(manifest.embedding_dim, 1024);
         assert_eq!(manifest.pooling, "last-token");
+        assert_eq!(manifest.embedding_max_tokens, 512);
         assert_eq!(manifest.chunking_version, 1);
         assert_eq!(manifest.vector_backend, "in-memory-v1");
         assert!(manifest.books.is_empty());
@@ -1032,9 +948,8 @@ mod tests {
         assert!(matches!(mismatches[0], ManifestMismatch::Dimensions { .. }));
     }
 
-    /// These four dimensions were declared in the manifest but never actually
-    /// compared, so switching quantization, precision or storage backend left a
-    /// stale index looking valid.
+    /// These dimensions were recorded but never compared, so switching quantization,
+    /// precision or storage backend left a stale index looking valid.
     #[test]
     fn validate_detects_quantization_precision_and_backend_changes() {
         let config = test_config();
@@ -1066,6 +981,15 @@ mod tests {
                 "pooling",
                 ManifestConfig {
                     pooling: "mean".to_string(),
+                    ..config.clone()
+                },
+            ),
+            // The cap decides how much of a long line the model saw, so a changed
+            // cap is a changed vector, not merely different chunk boundaries.
+            (
+                "max tokens",
+                ManifestConfig {
+                    embedding_max_tokens: 8192,
                     ..config.clone()
                 },
             ),
@@ -1108,8 +1032,7 @@ mod tests {
         ));
     }
 
-    /// Before a model is loaded the checksum and backend are unknown. Unknown
-    /// must not read as "changed", or every startup would look incompatible.
+    /// Unknown must not read as "changed", or every startup would look incompatible.
     #[test]
     fn unknown_checksum_or_backend_is_not_a_mismatch() {
         let mut recorded = test_config();
@@ -1188,7 +1111,6 @@ mod tests {
         );
         assert!(!manifest.book_needs_reindex("book_a", hash(12345), 1, 1));
 
-        // Changed content, chunking or normalization all force a re-index.
         for (name, need) in [
             (
                 "content",
@@ -1217,9 +1139,8 @@ mod tests {
         );
     }
 
-    /// The lexical engine records `contentHash = 0` for PDFs. Treating it as a
-    /// hash means `0 == 0` reads as "unchanged", so a replaced PDF would never be
-    /// re-indexed. It has to report as unverifiable instead.
+    /// The lexical engine records `contentHash = 0` for PDFs, so treating it as a
+    /// hash would make `0 == 0` read as "unchanged" for a replaced PDF.
     #[test]
     fn a_book_without_a_lexical_fingerprint_is_never_declared_up_to_date() {
         let config = test_config();
@@ -1234,18 +1155,15 @@ mod tests {
         );
         assert!(need.is_known(), "but it is not a new book");
 
-        // A version change still takes precedence: nothing about the lines can
-        // rescue an index built by different chunking.
+        // A version change takes precedence: the lines cannot rescue old chunking.
         assert_eq!(
             manifest.book_index_need("scan.pdf", ContentFingerprint::Unverifiable, 2, 1),
             BookIndexNeed::Changed
         );
     }
 
-    /// A fingerprint that covers the content and nothing else cannot license a
-    /// skip. Renaming a book or correcting its author changes what every one of
-    /// its vectors carries while leaving the file's bytes — and therefore a
-    /// size/mtime signature — identical.
+    /// A content-only fingerprint cannot license a skip: correcting a book's author
+    /// changes every vector while leaving the file's bytes identical.
     #[test]
     fn a_content_only_fingerprint_never_reaches_up_to_date() {
         let config = test_config();
@@ -1264,14 +1182,12 @@ mod tests {
             "the text is provably unchanged; the metadata is not, so the lines decide"
         );
 
-        // A different signature is a different matter: the content really did
-        // change, and that is known rather than merely unproven.
+        // A different signature is known change, not merely unproven.
         assert_eq!(
             manifest.book_index_need("scan.pdf", ContentFingerprint::content_only(999), 1, 1),
             BookIndexNeed::Changed
         );
 
-        // The canonical form is what reaches "nothing to do".
         assert_eq!(
             manifest.book_index_need(
                 "scan.pdf",
@@ -1283,9 +1199,8 @@ mod tests {
         );
     }
 
-    /// A recorded `0` is the "no fingerprint" marker. Nothing may ever match it —
-    /// including a caller that somehow presents zero as a hash, which the type
-    /// makes impossible and this checks anyway, because the record came off disk.
+    /// A recorded `0` is the "no fingerprint" marker, and nothing may ever match it —
+    /// not even a zero presented as a hash, which the type forbids but disk does not.
     #[test]
     fn a_recorded_zero_fingerprint_matches_nothing() {
         let config = test_config();
@@ -1306,8 +1221,7 @@ mod tests {
         }
     }
 
-    /// A book that yielded nothing embeddable must stay recorded, or every
-    /// startup reports it as new and reprocesses it.
+    /// Otherwise every startup reports the book as new and reprocesses it.
     #[test]
     fn an_empty_book_record_is_a_valid_up_to_date_record() {
         let config = test_config();
@@ -1323,8 +1237,7 @@ mod tests {
         assert_eq!(manifest.total_chunk_count(), 0);
     }
 
-    /// When the vectors are gone, records that claimed vectors are stale — but an
-    /// empty-book marker described no vectors, so nothing about it was lost.
+    /// An empty-book marker described no vectors, so nothing about it was lost.
     #[test]
     fn clearing_lost_vectors_keeps_the_empty_book_markers() {
         let config = test_config();
@@ -1337,7 +1250,6 @@ mod tests {
         assert!(manifest.book("scanned.pdf").is_some());
         assert!(manifest.book("with-vectors.txt").is_none());
 
-        // The surviving marker still answers "nothing to do" for its own lines.
         assert_eq!(
             manifest.book_index_need("scanned.pdf", ContentFingerprint::Unverifiable, 1, 1),
             BookIndexNeed::Unverifiable
@@ -1426,7 +1338,13 @@ mod tests {
     fn load_rejects_other_format_versions() {
         let dir = TempDir::new("format_version");
 
-        for version in [1u32, MANIFEST_FORMAT_VERSION + 1] {
+        // The immediate predecessor is in the list on purpose: it is the version an
+        // upgrading installation actually has on disk.
+        for version in [
+            1u32,
+            MANIFEST_FORMAT_VERSION - 1,
+            MANIFEST_FORMAT_VERSION + 1,
+        ] {
             std::fs::write(
                 SemanticManifest::file_path(dir.path()),
                 format!("{{\"format_version\": {version}}}").as_bytes(),
@@ -1441,6 +1359,108 @@ mod tests {
                 other => panic!("expected a format-version error for {version}, got {other:?}"),
             }
         }
+    }
+
+    /// A previous-schema document is *complete* by its own rules, so the version
+    /// probe is the only thing between it and being deserialized with an invented
+    /// token cap. It must be refused as a *version* problem, because that is what
+    /// `SemanticEngine::open` routes to quarantine-and-reset.
+    #[test]
+    fn a_complete_manifest_from_the_previous_schema_is_refused_by_version_not_by_parsing() {
+        let dir = TempDir::new("previous_schema");
+
+        let previous = serde_json::json!({
+            "format_version": MANIFEST_FORMAT_VERSION - 1,
+            "embedding_model_id": "EMD123/Otzaria-Embedding-V1-Flash-0.6B",
+            "model_checksum": "deadbeef",
+            "embedding_backend": "mock-hash-v1",
+            "embedding_dim": 1024,
+            "pooling": "last-token",
+            "model_quantization": "Q4",
+            "vector_precision": "f32",
+            "vector_backend": "in-memory-v1",
+            "chunking_version": 1,
+            "normalization_version": 1,
+            "created_at": 1_700_000_000u64,
+            "updated_at": 1_700_000_000u64,
+            "books": {
+                "otzaria/tanach/genesis.txt": {
+                    "source_book_key": "otzaria/tanach/genesis.txt",
+                    "content_hash": 12345u64,
+                    "line_fingerprint": 777u64,
+                    "chunk_count": 100,
+                    "indexed_at": 1_700_000_000u64,
+                    "chunking_version": 1,
+                    "normalization_version": 1
+                }
+            }
+        });
+        std::fs::write(
+            SemanticManifest::file_path(dir.path()),
+            serde_json::to_vec_pretty(&previous).unwrap(),
+        )
+        .unwrap();
+
+        match SemanticManifest::load(dir.path()) {
+            Err(ManifestError::UnsupportedFormatVersion { found, supported }) => {
+                assert_eq!(found, MANIFEST_FORMAT_VERSION - 1);
+                assert_eq!(supported, MANIFEST_FORMAT_VERSION);
+            }
+            other => panic!("a previous-schema manifest must report its version, got {other:?}"),
+        }
+
+        // Nor may it be promoted out of a recovery slot.
+        std::fs::rename(
+            SemanticManifest::file_path(dir.path()),
+            SemanticManifest::previous_path(dir.path()),
+        )
+        .unwrap();
+        assert!(matches!(
+            SemanticManifest::load(dir.path()),
+            Err(ManifestError::NotFound { .. })
+        ));
+        assert!(
+            SemanticManifest::previous_path(dir.path()).exists(),
+            "the rejected copy is evidence and must be left where it is"
+        );
+    }
+
+    /// The cap has to be one of the dimensions compared, not merely one recorded: it
+    /// survived a round trip and still reported nothing when it changed.
+    #[test]
+    fn a_changed_token_cap_makes_a_persisted_index_incompatible() {
+        let dir = TempDir::new("max_tokens_identity");
+        let config = test_config();
+
+        let mut manifest = SemanticManifest::new(&config);
+        manifest.mark_book_indexed("book_a".to_string(), 12345, 777, 100, 1, 1);
+        manifest.save(dir.path()).unwrap();
+
+        let loaded = SemanticManifest::load(dir.path()).unwrap();
+        assert_eq!(loaded.embedding_max_tokens, 512, "recorded and persisted");
+        assert!(loaded.validate(&config).is_empty());
+
+        let raised = ManifestConfig {
+            embedding_max_tokens: 8192,
+            ..config
+        };
+        let mismatches = loaded.validate(&raised);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0],
+            ManifestMismatch::MaxTokens {
+                manifest: 512,
+                config: 8192
+            }
+        );
+        assert!(
+            mismatches[0].invalidates_vectors(),
+            "re-chunking cannot repair a cap change; the vectors have to be redone"
+        );
+        // Both values, or the operator cannot tell which way the cap moved.
+        let described = describe_mismatches(&mismatches);
+        assert!(described.contains("512"), "unhelpful report: {described}");
+        assert!(described.contains("8192"), "unhelpful report: {described}");
     }
 
     #[test]
@@ -1490,9 +1510,7 @@ mod tests {
         );
     }
 
-    /// The retry path must never be a window with no manifest on disk: a crash
-    /// there would lose the index state entirely, which is worse than keeping
-    /// either version.
+    /// A crash in the retry window must never find a directory with no manifest.
     #[test]
     fn a_readable_manifest_exists_at_every_point_of_a_rewrite() {
         let dir = TempDir::new("always_readable");
@@ -1502,8 +1520,7 @@ mod tests {
         manifest.mark_book_indexed("a".to_string(), 1, 11, 10, 1, 1);
         manifest.save(dir.path()).unwrap();
 
-        // Rewrite repeatedly; after each one the manifest must still parse and no
-        // temporary or side-stepped file may be left behind.
+        // After each rewrite the manifest must parse and leave nothing behind.
         for round in 2..6u64 {
             let mut next = SemanticManifest::new(&config);
             next.mark_book_indexed(format!("book{round}"), round, round * 11, 10, 1, 1);
@@ -1524,9 +1541,8 @@ mod tests {
         }
     }
 
-    /// Simulates a crash inside `save`'s fallback window: the manifest is parked
-    /// under `.previous` and the target is gone. Without recovery this reads as a
-    /// first run and the entire index is silently rebuilt.
+    /// A crash inside `save`'s fallback window: parked under `.previous`, target
+    /// gone. Unrecovered, that reads as a first run and the index is rebuilt.
     #[test]
     fn a_manifest_parked_by_an_interrupted_save_is_recovered() {
         let dir = TempDir::new("parked_recovery");
@@ -1549,16 +1565,14 @@ mod tests {
         assert_eq!(recovered.book_count(), 1);
         assert!(recovered.book("book_a").is_some());
 
-        // Recovery is a move, so the file is back in place for the next open and
-        // the parked copy is gone.
+        // Recovery is a move: back in place, parked copy gone.
         assert!(SemanticManifest::file_path(dir.path()).exists());
         assert!(!SemanticManifest::previous_path(dir.path()).exists());
         assert_eq!(SemanticManifest::load(dir.path()).unwrap().book_count(), 1);
     }
 
-    /// A `.tmp` that outlived a crash is a complete manifest: `save` `fsync`s it
-    /// before renaming. With nothing else on disk it is better than declaring a
-    /// first run and silently rebuilding the whole index.
+    /// A `.tmp` that outlived a crash is complete — `save` `fsync`s it before
+    /// renaming — so it beats declaring a first run and rebuilding everything.
     #[test]
     fn a_temp_file_left_by_an_interrupted_save_is_recovered() {
         let dir = TempDir::new("tmp_recovery");
@@ -1566,8 +1580,7 @@ mod tests {
         manifest.mark_book_indexed("book_a".to_string(), 12345, 777, 100, 1, 1);
         manifest.save(dir.path()).unwrap();
 
-        // The crash window: the payload is written and flushed, the rename never
-        // happened.
+        // The crash window: payload written and flushed, rename never happened.
         std::fs::rename(
             SemanticManifest::file_path(dir.path()),
             SemanticManifest::tmp_path(dir.path()),
@@ -1581,14 +1594,13 @@ mod tests {
         assert!(!SemanticManifest::tmp_path(dir.path()).exists());
     }
 
-    /// A half-written `.tmp` — the crash landed inside `write_all` — must not be
-    /// promoted. Parsing it before the rename is what separates the two cases.
+    /// Parsing before the rename is what separates this from a complete `.tmp`.
     #[test]
     fn a_half_written_temp_file_is_not_recovered() {
         let dir = TempDir::new("tmp_partial");
         std::fs::write(
             SemanticManifest::tmp_path(dir.path()),
-            br#"{"format_version": 3, "embedding_model_id": "#,
+            format!("{{\"format_version\": {MANIFEST_FORMAT_VERSION}, \"embedding_model_id\": "),
         )
         .unwrap();
 
@@ -1599,8 +1611,7 @@ mod tests {
         assert!(!SemanticManifest::file_path(dir.path()).exists());
     }
 
-    /// The parked copy is preferred: it was a manifest in service, while a `.tmp`
-    /// was only ever a candidate.
+    /// The parked copy was a manifest in service; a `.tmp` was only a candidate.
     #[test]
     fn a_parked_copy_wins_over_a_temp_file() {
         let dir = TempDir::new("recovery_order");
@@ -1629,9 +1640,8 @@ mod tests {
         assert!(recovered.book("tmp_book").is_none());
     }
 
-    /// A file that contains only a matching version probe is not recoverable.
-    /// Recovery must validate the whole schema before preferring `.previous`
-    /// over a complete `.tmp`.
+    /// Recovery must validate the whole schema, not just the version probe, before
+    /// preferring `.previous` over a complete `.tmp`.
     #[test]
     fn an_incomplete_parked_copy_does_not_hide_a_complete_temp_file() {
         let dir = TempDir::new("recovery_requires_full_schema");
@@ -1659,8 +1669,7 @@ mod tests {
 
     // ── the save fallback, reached by injecting the failure it exists for ──
 
-    /// A denied rename (a Windows file lock, in practice) must still leave a
-    /// correct manifest in place, with no leftovers.
+    /// A denied rename must still leave a correct manifest, with no leftovers.
     #[test]
     fn a_denied_rename_is_retried_through_a_parked_copy() {
         let dir = TempDir::new("rename_retry");
@@ -1693,8 +1702,7 @@ mod tests {
         assert!(!SemanticManifest::tmp_path(dir.path()).exists());
     }
 
-    /// When the retry fails too, the old manifest goes back. The one outcome that
-    /// is not allowed is a directory with no manifest at all.
+    /// The one outcome not allowed is a directory with no manifest at all.
     #[test]
     fn a_failed_retry_restores_the_previous_manifest() {
         let dir = TempDir::new("rename_restore");
@@ -1722,8 +1730,7 @@ mod tests {
         assert!(loaded.book("new_book").is_none());
     }
 
-    /// Even when every rename is denied, `load` finds a manifest. Here the park
-    /// itself fails, so the target was never moved.
+    /// Here the park itself fails, so the target was never moved.
     #[test]
     fn a_manifest_remains_readable_when_every_rename_is_denied() {
         let dir = TempDir::new("rename_all_denied");
@@ -1746,10 +1753,8 @@ mod tests {
             .is_some());
     }
 
-    /// A directory `fsync` that fails means the rename may not survive a power
-    /// loss, so on Unix the save reports failure — the caller must not record
-    /// progress it might lose. The *contents* are still correct: this is a
-    /// durability failure, not an atomicity one.
+    /// A failed directory `fsync` means the rename may not survive a power loss, so
+    /// the save reports failure. The contents are still correct.
     #[cfg(unix)]
     #[test]
     fn a_failed_directory_sync_fails_the_save_on_unix() {
@@ -1779,9 +1784,7 @@ mod tests {
         );
     }
 
-    /// If fallback parked the old manifest, it cannot be deleted until the new
-    /// live name is durable. That copy is the recovery guarantee for this exact
-    /// failure window.
+    /// A parked copy cannot be deleted until the new live name is durable.
     #[cfg(unix)]
     #[test]
     fn a_directory_sync_failure_keeps_the_parked_manifest() {
@@ -1809,7 +1812,6 @@ mod tests {
         assert!(old.book("old_book").is_some());
     }
 
-    /// With neither file present it really is a first run.
     #[test]
     fn no_manifest_and_no_parked_copy_is_still_a_first_run() {
         let dir = TempDir::new("genuinely_missing");
@@ -1819,9 +1821,7 @@ mod tests {
         ));
     }
 
-    /// A leftover copy is parsed before it is promoted, so an unusable one is
-    /// passed over rather than renamed into place. It is also left where it is:
-    /// nothing on this path deletes evidence.
+    /// An unusable leftover is passed over rather than promoted, and left in place.
     #[test]
     fn a_corrupt_parked_copy_is_not_promoted_into_place() {
         let dir = TempDir::new("parked_corrupt");

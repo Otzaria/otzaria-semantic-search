@@ -1,20 +1,16 @@
 //! Semantic search engine orchestrator.
 //!
 //! Ties chunking, embedding, vector storage and manifest tracking into one
-//! indexing and retrieval subsystem, with its own lifecycle: a failure here must
-//! never take the lexical path down with it.
+//! indexing and retrieval subsystem; a failure here must never take the lexical
+//! path down with it.
 //!
-//! # Index compatibility
-//!
-//! Vectors are only comparable to other vectors produced by the same model, the
-//! same backend, the same pooling and the same dimensionality. When the on-disk
-//! manifest disagrees with the current configuration, the engine does not
-//! silently carry on — [`SemanticEngine::search`] and
-//! [`SemanticEngine::index_book`] refuse with
-//! [`SemanticSearchError::IncompatibleIndex`] (so the coordinator falls back to
-//! BM25) until [`SemanticEngine::reset_index`] rebuilds from scratch.
+//! Vectors are only comparable within one model, backend, pooling and
+//! dimensionality; when the on-disk manifest disagrees with the configuration the
+//! semantic path is refused with [`SemanticSearchError::IncompatibleIndex`] (so
+//! the coordinator falls back to BM25) until [`SemanticEngine::reset_index`].
 
 use crate::errors::{ManifestError, SemanticSearchError};
+use crate::semantic::backend::{ensure_pooling_is_implemented, Pooling};
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
@@ -35,15 +31,23 @@ pub struct SemanticConfig {
     pub embedding_model_id: String,
     pub embedding_dim: u32,
     pub model_path: PathBuf,
-    /// Pooling strategy the model requires (e.g. `"last-token"`).
+    /// Pooling strategy the model requires (e.g. `"last-token"`); the manifest
+    /// persists it verbatim, so [`SemanticConfig::validate`] refuses both a spelling
+    /// [`Pooling`] cannot parse and a strategy no backend implements.
     pub pooling: String,
-    /// Quantization of the model weights (e.g. `"Q4"`). Distinct from
-    /// [`SemanticConfig::vector_precision`] — that is the stored vectors.
+    /// Token cap requested per embedded text.
+    ///
+    /// Not enforced yet — truncation belongs to the backend and none implements it.
+    /// Recorded in the manifest as part of the index's identity anyway, so once one
+    /// does, changing it is an incompatibility rather than a silent re-embed of half
+    /// a library under a different cap.
+    pub embedding_max_tokens: usize,
+    /// Quantization of the model weights (e.g. `"Q4"`); not the stored vectors'
+    /// [`SemanticConfig::vector_precision`].
     pub model_quantization: String,
     /// Precision vectors are stored at (e.g. `"f32"`).
     pub vector_precision: String,
-    /// Version of the text preprocessing applied before embedding. Bump it when
-    /// preprocessing changes, so existing vectors are recognised as stale.
+    /// Text preprocessing version; bump it to mark existing vectors stale.
     pub normalization_version: u32,
     /// Texts handed to the embedding backend per inference call.
     pub embedding_batch_size: usize,
@@ -59,7 +63,8 @@ impl Default for SemanticConfig {
             embedding_model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
             embedding_dim: 1024,
             model_path: PathBuf::from("models/otzaria-embedding-v1-flash-q4.gguf"),
-            pooling: "last-token".to_string(),
+            pooling: Pooling::LastToken.as_str().to_string(),
+            embedding_max_tokens: 512,
             model_quantization: "Q4".to_string(),
             vector_precision: "f32".to_string(),
             normalization_version: 1,
@@ -75,11 +80,9 @@ impl Default for SemanticConfig {
 }
 
 impl SemanticConfig {
-    /// Reject configurations that cannot produce a working index.
-    ///
-    /// Catches the dimension disagreement in particular: `embedding_dim` and
-    /// `store.embedding_dim` are set independently, and a mismatch would surface
-    /// only as a `DimensionMismatch` on the first insert, i.e. mid-index.
+    /// Reject configurations that cannot produce a working index — notably an
+    /// `embedding_dim` / `store.embedding_dim` mismatch, which would otherwise
+    /// surface as a `DimensionMismatch` on the first insert, i.e. mid-index.
     pub fn validate(&self) -> Result<(), SemanticSearchError> {
         if self.embedding_dim == 0 {
             return Err(SemanticSearchError::Config(
@@ -103,7 +106,31 @@ impl SemanticConfig {
                 "embedding_model_id must not be empty".to_string(),
             ));
         }
+        // Refused *before* the manifest is written: the value is persisted as part
+        // of the index's identity, so correcting it later would report the *index*
+        // as incompatible rather than the configuration that caused it.
+        self.pooling_strategy()?;
+        if self.embedding_max_tokens == 0 {
+            return Err(SemanticSearchError::Config(
+                "embedding_max_tokens must be greater than zero; a zero cap truncates \
+                 every text to nothing"
+                    .to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    /// The configured pooling as the typed strategy the runtime needs.
+    ///
+    /// Refuses both a spelling [`Pooling`] cannot parse (`"last_token"`) and a
+    /// strategy that parses but no backend implements (`"mean"`); both are the
+    /// caller's [`SemanticSearchError::Config`], not a runtime failure.
+    pub fn pooling_strategy(&self) -> Result<Pooling, SemanticSearchError> {
+        let pooling = Pooling::parse(&self.pooling)
+            .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
+        ensure_pooling_is_implemented(pooling)
+            .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
+        Ok(pooling)
     }
 }
 
@@ -114,9 +141,8 @@ pub struct SemanticEngine {
     chunker: Chunker,
     store: VectorStore,
     runtime: Option<EmbeddingRuntime>,
-    /// Non-empty when the persisted index was built with a configuration this
-    /// one cannot use. While non-empty the semantic path is refused rather than
-    /// answered with vectors from a different space.
+    /// Non-empty when the persisted index was built with a configuration this one
+    /// cannot use; while non-empty the semantic path is refused.
     incompatibilities: Vec<ManifestMismatch>,
     last_error: Option<String>,
 }
@@ -124,10 +150,8 @@ pub struct SemanticEngine {
 impl SemanticEngine {
     /// Initialize or open an existing semantic search index.
     ///
-    /// Never fails because of a bad manifest: a corrupt or foreign-version file
-    /// is moved aside and a fresh index is started, with the reason kept in
-    /// [`SemanticStatus::last_error`]. It does fail on an invalid configuration
-    /// or an unusable store directory, which are the caller's bugs to fix.
+    /// A corrupt or foreign-version manifest is moved aside and a fresh index
+    /// started, with the reason in [`SemanticStatus::last_error`].
     pub fn open(config: SemanticConfig) -> Result<Self, SemanticSearchError> {
         config.validate()?;
 
@@ -168,14 +192,12 @@ impl SemanticEngine {
                     return Ok(());
                 }
 
-                // The manifest survived the restart but the vectors it describes
-                // did not. Left alone it would claim books are indexed while
-                // every query returns nothing.
+                // The manifest survived the restart but the vectors it describes did
+                // not; left alone it would claim books are indexed while every query
+                // returns nothing.
                 if !self.store.is_persistent() && self.manifest.book_count() > 0 {
-                    // Only records that claim vectors are stale. A `chunk_count == 0`
-                    // marker describes no vectors, so nothing about it was lost —
-                    // dropping it would just make a scanned PDF get reprocessed on
-                    // every startup.
+                    // Only records claiming vectors: a `chunk_count == 0` marker lost
+                    // nothing, and dropping it would reprocess a scanned PDF.
                     let dropped = self.manifest.clear_books_with_vectors();
                     if dropped > 0 {
                         log::info!(
@@ -191,15 +213,13 @@ impl SemanticEngine {
                 Ok(())
             }
 
-            // First run: nothing to reconcile.
             Err(ManifestError::NotFound { .. }) => {
                 self.manifest = SemanticManifest::new(&expected);
                 self.manifest.save(&self.config.root_dir)?;
                 Ok(())
             }
 
-            // Unusable file. Keep it for diagnosis, start clean, and remember
-            // why — an index that silently reset itself is hard to debug.
+            // Quarantined rather than deleted: a silent self-reset is hard to debug.
             Err(e) => {
                 let tag = match e {
                     ManifestError::UnsupportedFormatVersion { .. } => "unsupported-version",
@@ -223,8 +243,7 @@ impl SemanticEngine {
                     }
                 }
 
-                // The store is empty on a fresh open, but be explicit: a future
-                // persistent backend must not keep vectors whose manifest is gone.
+                // A future persistent backend must not keep orphaned vectors.
                 self.store.clear()?;
                 self.manifest = SemanticManifest::new(&expected);
                 self.manifest.save(&self.config.root_dir)?;
@@ -235,20 +254,22 @@ impl SemanticEngine {
 
     /// Load the embedding model into memory.
     ///
-    /// Also completes manifest validation: the model's file checksum and backend
-    /// are only knowable once it is loaded, so a model swapped behind an
-    /// unchanged model id is detected here rather than at open.
+    /// Also completes manifest validation: the checksum and backend are knowable
+    /// only once loaded, so a model swapped behind an unchanged id is caught here.
     pub fn load_model(&mut self) -> Result<(), SemanticSearchError> {
         if self.runtime.is_some() {
             return Ok(());
         }
 
+        // No `..Default::default()` tail: a new `EmbeddingConfig` field should fail
+        // to compile here rather than silently take a default the caller cannot set.
         let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: self.config.model_path.clone(),
             embedding_dim: self.config.embedding_dim,
-            pooling: self.config.pooling.clone(),
+            // `?` rather than `expect`: a bad spelling must not abort the host.
+            pooling: self.config.pooling_strategy()?,
+            max_tokens: self.config.embedding_max_tokens,
             batch_size: self.config.embedding_batch_size,
-            ..Default::default()
         });
 
         if let Err(e) = runtime.load() {
@@ -257,7 +278,7 @@ impl SemanticEngine {
         }
 
         let checksum = runtime.model_checksum().map(str::to_string);
-        let backend = runtime.backend().map(|b| b.id().to_string());
+        let backend = runtime.backend_id().map(str::to_string);
         self.runtime = Some(runtime);
 
         let expected = manifest_config(&self.config, checksum.clone(), backend.clone());
@@ -272,7 +293,7 @@ impl SemanticEngine {
             return Ok(());
         }
 
-        // Compatible: record the identity so a later session can compare.
+        // Record the identity so a later session can compare.
         let was_unknown =
             self.manifest.model_checksum.is_none() || self.manifest.embedding_backend.is_none();
         if was_unknown {
@@ -290,17 +311,10 @@ impl SemanticEngine {
 
     /// Index a book, replacing anything previously indexed for it.
     ///
-    /// The returned [`IndexOutcome`] says what happened: vectors written, the book
-    /// already current and skipped, or nothing embeddable. It is deliberately not
-    /// a bare chunk count — a skipped book has chunks in the index but wrote none,
-    /// and reporting the former as the latter made "chunks written" untrue.
-    ///
-    /// Saves the manifest, so a crash afterwards cannot leave the book looking
-    /// indexed when it is not. That costs a full serialize and `fsync` per call:
-    /// for more than one book use [`SemanticEngine::index_books`], or
-    /// [`SemanticEngine::index_book_deferred`] with an explicit
-    /// [`SemanticEngine::flush_manifest`] when the caller needs to release its
-    /// lock between books.
+    /// [`IndexOutcome`] distinguishes vectors written, an already-current skip, and
+    /// nothing embeddable. Saves the manifest, which costs a serialize and `fsync`
+    /// per call: for more than one book use [`SemanticEngine::index_books`], or
+    /// [`SemanticEngine::index_book_deferred`] plus [`SemanticEngine::flush_manifest`].
     pub fn index_book(
         &mut self,
         book: &BookForIndexing,
@@ -314,18 +328,11 @@ impl SemanticEngine {
 
     /// Index one book and leave the manifest unsaved.
     ///
-    /// For a caller driving the loop itself — [`HybridCoordinator::index_books`]
-    /// does, so it can release the engine lock between books. Whoever calls this
-    /// **must** call [`SemanticEngine::flush_manifest`] afterwards, including on
-    /// the error path: until then the vectors are in the store and nothing on
-    /// disk says so.
-    ///
-    /// The alternative, saving per book, is not merely slower — it is quadratic.
-    /// The manifest holds every book, so writing it after each of `B` books moves
-    /// `O(B²)` bytes and asks for `B` `fsync`s. Over a library of thousands of
-    /// books that is the difference between seconds and hours.
-    ///
-    /// [`HybridCoordinator::index_books`]: crate::hybrid::coordinator::HybridCoordinator::index_books
+    /// For a caller driving the loop itself, so it can release the engine lock
+    /// between books. It **must** call [`SemanticEngine::flush_manifest`] afterwards,
+    /// including on the error path: until then the vectors are in the store and
+    /// nothing on disk says so. Saving per book is quadratic — the manifest holds
+    /// every book, so `B` books move `O(B²)` bytes and ask for `B` `fsync`s.
     pub fn index_book_deferred(
         &mut self,
         book: &BookForIndexing,
@@ -333,22 +340,16 @@ impl SemanticEngine {
         self.index_book_inner(book)
     }
 
-    /// Persist the manifest.
-    ///
-    /// The commit point for [`SemanticEngine::index_book_deferred`]. Idempotent
-    /// and cheap to over-call — but not free, so a caller should batch changes
-    /// rather than call it per book.
+    /// Persist the manifest — the commit point for
+    /// [`SemanticEngine::index_book_deferred`]. Idempotent, but not free.
     pub fn flush_manifest(&mut self) -> Result<(), SemanticSearchError> {
         self.manifest.save(&self.config.root_dir)?;
         Ok(())
     }
 
-    /// Index several books, writing the manifest once at the end.
-    ///
-    /// Serializing the whole manifest after every book turns a full library
-    /// index into quadratic I/O. On failure, everything indexed so far is still
-    /// committed before the error propagates, so a retry resumes instead of
-    /// restarting.
+    /// Index several books, writing the manifest once at the end (a save per book
+    /// would be quadratic I/O). On failure everything indexed so far is committed
+    /// before the error propagates, so a retry resumes instead of restarting.
     pub fn index_books(
         &mut self,
         books: &[BookForIndexing],
@@ -362,9 +363,8 @@ impl SemanticEngine {
                     summary.record(outcome);
                 }
                 Err(e) => {
-                    // The failing call can also have removed a stale manifest
-                    // entry before its store insertion failed, so flush even
-                    // when every earlier outcome was a skip.
+                    // The failing call may have removed a stale manifest entry before
+                    // its insertion failed, so flush even after nothing but skips.
                     if let Err(save_err) = self.manifest.save(&self.config.root_dir) {
                         log::warn!(
                             "Could not save the manifest after an indexing failure: {save_err}"
@@ -380,7 +380,6 @@ impl SemanticEngine {
         Ok(summary)
     }
 
-    /// Index one book without saving the manifest.
     fn index_book_inner(
         &mut self,
         book: &BookForIndexing,
@@ -401,19 +400,16 @@ impl SemanticEngine {
             });
         }
 
-        // Only pay for the model when there is something to embed. A book with
-        // no embeddable lines still needs its stale vectors dropped below, and
-        // that cleanup must not depend on a model being available.
+        // Only pay for the model when there is something to embed: the stale-vector
+        // cleanup below must not depend on a model being available.
         if !chunks.is_empty() {
             self.load_model()?;
-            // Loading the model can itself uncover an incompatibility — the file
-            // checksum is only knowable once it is read.
+            // Loading can uncover an incompatibility: the checksum needs the file.
             self.ensure_index_usable()?;
         }
 
-        // Every mutation happens after embedding succeeds. Deleting first would
-        // leave a book with no vectors but an unchanged manifest entry if the
-        // model failed halfway through.
+        // Embed before mutating anything: deleting first would leave a book with no
+        // vectors but an unchanged manifest entry if inference failed halfway.
         let vectors = self.embed_chunks(&chunks)?;
 
         let removed = self.store.delete_book(&book.source_book_key)?;
@@ -425,9 +421,8 @@ impl SemanticEngine {
         }
 
         if chunks.is_empty() {
-            // No vectors, but the book *was* processed. Recording that — rather
-            // than dropping the entry — is what stops a scanned PDF or a book of
-            // headings from being handed over again on every startup.
+            // No vectors, but the book *was* processed; recording that is what stops
+            // a scanned PDF being handed over again on every startup.
             self.store.commit()?;
             self.manifest.mark_book_indexed(
                 book.source_book_key.clone(),
@@ -468,17 +463,12 @@ impl SemanticEngine {
         })
     }
 
-    /// Whether this exact book is already in the index, so embedding it again
-    /// would produce identical vectors.
+    /// Whether this exact book is already indexed, so re-embedding it would produce
+    /// identical vectors.
     ///
-    /// Checked against the book's own lines rather than the lexical content hash,
-    /// which is why it also works for PDFs — the lexical index has no fingerprint
-    /// for them, so [`SemanticEngine::diff_against_tantivy`] has to report every
-    /// PDF as needing attention. This is what makes that cheap: re-chunking, then
-    /// no inference at all when nothing changed.
-    ///
-    /// The stored vector count is part of the comparison, so a manifest entry can
-    /// never license a skip when the vectors it describes are absent.
+    /// Compared against the book's own lines, not the lexical content hash, so it
+    /// works for PDFs too. The stored vector count is part of the comparison, so an
+    /// entry can never license a skip when the vectors it describes are absent.
     fn book_is_already_current(
         &self,
         book: &BookForIndexing,
@@ -527,11 +517,9 @@ impl SemanticEngine {
         self.remove_books(&[source_book_key.to_owned()])
     }
 
-    /// Remove several books, committing the store and manifest once.
-    ///
-    /// This is the application path for [`IndexDiff::removed_books`]. Keeping it
-    /// batched avoids rewriting the whole manifest for every deleted library
-    /// book.
+    /// Remove several books, committing the store and manifest once — the application
+    /// path for [`IndexDiff::removed_books`]. Batching avoids rewriting the whole
+    /// manifest per deleted book.
     pub fn remove_books(
         &mut self,
         source_book_keys: &[String],
@@ -553,11 +541,9 @@ impl SemanticEngine {
         Ok(removed_vectors)
     }
 
-    /// Drop the whole index and start a fresh manifest for the current
-    /// configuration. Returns how many vectors were discarded.
-    ///
-    /// This is the recovery path out of [`SemanticSearchError::IncompatibleIndex`]:
-    /// afterwards the engine is usable again and every book needs re-indexing.
+    /// Drop the whole index and start a fresh manifest for the current configuration,
+    /// returning how many vectors were discarded. The recovery path out of
+    /// [`SemanticSearchError::IncompatibleIndex`]; every book then needs re-indexing.
     pub fn reset_index(&mut self) -> Result<u32, SemanticSearchError> {
         let removed = self.store.clear()?;
         self.store.commit()?;
@@ -570,8 +556,8 @@ impl SemanticEngine {
         let backend = self
             .runtime
             .as_ref()
-            .and_then(|r| r.backend())
-            .map(|b| b.id().to_string());
+            .and_then(|r| r.backend_id())
+            .map(str::to_string);
 
         self.manifest = SemanticManifest::new(&manifest_config(&self.config, checksum, backend));
         self.manifest.save(&self.config.root_dir)?;
@@ -603,27 +589,17 @@ impl SemanticEngine {
 
     /// Compare the library's per-book fingerprints against the semantic index.
     ///
-    /// This is the primary form: the caller decides what a book's fingerprint is.
-    ///
-    /// * A text book's lexical `contentHash` →
-    ///   [`ContentFingerprint::from_lexical_hash`]. It already covers the
-    ///   metadata the lexical engine indexes, so it can reach "nothing to do".
-    /// * A PDF → [`ContentFingerprint::canonical`], folding the caller's
-    ///   authoritative source revision (including extracted text structure and
-    ///   extraction/OCR version) together with the title, category path and
-    ///   facets. **Without the metadata a match proves
-    ///   too little**: renaming a book or correcting its author changes what is
-    ///   stored in every one of its vectors while leaving the file untouched, so
-    ///   a file-only signature would report "up to date" over a stale index.
-    ///   A size/mtime signature is not authoritative;
-    ///   [`ContentFingerprint::content_only`] says exactly that and lands the
-    ///   book in [`IndexDiff::unverifiable_books`] instead of claiming more.
-    /// * Nothing at all → [`ContentFingerprint::Unverifiable`], also
-    ///   [`IndexDiff::unverifiable_books`].
+    /// The caller decides what a book's fingerprint is: a text book's lexical
+    /// `contentHash` via [`ContentFingerprint::from_lexical_hash`]; a PDF via
+    /// [`ContentFingerprint::canonical`], which must fold title, category path and
+    /// facets in alongside the source revision, since renaming a book changes what
+    /// every one of its vectors stores while leaving the file untouched. A
+    /// non-authoritative signature ([`ContentFingerprint::content_only`]) or none at
+    /// all ([`ContentFingerprint::Unverifiable`]) lands the book in
+    /// [`IndexDiff::unverifiable_books`].
     ///
     /// When a configuration change invalidated the index, every known book is
-    /// reported as changed — an incremental update cannot repair a change of model
-    /// or chunking.
+    /// reported as changed.
     pub fn diff(&self, books: &HashMap<String, ContentFingerprint>) -> IndexDiff {
         let model_mismatch = self
             .incompatibilities
@@ -669,8 +645,7 @@ impl SemanticEngine {
             .cloned()
             .collect();
 
-        // Deterministic order: the caller may show these lists or drive progress
-        // from them, and `HashMap` iteration order changes between runs.
+        // Deterministic order: `HashMap` iteration order changes between runs.
         new_books.sort_unstable();
         changed_books.sort_unstable();
         unverifiable_books.sort_unstable();
@@ -689,18 +664,11 @@ impl SemanticEngine {
 
     /// Convenience wrapper over [`SemanticEngine::diff`] for raw lexical hashes.
     ///
-    /// `tantivy_books` maps a book key to its raw `contentHash`, and `0` is the
-    /// lexical engine's "no fingerprint" marker — it records that for every PDF,
-    /// because their extracted text never enters the library database. Comparing
-    /// it as a hash would make `0 == 0` mean "unchanged", so a replaced or
-    /// re-scanned PDF would never be re-indexed.
-    ///
-    /// Consequently **every PDF appears in [`IndexDiff::unverifiable_books`] on
-    /// every call**, and `is_up_to_date()` never returns `true` for a library that
-    /// contains one. That is honest rather than useful: the index genuinely cannot
-    /// tell. Producing such a book costs the caller a fresh text extraction, so a
-    /// caller that has its own PDF signature should call [`SemanticEngine::diff`]
-    /// with it and get a diff that can actually reach "nothing to do".
+    /// `0` is the lexical engine's "no fingerprint" marker, recorded for every PDF;
+    /// compared as a hash, `0 == 0` would mean "unchanged" and a re-scanned PDF would
+    /// never be re-indexed. So **every PDF lands in
+    /// [`IndexDiff::unverifiable_books`] on every call**; a caller with its own PDF
+    /// signature should use [`SemanticEngine::diff`] instead.
     pub fn diff_against_tantivy(&self, tantivy_books: &HashMap<String, u64>) -> IndexDiff {
         let fingerprints = tantivy_books
             .iter()
@@ -709,11 +677,9 @@ impl SemanticEngine {
         self.diff(&fingerprints)
     }
 
-    /// How many times this session has written the manifest.
-    ///
-    /// A cost, not a statistic: each write serializes every book record and
-    /// `fsync`s. Exposed so the indexing loop's write count can be asserted rather
-    /// than assumed — the quadratic version of that loop passed every other test.
+    /// How many times this session has written the manifest — a cost, not a
+    /// statistic, since each write serializes every book record and `fsync`s.
+    /// Exposed so the indexing loop's write count can be asserted.
     pub fn manifest_save_count(&self) -> u32 {
         self.manifest.save_count()
     }
@@ -734,8 +700,8 @@ impl SemanticEngine {
             embedding_backend: self
                 .runtime
                 .as_ref()
-                .and_then(|r| r.backend())
-                .map(|b| b.id().to_string()),
+                .and_then(|r| r.backend_id())
+                .map(str::to_string),
             vector_backend: self.store.backend_id().to_string(),
             vectors_persisted: self.store.is_persistent(),
             needs_full_reindex,
@@ -764,10 +730,8 @@ impl SemanticEngine {
     }
 }
 
-/// Build the manifest-comparison config from the engine configuration.
-///
-/// `model_checksum` and `embedding_backend` are `None` until a model is loaded;
-/// see [`ManifestConfig`].
+/// Build the manifest-comparison config; `model_checksum` and `embedding_backend`
+/// are `None` until a model is loaded.
 fn manifest_config(
     config: &SemanticConfig,
     model_checksum: Option<String>,
@@ -779,6 +743,7 @@ fn manifest_config(
         embedding_backend,
         embedding_dim: config.embedding_dim,
         pooling: config.pooling.clone(),
+        embedding_max_tokens: config.embedding_max_tokens,
         model_quantization: config.model_quantization.clone(),
         vector_precision: config.vector_precision.clone(),
         vector_backend: crate::semantic::store::BACKEND_ID.to_string(),
@@ -817,8 +782,7 @@ mod tests {
         }
     }
 
-    /// A config rooted at `dir` with a valid stub model and a small dimension so
-    /// the tests stay fast.
+    /// A config rooted at `dir` with a stub model and a small dimension.
     fn config_at(dir: &TempDir) -> SemanticConfig {
         let model_path = dir.path().join("model.gguf");
         mock::write_stub_gguf(&model_path, 3).unwrap();
@@ -904,6 +868,203 @@ mod tests {
         let mut no_model_id = config_at(&dir);
         no_model_id.embedding_model_id = "  ".to_string();
         assert!(SemanticEngine::open(no_model_id).is_err());
+
+        // A cap of zero truncates every text to nothing.
+        let mut zero_cap = config_at(&dir);
+        zero_cap.embedding_max_tokens = 0;
+        match SemanticEngine::open(zero_cap) {
+            Err(SemanticSearchError::Config(msg)) => assert!(
+                msg.contains("embedding_max_tokens"),
+                "the message must name the field, got {msg}"
+            ),
+            Err(other) => panic!("expected a config error, got {other}"),
+            Ok(_) => panic!("a zero token cap must be refused"),
+        }
+
+        // The manifest compares the spelling verbatim, so no aliases.
+        for misspelled in ["last_token", "Last-Token", " last-token ", ""] {
+            let mut config = config_at(&dir);
+            config.pooling = misspelled.to_string();
+            match SemanticEngine::open(config) {
+                Err(SemanticSearchError::Config(msg)) => assert!(
+                    msg.contains("pooling") || msg.contains("Unknown pooling"),
+                    "the message must name pooling, got {msg}"
+                ),
+                Err(other) => panic!("expected a config error, got {other}"),
+                Ok(_) => panic!("pooling {misspelled:?} must be refused"),
+            }
+        }
+    }
+
+    /// `"mean"` parses but no backend performs it. The load-bearing half is that
+    /// **nothing reached disk**: a recorded `"mean"` would outlive the typo as a
+    /// manifest mismatch escapable only by `reset_index()`.
+    #[test]
+    fn a_pooling_no_backend_implements_is_refused_before_the_manifest_is_written() {
+        let dir = TempDir::new("unimplemented_pooling");
+        let mut config = config_at(&dir);
+        config.pooling = "mean".to_string();
+
+        match SemanticEngine::open(config.clone()) {
+            Err(SemanticSearchError::Config(msg)) => {
+                assert!(
+                    msg.contains("mean"),
+                    "the error must name the configured value, got {msg}"
+                );
+                assert!(
+                    msg.contains("backend") && msg.contains("last-token"),
+                    "the error must say no backend implements it and what does, \
+                     got {msg}"
+                );
+            }
+            Err(other) => panic!("expected a config error, got {other}"),
+            Ok(_) => panic!("a pooling nothing performs must be refused"),
+        }
+
+        // Nothing on disk to disagree with once the typo is corrected.
+        let manifest_path = SemanticManifest::file_path(&config.root_dir);
+        assert!(
+            !manifest_path.exists(),
+            "a refused configuration must not have persisted an index identity at {}",
+            manifest_path.display()
+        );
+        assert!(matches!(
+            SemanticManifest::load(&config.root_dir),
+            Err(ManifestError::NotFound { .. })
+        ));
+
+        let mut corrected = config;
+        corrected.pooling = "last-token".to_string();
+        let mut engine = SemanticEngine::open(corrected).unwrap();
+        assert!(engine.incompatibilities().is_empty());
+        assert!(engine.status().needs_full_reindex.is_none());
+        assert_eq!(
+            engine.index_book(&three_line_book()).unwrap(),
+            IndexOutcome::Indexed { chunks: 3 }
+        );
+    }
+
+    /// The cap decides how much of a long line the model ever saw, so it is part of
+    /// the index's identity: unrecorded, half a library could be embedded under one
+    /// cap and half under another with the manifest calling it current.
+    #[test]
+    fn changing_the_token_cap_makes_the_persisted_index_incompatible() {
+        let dir = TempDir::new("token_cap_identity");
+        let config = config_at(&dir);
+        assert_eq!(config.embedding_max_tokens, 512);
+
+        {
+            let mut engine = SemanticEngine::open(config.clone()).unwrap();
+            engine.index_book(&three_line_book()).unwrap();
+            assert!(engine.status().needs_full_reindex.is_none());
+        }
+
+        {
+            let engine = SemanticEngine::open(config.clone()).unwrap();
+            assert!(
+                engine.status().needs_full_reindex.is_none(),
+                "an unchanged cap must not invalidate anything"
+            );
+        }
+
+        let mut raised = config;
+        raised.embedding_max_tokens = 8192;
+        let engine = SemanticEngine::open(raised).unwrap();
+
+        let reason = engine
+            .status()
+            .needs_full_reindex
+            .expect("a changed token cap describes different vectors");
+        assert!(
+            reason.contains("512") && reason.contains("8192"),
+            "the report must name both caps, got {reason}"
+        );
+        assert!(matches!(
+            engine.incompatibilities(),
+            [ManifestMismatch::MaxTokens {
+                manifest: 512,
+                config: 8192
+            }]
+        ));
+        // A vector-space change, not a re-chunking one: the model saw different text.
+        assert!(engine.diff(&HashMap::new()).model_mismatch);
+        assert!(matches!(
+            engine.search("בריאת העולם", 5, None),
+            Err(SemanticSearchError::IncompatibleIndex { .. })
+        ));
+    }
+
+    /// A manifest complete by the previous schema's rules must still be quarantined,
+    /// not reused: reuse would mean guessing the cap its vectors were embedded under.
+    #[test]
+    fn a_manifest_from_the_previous_schema_is_quarantined_and_the_index_starts_fresh() {
+        let dir = TempDir::new("previous_schema_manifest");
+        let config = config_at(&dir);
+        std::fs::create_dir_all(&config.root_dir).unwrap();
+
+        // Version 3, every field that version knew about, one book on record.
+        let previous = serde_json::json!({
+            "format_version": 3,
+            "embedding_model_id": config.embedding_model_id,
+            "model_checksum": null,
+            "embedding_backend": "mock-hash-v1",
+            "embedding_dim": config.embedding_dim,
+            "pooling": "last-token",
+            "model_quantization": "Q4",
+            "vector_precision": "f32",
+            "vector_backend": crate::semantic::store::BACKEND_ID,
+            "chunking_version": config.chunking.chunking_version,
+            "normalization_version": config.normalization_version,
+            "created_at": 1_700_000_000u64,
+            "updated_at": 1_700_000_000u64,
+            "books": {
+                "otzaria/tanach/genesis.txt": {
+                    "source_book_key": "otzaria/tanach/genesis.txt",
+                    "content_hash": 111u64,
+                    "line_fingerprint": 777u64,
+                    "chunk_count": 3,
+                    "indexed_at": 1_700_000_000u64,
+                    "chunking_version": config.chunking.chunking_version,
+                    "normalization_version": config.normalization_version
+                }
+            }
+        });
+        std::fs::write(
+            SemanticManifest::file_path(&config.root_dir),
+            serde_json::to_vec_pretty(&previous).unwrap(),
+        )
+        .unwrap();
+
+        let mut engine = SemanticEngine::open(config.clone()).unwrap();
+
+        let status = engine.status();
+        assert_eq!(status.indexed_book_count, 0);
+        assert_eq!(status.vector_count, 0);
+        assert!(
+            status.last_error.is_some(),
+            "a silent reset is untraceable; the reason must be reported"
+        );
+        assert!(
+            status.needs_full_reindex.is_none(),
+            "the fresh manifest matches the current configuration, so this is a \
+             reset rather than a standing incompatibility"
+        );
+
+        // Kept for diagnosis, tagged with why.
+        let quarantined: Vec<String> = std::fs::read_dir(&config.root_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains("unsupported-version"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "found {quarantined:?}");
+
+        let fresh = SemanticManifest::load(&config.root_dir).unwrap();
+        assert_eq!(fresh.embedding_max_tokens, config.embedding_max_tokens);
+        assert_eq!(
+            engine.index_book(&three_line_book()).unwrap(),
+            IndexOutcome::Indexed { chunks: 3 }
+        );
     }
 
     // ── indexing ──
@@ -940,9 +1101,8 @@ mod tests {
         assert_eq!(engine.status().indexed_book_count, 1);
     }
 
-    /// The bug: a re-index inserted the new chunks without removing the old
-    /// ones, so a line deleted from a book kept its vector and kept being
-    /// returned as a result.
+    /// Without the delete, a line removed from a book keeps its vector and keeps
+    /// being returned as a result.
     #[test]
     fn reindexing_a_shrunk_book_drops_the_vectors_of_deleted_lines() {
         let dir = TempDir::new("reindex_shrink");
@@ -972,7 +1132,6 @@ mod tests {
         );
         assert_eq!(engine.status().indexed_book_count, 1);
 
-        // And the manifest agrees the book is now current.
         let mut tantivy = HashMap::new();
         tantivy.insert("otzaria/tanach/genesis.txt".to_string(), 222u64);
         assert!(engine.diff_against_tantivy(&tantivy).is_up_to_date());
@@ -994,21 +1153,19 @@ mod tests {
             "the book was processed; the record is what stops it being reprocessed"
         );
 
-        // And the diff agrees there is nothing left to do for it.
         let mut tantivy = HashMap::new();
         tantivy.insert("otzaria/tanach/genesis.txt".to_string(), 333u64);
         assert!(engine.diff_against_tantivy(&tantivy).is_up_to_date());
     }
 
-    /// A scanned PDF yields no text. Without a marker it would be reported as new
-    /// and reprocessed on every startup — the problem the lexical indexer solves
-    /// with its own empty-book marker.
+    /// A scanned PDF yields no text; without a marker it would be reported as new
+    /// and reprocessed on every startup.
     #[test]
     fn a_book_that_yields_nothing_embeddable_is_not_offered_again() {
         let dir = TempDir::new("empty_book_marker");
         let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
 
-        // Lines too short to embed: the book is processed but produces no chunks.
+        // Lines too short to embed: processed, but no chunks.
         let headings = book(
             "headings.txt",
             4242,
@@ -1027,15 +1184,14 @@ mod tests {
         assert!(diff.new_books.is_empty());
         assert!(diff.changed_books.is_empty());
 
-        // It survives a restart too, since it never had vectors to lose.
+        // Survives a restart: it never had vectors to lose.
         drop(engine);
         let engine = SemanticEngine::open(config_at(&dir)).unwrap();
         assert_eq!(engine.status().indexed_book_count, 1);
         assert!(engine.diff_against_tantivy(&tantivy).is_up_to_date());
     }
 
-    /// Cleaning up a book that has nothing left to embed must not require a
-    /// working model — otherwise a missing model file would strand its vectors.
+    /// Otherwise a missing model file would strand such a book's stale vectors.
     #[test]
     fn indexing_a_book_with_no_embeddable_lines_needs_no_model() {
         let dir = TempDir::new("empty_book_no_model");
@@ -1043,7 +1199,6 @@ mod tests {
         config.model_path = dir.path().join("absent.gguf");
 
         let mut engine = SemanticEngine::open(config).unwrap();
-        // Lines too short to embed at all.
         let blank = book("blank.txt", 1, &[(1, 1, "א"), (2, 1, "   ")]);
 
         assert_eq!(engine.index_book(&blank).unwrap(), IndexOutcome::Empty);
@@ -1055,10 +1210,8 @@ mod tests {
         );
     }
 
-    /// The lexical engine records `contentHash = 0` for every PDF, because their
-    /// extracted text is not in the library database. Compared as an ordinary
-    /// hash, `0 == 0` means "unchanged" and a replaced PDF would keep its old
-    /// vectors forever.
+    /// The lexical engine records `contentHash = 0` for every PDF, so as an ordinary
+    /// hash `0 == 0` would mean "unchanged" and a replaced PDF would never be redone.
     #[test]
     fn a_changed_pdf_is_reindexed_even_though_its_content_hash_never_changes() {
         let dir = TempDir::new("pdf_reindex");
@@ -1076,7 +1229,7 @@ mod tests {
         engine.index_book(&scan).unwrap();
         assert_eq!(engine.status().vector_count, 2);
 
-        // The PDF is re-scanned: different text, same contentHash of 0.
+        // Re-scanned: different text, same contentHash of 0.
         let mut rescanned = scan.clone();
         rescanned.lines[1].text = "עמוד שני לאחר סריקה מחדש באיכות טובה יותר".to_string();
         rescanned.lines.push(BookLine {
@@ -1089,7 +1242,6 @@ mod tests {
         });
         assert_eq!(rescanned.content_fingerprint, 0);
 
-        // The diff must ask for it — it cannot prove anything from a hash of 0.
         let mut tantivy = HashMap::new();
         tantivy.insert("otzaria/scans/responsa.pdf".to_string(), 0u64);
         let diff = engine.diff_against_tantivy(&tantivy);
@@ -1097,8 +1249,7 @@ mod tests {
             !diff.is_up_to_date(),
             "a book with no usable fingerprint can never be declared current"
         );
-        // Reported as unverifiable, not as changed: it is not *known* to have
-        // changed, and producing it costs the caller a fresh text extraction.
+        // Unverifiable, not changed: it is not *known* to have changed.
         assert_eq!(diff.unverifiable_books, vec!["otzaria/scans/responsa.pdf"]);
         assert!(diff.changed_books.is_empty());
         assert_eq!(diff.books_to_index(), 1);
@@ -1113,7 +1264,6 @@ mod tests {
             "the re-scanned text must have replaced the old vectors"
         );
 
-        // The new text is findable and the replaced text is not.
         let hits = engine
             .search("עמוד שלישי שלא זוהה בסריקה הראשונה", 5, None)
             .unwrap();
@@ -1121,9 +1271,8 @@ mod tests {
         assert_eq!(hits[0].metadata.line_id, 3);
     }
 
-    /// The failure mode a file-only signature cannot catch: the PDF on disk is
-    /// byte-identical, but the library corrected its author. Every vector carries
-    /// that author, so "unchanged" would keep serving the old one.
+    /// What a file-only signature cannot catch: the PDF is byte-identical but its
+    /// author was corrected, and every vector carries that author.
     #[test]
     fn correcting_a_pdfs_metadata_is_reported_as_a_change() {
         let dir = TempDir::new("pdf_metadata_change");
@@ -1132,8 +1281,7 @@ mod tests {
         const KEY: &str = "otzaria/scans/responsa.pdf";
         const SIGNATURE: u64 = 0xBEEF_CAFE;
 
-        // The caller folds its authoritative extraction revision together with
-        // the metadata.
+        // The caller folds its extraction revision together with the metadata.
         let fingerprint_of = |book: &BookForIndexing| {
             ContentFingerprint::canonical(
                 SIGNATURE,
@@ -1157,14 +1305,12 @@ mod tests {
         scan.content_fingerprint = fingerprint_of(&scan).as_raw();
         engine.index_book(&scan).unwrap();
 
-        // Nothing changed: the same book reports as current.
         let current = HashMap::from([(KEY.to_string(), fingerprint_of(&scan))]);
         assert!(
             engine.diff(&current).is_up_to_date(),
             "a canonical fingerprint is what lets a PDF reach 'nothing to do'"
         );
 
-        // Same extracted source revision, corrected author.
         let mut corrected = scan.clone();
         corrected.extra_facets = vec!["/author/מחבר מדויק".to_string()];
         corrected.content_fingerprint = fingerprint_of(&corrected).as_raw();
@@ -1179,7 +1325,6 @@ mod tests {
         );
         assert!(diff.unverifiable_books.is_empty());
 
-        // And re-indexing really replaces the stored facets.
         assert_eq!(
             engine.index_book(&corrected).unwrap(),
             IndexOutcome::Indexed { chunks: 2 }
@@ -1228,8 +1373,7 @@ mod tests {
         );
     }
 
-    /// The manifest holds every book, so writing it per book moves `O(B²)` bytes.
-    /// This is the assertion that catches a loop that reverted to doing so.
+    /// The manifest holds every book, so a write per book moves `O(B²)` bytes.
     #[test]
     fn the_manifest_write_count_does_not_grow_with_the_number_of_books() {
         let index_books = |count: u64, name: &str| -> u32 {
@@ -1255,14 +1399,11 @@ mod tests {
             "ten times the books must not cost ten times the manifest writes \
              (measured {few} and {many})"
         );
-        // Three, all of them one-offs: the fresh manifest written at open, the
-        // model identity recorded the first time a model loads, and the batch
-        // commit. None of them scales with the library.
+        // Three one-offs: the open, the model identity, and the batch commit.
         assert!(many <= 3, "unexpectedly many manifest writes: {many}");
     }
 
-    /// Reporting every PDF as "needs attention" is only acceptable because
-    /// handing one back costs re-chunking and no inference when it is unchanged.
+    /// A cheap skip is what makes reporting every PDF as "needs attention" acceptable.
     #[test]
     fn an_unchanged_book_is_skipped_without_re_embedding() {
         let dir = TempDir::new("skip_unchanged");
@@ -1289,7 +1430,6 @@ mod tests {
         );
         assert_eq!(engine.status().vector_count, 1);
 
-        // Whereas a changed line does load the model and re-embed.
         let mut changed = scan.clone();
         changed.lines[0].text = "עמוד סרוק אחר לגמרי עם מספיק תווים להטמעה".to_string();
         engine.index_book(&changed).unwrap();
@@ -1363,7 +1503,6 @@ mod tests {
         assert_eq!(engine.status().vector_count, 10);
         assert_eq!(engine.status().indexed_book_count, 5);
 
-        // The single manifest write covered every book.
         let reloaded = SemanticManifest::load(&engine.config.root_dir).unwrap();
         assert_eq!(reloaded.book_count(), 5);
         assert_eq!(reloaded.total_chunk_count(), 10);
@@ -1376,8 +1515,7 @@ mod tests {
         let book = three_line_book();
         engine.index_book(&book).unwrap();
 
-        // Query with the exact text of a line: a batched embedding must be
-        // identical to the single-text one, or the top hit would not be exact.
+        // Exact-text query: the batched embedding must match the single-text one.
         let hits = engine.search(&book.lines[1].text, 3, None).unwrap();
         assert!(!hits.is_empty());
         assert!(
@@ -1480,8 +1618,7 @@ mod tests {
         assert!(engine.incompatibilities().is_empty());
     }
 
-    /// Same model id, different weights behind it. Only the checksum catches
-    /// this, and it must be caught: the old vectors are from another space.
+    /// Only the checksum catches a swap behind an unchanged model id.
     #[test]
     fn a_swapped_model_file_disables_the_semantic_path() {
         let dir = TempDir::new("swapped_model");
@@ -1492,7 +1629,6 @@ mod tests {
             engine.index_book(&three_line_book()).unwrap();
         }
 
-        // Replace the model file's contents, keeping its id and path.
         let mut bytes = std::fs::read(&config.model_path).unwrap();
         bytes.extend_from_slice(b"different weights entirely");
         std::fs::write(&config.model_path, bytes).unwrap();
@@ -1517,9 +1653,8 @@ mod tests {
 
     // ── reopen ──
 
-    /// With a non-persistent store the vectors are gone after a restart. A
-    /// manifest still claiming the books are indexed is the dangerous state:
-    /// the diff reports "nothing to do" while every query comes back empty.
+    /// A non-persistent store loses its vectors on restart; a manifest still claiming
+    /// the books are indexed would report "nothing to do" over an empty index.
     #[test]
     fn reopening_prunes_book_records_whose_vectors_did_not_survive() {
         let dir = TempDir::new("reopen_prune");
@@ -1545,7 +1680,6 @@ mod tests {
             "an empty index is not an incompatible one"
         );
 
-        // The diff therefore asks for the book again instead of reporting done.
         let mut tantivy = HashMap::new();
         tantivy.insert("otzaria/tanach/genesis.txt".to_string(), 111u64);
         let diff = engine.diff_against_tantivy(&tantivy);
@@ -1640,7 +1774,6 @@ mod tests {
             .expect("a reason must be reported");
         assert!(reason.contains("Dimensions"), "unhelpful reason: {reason}");
 
-        // Reset is the way out.
         engine.reset_index().unwrap();
         assert!(engine.incompatibilities().is_empty());
         assert_eq!(
@@ -1722,7 +1855,7 @@ mod tests {
         );
         assert!(engine.incompatibilities().is_empty());
 
-        // The broken file is kept for diagnosis, not deleted.
+        // Kept for diagnosis, not deleted.
         let quarantined: Vec<_> = std::fs::read_dir(&config.root_dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1731,7 +1864,6 @@ mod tests {
             .collect();
         assert_eq!(quarantined.len(), 1, "found {quarantined:?}");
 
-        // And the engine is fully usable again.
         assert_eq!(
             engine.index_book(&three_line_book()).unwrap(),
             IndexOutcome::Indexed { chunks: 3 }
@@ -1778,7 +1910,7 @@ mod tests {
         assert_eq!(status.indexed_book_count, 0);
         assert!(status.last_error.is_none());
 
-        // Persisted too, not just in memory.
+        // Persisted, not just in memory.
         let manifest = SemanticManifest::load(&engine.config.root_dir).unwrap();
         assert_eq!(manifest.book_count(), 0);
     }
@@ -1869,7 +2001,6 @@ mod tests {
         assert_eq!(status.vector_count, 3, "the index itself is untouched");
         assert!(engine.search("בריאה", 5, None).is_err());
 
-        // Re-loading brings it back.
         engine.load_model().unwrap();
         assert!(engine.status().available);
         assert!(engine.search("בריאה", 5, None).is_ok());

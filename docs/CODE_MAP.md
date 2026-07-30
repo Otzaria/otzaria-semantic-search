@@ -161,9 +161,11 @@ otzaria-semantic-search/
     קונטיינר ללא tensors, metadata type לא מוכר בגרסה נתמכת, alignment שאינו כפולה
     של 8 או tensor offset לא מיושר — נדחים; אין fallback לקבלת descriptors שלא
     הצלחנו לפרסר.
-  - `EmbeddingBackendKind` — זהות ה-backend, נשמרת ב-manifest. `is_semantic()` מחזיר
-    `false` ל-stand-in, כדי שלא יתחזה למודל.
-  - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו.
+  - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו. זו **נקודת החניקה
+    הראשית**: היא מחלקת ל-batches בגודל `batch_size`, בודקת שהוחזר וקטור לכל קלט,
+    ומריצה `normalize_validated` על כל אחד. ה-backends מחזירים וקטורים גלמיים ולא
+    מנורמלים, כדי שכולם יקבלו את אותו טיפול. ל-`VectorStore` יש guard עצמאי משלו —
+    הוא API ציבורי שיכול לקבל וקטורים שלא עברו כאן.
   - `normalize_validated()` — דוחה כל וקטור שלא ניתן להשוות: ממד שגוי, רכיב
     לא-finite, נורמה לא-finite (כולל וקטור finite שגולש), או נורמה `<= MIN_VECTOR_NORM`.
   - `MIN_VECTOR_NORM` — סף אחד ל-crate כולו (`pub(crate)`), עם אותה השוואה בכל שכבה.
@@ -172,6 +174,51 @@ otzaria-semantic-search/
   - `l2_normalize()` — נורמליזציית L2, מחזירה את הנורמה שהייתה לפני כן.
   - `mock` — ה-stand-in הדטרמיניסטי, זמין רק תחת `cfg(test)` או
     `--features mock-embedding`. **אינו מודל סמנטי.**
+
+* [`src/semantic/backend.rs`](../src/semantic/backend.rs) — החוזה שכל backend מקיים.
+  - `EmbeddingBackend` — trait עם `Send + Sync`, כי הקואורדינטור מחזיק את המנוע
+    ב-`RwLock` ו-`search` לוקח `.read()`; חיפושים נכנסים ל-`embed_batch_raw` דרך
+    `&self` במקביל. `&mut self` היה מסרייל חיפוש מאחורי אינדוקס.
+  - `embed_batch_raw()` — מחזיר וקטורים **גלמיים**. הנרמול אינו תפקיד ה-backend.
+  - `tokenize()` — קיים כי בדיקת ה-parity של P2 מחייבת שוויון `token_ids`, ואין דרך
+    לאמת אותה בלי לחשוף את הטוקנייזר. ה-stand-in מחזיר `TokenizationUnsupported`
+    ולא מימוש מנוון — ids "סבירים" היו הופכים את הבדיקה להשוואה בין שתי המצאות.
+  - `Pooling` — `LastToken` / `Mean`, עם התאמת מחרוזות **מדויקת** (לא case-insensitive
+    ובלי trim): אותה מחרוזת נשמרת ב-manifest ומושווית תו-בתו בסשן הבא, כך שקבלת
+    `"Last-Token"` כאליאס הייתה מייצרת mismatch מדומה ובנייה מחדש של האינדקס.
+    `Mean` בר-ייצוג ובלתי-שמיש: הוא מה שמאפשר לבטא "הקונפיג חולק על ה-backend".
+  - `CANDIDATES` / `select_backend()` — טבלה אחת שממנה קוראים גם הבחירה וגם בדיקת
+    ה-pooling, ולכן הוספת backend היא שורה. הטבלה **אינה** מותנית ב-feature: היא
+    מתארת אילו מימושים קיימים ב-crate, אחרת "אין backend" היה מדווח כ"קונפיגורציה
+    שגויה". מחזירה `Option<Result<..>>` — `None` = לא מקומפל (המשך לחפש),
+    `Some(Err)` = מקומפל ונכשל (עצור ודווח). עם `Option` בלבד, backend אמיתי שנכשל
+    היה נראה כחסר, וה-stand-in היה עונה על מודל שבור בווקטורי האש בשקט.
+
+* [`src/semantic/llama_backend.rs`](../src/semantic/llama_backend.rs) — inference אמיתי,
+  מאחורי `--features llama-backend` (ראו [`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md)).
+  - `ContextPool` — thread עובד לכל context, שיוצר את ה-context שלו מ-`Arc<LlamaModel>`
+    על ה-stack שלו. `LlamaContext<'a>` שואל את המודל, ולכן אחסון שלהם יחד היה
+    self-referential; כך ה-borrow לא יוצא ממסגרת ה-stack וה-context ש-`!Sync` לא חוצה
+    thread. ה-mutex שומר רק `Vec<usize>` של עובדים פנויים ומוחזק ל-`pop`/`push`,
+    **לא** על פני decode. mutex בודד סביב context אחד היה מסרייל את כל ה-inference.
+  - `tokenizer::RawVocab` — ה-`unsafe` היחיד ב-crate. `llama-cpp-2` מקדד בקשיחות
+    `parse_special = true`, וחוזה הזהב מחייב `false` (מדוד: `<|endoftext|>` בתוך ספר
+    שינה טקסט מ-162 ל-158 טוקנים). הפריסה היא **פרט מימוש בלתי מתועד** שהפין המדויק
+    לגרסה מקפיא — upstream מכחיש יציבות פריסה במפורש לטיפוסים אחיים.
+  - `truncate_with_eos()` — `max_tokens` הוא הסך **כולל** EOS. ה-EOS נדחף *אחרי*
+    החיתוך, ולכן שום אורך לא יכול להדיח אותו; בלעדיו pooling של הטוקן האחרון היה
+    קורא טוקן תוכן והוקטור היה חסר משמעות. חולץ לפונקציה חופשית כדי שיהיה ניתן
+    לבדיקה בלי המודל בן 396MB — הכרחי, כי הסבילות הווקטורית **אינה** רואה באגי
+    טרנקציה (off-by-one מקבל cosine 0.99838).
+  - `micro_batch_for()` — `n_ubatch = 256` ולא `n_ctx`, מה שחוסך ~162 MiB reserve
+    לכל context (טנזור logits ש-backend של embeddings לא קורא). מגודר בקאוזליות
+    מוכחת: `GGML_ASSERT((causal_attn || n_ubatch >= n_tokens_all))` — במודל לא-קאוזלי
+    התהליך קורס, ולא בטעינה אלא ב-batch האמיתי הראשון. 256 היא ההפחתה הגדולה ביותר
+    שמשאירה את כל 65 הוקטורים זהים סיבית.
+  - `release_contexts_at_exit()` — נרשם ב-`atexit` מתוך `spawn`, אחרי שה-context
+    הראשון קיים. `static` אינו נהרס לעולם, ולכן host שמחזיק את המנוע ב-global היה
+    מקבל `GGML_ASSERT` ב-destructor סטטי של ggml **אחרי** עבודה מוצלחת — crash
+    reporter מדווח על זה כקריסה. atexit רץ בסדר הפוך לרישום, ולכן ההקדמה מובטחת.
 
 * [`src/semantic/store.rs`](../src/semantic/store.rs)
   - `VectorStore` & `VectorStoreConfig` — מנגנון האחסון והשליפה הוקטורי.

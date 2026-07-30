@@ -1,19 +1,13 @@
-//! Vector store.
-//!
-//! Provides similarity search over the semantic index, isolated from Tantivy —
-//! its own directory, its own lifecycle, its own failure domain.
-//!
-//! # Backend status
+//! Vector store: similarity search over the semantic index, isolated from Tantivy —
+//! its own directory, lifecycle and failure domain.
 //!
 //! The current backend keeps vectors in memory and scans them exhaustively
-//! (`O(N·D)`). It is **not persistent**: nothing survives a restart, which
-//! [`VectorStore::is_persistent`] reports so callers never treat a stale
-//! manifest as a populated index. A persistent ANN backend is roadmap P4; the
-//! public API here is the seam it slots into.
+//! (`O(N·D)`). It is **not persistent**, which [`VectorStore::is_persistent`]
+//! reports so callers never treat a stale manifest as a populated index. A
+//! persistent ANN backend is roadmap P4; this API is the seam it slots into.
 
 use crate::errors::VectorStoreError;
-// One threshold for the whole crate: a boundary the store and the embedding layer
-// disagreed about is a vector one of them normalizes and the other rejects.
+// One threshold for the whole crate, so no two layers can disagree about it.
 use crate::semantic::embedding::MIN_VECTOR_NORM;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 use std::cmp::Ordering;
@@ -21,11 +15,9 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-/// Identifier of this storage backend, recorded in the manifest so an index
-/// built by one backend is never read through another.
+/// Recorded in the manifest, so one backend never reads another's index.
 pub const BACKEND_ID: &str = "in-memory-v1";
 
-/// Configuration for the vector store.
 #[derive(Debug, Clone)]
 pub struct VectorStoreConfig {
     pub db_path: PathBuf,
@@ -43,10 +35,8 @@ impl Default for VectorStoreConfig {
     }
 }
 
-/// A stored vector record.
-///
-/// Vectors are L2-normalized on the way in, so cosine similarity at search time
-/// is a single dot product.
+/// A stored vector record. Vectors are L2-normalized on the way in, so cosine
+/// similarity at search time is a single dot product.
 #[derive(Debug, Clone)]
 pub struct StoredVectorRecord {
     pub metadata: VectorMetadata,
@@ -54,21 +44,15 @@ pub struct StoredVectorRecord {
     pub vector: Vec<f32>,
 }
 
-/// Store state behind a single lock.
-///
-/// Both maps are guarded together on purpose: when they had a lock each, insert
-/// took them in the opposite order from delete, which is a lock-order inversion
-/// that can deadlock under concurrent indexing. One lock also makes a batch
-/// insert or a book delete atomic for readers — a search never observes a record
-/// that is missing from the book index, or the reverse.
+/// Both maps are guarded by one lock: with a lock each, insert took them in the
+/// opposite order from delete — a lock-order inversion that can deadlock under
+/// concurrent indexing. One lock also makes a batch or a delete atomic for readers.
 #[derive(Default)]
 struct StoreState {
     /// `semantic_id` → record.
     records: HashMap<String, StoredVectorRecord>,
-    /// `source_book_key` → the `semantic_id`s belonging to that book.
-    ///
-    /// Invariant: an id appears here exactly once, under exactly one book, and
-    /// only while `records` holds it.
+    /// `source_book_key` → its `semantic_id`s. Invariant: an id appears exactly once,
+    /// under exactly one book, and only while `records` holds it.
     book_index: HashMap<String, Vec<String>>,
 }
 
@@ -93,15 +77,10 @@ impl PartialOrd for ScoredEntry {
 }
 
 impl Ord for ScoredEntry {
-    /// Orders candidates **worst first**, which is what makes `BinaryHeap` — a
-    /// max-heap — usable as a bounded min-heap: `peek` yields the candidate to
-    /// evict, and a new candidate displaces it when it compares *less*.
-    ///
-    /// So a lower score is "greater", and among equal scores a larger
-    /// `semantic_id` is "greater". The id tie-break is what keeps the result set
-    /// reproducible: `HashMap` iteration order is randomized per process, so
-    /// without it a query over tied candidates returns a different top-k on every
-    /// run. `total_cmp` keeps the ordering total even if a NaN slips through.
+    /// Orders candidates **worst first**, making a max-heap a bounded min-heap: `peek`
+    /// yields the candidate to evict. Among equal scores a larger `semantic_id` is
+    /// "greater" — randomized `HashMap` order would otherwise return a different top-k
+    /// every run. `total_cmp` stays total if a NaN slips through.
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .score
@@ -110,7 +89,6 @@ impl Ord for ScoredEntry {
     }
 }
 
-/// Embedded vector store managing local vector storage and similarity search.
 pub struct VectorStore {
     config: VectorStoreConfig,
     state: RwLock<StoreState>,
@@ -144,16 +122,13 @@ impl VectorStore {
         Ok(store)
     }
 
-    /// Identifier of the active storage backend.
     pub fn backend_id(&self) -> &'static str {
         BACKEND_ID
     }
 
-    /// Whether stored vectors survive process restart.
-    ///
-    /// `false` for the in-memory backend. Callers must not trust an on-disk
-    /// manifest that claims books are indexed while this is `false` — the
-    /// vectors those records describe are gone.
+    /// Whether stored vectors survive process restart. `false` for the in-memory
+    /// backend, and a caller must not trust an on-disk manifest claiming indexed books
+    /// while it is: the vectors those records describe are gone.
     pub fn is_persistent(&self) -> bool {
         false
     }
@@ -163,22 +138,17 @@ impl VectorStore {
         self.config.embedding_dim
     }
 
-    /// Insert or replace a batch of vector records.
+    /// Insert or replace a batch of vector records, L2-normalizing each. Either the
+    /// whole batch is applied or none of it: everything is validated up front, so a
+    /// rejected vector cannot leave the store half-written.
     ///
-    /// Vectors are L2-normalized before storage. Either the whole batch is
-    /// applied or none of it: everything is validated up front so a rejected
-    /// vector cannot leave the store half-written.
-    ///
-    /// The store enforces the "retrievable vector" invariant itself, not only at
-    /// the embedding layer: whatever produced it, a vector that cannot be scored
-    /// leaves a record that exists but can never be returned by a search. Three
-    /// ways that happens, all rejected here:
-    ///
-    /// * a non-finite component — scores `NaN`, which search discards;
-    /// * a zero norm — no direction, so it matches nothing;
-    /// * a *finite* vector whose squares overflow `f32` (components around
-    ///   `1e30`) — the norm becomes `inf`, the reciprocal `0`, and normalization
-    ///   silently produces the zero vector.
+    /// The store re-checks that every vector is *retrievable* even though the runtime
+    /// already did, because this is a public entry point that also accepts vectors the
+    /// runtime never saw, and an unscorable vector leaves a record that exists but can
+    /// never be returned. Rejected: a non-finite component (scores `NaN`), a zero norm
+    /// (no direction), and a finite vector whose squares overflow `f32` (norm `inf`,
+    /// reciprocal `0`, so normalization silently yields zeros). The threshold has one
+    /// definition, `MIN_VECTOR_NORM`, compared with the same `<=` in both places.
     pub fn insert_batch(
         &self,
         batch: &[(VectorMetadata, Vec<f32>)],
@@ -210,8 +180,7 @@ impl VectorStore {
                     "has a non-finite norm ({norm}); its magnitudes overflowed f32"
                 )));
             }
-            // `<=`, so the vector exactly on the threshold is rejected rather
-            // than stored unnormalized. Same comparison in every layer.
+            // `<=`: a vector exactly on the threshold is rejected, as in every layer.
             if norm <= MIN_VECTOR_NORM {
                 return Err(reject(format!(
                     "has a norm of {norm}, at or below the minimum {MIN_VECTOR_NORM}, so it \
@@ -230,16 +199,14 @@ impl VectorStore {
             };
 
             match state.records.insert(id.clone(), record) {
-                // New id: add it to its book's id list.
                 None => state
                     .book_index
                     .entry(meta.source_book_key.clone())
                     .or_default()
                     .push(id),
-                // Replacing an existing id: it is already listed. Only if it
-                // moved between books does the index need fixing — the id is
-                // derived from the book key, so this should not happen, but a
-                // stale entry would leak vectors past a book delete.
+                // Already listed; only a move between books needs fixing. The id is
+                // derived from the book key, but a stale entry would leak vectors past
+                // a book delete.
                 Some(previous) => {
                     let previous_book = previous.metadata.source_book_key;
                     if previous_book != meta.source_book_key {
@@ -263,11 +230,9 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Search for nearest neighbours by cosine similarity.
-    ///
-    /// Uses a bounded min-heap for `O(N log k)` top-k selection and clones
-    /// metadata only for the selected candidates. Results are sorted by
-    /// descending similarity, ties broken by `semantic_id` for reproducibility.
+    /// Search for nearest neighbours by cosine similarity: a bounded min-heap for
+    /// `O(N log k)` top-k selection, results sorted by descending similarity with ties
+    /// broken by `semantic_id` for reproducibility.
     pub fn search(
         &self,
         query_vector: &[f32],
@@ -284,8 +249,7 @@ impl VectorStore {
             return Ok(Vec::new());
         }
 
-        // A query that is not comparable yields nothing rather than scoring
-        // every record as NaN and returning an arbitrary set.
+        // An incomparable query yields nothing rather than NaN-scoring everything.
         let norm = l2_norm(query_vector);
         if !norm.is_finite() || norm <= MIN_VECTOR_NORM {
             return Ok(Vec::new());
@@ -295,11 +259,8 @@ impl VectorStore {
         }
         let query = l2_normalize_vec(query_vector);
 
-        // Group the facet paths by dimension once for the whole scan. Calling
-        // `SearchFilters::matches` per record would recompile them for every
-        // stored vector — four allocations times the size of the index.
-        // `compile` returns `None` when nothing actually filters, which also
-        // skips the per-record check entirely.
+        // Group facet paths by dimension once per scan: `matches` per record would
+        // recompile them for every stored vector. `None` skips the check entirely.
         let filters = filters.and_then(SearchFilters::compile);
 
         let state = self.read_state();
@@ -325,8 +286,7 @@ impl VectorStore {
             if heap.len() < top_k {
                 heap.push(entry);
             } else if let Some(weakest) = heap.peek() {
-                // `ScoredEntry` orders worst-first, so `<` reads as "better than
-                // the weakest candidate currently kept".
+                // Worst-first ordering, so `<` reads as "better than the weakest kept".
                 if entry < *weakest {
                     heap.pop();
                     heap.push(entry);
@@ -373,9 +333,7 @@ impl VectorStore {
         Ok(deleted)
     }
 
-    /// Remove every vector in the store.
-    ///
-    /// Used when the index must be rebuilt from scratch (incompatible
+    /// Remove every vector in the store, for a rebuild from scratch (incompatible
     /// configuration, model change, corrupted manifest).
     pub fn clear(&self) -> Result<u32, VectorStoreError> {
         let mut state = self.write_state();
@@ -386,12 +344,10 @@ impl VectorStore {
         Ok(removed)
     }
 
-    /// Total number of vectors stored.
     pub fn vector_count(&self) -> usize {
         self.read_state().records.len()
     }
 
-    /// Number of vectors stored for a single book.
     pub fn book_vector_count(&self, source_book_key: &str) -> usize {
         self.read_state()
             .book_index
@@ -399,29 +355,22 @@ impl VectorStore {
             .map_or(0, |ids| ids.len())
     }
 
-    /// Whether a specific chunk is present.
     pub fn contains(&self, semantic_id: &str) -> bool {
         self.read_state().records.contains_key(semantic_id)
     }
 
-    /// Flush state to durable storage.
-    ///
-    /// A no-op for the in-memory backend, which has no durable storage — see
-    /// [`VectorStore::is_persistent`]. It returns `Ok` so callers can already
-    /// place commit points correctly; it does not mean anything was persisted.
+    /// Flush state to durable storage. A no-op for the in-memory backend — see
+    /// [`VectorStore::is_persistent`] — returning `Ok` so callers can place commit
+    /// points correctly, not to claim anything was persisted.
     pub fn commit(&self) -> Result<(), VectorStoreError> {
         Ok(())
     }
 
-    /// Acquire the write lock, recovering from poisoning.
-    ///
-    /// A panic while holding the lock poisons it. Refusing every later access
-    /// would take the semantic path down for the rest of the session over one
-    /// bad batch, so the state is recovered instead. That is sound here because
-    /// the two maps cannot be left disagreeing: each record is inserted or
-    /// removed from both in one uninterrupted step, and dimension validation
-    /// happens before the lock is taken, so an aborted batch only ever leaves
-    /// *fewer* vectors — and those books simply get re-indexed.
+    /// Acquire the write lock, recovering from poisoning: refusing every later access
+    /// would take the semantic path down for the whole session over one bad batch.
+    /// Recovery is sound because the two maps cannot be left disagreeing — each record
+    /// enters or leaves both in one uninterrupted step, and validation happens before
+    /// the lock is taken, so an aborted batch only ever leaves *fewer* vectors.
     fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, StoreState> {
         self.state.write().unwrap_or_else(|poisoned| {
             log::warn!("VectorStore lock was poisoned; recovering state");
@@ -438,12 +387,10 @@ impl VectorStore {
     }
 }
 
-/// Dot product of two equal-length vectors.
-///
-/// Split across several accumulators: a single running sum forces a serial
-/// dependency chain one float-add long per element, while independent lanes let
-/// the CPU pipeline them and let the compiler emit SIMD. This is the innermost
-/// loop of every semantic query, run once per stored vector.
+/// Dot product of two equal-length vectors, split across several accumulators: one
+/// running sum forces a serial float-add dependency chain per element, while
+/// independent lanes pipeline and vectorize. This is the innermost loop of every
+/// semantic query, run once per stored vector.
 #[inline]
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 8;
@@ -465,15 +412,12 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// L2 norm of a vector.
 fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
-/// Return a new L2-normalized copy of a vector.
-///
-/// A vector whose norm is indistinguishable from zero is returned unchanged;
-/// callers check the norm themselves before relying on the direction.
+/// Return a new L2-normalized copy. A vector whose norm is indistinguishable from
+/// zero is returned unchanged; callers check the norm themselves.
 fn l2_normalize_vec(v: &[f32]) -> Vec<f32> {
     let norm = l2_norm(v);
     if norm <= MIN_VECTOR_NORM {
@@ -705,8 +649,7 @@ mod tests {
         );
     }
 
-    /// A stored NaN scores NaN, gets skipped at search time, and leaves a record
-    /// that exists but is unreachable — so the store refuses it outright.
+    /// A stored NaN would leave a record that exists but can never be returned.
     #[test]
     fn non_finite_vectors_are_refused_by_the_store() {
         let dir = TempDir::new("non_finite_insert");
@@ -718,12 +661,10 @@ mod tests {
             vec![f32::NEG_INFINITY, 1.0, 0.0, 0.0],
             // No direction: matches nothing, so it can never be retrieved.
             vec![0.0, 0.0, 0.0, 0.0],
-            // Finite, but the squares overflow f32: the norm becomes `inf` and
-            // normalization turns the whole vector into zeros.
+            // Finite, but the squares overflow f32: norm `inf`, so all zeros.
             vec![1e30, 1e30, 1e30, 1e30],
             vec![f32::MAX, f32::MAX, 0.0, 0.0],
-            // Exactly on the threshold. The store and the embedding layer share
-            // one constant and one comparison, so this is refused in both.
+            // Exactly on the threshold: one constant, one comparison, refused in both.
             vec![MIN_VECTOR_NORM, 0.0, 0.0, 0.0],
         ] {
             let result = store.insert_batch(&[(sample_metadata("bad", "book.txt"), bad.clone())]);
@@ -734,8 +675,7 @@ mod tests {
         }
         assert_eq!(store.vector_count(), 0);
 
-        // A rejected vector does not take its batch-mates down silently: the
-        // whole batch is refused, so nothing is half-applied.
+        // The whole batch is refused, so nothing is half-applied.
         let result = store.insert_batch(&[
             (
                 sample_metadata("good", "book.txt"),
@@ -750,8 +690,7 @@ mod tests {
         assert_eq!(store.vector_count(), 0);
     }
 
-    /// The guard is against vectors that cannot be retrieved, not against large
-    /// ones — a magnitude that still squares within `f32` is perfectly usable.
+    /// A large magnitude that still squares within `f32` is perfectly usable.
     #[test]
     fn a_large_but_representable_vector_is_accepted() {
         let dir = TempDir::new("large_vector");
@@ -835,17 +774,15 @@ mod tests {
         assert_eq!(hits.len(), 3);
     }
 
-    /// The bounded heap must keep the *best* k, not merely k of them. A reversed
-    /// eviction comparison returns exactly the right number of results — all of
-    /// them the wrong ones — so counting results is not enough to catch it.
+    /// The heap must keep the *best* k, not merely k of them: a reversed eviction
+    /// comparison returns the right number of results, all of them the wrong ones.
     #[test]
     fn top_k_returns_the_best_candidates_not_just_k_of_them() {
         let dir = TempDir::new("top_k_best");
         let store = store(&dir, 2);
 
-        // 20 vectors fanned out from the query direction: index 0 is the closest,
-        // index 19 the furthest. Inserted worst-first so a naive implementation
-        // that keeps whatever it saw first also fails.
+        // 20 vectors fanned out from the query: 0 closest, 19 furthest, inserted
+        // worst-first so "keep whatever came first" also fails.
         let batch: Vec<(VectorMetadata, Vec<f32>)> = (0..20)
             .rev()
             .map(|i| {
@@ -869,7 +806,6 @@ mod tests {
             "the five nearest vectors must be the ones returned"
         );
 
-        // And every returned score beats every discarded one.
         let worst_kept = hits.last().unwrap().similarity_score;
         let all = store.search(&[1.0, 0.0], 20, None).unwrap();
         for discarded in &all[5..] {
@@ -913,8 +849,7 @@ mod tests {
         }
     }
 
-    /// `HashMap` iteration order is randomized per process, so tie-breaking has
-    /// to be explicit or the same query returns a different top-k each run.
+    /// Randomized `HashMap` order means tie-breaking has to be explicit.
     #[test]
     fn tied_scores_break_deterministically_and_reproducibly() {
         let dir = TempDir::new("ties");
@@ -989,8 +924,7 @@ mod tests {
         assert_eq!(filtered[0].metadata.semantic_id, "pdf");
     }
 
-    /// The contract from [`SearchFilters`]: an empty filter list must not empty
-    /// the result set.
+    /// [`SearchFilters`]: an empty filter list must not empty the result set.
     #[test]
     fn empty_filter_lists_do_not_remove_results() {
         let dir = TempDir::new("empty_filters");
@@ -1064,8 +998,7 @@ mod tests {
 
     #[test]
     fn dot_product_matches_the_naive_sum_including_non_multiples_of_the_lane_width() {
-        // Lengths around the 8-lane split: remainder handling is where a chunked
-        // dot product typically drops elements.
+        // Lengths around the 8-lane split, where a chunked dot product drops one.
         for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 1024, 1025] {
             let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.37).sin()).collect();
             let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.11).cos()).collect();
@@ -1117,8 +1050,7 @@ mod tests {
             handle.join().expect("worker thread panicked or deadlocked");
         }
 
-        // Every book still holds exactly the records inserted after its last
-        // delete — the two maps stayed in agreement.
+        // The two maps stayed in agreement.
         for worker in 0..4 {
             let book = format!("book{worker}.txt");
             let indexed = store.book_vector_count(&book);

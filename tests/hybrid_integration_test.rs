@@ -1,21 +1,20 @@
-//! End-to-end tests for the Otzaria hybrid semantic search engine.
+//! End-to-end tests for the Otzaria hybrid semantic search engine: a full index →
+//! restart → search cycle, mode selection through [`SearchRequest`], and recovery
+//! from a damaged index directory.
 //!
-//! These exercise the public API the app will call, across the boundaries the
-//! unit tests cannot: a full index → restart → search cycle, mode selection
-//! through [`SearchRequest`], and recovery from a damaged index directory.
+//! Driving the engine end to end requires an embedding backend, and requires the
+//! deterministic stand-in to be the one actually *selected* — every fixture builds
+//! its model with [`mock::write_stub_gguf`], a weightless stub that real inference
+//! rightly refuses — hence `mock-embedding` without `llama-backend`.
 //!
-//! # Why this file is feature-gated
-//!
-//! Driving the engine end to end requires an embedding backend. Real GGUF
-//! inference is not implemented yet (roadmap P2), and the deterministic stand-in
-//! is deliberately unavailable in a default build so a release binary cannot
-//! serve fake vectors. So these tests compile only with `--features
-//! mock-embedding`; CI runs both configurations.
-//!
-//! The opposite side of that gate — that a default build really does refuse to
-//! embed anything — is asserted in `tests/production_backend_gate.rs`.
+//! Consequently the hybrid pipeline is not exercised in a build holding both
+//! backends. That is acceptable: fusion, grouping, paging, filters and the manifest
+//! lifecycle are backend-agnostic. The selection rule that such a build does need
+//! asserted lives in `tests/backend_selection.rs`, and the opposite side of the gate
+//! — a default build refusing to embed at all — in
+//! `tests/production_backend_gate.rs`.
 
-#![cfg(feature = "mock-embedding")]
+#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
@@ -64,8 +63,7 @@ impl Drop for TempDir {
     }
 }
 
-/// A configuration rooted in `dir`, with a valid stub GGUF container and a small
-/// embedding dimension so the suite stays fast.
+/// A configuration rooted in `dir`, with a small embedding dimension for speed.
 fn config_at(dir: &TempDir) -> SemanticConfig {
     let model_path = dir.path().join("model.gguf");
     mock::write_stub_gguf(&model_path, 3).unwrap();
@@ -126,26 +124,18 @@ fn genesis_book() -> BookForIndexing {
     }
 }
 
-/// A PDF book.
-///
-/// Its `content_fingerprint` is the caller's own canonical fingerprint, not
-/// Tantivy's `0`. That is the integration contract: the value is whatever the
-/// caller can vouch for, it must fold in the metadata stored in every vector, and
-/// it has to be the same value later handed to the diff. Leaving it `0` is legal
-/// but means "I cannot vouch for this", and such a book is re-examined on every
-/// diff — see `a_pdf_without_a_caller_supplied_signature_is_always_offered`.
+/// A PDF book carrying the caller's own canonical fingerprint rather than Tantivy's
+/// `0`. Leaving it `0` is legal but means "I cannot vouch for this", and such a book
+/// is re-examined on every diff.
 fn berachot_book() -> BookForIndexing {
     let mut book = berachot_without_fingerprint();
     book.content_fingerprint = caller_fingerprint(&book, PDF_SIGNATURE).as_raw();
     book
 }
 
-/// The caller's canonical fingerprint for a book: its own signature for the file,
-/// folded together with the metadata that ends up inside every vector.
-///
-/// This is the whole reason a PDF can be reported as up to date. A signature over
-/// the file alone cannot: renaming the book or correcting its author changes what
-/// every one of its vectors carries while leaving the bytes on disk untouched.
+/// The file's own signature folded together with the metadata that ends up inside
+/// every vector — a signature over the bytes alone cannot notice a renamed book or a
+/// corrected author.
 fn caller_fingerprint(book: &BookForIndexing, source_signature: u64) -> ContentFingerprint {
     ContentFingerprint::canonical(
         source_signature,
@@ -197,13 +187,8 @@ fn lexical_hit(line_id: u64, text: &str, bm25_score: f32) -> LexicalCandidate {
     }
 }
 
-/// Stands in for a caller-computed authoritative PDF extraction revision.
-///
-/// Berachot is a PDF, so the lexical index records `contentHash = 0` for it — its
-/// extracted text is not in the library database. A caller that tracks its own
-/// revision over extracted text, line/section structure and extraction/OCR
-/// version uses it both when building the book and when asking for a diff. File
-/// size and mtime alone are not enough for this canonical contract.
+/// Stands in for a caller-computed PDF extraction revision, which the lexical index
+/// cannot supply: it records `contentHash = 0` for PDFs.
 const PDF_SIGNATURE: u64 = 0xBEEF_CAFE;
 
 /// The fingerprint map a caller with real signatures would supply.
@@ -259,7 +244,6 @@ fn indexes_a_library_and_serves_a_hybrid_search_through_the_api() {
     assert!(!result.results.is_empty());
     assert!(result.total_count > 0);
 
-    // The line both engines found ranks first and carries both scores.
     let top = &result.results[0];
     assert_eq!(top.id, 1);
     assert_eq!(top.source, ResultSource::Both);
@@ -296,8 +280,7 @@ fn a_semantic_only_search_returns_semantic_hits_and_no_lexical_ones() {
         .iter()
         .all(|r| r.source == ResultSource::Semantic));
 
-    // Semantic hits carry metadata but no line body: the text has to be
-    // hydrated from Tantivy by id, and the flag is what says so.
+    // Semantic hits carry metadata but no line body; the flag is what says so.
     for item in &result.results {
         assert!(item.needs_hydration);
         assert!(item.text.is_empty());
@@ -374,7 +357,6 @@ fn reopening_the_index_never_claims_books_whose_vectors_are_gone() {
         assert_eq!(api.get_semantic_status().vector_count, 4);
     }
 
-    // Restart: a new engine over the same directory.
     let engine = SemanticEngine::open(config.clone()).unwrap();
     let api = OtzariaHybridEngine::new(HybridCoordinator::new(Some(engine)));
 
@@ -387,14 +369,12 @@ fn reopening_the_index_never_claims_books_whose_vectors_are_gone() {
     assert!(!status.available);
     assert!(!status.vectors_persisted);
 
-    // The diff therefore asks for both books rather than reporting done.
     let fingerprints = library_fingerprints();
     let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
     assert!(!diff.is_up_to_date());
     assert_eq!(diff.books_to_index(), 2);
     assert!(!diff.needs_full_rebuild(), "the configuration is unchanged");
 
-    // Re-indexing restores a working index.
     let summary = api
         .index_books(&[genesis_book(), berachot_book()])
         .unwrap()
@@ -462,7 +442,6 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
     );
     assert_eq!(status.indexed_book_count, 2, "Berachot is untouched");
 
-    // The deleted line is really gone from the results.
     let result = api
         .search(SearchRequest {
             query: LINE_THREE.to_string(),
@@ -476,7 +455,6 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
         "the removed line must not survive a re-index"
     );
 
-    // And the manifest agrees the library is current.
     let fingerprints = HashMap::from([
         (
             GENESIS.to_string(),
@@ -506,16 +484,13 @@ fn reindexing_unchanged_content_does_not_duplicate_vectors() {
     assert_eq!(api.get_semantic_status().indexed_book_count, 2);
 }
 
-/// The failure a file signature alone cannot catch: the PDF is byte-identical and
-/// the library corrected its author. Every vector carries that author and drives
-/// filtering with it, so "up to date" would mean serving the wrong one — and the
-/// book would never be handed over for its lines to be compared.
+/// The failure a file signature alone cannot catch: the PDF is byte-identical and the
+/// library corrected its author, which every vector carries and filters on.
 #[test]
 fn correcting_a_pdfs_author_is_visible_at_diff_time() {
     let dir = TempDir::new("pdf_metadata_diff");
     let api = indexed_api(config_at(&dir));
 
-    // The same file, the same signature, one corrected author.
     let mut corrected = berachot_without_fingerprint();
     corrected.extra_facets = vec![
         "/era/תנאים".to_string(),
@@ -548,7 +523,6 @@ fn correcting_a_pdfs_author_is_visible_at_diff_time() {
     assert!(diff.unverifiable_books.is_empty());
     assert!(!diff.is_up_to_date());
 
-    // Re-indexing replaces the stored facets, so filtering follows the correction.
     api.index_books(&[corrected]).unwrap().unwrap();
     let count_with = |facet: &str| {
         api.search(SearchRequest {
@@ -570,8 +544,8 @@ fn correcting_a_pdfs_author_is_visible_at_diff_time() {
     );
 }
 
-/// A signature over the file alone says so, and is therefore never trusted to
-/// mean "current" — the book comes back as unverifiable and its lines decide.
+/// A file-only signature leaves the metadata unproven, so the book comes back as
+/// unverifiable and its lines decide.
 #[test]
 fn a_file_only_signature_cannot_declare_a_pdf_current() {
     let dir = TempDir::new("pdf_content_only");
@@ -602,15 +576,12 @@ fn a_file_only_signature_cannot_declare_a_pdf_current() {
     assert!(diff.changed_books.is_empty());
     assert!(!diff.is_up_to_date());
 
-    // Handing it back is cheap: nothing changed, so nothing is re-embedded.
     let summary = api.index_books(&[file_only]).unwrap().unwrap();
     assert_eq!(summary.books_skipped, 1);
     assert_eq!(summary.chunks_written, 0);
 }
 
-/// The other side of that contract: a caller with nothing but Tantivy's hashes
-/// gets every PDF back on every diff. Honest, but it costs a text extraction each
-/// time — which is why supplying a signature is worth it.
+/// A caller with nothing but Tantivy's hashes gets every PDF back on every diff.
 #[test]
 fn a_pdf_without_a_caller_supplied_signature_is_always_offered() {
     let dir = TempDir::new("pdf_no_signature");
@@ -637,7 +608,6 @@ fn a_pdf_without_a_caller_supplied_signature_is_always_offered() {
     assert!(!diff.is_up_to_date());
     assert!(!diff.needs_full_rebuild());
 
-    // Handing it back costs no inference, because its lines are unchanged.
     let summary = api.index_books(&[berachot_book()]).unwrap().unwrap();
     assert_eq!(
         summary.books_skipped, 1,
@@ -732,14 +702,12 @@ fn a_corrupt_manifest_is_quarantined_and_the_engine_recovers() {
         "a corrupt manifest is a fresh start, not an incompatibility"
     );
 
-    // The damaged file is kept for diagnosis.
     let kept = std::fs::read_dir(&config.root_dir)
         .unwrap()
         .filter_map(Result::ok)
         .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
     assert!(kept, "the unusable manifest must be preserved, not deleted");
 
-    // And the engine is immediately usable again.
     let summary = api.index_books(&[genesis_book()]).unwrap().unwrap();
     assert_eq!(summary.chunks_written, 3);
     assert!(api.get_semantic_status().available);
@@ -770,7 +738,6 @@ fn an_incompatible_configuration_disables_semantic_search_until_it_is_reset() {
         .expect("the caller must be told a rebuild is required");
     assert!(reason.contains("Dimensions"), "unhelpful reason: {reason}");
 
-    // A hybrid search still answers, from BM25, and says the semantic path was skipped.
     let result = api
         .search(SearchRequest {
             query: LINE_ONE.to_string(),
@@ -786,7 +753,6 @@ fn an_incompatible_configuration_disables_semantic_search_until_it_is_reset() {
     // Indexing is refused rather than mixing vector spaces.
     assert!(api.index_books(&[genesis_book()]).is_err());
 
-    // Reset is the documented way out.
     api.reset_semantic_index().unwrap();
     assert!(api.get_semantic_status().needs_full_reindex.is_none());
     let summary = api.index_books(&[genesis_book()]).unwrap().unwrap();
@@ -855,8 +821,7 @@ fn filters_select_the_same_documents_the_lexical_facets_would() {
         "no line is both Torah and Tannaitic"
     );
 
-    // Both of Genesis's authors select it — the case a single-valued author
-    // field could not represent.
+    // Both of Genesis's authors select it: a single-valued field could not.
     for author in ["/author/משה רבנו", "/author/עזרא הסופר"] {
         assert_eq!(
             semantic_search(Some(facet_filter(&[author]))),
@@ -876,7 +841,6 @@ fn filters_select_the_same_documents_the_lexical_facets_would() {
         "only Genesis is marked as a foundational book"
     );
 
-    // Book paths are exact.
     assert_eq!(
         semantic_search(Some(SearchFilters {
             book_paths: Some(vec![BERACHOT.to_string()]),
@@ -1014,7 +978,6 @@ fn paging_covers_every_result_exactly_once() {
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2, 3, 501]);
 
-    // Stable across repeated calls.
     let first_ids: Vec<u64> = first.results.iter().map(|r| r.id).collect();
     let again_ids: Vec<u64> = page(0).results.iter().map(|r| r.id).collect();
     assert_eq!(first_ids, again_ids);

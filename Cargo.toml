@@ -7,7 +7,9 @@ license-file = "LICENSE"
 publish = false
 
 [lib]
-crate-type = ["rlib", "cdylib", "staticlib"]
+# `rlib` only: `otzaria_search_engine` is what produces the native library
+# (roadmap §5). This crate exports no `extern "C"` symbol.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "otzaria-semantic-search"
@@ -16,38 +18,76 @@ path = "src/main.rs"
 [features]
 default = []
 
-# Enables the deterministic hash-based stand-in embedding backend.
-#
-# It is NOT a semantic model — it exists only so the rest of the pipeline
-# (chunking, storage, fusion, grouping) can be developed and tested before a
-# real GGUF inference backend lands. It must never be enabled in a production
-# build: without this feature `EmbeddingRuntime::load` fails with
-# `EmbeddingError::BackendUnavailable`, so a release binary cannot silently
-# serve fake vectors. In-crate `#[cfg(test)]` code enables it implicitly.
+# Deterministic hash-based stand-in. NOT a semantic model; non-default so a release
+# build fails with `BackendUnavailable` instead of serving fake vectors.
 mock-embedding = []
 
-# Plain program, not a Criterion harness: the point is a re-runnable measurement,
-# and a mobile-bound crate should not carry a benchmarking dependency tree for it.
-# Measures `VectorStore` directly, so it needs no embedding backend and runs in a
-# default build: `cargo bench`.
+# Real GGUF inference. Non-default because it compiles llama.cpp and ggml through
+# cmake in every downstream build.
+llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
+
 [[bench]]
 name = "vector_search"
 harness = false
-# Without this, `cargo test --all-targets` *runs* the benchmark: a `harness = false`
-# target is just a binary, and cargo executes it as a test. That meant every test
-# run silently performed the full 200k x 1024 workload in an unoptimized build.
+# Without this, `cargo test --all-targets` runs the full 200k x 1024 workload
+# unoptimized, because a `harness = false` target is just a binary.
 test = false
 
 [dependencies]
-# Error handling
 thiserror = "2.0"
-
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Logging
 log = "0.4"
-
-# Hashing (semantic IDs, chunk hashes, model checksums)
 sha2 = "0.10"
+
+# Optional, behind `llama-backend`. See `src/semantic/llama_backend.rs` and
+# `docs/P2_INFERENCE_SPIKE.md`.
+#
+# Pinned exactly, for three reasons — read them before bumping:
+#
+# 1. It vendors a specific llama.cpp commit, and the stored vectors depend on it
+#    (agreement between two builds is cosine 0.9948, not 1.0). The manifest records
+#    the backend as index identity, so the version cannot move implicitly.
+# 2. `llama_backend::tokenizer` derives the model pointer from `LlamaModel`'s
+#    `repr(transparent)` layout, which upstream documents nowhere and explicitly
+#    disclaims for sibling types. The pin is what makes that cast sound; the
+#    runtime cross-checks only detect a break after the fact. Read
+#    `llama_backend::tokenizer::RawVocab` first.
+# 3. `llama_backend::micro_batch_for` lowers `n_ubatch` below `n_ctx`, which is
+#    legal only for a causal model — llama.cpp aborts otherwise. Its list of
+#    non-causal architectures is correct for this commit only; re-check with
+#    `grep -rn 'causal_attn = false' llama.cpp/src/models/`.
+#
+# `default-features = false` because upstream defaults to
+# `["openmp", "android-shared-stdcxx", "common"]` and this crate builds on five
+# toolchains through Cargokit:
+#
+# * `android-shared-stdcxx` kept — sets `ANDROID_STL=c++_shared`, inert elsewhere.
+#   A process holding both a static and a shared libc++ crashes obscurely.
+# * `openmp` omitted — ggml has its own thread pool, and Apple clang ships no
+#   `libomp`.
+# * `common` omitted — it only gates grammar samplers, `json_schema_to_grammar`,
+#   speculative decoding and memory reporting. Re-check if a stage wants generation.
+#
+# No GPU feature is requested, but on Apple Silicon `llama-cpp-2` attaches
+# `metal` to its sys crate unconditionally, and Metal is then compiled *and used*:
+# a 270.61 MiB MTL0 compute buffer per context and `graph splits = 2`.
+# `n_gpu_layers = 0` keeps the weights on the CPU, not the backend out of the graph.
+# Consequence: CPU-versus-Metal agreement is cosine 0.99491, so this platform and a
+# CPU-only Android build may not produce identical vectors.
+[dependencies.llama-cpp-2]
+version = "=0.1.153"
+default-features = false
+features = ["android-shared-stdcxx"]
+optional = true
+
+# Reached directly for the one call `llama-cpp-2` does not expose: `llama_tokenize`
+# with `parse_special = false`. It hardcodes `true`, which promotes a literal
+# `<|endoftext|>` inside a book to a control token (measured: 162 tokens -> 158).
+#
+# Version-locked to `llama-cpp-2` so cargo unifies both on one build of llama.cpp;
+# a mismatch would compile ggml twice and hand the tokenizer a foreign vocabulary.
+[dependencies.llama-cpp-sys-2]
+version = "=0.1.153"
+default-features = false
+optional = true

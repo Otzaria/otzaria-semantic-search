@@ -1,25 +1,13 @@
-//! Embedding model runtime.
-//!
-//! # Backend status
-//!
-//! Real GGUF inference is **not implemented yet** (roadmap P2). This module
-//! provides the runtime shell around it: model-file validation, checksumming,
-//! batch API, pooling/normalization contract and backend selection.
-//!
-//! Two build configurations exist, and the difference is deliberate:
-//!
-//! | build | backend | behaviour of [`EmbeddingRuntime::load`] |
-//! |---|---|---|
-//! | default (production) | none | `Err(EmbeddingError::BackendUnavailable)` |
-//! | `--features mock-embedding` (and in-crate tests) | [`EmbeddingBackendKind::MockHash`] | `Ok` |
-//!
-//! The mock backend is a deterministic hash of the input text. It is **not a
-//! semantic model**: similarity between two of its vectors carries no meaning
-//! beyond token overlap. Gating it behind a non-default feature is what keeps a
-//! release build from silently serving fake vectors — a production binary fails
-//! loudly instead.
+//! Embedding model runtime: the shell *around* inference, never inference
+//! itself — model-file validation and checksumming, the batch API, and the single
+//! place a vector's dimension, finiteness and norm are checked before it can
+//! enter the index. What an implementation must provide, and which one a build
+//! gets, live in [`backend`](crate::semantic::backend).
 
 use crate::errors::EmbeddingError;
+use crate::semantic::backend::{
+    ensure_pooling_is_implemented, select_backend, EmbeddingBackend, Pooling,
+};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -28,64 +16,61 @@ const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 
 /// GGUF container versions this crate is willing to open.
 ///
-/// v1 is excluded deliberately: it stored `tensor_count` and
-/// `metadata_kv_count` as `u32`, and the widening to `u64` came in v2 (see the
-/// GGUF spec's version history). Reading a v1 header with the v2 layout would
-/// misparse it, so claiming v1 support while parsing v2 fields would be worse
-/// than refusing it. No v1 model is in circulation for this crate's purpose;
-/// supporting it, if ever needed, means a real per-version parser in the
-/// backend (roadmap P2).
+/// v1 is refused rather than misparsed: it stored `tensor_count` and
+/// `metadata_kv_count` as `u32`, widened to `u64` in v2, so reading a v1 header
+/// with the v2 layout would silently misread it. Supporting v1 would mean a real
+/// per-version parser.
 const GGUF_SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
 
 /// Size of the GGUF header: magic (4) + version (4) + `tensor_count` (8) +
 /// `metadata_kv_count` (8).
 const GGUF_HEADER_BYTES: usize = 24;
 
-/// Sanity ceiling for the header's declared counts.
-///
-/// A real embedding model has hundreds of tensors and tens of metadata entries.
-/// A wildly larger count means the bytes are not a GGUF header — a truncated
-/// download, or another format that happens to start with the right four bytes.
+/// Sanity ceiling for the header's declared counts. A real model has hundreds of
+/// tensors; a wildly larger count means the bytes are not a GGUF header.
 const GGUF_MAX_DECLARED_COUNT: u64 = 1 << 24;
 
-/// How much of the file's start is read to parse the metadata and tensor
-/// descriptors.
-///
-/// The descriptor region of a real model is a few megabytes at most — the
-/// tokenizer vocabulary dominates it. This is the ceiling on believing the
-/// declared sizes: a supported GGUF whose descriptor region exceeds it is
-/// rejected. Silently accepting a file whose structure was not validated would
-/// turn the validator into a magic-byte check.
+/// Ceiling on the descriptor region, which in a real model is a few megabytes
+/// dominated by the tokenizer vocabulary. A supported GGUF exceeding it is
+/// rejected rather than accepted unvalidated.
 const GGUF_MAX_DESCRIPTOR_REGION_BYTES: u64 = 64 << 20;
 
-/// Default tensor-data alignment when the file declares none.
-///
-/// GGUF pads between the descriptors and the tensor data to `general.alignment`
-/// bytes, 32 by default.
+/// Default tensor-data alignment when the file declares no `general.alignment`.
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 
-/// Read buffer for hashing the model file. Large enough that hashing a
-/// multi-hundred-megabyte model is bound by the hash, not by syscalls.
+/// Read buffer for hashing, large enough that hashing is bound by the hash rather
+/// than by syscalls.
 const HASH_BUFFER_BYTES: usize = 1 << 20;
 
 /// At or below this L2 norm a vector carries no direction and cannot be
 /// normalized.
 ///
-/// One threshold for the whole crate, used with the same `<=` comparison at every
-/// layer — the embedding runtime, the store's own guard, and the query path.
-/// Two copies would drift, and a vector that one layer rejects while another
-/// normalizes is exactly the record that exists but can never be found.
+/// One threshold for the whole crate, compared with the same `<=` at every layer:
+/// the runtime, the store's guard and the query path. Two copies would drift, and
+/// a vector one layer rejects while another normalizes is exactly the record that
+/// exists but can never be found.
 pub(crate) const MIN_VECTOR_NORM: f32 = 1e-12;
 
 /// Configuration for embedding runtime loading.
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
     pub model_path: PathBuf,
+    /// Dimensionality every stored vector must have, checked against the loaded
+    /// backend's [`EmbeddingBackend::dim`]: a real backend reads its width from
+    /// the model file, and a silent disagreement fills the index with wrong-width
+    /// vectors.
     pub embedding_dim: u32,
+    /// Token cap *requested* for a single input. This layer never enforces it —
+    /// it has no tokenizer; it is a contract the backend implements, spelled out
+    /// at [`EmbeddingBackend::max_tokens`]. Here it only travels: the backend
+    /// reports it back and the manifest records it, so a change is detected as an
+    /// incompatibility instead of silently changing what gets embedded.
     pub max_tokens: usize,
     /// Number of texts handed to the backend per inference call.
     pub batch_size: usize,
-    pub pooling: String,
+    /// How the backend must collapse token states into one vector. Typed rather
+    /// than a free string: it is part of the index's identity in the manifest.
+    pub pooling: Pooling,
 }
 
 impl Default for EmbeddingConfig {
@@ -95,44 +80,50 @@ impl Default for EmbeddingConfig {
             embedding_dim: 1024,
             max_tokens: 512,
             batch_size: 32,
-            pooling: "last-token".to_string(),
+            pooling: Pooling::LastToken,
         }
     }
 }
 
-/// Identifies which embedding implementation a runtime has loaded.
-///
-/// Recorded in the semantic manifest so an index built by one backend is never
-/// silently queried through another — vectors from different backends live in
-/// different spaces and are not comparable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmbeddingBackendKind {
-    /// Deterministic hash-based stand-in. Test/development only; requires the
-    /// `mock-embedding` feature. See the module docs.
-    MockHash,
-    // A real GGUF backend is added in roadmap P2.
+impl EmbeddingConfig {
+    /// Reject a configuration no backend could serve, before the model file is
+    /// opened. Also called by [`select_backend`], reachable without `load`.
+    ///
+    /// `batch_size` is deliberately absent: zero there is recoverable and means
+    /// "one text per call" ([`EmbeddingRuntime::batch_size`] clamps it), whereas a
+    /// zero dimensionality or token cap makes every embedding degenerate. The
+    /// pooling check asks whether any backend *performs* the strategy, and belongs
+    /// here because the value is persisted as the index's identity — see
+    /// [`ensure_pooling_is_implemented`].
+    pub fn validate(&self) -> Result<(), EmbeddingError> {
+        if self.embedding_dim == 0 {
+            return Err(EmbeddingError::LoadFailed {
+                reason: "embedding_dim is 0; a vector with no components cannot be \
+                         stored or compared"
+                    .to_string(),
+            });
+        }
+        if self.max_tokens == 0 {
+            return Err(EmbeddingError::LoadFailed {
+                reason: "max_tokens is 0; every input would truncate to nothing and \
+                         embed as a directionless vector"
+                    .to_string(),
+            });
+        }
+        ensure_pooling_is_implemented(self.pooling)?;
+        Ok(())
+    }
 }
 
-impl EmbeddingBackendKind {
-    /// Stable identifier persisted in the manifest.
-    pub fn id(&self) -> &'static str {
-        match self {
-            Self::MockHash => "mock-hash-v1",
-        }
-    }
-
-    /// Whether vectors produced by this backend carry semantic meaning.
-    pub fn is_semantic(&self) -> bool {
-        match self {
-            Self::MockHash => false,
-        }
-    }
-}
-
-/// Local embedding runtime.
+/// Local embedding runtime: owns the *policy* around a backend, while the backend
+/// owns inference. Batching, the returned-count check, dimension/finiteness/norm
+/// validation and L2 normalization happen here exactly once.
 pub struct EmbeddingRuntime {
     config: EmbeddingConfig,
-    backend: Option<EmbeddingBackendKind>,
+    /// `None` until a successful [`Self::load`]. Boxed rather than generic: a type
+    /// parameter would push a build-time choice into every signature above this
+    /// one, up through `SemanticEngine` and the coordinator.
+    backend: Option<Box<dyn EmbeddingBackend>>,
     /// SHA-256 of the model file, computed by [`Self::load`].
     model_checksum: Option<String>,
 }
@@ -149,11 +140,12 @@ impl EmbeddingRuntime {
 
     /// Load the model from disk.
     ///
-    /// Validates the GGUF container and computes the file's SHA-256 in a single
-    /// pass, then selects a backend. Fails with
-    /// [`EmbeddingError::BackendUnavailable`] in builds that have no inference
-    /// backend compiled in.
+    /// Nothing is installed unless every step succeeds: a failed load leaves the
+    /// runtime exactly as unloaded as it was, rather than half-loaded with a
+    /// checksum recorded for a backend that never materialized.
     pub fn load(&mut self) -> Result<(), EmbeddingError> {
+        self.config.validate()?;
+
         if !self.config.model_path.exists() {
             return Err(EmbeddingError::ModelNotFound {
                 path: self.config.model_path.display().to_string(),
@@ -161,31 +153,74 @@ impl EmbeddingRuntime {
         }
 
         let checksum = validate_and_checksum_gguf(&self.config.model_path)?;
+        let backend = select_backend(&self.config)?;
+        self.adopt(backend, Some(checksum))
+    }
 
-        #[cfg(any(test, feature = "mock-embedding"))]
-        {
+    /// Install a backend after checking it agrees with this configuration.
+    ///
+    /// A real backend reads width, context length and pooling from the model file,
+    /// and each disagreement is a silent corruption if let through: a wrong
+    /// dimensionality fails mid-index, a wrong pooling mislabels stored vectors in
+    /// the manifest, a zero cap truncates every input to nothing. Shared by
+    /// [`Self::load`] and the test-only constructor.
+    fn adopt(
+        &mut self,
+        backend: Box<dyn EmbeddingBackend>,
+        checksum: Option<String>,
+    ) -> Result<(), EmbeddingError> {
+        if backend.dim() != self.config.embedding_dim {
+            return Err(EmbeddingError::DimensionMismatch {
+                expected: self.config.embedding_dim,
+                actual: backend.dim(),
+            });
+        }
+        if backend.pooling() != self.config.pooling {
+            return Err(EmbeddingError::PoolingMismatch {
+                backend: backend.id().to_string(),
+                configured: self.config.pooling.to_string(),
+                actual: backend.pooling().to_string(),
+            });
+        }
+        if backend.max_tokens() == 0 {
+            return Err(EmbeddingError::LoadFailed {
+                reason: format!(
+                    "backend '{}' reports a token cap of 0, so every input would \
+                     truncate to nothing",
+                    backend.id()
+                ),
+            });
+        }
+
+        // An index built from non-semantic vectors looks entirely normal from the
+        // outside; nothing downstream can tell from the vectors alone.
+        if !backend.is_semantic() {
             log::warn!(
-                "Embedding backend = MOCK (deterministic hashing). \
-                 Vectors are NOT semantic; this build is not fit for production. \
+                "Embedding backend '{}' reports that its vectors are NOT semantic \
+                 (deterministic hashing); this build is not fit for production. \
                  Model file: {}",
+                backend.id(),
                 self.config.model_path.display()
             );
-            self.model_checksum = Some(checksum);
-            self.backend = Some(EmbeddingBackendKind::MockHash);
-            Ok(())
         }
 
-        #[cfg(not(any(test, feature = "mock-embedding")))]
-        {
-            let _ = checksum;
-            Err(EmbeddingError::BackendUnavailable {
-                reason: format!(
-                    "real GGUF inference is not implemented yet (roadmap P2); \
-                     model file {} validated but cannot be executed",
-                    self.config.model_path.display()
-                ),
-            })
-        }
+        self.model_checksum = checksum;
+        self.backend = Some(backend);
+        Ok(())
+    }
+
+    /// Install a ready-made backend, for tests that drive the runtime's validation
+    /// with backends misbehaving on purpose. Deliberately not public: a public
+    /// constructor would let a release build inject a fake and serve its vectors as
+    /// semantic, which `tests/production_backend_gate.rs` exists to keep refused.
+    #[cfg(test)]
+    fn with_backend(
+        config: EmbeddingConfig,
+        backend: Box<dyn EmbeddingBackend>,
+    ) -> Result<Self, EmbeddingError> {
+        let mut runtime = Self::new(config);
+        runtime.adopt(backend, None)?;
+        Ok(runtime)
     }
 
     /// Check if a backend is currently loaded.
@@ -194,8 +229,24 @@ impl EmbeddingRuntime {
     }
 
     /// The loaded backend, or `None` before a successful [`Self::load`].
-    pub fn backend(&self) -> Option<EmbeddingBackendKind> {
+    pub fn backend(&self) -> Option<&dyn EmbeddingBackend> {
+        self.backend.as_deref()
+    }
+
+    /// Identifier of the loaded backend, recorded by the manifest and the status
+    /// report. Two backends do not produce comparable vectors even from the same
+    /// weights, so the id is what tells a later session that the index it is about
+    /// to query was built by something else.
+    pub fn backend_id(&self) -> Option<&'static str> {
+        self.backend.as_ref().map(|backend| backend.id())
+    }
+
+    /// Whether the loaded backend's vectors carry semantic meaning. `false` before
+    /// a model is loaded too: nothing has produced a meaningful vector then either.
+    pub fn backend_is_semantic(&self) -> bool {
         self.backend
+            .as_ref()
+            .is_some_and(|backend| backend.is_semantic())
     }
 
     /// SHA-256 of the loaded model file, or `None` before a successful load.
@@ -203,8 +254,6 @@ impl EmbeddingRuntime {
         self.model_checksum.as_deref()
     }
 
-    /// Embed a single text into an L2-normalized vector.
-    ///
     /// Convenience wrapper over [`Self::embed_batch`]; indexing should call the
     /// batch form directly so the backend sees whole batches.
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
@@ -214,15 +263,18 @@ impl EmbeddingRuntime {
         })
     }
 
-    /// Embed a batch of texts into L2-normalized vectors, one per input, in
-    /// input order.
+    /// Embed a batch into L2-normalized vectors, one per input, in input order.
     ///
-    /// Inputs are split into chunks of [`EmbeddingConfig::batch_size`] before
-    /// reaching the backend. Every returned vector is verified to have the
-    /// configured dimensionality and a non-zero norm, so a degenerate vector
-    /// can never silently enter the index.
+    /// **The single normalization and validation choke point** — every vector this
+    /// crate produces passes through here, which is what lets
+    /// [`EmbeddingBackend::embed_batch_raw`] return raw vectors. A backend that
+    /// normalized or screened its own output would hide a degenerate vector behind
+    /// a plausible unit norm before this code could see it.
+    /// [`VectorStore::insert_batch`](crate::semantic::store::VectorStore::insert_batch)
+    /// re-checks the same invariant against the same `MIN_VECTOR_NORM`, because it
+    /// is public and accepts vectors that never came through here.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        let Some(backend) = self.backend else {
+        let Some(backend) = self.backend.as_deref() else {
             return Err(EmbeddingError::NotLoaded);
         };
 
@@ -230,8 +282,10 @@ impl EmbeddingRuntime {
         let mut results = Vec::with_capacity(texts.len());
 
         for group in texts.chunks(self.batch_size()) {
-            let raw = self.infer(backend, group)?;
+            let raw = backend.embed_batch_raw(group)?;
 
+            // Vectors get their metadata by position upstream, so a short batch
+            // would attach one line's text to another line's reference.
             if raw.len() != group.len() {
                 return Err(EmbeddingError::InferenceFailed {
                     reason: format!(
@@ -251,43 +305,27 @@ impl EmbeddingRuntime {
         Ok(results)
     }
 
-    /// Dispatch one already-sized batch to the loaded backend.
-    ///
-    /// Returns raw, unnormalized vectors; [`Self::embed_batch`] owns validation
-    /// and normalization so every backend gets the same treatment.
-    fn infer(
-        &self,
-        backend: EmbeddingBackendKind,
-        group: &[&str],
-    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        match backend {
-            EmbeddingBackendKind::MockHash => {
-                #[cfg(any(test, feature = "mock-embedding"))]
-                {
-                    Ok(group
-                        .iter()
-                        .map(|t| mock::hash_embedding(t, self.config.embedding_dim))
-                        .collect())
-                }
-                #[cfg(not(any(test, feature = "mock-embedding")))]
-                {
-                    let _ = group;
-                    Err(EmbeddingError::BackendUnavailable {
-                        reason: "mock backend is not compiled into this build".to_string(),
-                    })
-                }
-            }
-        }
-    }
-
-    /// Expected embedding dimensionality.
+    /// Expected embedding dimensionality: the configured value, which `adopt` has
+    /// proven equal to the backend's [`EmbeddingBackend::dim`] and which is also
+    /// answerable before a model is loaded.
     pub fn dim(&self) -> u32 {
         self.config.embedding_dim
     }
 
-    /// Pooling strategy this runtime is configured for.
-    pub fn pooling(&self) -> &str {
-        &self.config.pooling
+    /// Pooling strategy this runtime is configured for, which `adopt` has proven
+    /// the loaded backend performs.
+    pub fn pooling(&self) -> Pooling {
+        self.config.pooling
+    }
+
+    /// The token cap in force: the loaded backend's effective one, or the requested
+    /// one before a model is loaded. The two can differ, since a backend clamps the
+    /// request to its model's context length. This layer never truncates — the cap
+    /// is the backend's contract, see [`EmbeddingBackend::max_tokens`].
+    pub fn max_tokens(&self) -> usize {
+        self.backend
+            .as_ref()
+            .map_or(self.config.max_tokens, |backend| backend.max_tokens())
     }
 
     /// Maximum number of texts sent to the backend per inference call.
@@ -298,19 +336,13 @@ impl EmbeddingRuntime {
 
 /// L2-normalize a vector in place after checking it can be compared at all.
 ///
-/// Rejects anything that would enter the index as an unsearchable point:
+/// Two of the four guards are not redundant with a norm test: `NaN <
+/// MIN_VECTOR_NORM` is `false`, so a poisoned component passes one; and a
+/// *finite* vector whose squares overflow `f32` (components around `1e30`) gets an
+/// `inf` norm, a `0` reciprocal, and normalizes silently to all zeros.
 ///
-/// * **wrong dimensionality** — it could not be stored;
-/// * **a non-finite component** — `NaN` poisons its own norm, and
-///   `NaN < MIN_VECTOR_NORM` is `false`, so a norm test alone waves it through;
-/// * **a non-finite norm** — which also catches a *finite* vector whose squares
-///   overflow `f32` (components around `1e30`): the norm becomes `inf`, the
-///   reciprocal `0`, and the vector silently normalizes to all zeros;
-/// * **no direction** — a zero vector matches nothing.
-///
-/// Getting this wrong is quiet rather than loud: the book is recorded as indexed,
-/// then every one of its vectors scores `NaN` and is discarded during search. The
-/// result is an index that looks complete and returns nothing for that book.
+/// The failure mode is quiet — the book is recorded as indexed while every one of
+/// its vectors scores `NaN` and is discarded at search time.
 pub fn normalize_validated(vector: &mut [f32], expected_dim: u32) -> Result<(), EmbeddingError> {
     if vector.len() as u32 != expected_dim {
         return Err(EmbeddingError::DimensionMismatch {
@@ -335,10 +367,9 @@ pub fn normalize_validated(vector: &mut [f32], expected_dim: u32) -> Result<(), 
             reason: format!("vector norm is not finite ({norm}); the magnitudes overflowed f32"),
         });
     }
-    // `<=`, matching the `>` in `l2_normalize` and the store's own guard. At
-    // exactly the threshold a `<` test rejected nothing and `l2_normalize`
-    // normalized nothing, so the one vector on the boundary passed through
-    // unnormalized — scoring as its own magnitude rather than as a cosine.
+    // `<=`, matching the `>` in `l2_normalize` and the store's guard. With `<`,
+    // the vector exactly on the threshold was neither rejected nor normalized and
+    // scored as its own magnitude rather than as a cosine.
     if norm <= MIN_VECTOR_NORM {
         return Err(EmbeddingError::InferenceFailed {
             reason: format!(
@@ -348,19 +379,15 @@ pub fn normalize_validated(vector: &mut [f32], expected_dim: u32) -> Result<(), 
         });
     }
 
-    // Normalization only shrinks magnitudes (|x| <= norm), so this cannot fire
-    // once the input and the norm are finite. Cheap enough to keep as a backstop
-    // against a future backend normalizing on its own.
+    // Cannot fire once input and norm are finite, since normalization only shrinks
+    // magnitudes; kept as a cheap backstop.
     debug_assert!(vector.iter().all(|x| x.is_finite()));
     Ok(())
 }
 
-/// L2-normalize in place and return the norm the vector had beforehand.
-///
-/// A norm indistinguishable from zero leaves the vector untouched — the caller
-/// must treat the returned norm as a failure signal rather than dividing by it.
-/// Prefer [`normalize_validated`], which also rejects vectors that cannot be
-/// compared.
+/// L2-normalize in place and return the norm the vector had beforehand. A norm
+/// indistinguishable from zero leaves the vector untouched, so the caller must
+/// treat the returned norm as a failure signal. Prefer [`normalize_validated`].
 pub fn l2_normalize(vec: &mut [f32]) -> f32 {
     let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > MIN_VECTOR_NORM {
@@ -372,46 +399,21 @@ pub fn l2_normalize(vec: &mut [f32]) -> f32 {
     norm
 }
 
-/// Validate a GGUF container and return the file's SHA-256, reading the file
-/// exactly once.
+/// Validate a GGUF container and return the file's SHA-256, in one pass over the
+/// file.
 ///
-/// # What is checked
+/// Checks the header first (a non-GGUF file is rejected after 24 bytes), parses the
+/// descriptor region, then requires the file to hold what its descriptors describe.
 ///
-/// 1. **The header, before anything else is read.** Magic, version, and both
-///    declared counts. A file that is not GGUF at all is rejected after 24 bytes
-///    rather than after hashing however many gigabytes it happens to be.
-/// 2. **The descriptor region is parsed**: every metadata key/value pair and
-///    every tensor descriptor, which yields where the tensor data starts and,
-///    per tensor, the offset it claims within that data.
-/// 3. **The file is long enough to hold what its own descriptors describe.** Each
-///    tensor's size is bounded below by one bit per element — true of every ggml
-///    type, including the most aggressive ternary quantizations — so this is a
-///    real lower bound rather than a guess.
+/// That size check is deliberately a **lower** bound — one bit per element, below
+/// every ggml type. Exact lengths would need the block size of every quantization,
+/// and one wrong entry would reject a *valid* model, the worse failure: it makes
+/// the feature unavailable instead of failing late with a clear error. So a
+/// download cut off inside the final tensor can still pass; a placeholder, a
+/// header-only stub, or a download that stopped earlier cannot.
 ///
-/// # What is not
-///
-/// The bound is a lower bound. Deriving each tensor's *exact* length needs the
-/// ggml type table with the block size of every quantization, and getting one
-/// entry of that wrong rejects a valid model — a worse failure than accepting an
-/// invalid one, since it makes the feature unavailable rather than late-failing
-/// with a clear error. So a download cut off inside the final tensor can still
-/// pass. What cannot pass: a placeholder, another format that begins with
-/// `GGUF`, a header-only stub, or a download that stopped anywhere before the
-/// last tensor's data.
-///
-/// If the descriptors cannot be parsed — an unknown value type from a future
-/// spec revision, or a descriptor region larger than this code is willing to read
-/// — the structural check is skipped and only the coarse floor applies. Failing there would mean rejecting a model this
-/// crate merely failed to understand.
-///
-/// **This is not download verification.** A checksum computed from the file
-/// cannot attest to the file; only comparing it against a published SHA-256 can,
-/// which belongs with model distribution (roadmap P2/P9). What this checksum is
-/// for is detecting that the bytes behind a model path *changed* between
-/// sessions, which would silently invalidate every stored vector.
-///
-/// One pass over the file: a multi-hundred-megabyte model is read once, not once
-/// to validate and again to hash.
+/// **Not download verification** — a checksum from the file cannot attest to the
+/// file. It detects that the bytes behind a model path *changed* between sessions.
 pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError> {
     let invalid = |reason: String| EmbeddingError::InvalidModelFile {
         path: path.display().to_string(),
@@ -523,8 +525,7 @@ struct GgufHeader {
 struct GgufLayout {
     /// First byte of the tensor data blob, after alignment padding.
     data_start: u64,
-    /// Highest `tensor offset + lower bound on that tensor's size`, relative to
-    /// [`Self::data_start`].
+    /// Highest `offset + size lower bound`, relative to [`Self::data_start`].
     min_data_bytes: u64,
 }
 
@@ -536,16 +537,13 @@ enum LayoutOutcome {
         at: u64,
         wanted: &'static str,
     },
-    /// Invalid under the supported schema, or beyond this validator's explicit
-    /// resource limits. In either case the model is not safe to accept.
+    /// Invalid under the supported schema, or past this validator's resource
+    /// limits. Either way the model is not safe to accept.
     Unparsed(String),
 }
 
-/// Parse the metadata and tensor descriptors, hashing every byte on the way
-/// through.
-///
-/// Reads strictly forward and never seeks, so the caller's single pass over the
-/// file is preserved.
+/// Parse the metadata and tensor descriptors, hashing every byte and reading
+/// strictly forward so the caller's single pass is preserved.
 fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOutcome {
     const MAX_METADATA_KEY_BYTES: u64 = u16::MAX as u64;
     const MAX_TENSOR_NAME_BYTES: u64 = 64;
@@ -578,7 +576,7 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
         if key_len > MAX_METADATA_KEY_BYTES {
             return LayoutOutcome::Unparsed(format!("metadata key {index} claims {key_len} bytes"));
         }
-        // Keys are short enough to keep; the alignment is read from one of them.
+        // Kept rather than skipped because the alignment is read from one of them.
         let key = read!(reader.read_bytes(key_len), "a metadata key");
         let value_type = read!(reader.read_u32(), "a metadata value type");
 
@@ -640,9 +638,8 @@ fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOu
             ));
         }
 
-        // One bit per element. Every ggml type stores more than that — the most
-        // aggressive quantizations in existence sit around 1.6 bits per weight —
-        // so this cannot over-reject, whatever type table a future model uses.
+        // One bit per element: every ggml type stores more, so this cannot
+        // over-reject whatever type table a future model uses.
         let floor = elements.div_ceil(8).max(1);
         min_data_bytes = min_data_bytes.max(offset.saturating_add(floor));
     }
@@ -714,10 +711,8 @@ enum SkipOutcome {
     Unparsed(String),
 }
 
-/// Skip one metadata value, whatever its type.
-///
-/// `depth` guards the array-of-arrays case: the spec permits nesting, and a
-/// corrupt file could describe it without end.
+/// Skip one metadata value. `depth` guards the array-of-arrays case: the spec
+/// permits nesting, and a corrupt file could describe it without end.
 fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> SkipOutcome {
     const MAX_NESTING: u32 = 4;
     const MAX_ARRAY_LEN: u64 = 1 << 28;
@@ -728,8 +723,7 @@ fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> Ski
     }
 
     let Some(value_type) = GgufValueType::from_raw(raw_type) else {
-        // A type this parser does not know. Later bytes cannot be located, so the
-        // structural check is abandoned rather than the file condemned.
+        // An unknown type makes every later byte unlocatable.
         return SkipOutcome::Unparsed(format!("unknown metadata value type {raw_type}"));
     };
 
@@ -764,8 +758,8 @@ fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> Ski
                 return SkipOutcome::Unparsed(format!("metadata array claims {count} elements"));
             }
 
-            // Fixed-width elements are one arithmetic skip rather than `count`
-            // round trips: a tokenizer's token-type array has ~150k entries.
+            // One arithmetic skip rather than `count` round trips: a tokenizer's
+            // token-type array has ~150k entries.
             if let Some(width) = GgufValueType::from_raw(element_type).and_then(|t| t.fixed_width())
             {
                 read!(
@@ -787,20 +781,15 @@ fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> Ski
     }
 }
 
-/// A read failure, distinguishing "the file ended" from "the read failed".
-///
-/// The difference decides whether a model is rejected: hitting EOF inside a
-/// structure the file itself declared is proof of truncation, whereas an I/O
-/// error is a fact about the disk.
+/// EOF inside a structure the file itself declared is proof of truncation; an I/O
+/// error is a fact about the disk. Only the first condemns the model.
 enum ReadError {
     Eof { at: u64 },
     Io(std::io::Error),
 }
 
-/// Buffered forward reader that hashes everything it passes over.
-///
-/// The point is the single pass: validating and checksumming a model that may be
-/// hundreds of megabytes must not read it twice.
+/// Buffered forward reader that hashes everything it passes over, so validating
+/// and checksumming a multi-hundred-megabyte model reads it once.
 struct HashingReader {
     inner: std::io::BufReader<std::fs::File>,
     hasher: sha2::Sha256,
@@ -852,8 +841,7 @@ impl HashingReader {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    /// Read `len` bytes and return them. For short fields only — the caller
-    /// bounds `len` first.
+    /// For short fields only — the caller bounds `len` first.
     fn read_bytes(&mut self, len: u64) -> Result<Vec<u8>, ReadError> {
         let mut bytes = vec![0u8; len as usize];
         self.fill(&mut bytes)?;
@@ -872,7 +860,7 @@ impl HashingReader {
         Ok(())
     }
 
-    /// Hash whatever is left and return the digest with the total byte count.
+    /// Hash whatever is left; returns the digest and the total byte count.
     fn finish(mut self) -> std::io::Result<(String, u64)> {
         use sha2::Digest;
         let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
@@ -903,12 +891,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub mod mock {
     use sha2::{Digest, Sha256};
 
-    /// Feature-hash `text` into a `dim`-sized vector.
-    ///
-    /// Deterministic across runs and platforms, which is all the rest of the
-    /// pipeline needs from it. Whitespace-only input yields the zero vector;
-    /// [`super::EmbeddingRuntime::embed_batch`] rejects that rather than
-    /// storing a directionless vector.
+    /// Feature-hash `text` into a `dim`-sized vector, deterministically across runs
+    /// and platforms. Whitespace-only input yields the zero vector, which
+    /// [`super::EmbeddingRuntime::embed_batch`] rejects.
     pub fn hash_embedding(text: &str, dim: u32) -> Vec<f32> {
         let dim = dim.max(1) as usize;
         let mut vec = vec![0.0f32; dim];
@@ -930,11 +915,9 @@ pub mod mock {
         vec
     }
 
-    /// Write a minimal structurally valid GGUF with one scalar F32 tensor.
-    ///
-    /// It is only a container fixture, not a usable embedding model, but it makes
-    /// tests exercise descriptor, alignment and payload validation rather than a
-    /// magic-byte placeholder.
+    /// Write a minimal structurally valid GGUF with one scalar F32 tensor: a
+    /// container fixture, not a usable model, so tests exercise descriptor,
+    /// alignment and payload validation rather than a magic-byte placeholder.
     pub fn write_stub_gguf(path: &std::path::Path, version: u32) -> std::io::Result<()> {
         let mut bytes = Vec::with_capacity(68);
         bytes.extend_from_slice(b"GGUF");
@@ -1030,7 +1013,6 @@ mod tests {
     fn load_rejects_placeholder_that_is_not_gguf() {
         let dir = TempDir::new("placeholder");
         let model = dir.path().join("fake.gguf");
-        // The exact placeholder the old integration test relied on.
         std::fs::write(&model, b"GGUF_MOCK").unwrap();
 
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
@@ -1072,8 +1054,6 @@ mod tests {
         ));
     }
 
-    /// The whole header has to be there. A file holding only the magic and a
-    /// version is 8 bytes of coincidence, not a model.
     #[test]
     fn load_rejects_a_header_that_stops_after_the_version() {
         let dir = TempDir::new("partial_header");
@@ -1103,8 +1083,6 @@ mod tests {
         ));
     }
 
-    /// A corrupt or misidentified file can carry the right magic and a garbage
-    /// tensor count. Real models have hundreds of tensors, not billions.
     #[test]
     fn load_rejects_implausible_header_counts() {
         let dir = TempDir::new("implausible");
@@ -1150,8 +1128,7 @@ mod tests {
         let dir = TempDir::new("version");
         let model = dir.path().join("other-version.gguf");
 
-        // v1 stored the counts as u32; parsing it with the v2 layout would
-        // misread the header, so it is refused rather than misparsed.
+        // v1 is refused rather than misparsed — see GGUF_SUPPORTED_VERSIONS.
         for version in [0, 1, GGUF_SUPPORTED_VERSIONS.end() + 1] {
             mock::write_stub_gguf(&model, version).unwrap();
             let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
@@ -1173,9 +1150,8 @@ mod tests {
         }
     }
 
-    /// A download cut short keeps its header, so the header alone cannot detect
-    /// it. The declared counts can: each tensor and metadata entry has a minimum
-    /// size, and a file below that floor is provably incomplete.
+    /// A download cut short keeps its header, so only the declared counts can
+    /// detect it: a file below their size floor is provably incomplete.
     #[test]
     fn load_rejects_a_truncated_download_whose_header_survived() {
         let dir = TempDir::new("truncated_download");
@@ -1190,7 +1166,7 @@ mod tests {
             bytes
         };
 
-        // A realistic embedding model header, with almost none of the body.
+        // A realistic header, with almost none of the body.
         let mut interrupted = header(291, 24);
         interrupted.extend_from_slice(&[0u8; 128]);
         std::fs::write(&model, &interrupted).unwrap();
@@ -1202,8 +1178,7 @@ mod tests {
             other => panic!("a truncated download must be rejected, got {other:?}"),
         }
 
-        // Padding arbitrary bytes until a guessed size floor is not enough:
-        // descriptors themselves must parse.
+        // Padding to a guessed size floor is not enough: descriptors must parse.
         let mut padded_garbage = header(291, 24);
         padded_garbage.resize(16_000, 0u8);
         std::fs::write(&model, &padded_garbage).unwrap();
@@ -1213,11 +1188,9 @@ mod tests {
         ));
     }
 
-    /// Build a structurally valid GGUF: header, three metadata entries covering
-    /// the variable-length types (a string, an array of strings, a `u32`), one
-    /// tensor descriptor, alignment padding, then `data_bytes` of tensor data.
-    ///
-    /// The point is a file whose own descriptors let the validator prove whether
+    /// A structurally valid GGUF: header, three metadata entries covering the
+    /// variable-length types, one tensor descriptor, padding, then `data_bytes` of
+    /// tensor data — a file whose own descriptors let the validator prove whether
     /// its payload is present.
     fn gguf_with_one_tensor(dims: &[u64], data_bytes: usize) -> Vec<u8> {
         gguf_with_one_tensor_layout(dims, data_bytes, 32, 0)
@@ -1274,17 +1247,14 @@ mod tests {
         bytes
     }
 
-    /// The case a size floor cannot see: the descriptors are all there, and the
-    /// weights they describe are not. A download interrupted after the tensor
-    /// table looks perfectly well-formed until its own numbers are checked.
+    /// The case a header-derived floor cannot see: all the descriptors present, the
+    /// weights they describe absent.
     #[test]
     fn a_download_cut_off_inside_the_weights_is_rejected() {
         let dir = TempDir::new("truncated_weights");
         let model = dir.path().join("cut_short.gguf");
 
-        // 1024×1024 elements need at least 131072 bytes at one bit each. This file
-        // carries a token amount of data and would sail past any floor derived
-        // from the header counts alone (one tensor, three metadata entries).
+        // 1024×1024 elements need at least 131072 bytes at one bit each.
         std::fs::write(&model, gguf_with_one_tensor(&[1024, 1024], 1_024)).unwrap();
         match validate_and_checksum_gguf(&model) {
             Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
@@ -1293,8 +1263,8 @@ mod tests {
             other => panic!("a download cut off inside the weights must be rejected: {other:?}"),
         }
 
-        // With the data present it is accepted, so the bound is not simply
-        // rejecting everything.
+        // With the data present it is accepted, so the bound is not rejecting
+        // everything.
         std::fs::write(&model, gguf_with_one_tensor(&[1024, 1024], 131_072)).unwrap();
         assert!(
             validate_and_checksum_gguf(&model).is_ok(),
@@ -1302,9 +1272,8 @@ mod tests {
         );
     }
 
-    /// The lower bound must be genuinely below every real quantization, or it
-    /// rejects valid models. One bit per element is; the file above carries
-    /// exactly that much and passes, and one byte less does not.
+    /// The bound must stay below every real quantization or it rejects valid
+    /// models, so it is pinned to exactly one bit per element.
     #[test]
     fn the_size_bound_is_exactly_one_bit_per_element() {
         let dir = TempDir::new("bound_boundary");
@@ -1322,8 +1291,7 @@ mod tests {
         ));
     }
 
-    /// Supported GGUF versions have a closed metadata type enum. An unknown type
-    /// means the descriptor table cannot be validated and must not be accepted.
+    /// An unknown type means the descriptor table cannot be validated at all.
     #[test]
     fn an_unknown_metadata_type_is_rejected() {
         let dir = TempDir::new("future_metadata");
@@ -1405,9 +1373,8 @@ mod tests {
         let a = dir.path().join("a.gguf");
         let b = dir.path().join("b.gguf");
 
-        // Two structurally valid files identical for the first
-        // HASH_BUFFER_BYTES + 1 bytes, so only whole-file hashing can distinguish
-        // the extra trailing byte.
+        // Identical for the first HASH_BUFFER_BYTES + 1 bytes, so only whole-file
+        // hashing can distinguish the extra trailing byte.
         mock::write_stub_gguf(&a, 3).unwrap();
         let mut base = std::fs::read(&a).unwrap();
         base.resize(HASH_BUFFER_BYTES + 1, 7u8);
@@ -1453,7 +1420,7 @@ mod tests {
         let dir = TempDir::new("batch_order");
         let rt = loaded_runtime(&dir, 32);
 
-        // More texts than batch_size (4) so several backend calls are made.
+        // More texts than batch_size (4), so several backend calls are made.
         let texts = [
             "בראשית ברא אלהים",
             "והארץ היתה תהו ובהו",
@@ -1491,8 +1458,7 @@ mod tests {
     }
 
     /// A norm test alone is not enough: `NaN < MIN_VECTOR_NORM` is `false`, so a
-    /// poisoned vector would be stored and then silently dropped at search time,
-    /// leaving a book that is recorded as indexed but unsearchable.
+    /// poisoned vector would be stored and then dropped at search time.
     #[test]
     fn non_finite_vectors_are_rejected() {
         let cases: Vec<(&str, Vec<f32>)> = vec![
@@ -1503,8 +1469,8 @@ mod tests {
                 vec![f32::NEG_INFINITY, 1.0, 0.0, 0.0],
             ),
             ("all NaN", vec![f32::NAN; 4]),
-            // Finite components whose squares overflow f32: the norm becomes
-            // `inf`, the reciprocal `0`, and the vector normalizes to all zeros.
+            // Squares overflow f32: the norm becomes `inf` and the vector would
+            // normalize to all zeros.
             ("finite but overflowing", vec![1e30, 1e30, 1e30, 1e30]),
         ];
 
@@ -1517,9 +1483,9 @@ mod tests {
         }
     }
 
-    /// The one vector on the boundary. With `<` on one side and `>` on the other
-    /// it was neither rejected nor normalized, and went into the index scoring as
-    /// its own magnitude instead of as a cosine.
+    /// The vector exactly on the threshold: with `<` here and `>` in
+    /// `l2_normalize` it was neither rejected nor normalized, and entered the index
+    /// scoring as its own magnitude instead of as a cosine.
     #[test]
     fn a_vector_exactly_at_the_minimum_norm_is_rejected() {
         let mut boundary = vec![MIN_VECTOR_NORM, 0.0, 0.0, 0.0];
@@ -1536,7 +1502,7 @@ mod tests {
              {result:?}"
         );
 
-        // Just above it, normalization happens and the result is a unit vector.
+        // Just above it, the result is a unit vector.
         let mut above = vec![MIN_VECTOR_NORM * 1_000.0, 0.0, 0.0, 0.0];
         normalize_validated(&mut above, 4).unwrap();
         assert!((above[0] - 1.0).abs() < 1e-6);
@@ -1578,8 +1544,7 @@ mod tests {
         assert!(vector.iter().all(|x| x.is_finite()));
     }
 
-    /// A very small but representable vector still has a direction and must be
-    /// kept — the guard is against zero and non-finite, not against "small".
+    /// The guard is against zero and non-finite, not against "small".
     #[test]
     fn a_tiny_but_representable_vector_is_kept() {
         let mut vector = vec![1e-6f32, 0.0, 0.0, 0.0];
@@ -1594,17 +1559,398 @@ mod tests {
         assert!(rt.embed_batch(&[]).unwrap().is_empty());
     }
 
+    /// The id is what the manifest records, so it is pinned to a literal:
+    /// changing it invalidates every index already built by this backend.
     #[test]
     fn backend_is_reported_and_marked_non_semantic() {
         let dir = TempDir::new("backend_kind");
         let rt = loaded_runtime(&dir, 16);
+
         let backend = rt.backend().expect("loaded");
-        assert_eq!(backend, EmbeddingBackendKind::MockHash);
         assert_eq!(backend.id(), "mock-hash-v1");
         assert!(
             !backend.is_semantic(),
             "the stand-in backend must never claim to be semantic"
         );
+
+        // The same facts through the accessors the manifest and status paths use,
+        // which must not disagree with the backend itself.
+        assert_eq!(rt.backend_id(), Some("mock-hash-v1"));
+        assert!(!rt.backend_is_semantic());
+
+        let unloaded = EmbeddingRuntime::new(EmbeddingConfig::default());
+        assert!(unloaded.backend().is_none());
+        assert_eq!(unloaded.backend_id(), None);
+        assert!(!unloaded.backend_is_semantic());
+    }
+
+    // ── the backend contract, exercised with backends that misbehave on purpose ──
+
+    /// A backend whose output is under the test's control: every field is a lever
+    /// on something the runtime is supposed to catch, and no honest backend can be
+    /// made to produce these.
+    struct FakeBackend {
+        reported_dim: u32,
+        pooling: Pooling,
+        max_tokens: usize,
+        /// Returned verbatim for every input.
+        vector: Vec<f32>,
+        /// 1 is correct; 0 and 2 are the bugs the returned-count check exists for.
+        vectors_per_input: usize,
+    }
+
+    impl FakeBackend {
+        fn healthy(dim: u32) -> Self {
+            // Not unit length: the runtime must normalize whatever it is handed.
+            let mut vector = vec![0.0f32; dim as usize];
+            if let Some(first) = vector.first_mut() {
+                *first = 7.0;
+            }
+            if dim > 1 {
+                vector[1] = -24.0;
+            }
+            Self {
+                reported_dim: dim,
+                pooling: Pooling::LastToken,
+                max_tokens: 512,
+                vector,
+                vectors_per_input: 1,
+            }
+        }
+
+        fn returning(dim: u32, vector: Vec<f32>) -> Self {
+            Self {
+                vector,
+                ..Self::healthy(dim)
+            }
+        }
+
+        fn boxed(self) -> Box<dyn EmbeddingBackend> {
+            Box::new(self)
+        }
+    }
+
+    impl EmbeddingBackend for FakeBackend {
+        fn id(&self) -> &'static str {
+            "fake-test-backend"
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn dim(&self) -> u32 {
+            self.reported_dim
+        }
+        fn max_tokens(&self) -> usize {
+            self.max_tokens
+        }
+        fn pooling(&self) -> Pooling {
+            self.pooling
+        }
+        fn tokenize(&self, _text: &str) -> Result<Vec<u32>, EmbeddingError> {
+            Ok(vec![1, 2, 3])
+        }
+        fn embed_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(
+                std::iter::repeat_n(self.vector.clone(), texts.len() * self.vectors_per_input)
+                    .collect(),
+            )
+        }
+    }
+
+    /// A real backend reads its width from the GGUF, so a 512-dimension model
+    /// behind a 1024 configuration can really happen. Caught at load, because the
+    /// alternative is wrong-width vectors reaching the store mid-index.
+    #[test]
+    fn a_backend_whose_dimension_disagrees_with_the_configuration_is_refused() {
+        let config = EmbeddingConfig {
+            embedding_dim: 64,
+            ..Default::default()
+        };
+
+        match EmbeddingRuntime::with_backend(config.clone(), FakeBackend::healthy(32).boxed()) {
+            Err(EmbeddingError::DimensionMismatch { expected, actual }) => {
+                assert_eq!((expected, actual), (64, 32));
+            }
+            Err(other) => panic!("expected a dimension mismatch, got {other:?}"),
+            Ok(_) => panic!("a backend narrower than the configuration must be refused"),
+        }
+
+        // Wider is equally refused.
+        assert!(matches!(
+            EmbeddingRuntime::with_backend(config.clone(), FakeBackend::healthy(128).boxed()),
+            Err(EmbeddingError::DimensionMismatch { .. })
+        ));
+
+        // Agreement loads, so the check is not refusing everything.
+        let runtime = EmbeddingRuntime::with_backend(config, FakeBackend::healthy(64).boxed())
+            .expect("a backend that agrees must load");
+        assert!(runtime.is_loaded());
+        assert_eq!(runtime.dim(), 64);
+    }
+
+    /// A *valid* configuration against a backend that pools otherwise — the case no
+    /// configuration-time guard can pre-empt, since nothing about the configuration
+    /// is wrong. A model built with `--pooling mean` behind a `last-token`
+    /// configuration lands here, and this is why [`Pooling::Mean`] must stay a
+    /// variant.
+    #[test]
+    fn a_backend_that_pools_differently_from_the_configuration_is_refused() {
+        let config = EmbeddingConfig {
+            embedding_dim: 16,
+            pooling: Pooling::LastToken,
+            ..Default::default()
+        };
+        let backend = FakeBackend {
+            pooling: Pooling::Mean,
+            ..FakeBackend::healthy(16)
+        };
+
+        match EmbeddingRuntime::with_backend(config, backend.boxed()) {
+            Err(EmbeddingError::PoolingMismatch {
+                configured, actual, ..
+            }) => {
+                assert_eq!(configured, "last-token");
+                assert_eq!(actual, "mean");
+            }
+            Err(other) => panic!("expected a pooling mismatch, got {other:?}"),
+            Ok(_) => panic!("a backend that pools differently must be refused"),
+        }
+    }
+
+    /// Refused *before the model file is opened*, so it cannot reach a backend or a
+    /// manifest. The model path here does not exist — a `ModelNotFound` would prove
+    /// the check ran too late.
+    #[test]
+    fn load_refuses_a_pooling_no_backend_implements_before_reading_the_model() {
+        let dir = TempDir::new("pooling_unimplemented");
+        let absent = dir.path().join("not-even-there.gguf");
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: absent,
+            embedding_dim: 16,
+            pooling: Pooling::Mean,
+            ..Default::default()
+        });
+
+        match rt.load() {
+            Err(EmbeddingError::PoolingNotImplemented {
+                pooling,
+                implemented,
+            }) => {
+                assert_eq!(pooling, "mean");
+                assert!(
+                    implemented.contains("last-token"),
+                    "unhelpful reason: {implemented}"
+                );
+            }
+            other => panic!("a pooling nothing performs must be refused, got {other:?}"),
+        }
+        assert!(!rt.is_loaded(), "a refused backend must not be installed");
+        assert!(
+            rt.model_checksum().is_none(),
+            "nothing may be recorded for a backend that was never installed"
+        );
+    }
+
+    /// A cap of zero truncates every input to nothing.
+    #[test]
+    fn a_backend_with_a_zero_token_cap_is_refused() {
+        let backend = FakeBackend {
+            max_tokens: 0,
+            ..FakeBackend::healthy(16)
+        };
+        assert!(matches!(
+            EmbeddingRuntime::with_backend(
+                EmbeddingConfig {
+                    embedding_dim: 16,
+                    ..Default::default()
+                },
+                backend.boxed()
+            ),
+            Err(EmbeddingError::LoadFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_nonsensical_configuration_is_refused_before_the_model_is_read() {
+        let dir = TempDir::new("bad_config");
+        let absent = dir.path().join("not-even-there.gguf");
+
+        for config in [
+            EmbeddingConfig {
+                model_path: absent.clone(),
+                embedding_dim: 0,
+                ..Default::default()
+            },
+            EmbeddingConfig {
+                model_path: absent,
+                max_tokens: 0,
+                ..Default::default()
+            },
+        ] {
+            let mut rt = EmbeddingRuntime::new(config);
+            // `LoadFailed`, not `ModelNotFound`, proves the file was never touched.
+            assert!(matches!(rt.load(), Err(EmbeddingError::LoadFailed { .. })));
+        }
+    }
+
+    /// Pins the guard to `EmbeddingConfig::validate` rather than to the order of
+    /// steps inside `load`, so every entry point that validates gets it.
+    #[test]
+    fn validate_refuses_a_pooling_no_backend_implements() {
+        let unimplemented = EmbeddingConfig {
+            pooling: Pooling::Mean,
+            ..Default::default()
+        };
+        assert!(matches!(
+            unimplemented.validate(),
+            Err(EmbeddingError::PoolingNotImplemented { .. })
+        ));
+
+        // The default must stay valid, or nothing loads at all.
+        assert!(EmbeddingConfig::default().validate().is_ok());
+    }
+
+    /// The choke point from the other side. `FakeBackend` returns non-unit vectors
+    /// on purpose, or this would be indistinguishable from doing nothing.
+    #[test]
+    fn embed_batch_normalizes_whatever_the_backend_returns() {
+        let config = EmbeddingConfig {
+            embedding_dim: 4,
+            batch_size: 2,
+            ..Default::default()
+        };
+        let rt = EmbeddingRuntime::with_backend(config, FakeBackend::healthy(4).boxed()).unwrap();
+
+        // More inputs than batch_size, so several backend calls happen.
+        let vectors = rt.embed_batch(&["a", "b", "c"]).unwrap();
+        assert_eq!(vectors.len(), 3);
+        for vector in &vectors {
+            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-6,
+                "the runtime must normalize a raw vector, got norm {norm}"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_batch_rejects_every_unusable_vector_a_backend_can_return() {
+        let config = EmbeddingConfig {
+            embedding_dim: 4,
+            ..Default::default()
+        };
+
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            ("a NaN component", vec![f32::NAN, 1.0, 0.0, 0.0]),
+            ("an infinite component", vec![f32::INFINITY, 1.0, 0.0, 0.0]),
+            ("all zeros", vec![0.0; 4]),
+            // Squares overflow f32: the norm becomes `inf` and the vector would
+            // normalize to all zeros.
+            ("finite but overflowing", vec![1e30; 4]),
+            (
+                "exactly at the minimum norm",
+                vec![MIN_VECTOR_NORM, 0.0, 0.0, 0.0],
+            ),
+        ];
+
+        for (name, vector) in cases {
+            let rt = EmbeddingRuntime::with_backend(
+                config.clone(),
+                FakeBackend::returning(4, vector).boxed(),
+            )
+            .unwrap();
+            let result = rt.embed_batch(&["שורה כלשהי"]);
+            assert!(
+                matches!(result, Err(EmbeddingError::InferenceFailed { .. })),
+                "{name} must be rejected, got {result:?}"
+            );
+        }
+
+        // A wrong *length* is diagnosed as the dimension problem it is, even though
+        // the reported dim agreed at load time: a backend can be inconsistent with
+        // itself, and this is the last line before the store.
+        let rt = EmbeddingRuntime::with_backend(
+            config,
+            FakeBackend::returning(4, vec![1.0, 2.0]).boxed(),
+        )
+        .unwrap();
+        assert!(matches!(
+            rt.embed_batch(&["שורה כלשהי"]),
+            Err(EmbeddingError::DimensionMismatch {
+                expected: 4,
+                actual: 2
+            })
+        ));
+    }
+
+    /// Vectors are paired with chunk metadata by position, so a wrong-length batch
+    /// would mislabel results rather than lose them.
+    #[test]
+    fn embed_batch_rejects_a_backend_that_returns_the_wrong_number_of_vectors() {
+        let config = EmbeddingConfig {
+            embedding_dim: 4,
+            batch_size: 8,
+            ..Default::default()
+        };
+
+        for (name, per_input) in [("too few", 0usize), ("too many", 2)] {
+            let backend = FakeBackend {
+                vectors_per_input: per_input,
+                ..FakeBackend::healthy(4)
+            };
+            let rt = EmbeddingRuntime::with_backend(config.clone(), backend.boxed()).unwrap();
+
+            match rt.embed_batch(&["א", "ב", "ג"]) {
+                Err(EmbeddingError::InferenceFailed { reason }) => {
+                    assert!(
+                        reason.contains("vectors for"),
+                        "{name}: unhelpful reason: {reason}"
+                    );
+                }
+                other => panic!("{name} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// The request reaches the backend, and the backend's effective answer is what
+    /// the runtime reports — a real one clamps to the model's context length.
+    #[test]
+    fn the_requested_token_cap_reaches_the_backend_and_the_backends_answer_wins() {
+        let dir = TempDir::new("max_tokens");
+        let model = dir.path().join("model.gguf");
+        mock::write_stub_gguf(&model, 3).unwrap();
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: model,
+            embedding_dim: 16,
+            max_tokens: 128,
+            ..Default::default()
+        });
+        // Before loading, the request is all there is to report.
+        assert_eq!(rt.max_tokens(), 128);
+        rt.load().unwrap();
+        assert_eq!(
+            rt.max_tokens(),
+            128,
+            "the selected backend must have been built with the requested cap"
+        );
+
+        // A backend that clamps is reported as it is, not as the caller asked.
+        let clamped = FakeBackend {
+            max_tokens: 32,
+            ..FakeBackend::healthy(16)
+        };
+        let rt = EmbeddingRuntime::with_backend(
+            EmbeddingConfig {
+                embedding_dim: 16,
+                max_tokens: 4096,
+                ..Default::default()
+            },
+            clamped.boxed(),
+        )
+        .unwrap();
+        assert_eq!(rt.max_tokens(), 32);
     }
 
     #[test]
