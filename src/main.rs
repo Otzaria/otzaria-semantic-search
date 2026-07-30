@@ -129,7 +129,7 @@ fn main() {
                         res.latency_ms
                     );
                     if let Some(reason) = &res.fallback_reason {
-                        println!("Note: {}", reason);
+                        println!("Note: {reason}");
                     }
                     if res.results.is_empty() {
                         println!("No matching items found.");

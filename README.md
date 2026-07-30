@@ -10,10 +10,18 @@ bringing local semantic search to **Otzaria**, the open rabbinic digital library
 It is not production-ready yet.
 
 The current crate implements chunking, lifecycle contracts, brute-force vector
-search, result fusion and a Rust API seam. Real GGUF inference, a persistent ANN
-store, generated FFI bindings, Tantivy hydration and application integration are
-still roadmap work. Tests can enable a deterministic mock embedder; normal builds
-refuse to produce fake semantic vectors.
+search, result fusion, a Rust API seam, and — behind the non-default
+`llama-backend` feature — **real GGUF inference** against the Otzaria Qwen3
+embedding model, verified against committed golden reference vectors. A persistent
+ANN store, generated FFI bindings, Tantivy hydration and application integration
+are still roadmap work.
+
+**A default build has no embedding backend at all** and fails loudly
+(`EmbeddingError::BackendUnavailable`) rather than producing vectors. That is
+deliberate: the two backends are opt-in for different reasons — the deterministic
+stand-in (`mock-embedding`) because it is *fake*, and real inference
+(`llama-backend`) because it is *expensive*, compiling llama.cpp and ggml through
+cmake on every downstream build.
 
 ---
 
@@ -21,7 +29,7 @@ refuse to produce fake semantic vectors.
 
 1. **Non-Destructive Sidecar Architecture**: The semantic engine operates as an independent sidecar database (`semantic_db`). It **never** mutates, alters, or replaces Otzaria's existing Tantivy lexical database.
 2. **Graceful Fallback & Resilience**: If the semantic path fails (e.g. model missing, disk I/O error), the coordinator automatically falls back to lexical-only mode without crashing the app.
-3. **Offline & Private Target**: The intended production design runs entirely on-device. The present crate performs no model download or telemetry, but the real inference backend is not implemented.
+3. **Offline & Private Target**: Runs entirely on-device — inference is local llama.cpp over a GGUF file. The crate performs no model download and no telemetry; obtaining the model is the host application's job.
 4. **Source Retrieval (Not RAG)**: Designed strictly for accurate source and text retrieval within Jewish literature. It returns verifiable textual sources, never hallucinated AI responses.
 5. **Defensive Error Handling**: Known poisoned-lock and input edge cases use error propagation or graceful fallback; this is not an absolute panic-freedom guarantee.
 
@@ -123,7 +131,9 @@ otzaria-semantic-search/
 | **Result Grouping** | [`src/hybrid/grouping.rs`](src/hybrid/grouping.rs) | `group_by_section`, `group_by_identical_text` | Section-level grouping and identical text line hash deduplication |
 | **Domain Models** | [`src/semantic/types.rs`](src/semantic/types.rs) | `BookLine`, `SemanticChunk`, `FusedCandidate`, `HybridSearchResult` | All data transfer objects, candidate models, and filter definitions |
 | **Text Chunker** | [`src/semantic/chunker.rs`](src/semantic/chunker.rs) | `Chunker`, `ChunkerConfig`, `compute_semantic_id` | Anchored chunking with context constrained to the anchor's section |
-| **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | GGUF structure/checksum validation and runtime interface; real inference pending |
+| **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | GGUF structure/checksum validation; the primary choke point that normalizes and validates every vector |
+| **Backend Contract** | [`src/semantic/backend.rs`](src/semantic/backend.rs) | `EmbeddingBackend`, `Pooling`, `select_backend` | `Send + Sync` trait every backend implements; backends return **raw** vectors |
+| **Real Inference** | [`src/semantic/llama_backend.rs`](src/semantic/llama_backend.rs) | `LlamaCppBackend`, `ContextPool`, `truncate_with_eos` | llama.cpp GGUF inference behind `--features llama-backend`: Qwen2-BPE tokenizer, EOS appended, last-token pooling, real multi-sequence batching |
 | **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K |
 | **Index Manifest** | [`src/semantic/manifest.rs`](src/semantic/manifest.rs) | `SemanticManifest`, `BookManifestEntry`, `validate` | Atomic JSON tracking (`.tmp` write + rename) & Tantivy incremental diffing |
 | **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Master sidecar engine orchestrating chunking, embedding & storage |
@@ -143,7 +153,7 @@ otzaria-semantic-search/
 │ [✔] Phase 3: Correct brute-force baseline (Pre-norm Dot Product + Min-Heap)      │
 │ [✔] Phase 4: Correctness baseline, lifecycle contracts & complete filters        │
 ├──────────────────────────────────────────────────────────────────────────────────┤
-│ [ ] Phase 5: Native GGUF Model Runtime Integration (Candle / GGUF Tensor)        │
+│ [✔] Phase 5: Real GGUF inference (llama.cpp) verified against golden vectors     │
 │ [ ] Phase 6: Persistent Disk Vector Store (zvec / HNSW Index on Disk)            │
 │ [ ] Phase 7: Flutter Rust Bridge (FRB) Bindings & Otzaria UI Integration         │
 │ [ ] Phase 8: Background Streaming Indexer (StreamSink<IndexingProgress>)         │
@@ -153,9 +163,9 @@ otzaria-semantic-search/
 
 ### Detailed Next Steps
 
-1. **Native GGUF Model Runtime (`candle-core`)**:
-   - Replace deterministic feature hashing fallback with `candle-core` & `candle-transformers` GGUF tensor execution.
-   - Implement Last-Token Pooling and SIMD/GPU hardware acceleration (AVX2 / Metal / DirectX).
+1. **Line representation & dimension selection** (roadmap P3):
+   - Measure `line` versus `title + reference + line` versus neighbour context.
+   - Choose 1024/512/256/128 dimensions on measured quality — the size arithmetic in the roadmap (~23.1 GiB at f32/1024 for 6M lines) is why this matters.
 2. **Persistent Disk Vector Store (`zvec-core` / HNSW)**:
    - Connect disk-backed HNSW vector storage in `semantic_db/zvec`.
    - Implement atomic `commit()` and Memory-Mapped File (`mmap`) reads for minimal memory footprint.
@@ -183,6 +193,17 @@ otzaria-semantic-search/
 
 ### Prerequisites
 - [Rust Toolchain](https://rustup.rs/) (Stable 2021 Edition)
+- For `--features llama-backend` only: **cmake** and a C++ toolchain. `llama-cpp-2`
+  builds llama.cpp and ggml from source (~1–2 minutes cold).
+
+### Feature matrix
+
+| Build | Backend | `EmbeddingRuntime::load` |
+|---|---|---|
+| default | none | `Err(BackendUnavailable)` — a release build cannot serve fake vectors |
+| `--features mock-embedding` | deterministic hash stand-in | `Ok` — **not a semantic model**, development and testing only |
+| `--features llama-backend` | real llama.cpp GGUF inference | `Ok` |
+| both | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
 
 ### Commands
 
@@ -190,16 +211,38 @@ otzaria-semantic-search/
 # Build release library
 cargo build --release
 
-# Run unit and integration tests (does not execute the benchmark target)
+# Run unit and integration tests (never `--all-targets`: that selects the bench
+# target, overriding its `test = false`, and runs a 200k x 1024 workload unoptimized)
 cargo test --lib --tests
 cargo test --lib --tests --features mock-embedding
+cargo test --lib --tests --features llama-backend
+cargo test --lib --tests --features mock-embedding,llama-backend
 
 # Verify formatting
 cargo fmt --check
 
-# Run strict Clippy lints
+# Run strict Clippy lints (run for each feature combination above)
 cargo clippy --all-targets -- -D warnings
 ```
+
+### Testing against the real model
+
+Tests that need the 396 MB GGUF are `#[ignore]`d and **skip loudly** when the model
+is absent, so CI stays green without it. To run them, point `OTZARIA_TEST_MODEL` at
+the file:
+
+```bash
+OTZARIA_TEST_MODEL=/abs/path/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf \
+  cargo test --lib --features llama-backend -- --ignored --nocapture
+```
+
+These assert **exact `token_ids` equality** against the committed golden vectors in
+[`tests/data/golden_vectors.json`](tests/data/golden_vectors.json), then cosine and
+per-component agreement. The token-id assertion is the primary gate, not the cosine
+one — a wrongly prepended BOS scores *higher* than a legitimate independent
+reference, so no cosine threshold can separate them. See
+[`docs/P2_REFERENCE_VECTORS.md`](docs/P2_REFERENCE_VECTORS.md) for the measurements
+and [`tools/README.md`](tools/README.md) for regenerating the goldens.
 
 ---
 

@@ -66,6 +66,57 @@ pub enum EmbeddingError {
     #[error("Inference failed: {reason}")]
     InferenceFailed { reason: String },
 
+    /// A configured pooling strategy this build does not implement.
+    ///
+    /// Refused rather than ignored: pooling decides what a vector *is* and is
+    /// recorded in the manifest as part of the index's identity, so a typo that
+    /// fell through used to produce vectors pooled one way while the manifest
+    /// claimed another — with no error anywhere.
+    #[error("Unknown pooling strategy '{found}' (supported: {supported})")]
+    UnknownPooling { found: String, supported: String },
+
+    /// A pooling strategy this crate has a name for but no backend performs.
+    ///
+    /// Distinct from [`Self::UnknownPooling`], which is a spelling nothing can
+    /// even parse. This one parses, round-trips through the manifest, and used to
+    /// be accepted: `pooling = "mean"` validated, the manifest was written with
+    /// `"pooling": "mean"`, and only the later model load failed. Correcting the
+    /// configuration afterwards then produced a *different* failure that outlived
+    /// the typo — a pooling mismatch against the manifest the typo had written,
+    /// pointing at the index instead of at the value that caused it, and
+    /// recoverable only by discarding the index. Refusing it while it is still
+    /// only a configuration keeps the diagnosis where the mistake is.
+    #[error("No embedding backend implements pooling '{pooling}' (implemented: {implemented})")]
+    PoolingNotImplemented {
+        pooling: String,
+        implemented: String,
+    },
+
+    /// The loaded backend pools differently from the configuration it was loaded
+    /// for.
+    ///
+    /// A real backend reports what its model requires, not what it was asked for.
+    /// Carrying on would store vectors under a pooling label that does not
+    /// describe them, and the mislabelling only becomes visible as bad search
+    /// results.
+    #[error(
+        "Pooling mismatch: configuration says '{configured}', backend '{backend}' pools '{actual}'"
+    )]
+    PoolingMismatch {
+        backend: String,
+        configured: String,
+        actual: String,
+    },
+
+    /// The backend has no tokenizer to answer with.
+    ///
+    /// Distinct from a failed tokenization: the hash stand-in has no token ids at
+    /// all, and inventing plausible ones would turn the roadmap P2 stage 4 parity
+    /// check against a reference tokenizer into a comparison between two
+    /// fabrications.
+    #[error("Backend '{backend}' cannot tokenize: {reason}")]
+    TokenizationUnsupported { backend: String, reason: String },
+
     #[error("Dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: u32, actual: u32 },
 

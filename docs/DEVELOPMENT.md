@@ -431,6 +431,9 @@ min_embeddable_chars = 5
 chunking_version     = 1
 ```
 
+כל אחד מהערכים האלה משנה את הטקסט שהוטמע, ולכן כולם נכנסים יחד ל־`ChunkerConfig::identity()`
+שנשמר ב־manifest: שינוי של אחד מהם מבטל את האינדקס בדיוק כמו העלאת `chunking_version`.
+
 ---
 
 # 8. Context Window
@@ -462,7 +465,7 @@ source_book_key
 +
 line_id
 +
-chunking_version
+chunking_identity   ← טביעת אצבע של כל ה־ChunkerConfig, לא רק chunking_version
 ```
 
 ונוצר באמצעות SHA-256.
@@ -743,7 +746,7 @@ content_hash        ← החתימה שהקורא התחייב עליה; 0 = "א
 line_fingerprint    ← חתימה שהמנוע מחשב מהספר עצמו: שורות + metadata
 chunk_count         ← 0 הוא ערך תקין (empty-book marker)
 indexed_at
-chunking_version
+chunking_identity   ← טביעת אצבע של כל ה־ChunkerConfig
 normalization_version
 ```
 

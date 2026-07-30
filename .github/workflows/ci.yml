@@ -5,6 +5,14 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # For the golden-vector job, which needs the gated 396 MB model.
+  # No inputs by design: the credential belongs in a secret, and inputs are not
+  # secrets — they land in the event payload and are not redacted.
+  workflow_dispatch:
+
+# Read-only: nothing here writes to the repo, and the golden job holds a secret.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,23 +27,18 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      # Cheapest first: format check (no compilation)
       - name: Check Formatting
         run: cargo fmt --check
-
-      # ── Default features = the shipping configuration ──
-      # No embedding backend is compiled in, so this proves a release build
-      # cannot fall back to the deterministic stand-in embedder.
 
       - name: Cargo Check (default features)
         run: cargo check --all-targets
@@ -43,21 +46,11 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 
-      # `--lib --tests`, never `--all-targets`: the latter explicitly selects the
-      # bench target, and an explicit selection overrides its `test = false`, so
-      # cargo would *run* the 200k x 1024 benchmark — unoptimized — as part of the
-      # test suite. Compiling benches/ is the release step's job.
-      #
-      # Asserts the production gate itself: tests/production_backend_gate.rs
-      # only compiles without `mock-embedding` and requires the engine to refuse
-      # to embed anything.
+      # `--lib --tests`, never `--all-targets`: an explicit selection overrides the
+      # bench target's `test = false`, so cargo would run the 200k x 1024 workload
+      # unoptimized.
       - name: Test (default features)
         run: cargo test --lib --tests
-
-      # ── With the stand-in backend = the full behavioural suite ──
-      # The end-to-end tests need *some* embedding backend. Until real GGUF
-      # inference lands (roadmap P2) that is the mock, which is why the whole
-      # suite has to run in both configurations rather than one.
 
       - name: Clippy (mock-embedding)
         run: cargo clippy --all-targets --features mock-embedding -- -D warnings
@@ -65,14 +58,121 @@ jobs:
       - name: Test (mock-embedding)
         run: cargo test --lib --tests --features mock-embedding
 
-      # Broken intra-doc links are the usual way documentation rots silently.
+      # Also the only step in this job that compiles llama.cpp, since
+      # `--all-features` turns on `llama-backend`.
       - name: Check Documentation
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
-      # Release compilation of the artifact that actually ships. `--all-targets`
-      # covers benches/, so the benchmark cannot rot unnoticed; it is compiled,
-      # not run — CI runners are too noisy for the numbers to mean anything.
+      # `--all-targets` compiles benches/ so it cannot rot; it is not run, because
+      # CI runners are too noisy for the numbers to mean anything.
       - name: Build Release
         run: cargo build --release --all-targets
+
+  # Separate job: `llama-backend` builds llama.cpp through cmake, which is minutes
+  # of C++ per runner, and its failures are almost never OS-specific. ubuntu for
+  # the general coverage, macos because it is the only runner compiling the Metal
+  # path. Windows gets the backend via the `cargo doc --all-features` step above.
+  llama-backend:
+    name: Inference Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+
+      # Keyed separately: this cache holds the cmake build of llama.cpp.
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: llama-backend
+
+      - name: Clippy (llama-backend)
+        run: cargo clippy --all-targets --features llama-backend -- -D warnings
+
+      # The model-gated tests are `#[ignore]`d and also skip loudly without
+      # `OTZARIA_TEST_MODEL`, so the missing GGUF cannot redden this.
+      - name: Test (llama-backend)
+        run: cargo test --lib --tests --features llama-backend
+
+      # The combination is the only configuration that exercises `select_backend`'s
+      # `Option<Result<..>>`: a real backend that fails to load must report why
+      # rather than falling through to the stand-in. `tests/backend_selection.rs`
+      # asserts it.
+      - name: Clippy (mock-embedding + llama-backend)
+        run: cargo clippy --all-targets --features mock-embedding,llama-backend -- -D warnings
+
+      - name: Test (mock-embedding + llama-backend)
+        run: cargo test --lib --tests --features mock-embedding,llama-backend
+
+  # `token_ids` exact equality against tests/data/golden_vectors.json is the primary
+  # correctness gate for the backend (docs/P2_INFERENCE_SPIKE.md §2) — it catches a
+  # prepended BOS, a missing EOS, `parse_special = true` and off-by-one truncation,
+  # none of which the cosine tolerances can see. It needs the gated 396 MB model, so it
+  # runs on every push and same-repo PR off the OTZARIA_HF_TOKEN secret.
+  #
+  # If the secret is unset the job fails rather than skipping: a green tick here must
+  # never mean "the tokenizer was not checked".
+  #
+  # Skipped only for pull requests from forks, which GitHub deliberately denies
+  # secrets. Those need a maintainer `workflow_dispatch` on the branch before merge —
+  # the one case where this gate is not automatic.
+  golden-vectors:
+    name: Golden Vectors (real model)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: llama-backend
+
+      # Downloaded fresh every run, deliberately NOT cached. An Actions cache on `main`
+      # is readable by a workflow run from a fork's pull request, so caching the file
+      # would republish a `gated: manual` model to anyone who opens a PR.
+      #
+      # The URL is public; only the token is secret, and it reaches curl through a
+      # config on stdin rather than argv — no process listing, no `set -x`.
+      - name: Fetch the model
+        id: model
+        env:
+          HF_TOKEN: ${{ secrets.OTZARIA_HF_TOKEN }}
+        run: |
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The golden gate cannot run, and is NOT being reported as passing."
+            exit 1
+          fi
+          printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+            curl -fSL --output model.gguf -K - \
+              https://huggingface.co/EMD123/Otzaria-Embedding-V1-Flash-0.6B-GGUF/resolve/main/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
+          # A mismatch must read as "wrong model" rather than as confusing vector diffs.
+          expected=$(python3 -c "import json;print(json.load(open('tests/data/golden_vectors.json'))['header']['model_sha256'])")
+          actual=$(sha256sum model.gguf | cut -d' ' -f1)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Model SHA-256 mismatch. Goldens expect $expected, got $actual."
+            exit 1
+          fi
+          echo "path=$(pwd)/model.gguf" >> "$GITHUB_OUTPUT"
+
+      # `--ignored` is what selects them; without it the job would be meaningless.
+      - name: Golden parity (token_ids exact, then vector tolerances)
+        env:
+          OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
+        run: cargo test --lib --features llama-backend -- --ignored --nocapture

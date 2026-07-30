@@ -21,3 +21,9 @@ target
 #.idea/
 Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
 semantic_db/
+
+# Byte-code left behind by the golden-vector tooling in tools/. Running
+# `generate_golden_vectors.py` writes `tools/__pycache__/*.pyc`, which is
+# otherwise committable — it has already been staged accidentally once.
+__pycache__/
+*.pyc

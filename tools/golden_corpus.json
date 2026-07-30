@@ -1,0 +1,393 @@
+{
+  "corpus_version": 2,
+  "description": "Input corpus for tools/generate_golden_vectors.py. Reviewable and extensible without touching code. Each entry becomes one record in tests/data/golden_vectors.json. Add entries freely; regenerating the golden file is the only step required.",
+  "field_docs": {
+    "id": "Stable, unique, ASCII identifier. Never rename an existing id -- Stage 4 tests may reference it by name.",
+    "text": "The exact input string, verbatim. Invisible/ambiguous characters MUST be written as \\uXXXX escapes so the corpus stays reviewable in a diff.",
+    "same_text_as": "Alternative to 'text': reuse another entry's text verbatim. Used by the truncation fixtures, which must embed the SAME text under different truncation conventions. Exactly one of 'text' or 'same_text_as' is required.",
+    "tags": "Free-form coverage labels. Used only for the human-readable coverage summary.",
+    "notes": "Why this entry exists / what regression it is meant to catch.",
+    "expect_total_tokens": "Optional. If present, the generator hard-fails unless the final embedded token sequence has exactly this length. Used to pin the 512-token boundary fixtures so a tokenizer change is loud rather than silent.",
+    "truncate": "Optional {\"tokens\": N, \"mode\": \"total\"|\"content\"}. Applied to the content tokens before EOS is appended. mode=total => content is cut to N-1 and EOS appended, so the embedded sequence is exactly N tokens. mode=content => content is cut to N and EOS appended, so the embedded sequence is N+1 tokens. Absent => no truncation."
+  },
+  "deliberately_uncovered": {
+    "empty_string": "The empty string is NOT a corpus record, on purpose -- do not add it back without reading this. The reference does handle it: content tokens are [] and add_special yields the 1-token sequence [151643], giving a finite vector (raw L2 norm 110.44, cos 0.1107 against the space_only golden). It was added, measured, and removed, because a zero-content sequence is where the two references diverge FURTHEST: Reference B (PyTorch fp32) agrees with Reference A on it at cosine 0.98860, relative raw-norm diff 0.110, max abs component diff 7.37e-2 -- outside three of the recommended tolerances at once (0.99 / 0.05 / 0.03). With no content tokens the pooled EOS state carries no context, so the quantization error is proportionally far larger than anywhere else in the corpus. Committing it would have forced either a special-case exemption in the Stage 4 test or a loosening of thresholds that two legitimate triangulations already pin at ~0.9948. The crate's own pipeline rejects empty and whitespace-only text upstream of the embedder anyway, so the record would have asserted behaviour production never reaches. space_only (a single space, 2 tokens) covers the degenerate-input path that IS reachable."
+  },
+  "texts": [
+    {
+      "id": "heb_prose_mishneh_torah",
+      "text": "יסוד היסודות ועמוד החכמות לידע שיש שם מצוי ראשון, והוא ממציא כל נמצא, וכל הנמצאים משמים וארץ ומה שביניהם לא נמצאו אלא מאמתת המצאו.",
+      "tags": [
+        "hebrew",
+        "prose",
+        "unpointed",
+        "halacha"
+      ],
+      "notes": "Plain unpointed Hebrew prose, Rambam register. The single most common shape of real Otzaria data."
+    },
+    {
+      "id": "heb_prose_aggada",
+      "text": "בשעה שברא הקדוש ברוך הוא את האדם הראשון, נטלו והחזירו על כל אילני גן עדן, ואמר לו: ראה מעשי כמה נאים ומשובחים הם, וכל מה שבראתי בשבילך בראתי.",
+      "tags": [
+        "hebrew",
+        "prose",
+        "unpointed",
+        "aggada"
+      ],
+      "notes": "Second plain-Hebrew sample in a different register (midrashic narrative) so a regression that happens to spare one style is still caught."
+    },
+    {
+      "id": "aramaic_talmud_sugya",
+      "text": "אמר ליה רבא לרב נחמן: מנא הני מילי? דתנן, כל הפוסל את זרעו אינו נאמן על זרעו. ותו לא מידי. איתמר נמי, אמר רב יהודה אמר שמואל: הלכה כרבי יוסי.",
+      "tags": [
+        "aramaic",
+        "talmud",
+        "unpointed"
+      ],
+      "notes": "Talmudic Aramaic with the standard argumentation formulas (מנא הני מילי, איתמר נמי, תו לא מידי)."
+    },
+    {
+      "id": "aramaic_talmud_short",
+      "text": "תא שמע: דאמר רב חסדא אמר רבינא בר שילא, ואמרי לה משמיה דרבי יוחנן, ולא היא.",
+      "tags": [
+        "aramaic",
+        "talmud",
+        "unpointed",
+        "short"
+      ],
+      "notes": "Short Aramaic line dominated by Talmudic technical terms; stresses BPE handling of high-frequency Aramaic particles."
+    },
+    {
+      "id": "nikud_bereshit",
+      "text": "בְּרֵאשִׁית בָּרָא אֱלֹהִים אֵת הַשָּׁמַיִם וְאֵת הָאָרֶץ. וְהָאָרֶץ הָיְתָה תֹהוּ וָבֹהוּ, וְחֹשֶׁךְ עַל־פְּנֵי תְהוֹם.",
+      "tags": [
+        "hebrew",
+        "nikud",
+        "combining-marks",
+        "maqaf"
+      ],
+      "notes": "Nikud (vowel points) as combining marks. Each mark is its own codepoint and typically its own token, so token counts explode relative to unpointed text -- a good detector of tokenizer or UTF-8 handling bugs."
+    },
+    {
+      "id": "nikud_qamats_qatan",
+      "text": "כׇּל יִשְׂרָאֵל יֵשׁ לָהֶם חֵלֶק לָעוֹלָם הַבָּא, שֶׁנֶּאֱמַר: וְעַמֵּךְ כֻּלָּם צַדִּיקִים, לְעוֹלָם יִירְשׁוּ אָרֶץ.",
+      "tags": [
+        "hebrew",
+        "nikud",
+        "qamats-qatan",
+        "rare-codepoints"
+      ],
+      "notes": "Contains U+05C7 HEBREW POINT QAMATS QATAN (כׇּל) plus shin/sin dots and dagesh. Rare codepoints are exactly where a hand-rolled tokenizer diverges from the GGUF vocabulary."
+    },
+    {
+      "id": "teamim_shema",
+      "text": "שְׁמַ֖ע יִשְׂרָאֵ֑ל יְהוָ֥ה אֱלֹהֵ֖ינוּ יְהוָ֥ה ׀ אֶחָֽד׃",
+      "tags": [
+        "hebrew",
+        "nikud",
+        "teamim",
+        "cantillation",
+        "paseq",
+        "sof-pasuq"
+      ],
+      "notes": "Cantillation marks (tipcha, etnachta, merkha, silluq) plus U+05C0 PASEQ and U+05C3 SOF PASUQ. Densest combining-mark stack in real Tanakh data."
+    },
+    {
+      "id": "teamim_bereshit",
+      "text": "בְּרֵאשִׁ֖ית בָּרָ֣א אֱלֹהִ֑ים אֵ֥ת הַשָּׁמַ֖יִם וְאֵ֥ת הָאָֽרֶץ׃",
+      "tags": [
+        "hebrew",
+        "nikud",
+        "teamim",
+        "cantillation",
+        "sof-pasuq"
+      ],
+      "notes": "Second cantillated verse. Paired with nikud_bereshit and heb_prose_mishneh_torah it isolates the effect of marks alone on the same underlying words."
+    },
+    {
+      "id": "punct_hebrew_abbrev",
+      "text": "רמב״ם, הלכות תשובה, פרק ג׳; ועיין בשו״ת הרשב״א ח״א סי׳ ת״ה, ובמשנה־ברורה שם׃",
+      "tags": [
+        "hebrew",
+        "punctuation",
+        "geresh",
+        "gershayim",
+        "maqaf",
+        "sof-pasuq",
+        "abbreviations"
+      ],
+      "notes": "Hebrew-specific punctuation: U+05F4 GERSHAYIM (רמב״ם), U+05F3 GERESH (סי׳), U+05BE MAQAF (משנה־ברורה), U+05C3 SOF PASUQ. These are NOT the ASCII quote/hyphen lookalikes; substituting ASCII changes the tokenization."
+    },
+    {
+      "id": "punct_rashi_abbrev_dense",
+      "text": "וכו׳ וכו׳ ע״ש ודו״ק. עי׳ תוס׳ ד״ה אין, ובחי׳ הרש״ש שם, וע״ע בשו״ע יו״ד סי׳ פ״ז ס״ק ד׳.",
+      "tags": [
+        "hebrew",
+        "punctuation",
+        "abbreviations",
+        "commentary-apparatus"
+      ],
+      "notes": "Commentary apparatus: a line that is almost entirely abbreviations. Real Otzaria commentary text looks like this and it is the worst case for subword segmentation."
+    },
+    {
+      "id": "mixed_hebrew_english",
+      "text": "Otzaria semantic search — חיפוש סמנטי בספרי קודש using Qwen3 embeddings, dim=1024.",
+      "tags": [
+        "mixed",
+        "hebrew",
+        "latin",
+        "bidi"
+      ],
+      "notes": "Mixed-script line. Implicit bidi reordering must not affect the byte sequence fed to the tokenizer."
+    },
+    {
+      "id": "short_single_word",
+      "text": "תורה",
+      "tags": [
+        "hebrew",
+        "short",
+        "single-word"
+      ],
+      "notes": "Single short Hebrew word. Minimal non-degenerate input; with add_eos the sequence is only a handful of tokens, so last-token pooling is dominated by EOS -- exactly the case where a wrong pooling index is still numerically plausible."
+    },
+    {
+      "id": "ascii_only_pangram",
+      "text": "The quick brown fox jumps over the lazy dog, 0123456789.",
+      "tags": [
+        "ascii",
+        "latin",
+        "common-path"
+      ],
+      "notes": "Pure ASCII. If a tokenizer regression breaks even the common Latin path, this fails first and unambiguously."
+    },
+    {
+      "id": "digits_only",
+      "text": "1234567890",
+      "tags": [
+        "ascii",
+        "digits"
+      ],
+      "notes": "Qwen2-style pretokenizers split digits in specific group sizes. A digit-splitting mismatch is invisible in prose but obvious here."
+    },
+    {
+      "id": "digits_and_gematria",
+      "text": "בשנת ה׳תשפ״ד, דף מ״ה עמוד ב, סימן קכ״ח סעיף 12, ובגמטריא תרי״ג מצוות ו־248 איברים.",
+      "tags": [
+        "hebrew",
+        "digits",
+        "gematria",
+        "maqaf",
+        "mixed-numerals"
+      ],
+      "notes": "Hebrew alphabetic numerals (ה׳תשפ״ד, מ״ה, תרי״ג) alongside Western digits (12, 248), joined by a maqaf. Covers the numeral-mixing that pervades Otzaria references."
+    },
+    {
+      "id": "invisible_bidi_marks",
+      "text": "‏ירושלים‎ — ‏עיר הקודש‏ (תשמ״ה)‌‍­",
+      "tags": [
+        "hebrew",
+        "invisible",
+        "bidi",
+        "rtl-marks",
+        "nbsp",
+        "soft-hyphen",
+        "zwj"
+      ],
+      "notes": "U+200F RLM, U+200E LRM, U+00A0 NBSP, U+200C ZWNJ, U+200D ZWJ, U+00AD SOFT HYPHEN. Such characters do occur in scraped/converted Otzaria source text. They are invisible, so a normalization difference between the reference and the Rust side would otherwise be undetectable."
+    },
+    {
+      "id": "whitespace_shapes",
+      "text": "שורה ראשונה\nשורה שנייה\tעם טאב\n\n  ושורה אחרונה עם רווחים מובילים",
+      "tags": [
+        "hebrew",
+        "whitespace",
+        "newlines",
+        "tabs"
+      ],
+      "notes": "Embedded newlines, a tab, a blank line and leading spaces. BPE encodes whitespace runs as distinct tokens, so any trimming/normalization mismatch shows up here."
+    },
+    {
+      "id": "space_only",
+      "text": " ",
+      "tags": [
+        "degenerate",
+        "whitespace"
+      ],
+      "notes": "Degenerate input: a single space. Must not panic and must still yield a finite unit vector. Nearly all of the signal comes from EOS."
+    },
+    {
+      "id": "final_letters",
+      "text": "מלך על ארץ, קץ הימים, כסף וזהב, אדון הנביאים — אותיות סופיות בסוף מילה: ך ם ן ף ץ.",
+      "tags": [
+        "hebrew",
+        "final-letters",
+        "unpointed"
+      ],
+      "notes": "Hebrew final-form letters both in context and in isolation. Isolated final letters are low-frequency tokens and a plausible place for vocabulary lookup errors."
+    },
+    {
+      "id": "otzaria_line_with_reference",
+      "text": "משנה תורה, הלכות דעות, פרק ב, הלכה ג — כיצד היא הרפואה של בעלי הדעות הרעות? ילך אצל החכמים והם מרפאין אותו.",
+      "tags": [
+        "hebrew",
+        "otzaria-format",
+        "title-reference-line"
+      ],
+      "notes": "The 'title + reference + line' representation that P3 will evaluate. Fixing a golden for it now means the P3 experiment can be measured against a known-good embedding path."
+    },
+    {
+      "id": "near_identical_a",
+      "text": "רבי עקיבא אומר: כל המרבה שיחה עם האשה גורם רעה לעצמו, ובוטל מדברי תורה, וסופו יורש גיהנם.",
+      "tags": [
+        "hebrew",
+        "relation",
+        "near-identical"
+      ],
+      "notes": "Pair member A. Differs from near_identical_b by exactly one word (the tradent's name)."
+    },
+    {
+      "id": "near_identical_b",
+      "text": "רבי ישמעאל אומר: כל המרבה שיחה עם האשה גורם רעה לעצמו, ובוטל מדברי תורה, וסופו יורש גיהנם.",
+      "tags": [
+        "hebrew",
+        "relation",
+        "near-identical"
+      ],
+      "notes": "Pair member B. One word changed vs near_identical_a (עקיבא -> ישמעאל). Cosine must stay very high; see relations."
+    },
+    {
+      "id": "unrelated_a",
+      "text": "הלכות שבת: אין מבשלין בשבת, ואין אופין בשבת, ואין צולין, וכל המבשל בשבת במזיד אסור לו לעולם.",
+      "tags": [
+        "hebrew",
+        "relation",
+        "unrelated",
+        "halacha"
+      ],
+      "notes": "Unrelated-pair member A. Deliberately also Hebrew, so the low-similarity assertion tests semantics rather than merely script or language."
+    },
+    {
+      "id": "unrelated_b",
+      "text": "מרשם מדויק לאפיית לחם מחמצת: קמח מלא, מים בטמפרטורת החדר, מלח גס, ואפייה בתנור לוהט על אבן שמוט.",
+      "tags": [
+        "hebrew",
+        "relation",
+        "unrelated",
+        "modern"
+      ],
+      "notes": "Unrelated-pair member B: modern Hebrew, entirely different domain. cos(unrelated_a, unrelated_b) must sit far below cos(near_identical_a, near_identical_b)."
+    },
+    {
+      "id": "medium_paragraph",
+      "text": "שאלה: אדם שקיבל עליו תענית בחלום, ונזכר למחר שיש לו סעודת מצוה, כיצד יעשה? תשובה: דעת הראשונים חלוקה בזה. יש אומרים שתענית חלום דוחה את סעודת המצוה, מפני שהיא כנדר, ויש אומרים שסעודת מצוה עדיפה, שהרי אין אדם רשאי לצער עצמו במקום שמחה. ולמעשה נהגו שיתענה ביום אחר, ויפדה את תעניתו בצדקה, וישתתף בסעודה כמנהג המקום. וכל זה כשאין חשש איבה, אבל במקום שיש חשש איבה או ביטול כבוד הבריות, בודאי ישתתף.",
+      "tags": [
+        "hebrew",
+        "prose",
+        "medium-length",
+        "responsa"
+      ],
+      "notes": "Mid-length realistic responsum (~100-200 tokens): the length band most Otzaria chunks actually fall into, sitting between the short samples and the truncation fixtures."
+    },
+    {
+      "id": "boundary_exactly_512",
+      "text": "אמר רבי חנינא: לא מצאתי לגוף טוב אלא שתיקה, וכל המרבה דברים מביא חטא. תנו רבנן: שלושה סימנים יש באומה זו, רחמנים, ביישנים וגומלי חסדים. המהלך בדרך ואין עמו לויה, יעסוק בתורה, שנאמר כי לוית חן הם לראשך. אין הברכה שורה אלא על דבר הסמוי מן העין, וכל המונה את הברכה ממעטה. כל המלמד את בן חברו תורה, מעלה עליו הכתוב כאילו ילדו, שנאמר ואלה תולדות אהרן ומשה. רבן גמליאל אומר: עשה לך רב, והסתלק מן הספק, ואל תרבה לעשר אומדות. הוי זהיר בקריאת שמע ובתפילה, וכשאתה מתפלל אל תעש תפילתך קבע אלא רחמים ותחנונים. מאי טעמא? דאמר קרא: ושמרתם ועשיתם, שמירה בלב ועשייה במעשה, ותרוייהו בעינן. איתמר: הלכה כרבי מאיר לחומרא וכרבי יוסי לקולא, ולא איפשיטא לן טעמא דמילתא. לפיכך צריך אדם לשקול דעותיו ולכוון אותן בדרך האמצעית, כדי שיהיה שלם בגופו. וכן החכם ניכר בחכמתו ובדעותיו, והוא מובדל בהן משאר העם בדיבורו ובמאכלו ובמשתהו. אמר ליה: ולא סבר לה מר דהא מתניתין רבי יהודה היא, ואנן קיימא לן כרבנן. כיצד? נותן צדקה לעני כפי מה שחסר לו, אם אין לו כסות מכסים אותו וכלי בית קונים לו. המקדש עצמו במותר לו נקרא קדוש, ואל יאמר אדם הרי התורה התירה ואעשה כל אשר תאווה נפשי. וטעם הדבר, מפני שהלב נמשך אחר המעשים, וכל אדם נפעל כפי פעולותיו בהתמדה. ומכאן למדו רבותינו שאין אדם עומד על דברי תורה אלא אם כן נכשל בהן תחילה. אמר רבי חנינא: לא מצאתי לגוף",
+      "tags": [
+        "boundary",
+        "truncation",
+        "hebrew"
+      ],
+      "notes": "Calibrated fixture: tokenizes to exactly 512 tokens INCLUDING the appended EOS, i.e. exactly at the max_tokens=512 limit in src/semantic/embedding.rs. Must NOT be truncated. Built from distinct Hebrew/Aramaic sentences plus single-token filler; the generator hard-fails if the count is not 512, so a tokenizer change is loud.",
+      "expect_total_tokens": 512
+    },
+    {
+      "id": "over_512_full",
+      "text": "אמר רבי חנינא: לא מצאתי לגוף טוב אלא שתיקה, וכל המרבה דברים מביא חטא. תנו רבנן: שלושה סימנים יש באומה זו, רחמנים, ביישנים וגומלי חסדים. המהלך בדרך ואין עמו לויה, יעסוק בתורה, שנאמר כי לוית חן הם לראשך. אין הברכה שורה אלא על דבר הסמוי מן העין, וכל המונה את הברכה ממעטה. כל המלמד את בן חברו תורה, מעלה עליו הכתוב כאילו ילדו, שנאמר ואלה תולדות אהרן ומשה. רבן גמליאל אומר: עשה לך רב, והסתלק מן הספק, ואל תרבה לעשר אומדות. הוי זהיר בקריאת שמע ובתפילה, וכשאתה מתפלל אל תעש תפילתך קבע אלא רחמים ותחנונים. מאי טעמא? דאמר קרא: ושמרתם ועשיתם, שמירה בלב ועשייה במעשה, ותרוייהו בעינן. איתמר: הלכה כרבי מאיר לחומרא וכרבי יוסי לקולא, ולא איפשיטא לן טעמא דמילתא. לפיכך צריך אדם לשקול דעותיו ולכוון אותן בדרך האמצעית, כדי שיהיה שלם בגופו. וכן החכם ניכר בחכמתו ובדעותיו, והוא מובדל בהן משאר העם בדיבורו ובמאכלו ובמשתהו. אמר ליה: ולא סבר לה מר דהא מתניתין רבי יהודה היא, ואנן קיימא לן כרבנן. כיצד? נותן צדקה לעני כפי מה שחסר לו, אם אין לו כסות מכסים אותו וכלי בית קונים לו. המקדש עצמו במותר לו נקרא קדוש, ואל יאמר אדם הרי התורה התירה ואעשה כל אשר תאווה נפשי. וטעם הדבר, מפני שהלב נמשך אחר המעשים, וכל אדם נפעל כפי פעולותיו בהתמדה. ומכאן למדו רבותינו שאין אדם עומד על דברי תורה אלא אם כן נכשל בהן תחילה. שאלו את הזקן: מפני מה זכיתי לאריכות ימים? אמר להם: מימי לא נסתכלתי בדמות אדם רשע. וכתב הרמבן שהמקרא הזה יסוד גדול בתורה, והמאמין בו בלב שלם זוכה לחיי העולם הבא. אמר רבי חנינא: לא מצאתי לגוף טוב אלא שתיקה, וכל המרבה דברים מביא חטא. תנו רבנן: שלושה סימנים יש באומה זו, רחמנים, ביישנים וגומלי חסדים. המהלך בדרך ואין עמו לויה, יעסוק בתורה, שנאמר כי לוית חן הם לראשך. אין הברכה שורה אלא על דבר הסמוי מן העין, וכל המונה את הברכה ממעטה. כל המלמד את בן חברו תורה, מעלה עליו הכתוב כאילו ילדו, שנאמר ואלה תולדות אהרן ומשה. רבן גמליאל אומר: עשה לך רב, והסתלק מן הספק, ואל תרבה לעשר אומדות. הוי זהיר בקריאת שמע ובתפילה, וכשאתה מתפלל אל תעש תפילתך קבע אלא רחמים ותחנונים. מאי טעמא? דאמר קרא: ושמרתם ועשיתם, שמירה בלב ועשייה במעשה, ותרוייהו בעינן. איתמר: הלכה כרבי מאיר לחומרא וכרבי יוסי לקולא, ולא איפשיטא לן טעמא דמילתא. לפיכך צריך אדם לשקול דעותיו ולכוון אותן בדרך האמצעית, כדי שיהיה שלם בגופו. וכן החכם ניכר בחכמתו ובדעותיו, והוא מובדל בהן משאר העם בדיבורו ובמאכלו ובמשתהו.",
+      "tags": [
+        "boundary",
+        "truncation",
+        "long",
+        "hebrew"
+      ],
+      "notes": "Calibrated fixture: 915 tokens including EOS, i.e. well over the 512 limit, embedded at FULL length with no truncation. Baseline for the two truncated variants below."
+    },
+    {
+      "id": "over_512_trunc_total_512",
+      "tags": [
+        "boundary",
+        "truncation",
+        "long",
+        "hebrew"
+      ],
+      "notes": "Same text as over_512_full, truncated so the embedded sequence is exactly 512 tokens (511 content tokens + EOS). This is the convention where max_tokens=512 counts EOS.",
+      "truncate": {
+        "tokens": 512,
+        "mode": "total"
+      },
+      "same_text_as": "over_512_full"
+    },
+    {
+      "id": "over_512_trunc_content_512",
+      "tags": [
+        "boundary",
+        "truncation",
+        "long",
+        "hebrew"
+      ],
+      "notes": "Same text as over_512_full, truncated to 512 content tokens then EOS appended, i.e. 513 tokens total. This is the convention where max_tokens=512 counts content only. Stage 4 asserts against whichever of the two variants matches the implemented convention -- having both means the test does not have to guess.",
+      "truncate": {
+        "tokens": 512,
+        "mode": "content"
+      },
+      "same_text_as": "over_512_full"
+    },
+    {
+      "id": "special_token_markup_literal",
+      "text": "בשולי הקובץ נשתמר הטקסט <|endoftext|> ואחריו <|im_start|>assistant<|im_end|> כפי שהופיע במקור הסרוק, ובסוף השורה <|endoftext|>",
+      "tags": [
+        "hebrew",
+        "special-token-markup",
+        "parse-special",
+        "mixed"
+      ],
+      "notes": "COVERS parse_special=false, which the header declares critical but which no other record exercises: without a record like this, a Rust implementation using parse_special=true passes the whole corpus. Contains three literal markers -- <|endoftext|> mid-text, an <|im_start|>...<|im_end|> pair, and a trailing <|endoftext|>. With parse_special=false all of it is ordinary characters: 51 content tokens + EOS = 52, and the EOS id 151643 appears ONLY as the final appended token. With parse_special=true the markers collapse to control ids, the sequence shrinks to 36 tokens, and 151643 appears INSIDE the content -- so the model attends over a different sequence entirely. Measured cos(false, true) = 0.9028, max abs component diff 6.02e-2: for this short line both the cosine and the per-component gate happen to catch the bug. See special_token_markup_in_paragraph for the case where they do not.",
+      "expect_total_tokens": 52
+    },
+    {
+      "id": "special_token_markup_in_paragraph",
+      "text": "שאלה: אדם שקיבל עליו תענית בחלום, ונזכר למחר שיש לו סעודת מצוה, כיצד יעשה? <|endoftext|> תשובה: דעת הראשונים חלוקה בזה. יש אומרים שתענית חלום דוחה את סעודת המצוה, מפני שהיא כנדר, ויש אומרים שסעודת מצוה עדיפה, שהרי אין אדם רשאי לצער עצמו במקום שמחה. ולמעשה נהגו שיתענה ביום אחר, ויפדה את תעניתו בצדקה, וישתתף בסעודה כמנהג המקום. וכל זה כשאין חשש איבה, אבל במקום שיש חשש איבה או ביטול כבוד הבריות, בודאי ישתתף.",
+      "tags": [
+        "hebrew",
+        "special-token-markup",
+        "parse-special",
+        "prose",
+        "medium-length"
+      ],
+      "notes": "The realistic form of the parse_special hazard: a production-length chunk (medium_paragraph's text) carrying ONE stray <|endoftext|> spliced in, as a scraped or model-generated source file would. 161 content tokens + EOS = 162 under parse_special=false; 158 under the wrong parse_special=true. Measured cos(false, true) = 0.99287 and max abs component diff 1.40e-2 -- so BOTH vector gates (cosine >= 0.99 and max component <= 0.03) are BLIND to it and only the exact token_ids assertion catches it. This record is the coverage reason parse_special is gated on token_ids rather than on any vector tolerance.",
+      "expect_total_tokens": 162
+    }
+  ],
+  "relations": [
+    {
+      "kind": "near_identical",
+      "a": "near_identical_a",
+      "b": "near_identical_b",
+      "note": "Differ by one word. Expect a very high cosine."
+    },
+    {
+      "kind": "unrelated",
+      "a": "unrelated_a",
+      "b": "unrelated_b",
+      "note": "Different domains, same language. Expect a clearly lower cosine."
+    },
+    {
+      "kind": "ordering",
+      "note": "The load-bearing assertion for Stage 4: cos(near_identical_a, near_identical_b) MUST exceed cos(unrelated_a, unrelated_b) by at least the margin recorded in the generated golden file. A subtly wrong forward pass can still emit plausible unit vectors that pass a per-vector cosine threshold; it cannot easily preserve this ordering."
+    },
+    {
+      "kind": "marks_sensitivity",
+      "a": "nikud_bereshit",
+      "b": "teamim_bereshit",
+      "note": "Same words, nikud only vs nikud+cantillation. Recorded for information; the generated file carries the measured cosine."
+    }
+  ]
+}
