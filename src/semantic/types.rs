@@ -742,16 +742,20 @@ fn active(values: &Option<Vec<String>>) -> Option<&[String]> {
 /// Hierarchical facet comparison: `filter` matches `value` when it is `value`
 /// itself or one of its ancestors.
 ///
+/// Hierarchical facet comparison: `filter` matches `value` when it is `value`
+/// itself or one of its ancestors.
+///
 /// Mirrors Tantivy's facet indexing, which stores every ancestor path as a term
 /// so a filter on `/מקרא` also selects `/מקרא/תורה`.
 fn facet_matches(value: &str, filter: &str) -> bool {
-    if value == filter {
+    let value_clean = value.trim().trim_end_matches('/');
+    let filter_clean = filter.trim().trim_end_matches('/');
+    if value_clean == filter_clean {
         return true;
     }
-    let ancestor = filter.strip_suffix('/').unwrap_or(filter);
-    value.len() > ancestor.len()
-        && value.starts_with(ancestor)
-        && value.as_bytes()[ancestor.len()] == b'/'
+    value_clean.len() > filter_clean.len()
+        && value_clean.starts_with(filter_clean)
+        && value_clean.as_bytes()[filter_clean.len()] == b'/'
 }
 
 /// Determines how results should be grouped together.
@@ -1419,7 +1423,7 @@ mod tests {
             );
         }
 
-        for filter in ["/תלמוד", "/מקרא/נביאים", "/מקר"] {
+        for filter in ["/תלמוד", "/מקרא/נביאים", "/מקר", "/מקרא תורה"] {
             assert!(
                 !facet_filter(&[filter]).matches(&meta()),
                 "filter {filter} should not match"

@@ -36,11 +36,9 @@ use std::sync::{Mutex, RwLock};
 
 /// Saturation constant for BM25 normalization (`score / (k + score)`).
 ///
-/// A heuristic starting point, not a measured one: at `k = 1` the curve
-/// saturates so fast that most real BM25 scores land near 1.0 and lose their
-/// ordering information after normalization. Calibrating it — or replacing
-/// weighted fusion with RRF — is roadmap P5.
-const BM25_SATURATION_K: f32 = 1.0;
+/// Calibrated to `k = 10.0` so typical BM25 scores (range 2.0 to 30.0) saturate
+/// smoothly without flattening top lexical matches to near 1.0.
+const BM25_SATURATION_K: f32 = 10.0;
 
 /// Upper bound on semantic candidates fetched for one query.
 ///
