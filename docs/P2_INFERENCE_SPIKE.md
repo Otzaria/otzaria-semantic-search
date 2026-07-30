@@ -286,9 +286,12 @@ The `golden-vectors` job closes that. It downloads the gated 396 MB GGUF with th
 `OTZARIA_HF_TOKEN` secret (an HF read token granted access to the manually gated repo),
 verifies its SHA-256 against `golden_vectors.json`'s header, and runs the tests with
 `--ignored`. It fails loudly rather than skipping when the secret is missing, so a green
-tick can never mean "the tokenizer was not checked". The download is cached under a key
-derived from the goldens file, so a model bump misses the cache instead of restoring the
-wrong 396 MB.
+tick can never mean "the tokenizer was not checked".
+
+The download is deliberately **not** cached. An Actions cache on `main` is readable by a
+workflow run from a fork's pull request, so caching the file would republish a
+`gated: manual` model to anyone who opens a PR — a licensing breach that needs no access
+to the token at all. Paying ~400 MB per run is the cheaper side of that trade.
 
 The HF file was confirmed byte-identical to the model the goldens were generated from
 (`x-linked-etag` == `model_sha256` == `a1a89520…b064`, 396,474,560 bytes), which also
@@ -301,9 +304,6 @@ repo — is automatic.
 
 **Open, and belonging to a later stage:**
 
-- `ChunkerConfig::max_chunk_chars` truncates text but is not part of index identity — only
-  `chunking_version` is. Changing it silently changes what was embedded. Same class as the
-  `max_tokens` gap fixed in this PR; P3 revisits chunking anyway.
 - The manifest records the *requested* token cap, not the backend's *effective* one. If a
   backend ever clamps 8192 down to its own limit, the manifest keeps 8192.
 - The output buffer still reserves logits this backend never reads (18.64 MiB per context).

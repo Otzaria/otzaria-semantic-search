@@ -35,12 +35,12 @@ pub struct SemanticConfig {
     /// persists it verbatim, so [`SemanticConfig::validate`] refuses both a spelling
     /// [`Pooling`] cannot parse and a strategy no backend implements.
     pub pooling: String,
-    /// Token cap requested per embedded text.
+    /// Token cap requested per embedded text, EOS included.
     ///
-    /// Not enforced yet — truncation belongs to the backend and none implements it.
-    /// Recorded in the manifest as part of the index's identity anyway, so once one
-    /// does, changing it is an incompatibility rather than a silent re-embed of half
-    /// a library under a different cap.
+    /// Enforced by the backend, which may clamp it to the model's trained context;
+    /// the *requested* value is what the manifest records as part of the index's
+    /// identity, so changing it is an incompatibility rather than a silent re-embed
+    /// of half a library under a different cap.
     pub embedding_max_tokens: usize,
     /// Quantization of the model weights (e.g. `"Q4"`); not the stored vectors'
     /// [`SemanticConfig::vector_precision`].
@@ -110,12 +110,14 @@ impl SemanticConfig {
         // of the index's identity, so correcting it later would report the *index*
         // as incompatible rather than the configuration that caused it.
         self.pooling_strategy()?;
-        if self.embedding_max_tokens == 0 {
-            return Err(SemanticSearchError::Config(
-                "embedding_max_tokens must be greater than zero; a zero cap truncates \
-                 every text to nothing"
-                    .to_string(),
-            ));
+        // 2, not 1: the cap counts the EOS the backend appends, so 1 leaves no room for
+        // content and every text embeds as a bare `[eos]`.
+        if self.embedding_max_tokens < 2 {
+            return Err(SemanticSearchError::Config(format!(
+                "embedding_max_tokens is {}; the cap includes the EOS token, so at least 2 \
+                 are needed for any content to reach the model",
+                self.embedding_max_tokens
+            )));
         }
         Ok(())
     }
@@ -429,7 +431,7 @@ impl SemanticEngine {
                 book.content_fingerprint,
                 line_fingerprint,
                 0,
-                self.config.chunking.chunking_version,
+                self.config.chunking.identity(),
                 self.config.normalization_version,
             );
             return Ok(IndexOutcome::Empty);
@@ -454,7 +456,7 @@ impl SemanticEngine {
             book.content_fingerprint,
             line_fingerprint,
             chunks.len() as u32,
-            self.config.chunking.chunking_version,
+            self.config.chunking.identity(),
             self.config.normalization_version,
         );
 
@@ -482,7 +484,7 @@ impl SemanticEngine {
         entry.line_fingerprint == line_fingerprint
             && entry.content_hash == book.content_fingerprint
             && entry.chunk_count as usize == chunk_count
-            && entry.chunking_version == self.config.chunking.chunking_version
+            && entry.chunking_identity == self.config.chunking.identity()
             && entry.normalization_version == self.config.normalization_version
             && self.store.book_vector_count(&book.source_book_key) == chunk_count
     }
@@ -608,7 +610,7 @@ impl SemanticEngine {
         let chunking_mismatch = self
             .incompatibilities
             .iter()
-            .any(|m| matches!(m, ManifestMismatch::ChunkingVersion { .. }));
+            .any(|m| matches!(m, ManifestMismatch::ChunkingIdentity { .. }));
         let normalization_mismatch = self
             .incompatibilities
             .iter()
@@ -623,7 +625,7 @@ impl SemanticEngine {
             let need = self.manifest.book_index_need(
                 book_key,
                 fingerprint,
-                self.config.chunking.chunking_version,
+                self.config.chunking.identity(),
                 self.config.normalization_version,
             );
 
@@ -747,7 +749,7 @@ fn manifest_config(
         model_quantization: config.model_quantization.clone(),
         vector_precision: config.vector_precision.clone(),
         vector_backend: crate::semantic::store::BACKEND_ID.to_string(),
-        chunking_version: config.chunking.chunking_version,
+        chunking_identity: config.chunking.identity(),
         normalization_version: config.normalization_version,
     }
 }
@@ -1784,29 +1786,62 @@ mod tests {
         assert!(engine.status().needs_full_reindex.is_none());
     }
 
+    /// Every knob, not just `chunking_version`: each one changes the text that was
+    /// embedded, so each must invalidate the index.
     #[test]
-    fn a_changed_chunking_version_forces_every_book_to_be_reindexed() {
-        let dir = TempDir::new("chunking_change");
-        let config = config_at(&dir);
+    fn a_changed_chunking_config_forces_every_book_to_be_reindexed() {
+        type Change = (&'static str, fn(&mut ChunkerConfig));
+        let changes: [Change; 5] = [
+            ("version", |c| c.chunking_version = 2),
+            ("max_chunk_chars", |c| c.max_chunk_chars = 256),
+            ("context_window_lines", |c| c.context_window_lines = 5),
+            ("min_meaningful_chars", |c| c.min_meaningful_chars = 40),
+            ("min_embeddable_chars", |c| c.min_embeddable_chars = 9),
+        ];
 
-        {
-            let mut engine = SemanticEngine::open(config.clone()).unwrap();
-            engine.index_book(&three_line_book()).unwrap();
+        for (name, change) in changes {
+            let dir = TempDir::new(&format!("chunking_change_{name}"));
+            let config = config_at(&dir);
+
+            {
+                let mut engine = SemanticEngine::open(config.clone()).unwrap();
+                engine.index_book(&three_line_book()).unwrap();
+            }
+
+            let mut changed = config.clone();
+            change(&mut changed.chunking);
+            let engine = SemanticEngine::open(changed).unwrap();
+
+            let mut tantivy = HashMap::new();
+            tantivy.insert("otzaria/tanach/genesis.txt".to_string(), 111u64);
+            let diff = engine.diff_against_tantivy(&tantivy);
+
+            assert!(diff.chunking_mismatch, "changing {name} must be detected");
+            assert!(
+                !diff.model_mismatch,
+                "{name} does not change the vector space"
+            );
+            assert!(diff.needs_full_rebuild(), "changing {name} needs a rebuild");
+            assert!(!diff.is_up_to_date());
+            assert_eq!(diff.books_to_index(), 1, "changing {name}");
         }
+    }
 
-        let mut bumped = config;
-        bumped.chunking.chunking_version = 2;
-        let engine = SemanticEngine::open(bumped).unwrap();
-
-        let mut tantivy = HashMap::new();
-        tantivy.insert("otzaria/tanach/genesis.txt".to_string(), 111u64);
-        let diff = engine.diff_against_tantivy(&tantivy);
-
-        assert!(diff.chunking_mismatch);
-        assert!(!diff.model_mismatch);
-        assert!(diff.needs_full_rebuild());
-        assert!(!diff.is_up_to_date());
-        assert_eq!(diff.books_to_index(), 1);
+    #[test]
+    fn a_max_token_cap_of_one_is_refused_because_it_leaves_no_room_for_content() {
+        let dir = TempDir::new("max_tokens_one");
+        for cap in [0, 1] {
+            let mut config = config_at(&dir);
+            config.embedding_max_tokens = cap;
+            let error = config
+                .validate()
+                .expect_err("a cap below 2 embeds only an EOS");
+            assert!(
+                matches!(&error, SemanticSearchError::Config(m) if m.contains("embedding_max_tokens")),
+                "cap {cap}: {error}"
+            );
+            assert!(SemanticEngine::open(config).is_err(), "cap {cap}");
+        }
     }
 
     #[test]

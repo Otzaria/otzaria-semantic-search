@@ -147,7 +147,8 @@ otzaria-semantic-search/
 
 * [`src/semantic/chunker.rs`](../src/semantic/chunker.rs)
   - `Chunker` & `ChunkerConfig` — מנגנון Chunker מעוגן (Anchored Chunking) המוסיף הקשר משורות סמוכות באותו סעיף לשורות קצרות.
-  - `compute_semantic_id()` — יצירת מזהה SHA256 hex יציב לפי מפתח ספר, שורה וגרסת חלוקה.
+  - `compute_semantic_id()` — יצירת מזהה SHA256 hex יציב לפי מפתח ספר, שורה וטביעת האצבע של ה־ChunkerConfig.
+  - `ChunkerConfig::identity()` — טביעת אצבע u64 של כל שדות החלוקה; נשמרת ב־manifest כזהות האינדקס.
   - `truncate_to_chars()` — חיתוך UTF-8 יעיל במעבר יחיד.
 
 * [`src/semantic/embedding.rs`](../src/semantic/embedding.rs)

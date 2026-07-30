@@ -10,6 +10,10 @@ on:
   # secrets — they land in the event payload and are not redacted.
   workflow_dispatch:
 
+# Read-only: nothing here writes to the repo, and the golden job holds a secret.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -23,15 +27,15 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Check Formatting
         run: cargo fmt --check
@@ -79,16 +83,16 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
 
       # Keyed separately: this cache holds the cmake build of llama.cpp.
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: llama-backend
 
@@ -130,52 +134,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: llama-backend
 
-      # Keyed on the SHA-256 the goldens demand, so a model bump misses the cache
-      # instead of restoring the wrong 396 MB.
-      - name: Cache the model
-        id: model-cache
-        uses: actions/cache@v4
-        with:
-          path: model.gguf
-          key: gguf-${{ hashFiles('tests/data/golden_vectors.json') }}
-
-      # The repo is `gated: manual`, so the download needs an HF token that has been
-      # granted access. The URL is public; only the token is secret, and it reaches
-      # curl through a config on stdin rather than argv — no process listing, no `set -x`.
+      # Downloaded fresh every run, deliberately NOT cached. An Actions cache on `main`
+      # is readable by a workflow run from a fork's pull request, so caching the file
+      # would republish a `gated: manual` model to anyone who opens a PR.
+      #
+      # The URL is public; only the token is secret, and it reaches curl through a
+      # config on stdin rather than argv — no process listing, no `set -x`.
       - name: Fetch the model
         id: model
         env:
           HF_TOKEN: ${{ secrets.OTZARIA_HF_TOKEN }}
         run: |
-          if [ ! -f model.gguf ]; then
-            if [ -z "${HF_TOKEN:-}" ]; then
-              echo "::error::The OTZARIA_HF_TOKEN secret is not set. The golden gate cannot run, and is NOT being reported as passing."
-              exit 1
-            fi
-            printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
-              curl -fSL --output model.gguf -K - \
-                https://huggingface.co/EMD123/Otzaria-Embedding-V1-Flash-0.6B-GGUF/resolve/main/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The golden gate cannot run, and is NOT being reported as passing."
+            exit 1
           fi
-          # Verified even on a cache hit: it is the only check that a restored 396 MB
-          # is the model the goldens describe, and a mismatch must read as "wrong
-          # model" rather than as confusing vector diffs.
+          printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+            curl -fSL --output model.gguf -K - \
+              https://huggingface.co/EMD123/Otzaria-Embedding-V1-Flash-0.6B-GGUF/resolve/main/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
+          # A mismatch must read as "wrong model" rather than as confusing vector diffs.
           expected=$(python3 -c "import json;print(json.load(open('tests/data/golden_vectors.json'))['header']['model_sha256'])")
           actual=$(sha256sum model.gguf | cut -d' ' -f1)
           if [ "$expected" != "$actual" ]; then
             echo "::error::Model SHA-256 mismatch. Goldens expect $expected, got $actual."
-            # Removed so the post-job cache save cannot persist a bad 396 MB under
-            # this key and make every later run fail the same way.
-            rm -f model.gguf
             exit 1
           fi
           echo "path=$(pwd)/model.gguf" >> "$GITHUB_OUTPUT"

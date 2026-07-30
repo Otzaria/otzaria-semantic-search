@@ -103,11 +103,16 @@ impl EmbeddingConfig {
                     .to_string(),
             });
         }
-        if self.max_tokens == 0 {
+        // 2, not 1: the cap counts the appended EOS, so a cap of 1 leaves no budget
+        // for content and embeds every text as a bare `[eos]` — a plausible-looking
+        // vector carrying nothing of the input.
+        if self.max_tokens < 2 {
             return Err(EmbeddingError::LoadFailed {
-                reason: "max_tokens is 0; every input would truncate to nothing and \
-                         embed as a directionless vector"
-                    .to_string(),
+                reason: format!(
+                    "max_tokens is {}; the cap includes the EOS token, so at least 2 are \
+                     needed for any content to reach the model",
+                    self.max_tokens
+                ),
             });
         }
         ensure_pooling_is_implemented(self.pooling)?;

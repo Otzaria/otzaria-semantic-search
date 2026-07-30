@@ -24,6 +24,31 @@ pub struct ChunkerConfig {
     pub chunking_version: u32,
 }
 
+impl ChunkerConfig {
+    /// Identity of this chunking configuration, recorded in the manifest.
+    ///
+    /// Every field is folded in, not just `chunking_version`: `max_chunk_chars`,
+    /// `context_window_lines` and both minimums all change the text that was embedded,
+    /// so a change to any of them has to invalidate the index the same way a version
+    /// bump does. `chunking_version` remains the manual lever for a change in the
+    /// algorithm rather than in these numbers.
+    pub fn identity(&self) -> u64 {
+        let mut hasher = Sha256::new();
+        // `as u64`, so a 32-bit build derives the same identity as a 64-bit one.
+        for field in [
+            self.min_meaningful_chars as u64,
+            self.context_window_lines as u64,
+            self.max_chunk_chars as u64,
+            self.min_embeddable_chars as u64,
+            u64::from(self.chunking_version),
+        ] {
+            hasher.update(field.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 yields 32 bytes"))
+    }
+}
+
 impl Default for ChunkerConfig {
     fn default() -> Self {
         Self {
@@ -49,6 +74,7 @@ impl Chunker {
         let mut chunks = Vec::with_capacity(book.lines.len());
         // Built once per book, not per line: every chunk carries the same set.
         let facets = book.all_facets();
+        let chunking_identity = self.config.identity();
 
         for (i, line) in book.lines.iter().enumerate() {
             // Trimmed, so a line made of spaces or a lone newline is skipped
@@ -73,11 +99,8 @@ impl Chunker {
                 continue;
             }
             let chunk_hash = compute_chunk_hash(&truncated_text);
-            let semantic_id = compute_semantic_id(
-                &book.source_book_key,
-                line.line_id,
-                self.config.chunking_version,
-            );
+            let semantic_id =
+                compute_semantic_id(&book.source_book_key, line.line_id, chunking_identity);
 
             chunks.push(SemanticChunk {
                 semantic_id: semantic_id.clone(),
@@ -136,14 +159,14 @@ impl Chunker {
     }
 }
 
-pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_version: u32) -> String {
+pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_identity: u64) -> String {
     use std::fmt::Write;
     let mut hasher = Sha256::new();
     hasher.update(source_book_key.as_bytes());
     hasher.update(b":");
     hasher.update(line_id.to_string().as_bytes());
     hasher.update(b":");
-    hasher.update(chunking_version.to_string().as_bytes());
+    hasher.update(chunking_identity.to_string().as_bytes());
 
     let result = hasher.finalize();
     let mut hex = String::with_capacity(32);

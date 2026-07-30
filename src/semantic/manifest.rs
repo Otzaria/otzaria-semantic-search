@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 /// Current manifest format version; bump when the schema changes. An older manifest
 /// is refused by [`SemanticManifest::load`] rather than upgraded: filling in a field
 /// it never recorded would be a guess that reads as agreement.
-const MANIFEST_FORMAT_VERSION: u32 = 4;
+const MANIFEST_FORMAT_VERSION: u32 = 5;
 
 const MANIFEST_FILENAME: &str = "semantic_manifest.json";
 
@@ -64,8 +64,11 @@ pub struct SemanticManifest {
     pub vector_backend: String,
 
     // ── Algorithm versions ──
-    /// Chunking algorithm version. Increment when chunking logic changes.
-    pub chunking_version: u32,
+    /// Identity of the whole [`ChunkerConfig`](crate::semantic::chunker::ChunkerConfig),
+    /// not only its `chunking_version`: every knob in it changes the text that was
+    /// embedded. See
+    /// [`ChunkerConfig::identity`](crate::semantic::chunker::ChunkerConfig::identity).
+    pub chunking_identity: u64,
     /// Semantic normalization version. Increment when text preprocessing changes.
     pub normalization_version: u32,
 
@@ -107,7 +110,7 @@ pub struct BookManifestEntry {
     pub chunk_count: u32,
     /// When this book was last indexed (Unix timestamp).
     pub indexed_at: u64,
-    pub chunking_version: u32,
+    pub chunking_identity: u64,
     pub normalization_version: u32,
 }
 
@@ -128,7 +131,7 @@ pub struct ManifestConfig {
     pub model_quantization: String,
     pub vector_precision: String,
     pub vector_backend: String,
-    pub chunking_version: u32,
+    pub chunking_identity: u64,
     pub normalization_version: u32,
 }
 
@@ -146,7 +149,7 @@ impl SemanticManifest {
             model_quantization: config.model_quantization.clone(),
             vector_precision: config.vector_precision.clone(),
             vector_backend: config.vector_backend.clone(),
-            chunking_version: config.chunking_version,
+            chunking_identity: config.chunking_identity,
             normalization_version: config.normalization_version,
             created_at: now,
             updated_at: now,
@@ -455,10 +458,10 @@ impl SemanticManifest {
             });
         }
 
-        if self.chunking_version != config.chunking_version {
-            mismatches.push(ManifestMismatch::ChunkingVersion {
-                manifest: self.chunking_version,
-                config: config.chunking_version,
+        if self.chunking_identity != config.chunking_identity {
+            mismatches.push(ManifestMismatch::ChunkingIdentity {
+                manifest: self.chunking_identity,
+                config: config.chunking_identity,
             });
         }
 
@@ -492,14 +495,14 @@ impl SemanticManifest {
         &self,
         source_book_key: &str,
         fingerprint: ContentFingerprint,
-        chunking_version: u32,
+        chunking_identity: u64,
         normalization_version: u32,
     ) -> BookIndexNeed {
         let Some(entry) = self.books.get(source_book_key) else {
             return BookIndexNeed::Missing;
         };
 
-        if entry.chunking_version != chunking_version
+        if entry.chunking_identity != chunking_identity
             || entry.normalization_version != normalization_version
         {
             return BookIndexNeed::Changed;
@@ -531,13 +534,13 @@ impl SemanticManifest {
         &self,
         source_book_key: &str,
         fingerprint: ContentFingerprint,
-        chunking_version: u32,
+        chunking_identity: u64,
         normalization_version: u32,
     ) -> bool {
         self.book_index_need(
             source_book_key,
             fingerprint,
-            chunking_version,
+            chunking_identity,
             normalization_version,
         )
         .needs_work()
@@ -555,7 +558,7 @@ impl SemanticManifest {
         content_hash: u64,
         line_fingerprint: u64,
         chunk_count: u32,
-        chunking_version: u32,
+        chunking_identity: u64,
         normalization_version: u32,
     ) {
         let entry = BookManifestEntry {
@@ -564,7 +567,7 @@ impl SemanticManifest {
             line_fingerprint,
             chunk_count,
             indexed_at: current_unix_timestamp(),
-            chunking_version,
+            chunking_identity,
             normalization_version,
         };
         self.books.insert(source_book_key, entry);
@@ -659,7 +662,7 @@ pub enum ManifestMismatch {
     ModelQuantization { manifest: String, config: String },
     VectorPrecision { manifest: String, config: String },
     VectorBackend { manifest: String, config: String },
-    ChunkingVersion { manifest: u32, config: u32 },
+    ChunkingIdentity { manifest: u64, config: u64 },
     NormalizationVersion { manifest: u32, config: u32 },
 }
 
@@ -731,8 +734,8 @@ impl std::fmt::Display for ManifestMismatch {
                     "Vector backend: manifest='{manifest}', config='{config}'"
                 )
             }
-            Self::ChunkingVersion { manifest, config } => {
-                write!(f, "Chunking version: manifest={manifest}, config={config}")
+            Self::ChunkingIdentity { manifest, config } => {
+                write!(f, "Chunking config: manifest={manifest}, config={config}")
             }
             Self::NormalizationVersion { manifest, config } => {
                 write!(
@@ -871,7 +874,7 @@ mod tests {
             model_quantization: "Q4".to_string(),
             vector_precision: "f32".to_string(),
             vector_backend: "in-memory-v1".to_string(),
-            chunking_version: 1,
+            chunking_identity: 1,
             normalization_version: 1,
         }
     }
@@ -909,7 +912,7 @@ mod tests {
         assert_eq!(manifest.embedding_dim, 1024);
         assert_eq!(manifest.pooling, "last-token");
         assert_eq!(manifest.embedding_max_tokens, 512);
-        assert_eq!(manifest.chunking_version, 1);
+        assert_eq!(manifest.chunking_identity, 1);
         assert_eq!(manifest.vector_backend, "in-memory-v1");
         assert!(manifest.books.is_empty());
     }
@@ -1056,7 +1059,7 @@ mod tests {
         let changed = ManifestConfig {
             embedding_model_id: "other".to_string(),
             embedding_dim: 256,
-            chunking_version: 9,
+            chunking_identity: 9,
             normalization_version: 4,
             ..config
         };
@@ -1073,7 +1076,7 @@ mod tests {
 
         for changed in [
             ManifestConfig {
-                chunking_version: 2,
+                chunking_identity: 2,
                 ..config.clone()
             },
             ManifestConfig {

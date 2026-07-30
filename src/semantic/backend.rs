@@ -261,7 +261,8 @@ fn describe_implemented_poolings() -> String {
 ///
 /// `config` is validated here too: this function is public and reachable without
 /// [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load),
-/// so a direct caller could otherwise get a backend built for `max_tokens: 0`.
+/// so a direct caller could otherwise get a backend built for `max_tokens: 1`,
+/// which embeds every text as a bare EOS.
 ///
 /// # Errors
 ///
@@ -604,6 +605,14 @@ mod tests {
                 "a zero token cap",
                 EmbeddingConfig {
                     max_tokens: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                // The cap counts the EOS, so 1 leaves no content budget at all.
+                "a token cap of one",
+                EmbeddingConfig {
+                    max_tokens: 1,
                     ..Default::default()
                 },
             ),
