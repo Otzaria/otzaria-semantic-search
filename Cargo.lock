@@ -243,8 +243,6 @@ dependencies = [
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.153"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a86ff114bb5ec602625776ec11d80d6ac8d113c74460e6a17bd44a6fedff15ef"
 dependencies = [
  "encoding_rs",
  "enumflags2",

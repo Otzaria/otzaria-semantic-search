@@ -81,7 +81,13 @@ sha2 = "0.10"
 # `n_gpu_layers = 0` keeps the weights on the CPU, not the backend out of the graph.
 # Consequence: CPU-versus-Metal agreement is cosine 0.99491, so this platform and a
 # CPU-only Android build may not produce identical vectors.
+#
+# Vendored: upstream's own `llama-cpp-sys-2` declaration omits
+# `default-features = false`, so sys's `default = ["common"]` came back on
+# regardless of what is set here, and the unlinkable `cpp-httplib` dependency
+# it drags in breaks the Apple app link. See vendor/llama-cpp-2/README-VENDORED.md.
 [target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-2]
+path = "vendor/llama-cpp-2"
 version = "=0.1.153"
 default-features = false
 features = ["android-shared-stdcxx"]
