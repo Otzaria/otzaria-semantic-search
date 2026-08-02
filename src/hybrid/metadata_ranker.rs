@@ -71,7 +71,13 @@ impl MetadataRanker {
     fn compute_primary_source_bonus(&self, file_path: &str) -> f32 {
         let lower_path = file_path.to_lowercase();
         let primary_keywords = [
-            "תנ\"ך", "תורה", "משנה", "תלמוד", "tanach", "mishna", "talmud",
+            "תנ\"ך",
+            "תורה",
+            "משנה",
+            "תלמוד",
+            "tanach",
+            "mishna",
+            "talmud",
         ];
 
         for keyword in primary_keywords.iter() {
@@ -111,7 +117,7 @@ mod tests {
     #[test]
     fn test_primary_source_detection() {
         let ranker = MetadataRanker::new(MetadataRankingConfig::default());
-        
+
         let signal = ranker.compute_signal("C:/library/תלמוד/בבלי/ברכות.txt", &[], &[]);
         assert_eq!(signal.primary_source_bonus, 0.03);
 
@@ -122,10 +128,10 @@ mod tests {
     #[test]
     fn test_category_matching() {
         let ranker = MetadataRanker::new(MetadataRankingConfig::default());
-        
+
         let facets = vec!["halacha".to_string(), "rambam".to_string()];
         let query_facets = vec!["halacha".to_string()];
-        
+
         let signal = ranker.compute_signal("path", &facets, &query_facets);
         assert_eq!(signal.category_match_bonus, 0.02);
 
@@ -139,8 +145,9 @@ mod tests {
         let mut config = MetadataRankingConfig::default();
         config.enabled = false;
         let ranker = MetadataRanker::new(config);
-        
-        let signal = ranker.compute_signal("תלמוד", &["halacha".to_string()], &["halacha".to_string()]);
+
+        let signal =
+            ranker.compute_signal("תלמוד", &["halacha".to_string()], &["halacha".to_string()]);
         assert_eq!(signal.total, 0.0);
         assert_eq!(signal.primary_source_bonus, 0.0);
     }

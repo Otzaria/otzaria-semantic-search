@@ -64,7 +64,7 @@ impl TelemetryCollector {
     /// Records metrics from a single search execution.
     pub fn record_search(&self, telemetry: &SearchTelemetry) {
         self.total_searches.fetch_add(1, Ordering::Relaxed);
-        
+
         if telemetry.cache_hit {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -76,7 +76,8 @@ impl TelemetryCollector {
 
         // Convert latency to microseconds to retain precision in total
         let latency_us = telemetry.latency_ms.saturating_mul(1000);
-        self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.total_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
 
         // Update strategy counts
         if let Ok(mut counts) = self.strategy_counts.lock() {
@@ -105,7 +106,9 @@ impl TelemetryCollector {
             0.0
         };
 
-        let strategy_distribution = self.strategy_counts.lock()
+        let strategy_distribution = self
+            .strategy_counts
+            .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
 
@@ -127,7 +130,7 @@ impl TelemetryCollector {
         self.cache_misses.store(0, Ordering::Relaxed);
         self.embedding_calls.store(0, Ordering::Relaxed);
         self.total_latency_us.store(0, Ordering::Relaxed);
-        
+
         if let Ok(mut counts) = self.strategy_counts.lock() {
             counts.clear();
         }
@@ -150,7 +153,11 @@ mod tests {
             fused_candidates: 10,
             cache_hit,
             latency_ms,
-            embedding_latency_ms: if cache_hit { None } else { Some(latency_ms / 2) },
+            embedding_latency_ms: if cache_hit {
+                None
+            } else {
+                Some(latency_ms / 2)
+            },
             fusion_latency_ms: 1,
             confidence: None,
             profile: "Balanced".into(),
@@ -160,7 +167,7 @@ mod tests {
     #[test]
     fn test_record_and_snapshot() {
         let collector = TelemetryCollector::new();
-        
+
         collector.record_search(&make_telemetry(false, 100, "RRF"));
         collector.record_search(&make_telemetry(true, 10, "Weighted"));
         collector.record_search(&make_telemetry(true, 10, "Weighted"));
@@ -171,10 +178,10 @@ mod tests {
         assert_eq!(snapshot.cache_misses, 1);
         assert_eq!(snapshot.embedding_calls, 1);
         assert_eq!(snapshot.avg_latency_ms, 40.0); // (100 + 10 + 10) / 3
-        
+
         // Cache hit rate = 2 / 3
         assert!((snapshot.cache_hit_rate - 0.666).abs() < 0.01);
-        
+
         assert_eq!(snapshot.strategy_distribution.get("RRF"), Some(&1));
         assert_eq!(snapshot.strategy_distribution.get("Weighted"), Some(&2));
     }
@@ -183,10 +190,10 @@ mod tests {
     fn test_reset() {
         let collector = TelemetryCollector::new();
         collector.record_search(&make_telemetry(false, 100, "RRF"));
-        
+
         collector.reset();
         let snapshot = collector.snapshot();
-        
+
         assert_eq!(snapshot.total_searches, 0);
         assert_eq!(snapshot.cache_hits, 0);
         assert_eq!(snapshot.cache_misses, 0);

@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
 
 /// Cache statistics for the query cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ impl QueryCache {
             // If invalid due to generation or TTL, we can remove it
             entries.remove(&key);
         }
-        
+
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
@@ -72,10 +72,7 @@ impl QueryCache {
 
         if entries.len() >= self.capacity {
             // Simple eviction: remove the oldest entry
-            if let Some((&oldest_key, _)) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.inserted)
-            {
+            if let Some((&oldest_key, _)) = entries.iter().min_by_key(|(_, entry)| entry.inserted) {
                 entries.remove(&oldest_key);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
             }
@@ -106,7 +103,7 @@ impl QueryCache {
         offset: usize,
     ) -> u64 {
         let mut hash: u64 = 0xcbf29ce484222325;
-        
+
         let update_hash = |h: &mut u64, bytes: &[u8]| {
             for &byte in bytes {
                 *h ^= byte as u64;
@@ -146,10 +143,10 @@ mod tests {
     fn test_insert_and_get() {
         let cache = QueryCache::new(10, Duration::from_secs(60));
         let key = QueryCache::compute_key("query", 123, "Hybrid", "None", 10, 0);
-        
+
         cache.insert(key, "{}".to_string());
         assert_eq!(cache.get(key), Some("{}".to_string()));
-        
+
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
@@ -160,7 +157,7 @@ mod tests {
         let cache = QueryCache::new(10, Duration::from_millis(10));
         cache.insert(1, "{}".to_string());
         thread::sleep(Duration::from_millis(20));
-        
+
         assert_eq!(cache.get(1), None);
     }
 
@@ -168,7 +165,7 @@ mod tests {
     fn test_generation_invalidation() {
         let cache = QueryCache::new(10, Duration::from_secs(60));
         cache.insert(1, "{}".to_string());
-        
+
         assert_eq!(cache.get(1), Some("{}".to_string()));
         cache.invalidate();
         assert_eq!(cache.get(1), None); // Old generation
@@ -177,13 +174,13 @@ mod tests {
     #[test]
     fn test_capacity_eviction() {
         let cache = QueryCache::new(2, Duration::from_secs(60));
-        
+
         cache.insert(1, "1".to_string());
         thread::sleep(Duration::from_millis(5));
         cache.insert(2, "2".to_string());
         thread::sleep(Duration::from_millis(5));
         cache.insert(3, "3".to_string()); // Should evict 1
-        
+
         assert_eq!(cache.get(1), None);
         assert_eq!(cache.get(2), Some("2".to_string()));
         assert_eq!(cache.get(3), Some("3".to_string()));

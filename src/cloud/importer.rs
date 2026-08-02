@@ -28,25 +28,31 @@ impl IndexImporter {
 
     pub fn import(&self, current_version: &IndexVersion) -> io::Result<ImportResult> {
         let start_time = Instant::now();
-        
+
         let package = IndexPackage::read(&self.config.source_path)?;
-        
+
         if self.config.verify_checksums {
             if !package.verify_checksums(&self.config.source_path)? {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum verification failed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Checksum verification failed",
+                ));
             }
         }
-        
+
         if !package.manifest.version.is_compatible(current_version) {
-            let diffs = package.manifest.version.describe_incompatibilities(current_version);
+            let diffs = package
+                .manifest
+                .version
+                .describe_incompatibilities(current_version);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Incompatible index version: {:?}", diffs)
+                format!("Incompatible index version: {:?}", diffs),
             ));
         }
-        
+
         fs::create_dir_all(&self.config.target_store_path)?;
-        
+
         for filename in package.checksums.keys() {
             let src = self.config.source_path.join(filename);
             let dest = self.config.target_store_path.join(filename);
@@ -54,10 +60,10 @@ impl IndexImporter {
                 fs::copy(&src, &dest)?;
             }
         }
-        
+
         let manifest_dest = self.config.target_store_path.join("manifest.json");
         fs::write(manifest_dest, package.manifest_json)?;
-        
+
         Ok(ImportResult {
             books_imported: package.manifest.book_count,
             vectors_imported: package.manifest.vector_count,
@@ -114,7 +120,7 @@ mod tests {
         let dir = TempDir::new("compat");
         let source_path = dir.path().join("source");
         let target_path = dir.path().join("target");
-        
+
         let manifest = PackageManifest {
             version: sample_version(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
@@ -123,31 +129,34 @@ mod tests {
             total_size_bytes: 500,
         };
         let manifest_json = serde_json::to_string(&manifest).unwrap();
-        
+
         let mut checksums = HashMap::new();
         // Just mock a file
         let bin_path = source_path.join("vectors.bin");
         fs::create_dir_all(&source_path).unwrap();
         fs::write(&bin_path, b"data").unwrap();
-        
+
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"data");
-        checksums.insert("vectors.bin".to_string(), format!("{:x}", hasher.finalize()));
-        
+        checksums.insert(
+            "vectors.bin".to_string(),
+            format!("{:x}", hasher.finalize()),
+        );
+
         let pkg = IndexPackage {
             manifest,
             manifest_json,
             checksums,
         };
         IndexPackage::write(&source_path, &pkg).unwrap();
-        
+
         let importer = IndexImporter::new(ImportConfig {
             source_path,
             target_store_path: target_path.clone(),
             verify_checksums: true,
         });
-        
+
         let res = importer.import(&sample_version()).unwrap();
         assert_eq!(res.books_imported, 5);
         assert!(target_path.join("vectors.bin").exists());
@@ -158,10 +167,10 @@ mod tests {
     fn test_import_incompatible() {
         let dir = TempDir::new("incompat");
         let source_path = dir.path().join("source");
-        
+
         let mut version = sample_version();
         version.embedding_dim = 256;
-        
+
         let manifest = PackageManifest {
             version,
             created_at: "2024-01-01T00:00:00Z".to_string(),
@@ -170,22 +179,25 @@ mod tests {
             total_size_bytes: 500,
         };
         let manifest_json = serde_json::to_string(&manifest).unwrap();
-        
+
         let pkg = IndexPackage {
             manifest,
             manifest_json,
             checksums: HashMap::new(),
         };
         IndexPackage::write(&source_path, &pkg).unwrap();
-        
+
         let importer = IndexImporter::new(ImportConfig {
             source_path,
             target_store_path: dir.path().join("target"),
             verify_checksums: false,
         });
-        
+
         let res = importer.import(&sample_version());
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Incompatible index version"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Incompatible index version"));
     }
 }

@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Instant;
-use serde::{Deserialize, Serialize};
 
 /// Cache statistics for the embedding cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,12 +54,11 @@ impl EmbeddingCache {
     /// Insert a new embedding vector into the cache.
     pub fn insert(&self, text_hash: u64, vector: Vec<f32>) {
         let mut write_guard = self.entries.write().unwrap();
-        
+
         if write_guard.len() >= self.max_entries {
             // Evict the oldest entry (approximation of LRU via oldest insertion time)
-            if let Some((&oldest_key, _)) = write_guard
-                .iter()
-                .min_by_key(|(_, entry)| entry.inserted)
+            if let Some((&oldest_key, _)) =
+                write_guard.iter().min_by_key(|(_, entry)| entry.inserted)
             {
                 write_guard.remove(&oldest_key);
             }
@@ -112,10 +111,10 @@ mod tests {
         let cache = EmbeddingCache::new(10);
         let hash = compute_text_hash("hello world");
         let vec = vec![0.1, 0.2, 0.3];
-        
+
         cache.insert(hash, vec.clone());
         assert_eq!(cache.get(hash), Some(vec));
-        
+
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
@@ -124,13 +123,13 @@ mod tests {
     #[test]
     fn test_capacity_eviction() {
         let cache = EmbeddingCache::new(2);
-        
+
         cache.insert(1, vec![1.0]);
         thread::sleep(std::time::Duration::from_millis(5));
         cache.insert(2, vec![2.0]);
         thread::sleep(std::time::Duration::from_millis(5));
         cache.insert(3, vec![3.0]); // Should evict 1
-        
+
         assert_eq!(cache.get(1), None);
         assert_eq!(cache.get(2), Some(vec![2.0]));
         assert_eq!(cache.get(3), Some(vec![3.0]));
@@ -141,7 +140,7 @@ mod tests {
         let cache = EmbeddingCache::new(10);
         cache.insert(1, vec![1.0]);
         cache.insert(2, vec![2.0]);
-        
+
         assert_eq!(cache.stats().size, 2);
         cache.invalidate_all();
         assert_eq!(cache.stats().size, 0);
@@ -151,7 +150,7 @@ mod tests {
     fn test_concurrent_access() {
         let cache = std::sync::Arc::new(EmbeddingCache::new(1000));
         let mut handles = vec![];
-        
+
         for i in 0..10 {
             let cache_clone = cache.clone();
             handles.push(thread::spawn(move || {
@@ -161,11 +160,11 @@ mod tests {
                 }
             }));
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         let stats = cache.stats();
         assert_eq!(stats.size, 1000);
         assert_eq!(stats.hits, 1000);

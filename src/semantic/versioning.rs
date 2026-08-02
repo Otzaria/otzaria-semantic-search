@@ -25,31 +25,52 @@ impl IndexVersion {
     pub fn describe_incompatibilities(&self, other: &IndexVersion) -> Vec<String> {
         let mut diffs = Vec::new();
         if self.schema_version != other.schema_version {
-            diffs.push(format!("schema_version: {} vs {}", self.schema_version, other.schema_version));
+            diffs.push(format!(
+                "schema_version: {} vs {}",
+                self.schema_version, other.schema_version
+            ));
         }
         if self.model_id != other.model_id {
             diffs.push(format!("model_id: {} vs {}", self.model_id, other.model_id));
         }
         if self.embedding_dim != other.embedding_dim {
-            diffs.push(format!("embedding_dim: {} vs {}", self.embedding_dim, other.embedding_dim));
+            diffs.push(format!(
+                "embedding_dim: {} vs {}",
+                self.embedding_dim, other.embedding_dim
+            ));
         }
         if self.pooling != other.pooling {
             diffs.push(format!("pooling: {} vs {}", self.pooling, other.pooling));
         }
         if self.max_tokens != other.max_tokens {
-            diffs.push(format!("max_tokens: {} vs {}", self.max_tokens, other.max_tokens));
+            diffs.push(format!(
+                "max_tokens: {} vs {}",
+                self.max_tokens, other.max_tokens
+            ));
         }
         if self.normalization_version != other.normalization_version {
-            diffs.push(format!("normalization_version: {} vs {}", self.normalization_version, other.normalization_version));
+            diffs.push(format!(
+                "normalization_version: {} vs {}",
+                self.normalization_version, other.normalization_version
+            ));
         }
         if self.chunking_identity != other.chunking_identity {
-            diffs.push(format!("chunking_identity: {} vs {}", self.chunking_identity, other.chunking_identity));
+            diffs.push(format!(
+                "chunking_identity: {} vs {}",
+                self.chunking_identity, other.chunking_identity
+            ));
         }
         if self.store_backend != other.store_backend {
-            diffs.push(format!("store_backend: {} vs {}", self.store_backend, other.store_backend));
+            diffs.push(format!(
+                "store_backend: {} vs {}",
+                self.store_backend, other.store_backend
+            ));
         }
         if self.vector_precision != other.vector_precision {
-            diffs.push(format!("vector_precision: {} vs {}", self.vector_precision, other.vector_precision));
+            diffs.push(format!(
+                "vector_precision: {} vs {}",
+                self.vector_precision, other.vector_precision
+            ));
         }
         diffs
     }

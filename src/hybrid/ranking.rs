@@ -66,7 +66,7 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
     let mut hebrew_chars = 0;
     let mut latin_chars = 0;
     let mut rare_tokens = Vec::new();
-    
+
     for t in &tokens {
         let char_count = t.chars().count();
         for c in t.chars() {
@@ -80,7 +80,7 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
             rare_tokens.push(t.to_string());
         }
     }
-    
+
     let detected_language = if hebrew_chars > 0 && latin_chars == 0 {
         "hebrew".to_string()
     } else if latin_chars > 0 && hebrew_chars == 0 {
@@ -90,7 +90,7 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
     } else {
         "other".to_string()
     };
-    
+
     let mut quoted_phrases = Vec::new();
     let mut in_quotes = false;
     let mut current_phrase = String::new();
@@ -300,7 +300,7 @@ mod tests {
         let phrases = vec!["בראשית ברא".to_string(), "השמים ואת".to_string()];
         let bonus = compute_phrase_match_bonus(text, &phrases);
         assert_eq!(bonus, 1.0);
-        
+
         let phrases_partial = vec!["בראשית ברא".to_string(), "לא קיים".to_string()];
         let bonus_partial = compute_phrase_match_bonus(text, &phrases_partial);
         assert_eq!(bonus_partial, 0.5);

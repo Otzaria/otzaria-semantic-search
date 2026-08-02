@@ -24,57 +24,57 @@ pub struct IndexPackage {
 impl IndexPackage {
     pub fn write(path: &Path, package: &IndexPackage) -> io::Result<()> {
         fs::create_dir_all(path)?;
-        
+
         let manifest_path = path.join("manifest.json");
         let mut manifest_file = File::create(manifest_path)?;
         manifest_file.write_all(package.manifest_json.as_bytes())?;
-        
+
         let checksums_path = path.join("checksums.json");
         let mut checksums_file = File::create(checksums_path)?;
         let checksums_json = serde_json::to_string_pretty(&package.checksums)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         checksums_file.write_all(checksums_json.as_bytes())?;
-        
+
         Ok(())
     }
-    
+
     pub fn read(path: &Path) -> io::Result<Self> {
         let manifest_path = path.join("manifest.json");
         let mut manifest_file = File::open(manifest_path)?;
         let mut manifest_json = String::new();
         manifest_file.read_to_string(&mut manifest_json)?;
-        
+
         let manifest: PackageManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            
+
         let checksums_path = path.join("checksums.json");
         let mut checksums_file = File::open(checksums_path)?;
         let mut checksums_json = String::new();
         checksums_file.read_to_string(&mut checksums_json)?;
-        
+
         let checksums: HashMap<String, String> = serde_json::from_str(&checksums_json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            
+
         Ok(Self {
             manifest,
             manifest_json,
             checksums,
         })
     }
-    
+
     pub fn verify_checksums(&self, base_path: &Path) -> io::Result<bool> {
         for (filename, expected_hash) in &self.checksums {
             let file_path = base_path.join(filename);
             if !file_path.exists() {
                 return Ok(false);
             }
-            
+
             let mut file = File::open(file_path)?;
             let mut hasher = Sha256::new();
             io::copy(&mut file, &mut hasher)?;
             let hash_bytes = hasher.finalize();
             let actual_hash = format!("{:x}", hash_bytes);
-            
+
             if actual_hash != *expected_hash {
                 return Ok(false);
             }
@@ -136,18 +136,18 @@ mod tests {
             total_size_bytes: 1000,
         };
         let manifest_json = serde_json::to_string(&manifest).unwrap();
-        
+
         let mut checksums = HashMap::new();
         checksums.insert("vectors.bin".to_string(), "hash123".to_string());
-        
+
         let pkg = IndexPackage {
             manifest,
             manifest_json,
             checksums,
         };
-        
+
         IndexPackage::write(dir.path(), &pkg).unwrap();
-        
+
         let pkg2 = IndexPackage::read(dir.path()).unwrap();
         assert_eq!(pkg2.manifest.book_count, 10);
         assert_eq!(pkg2.checksums.get("vectors.bin").unwrap(), "hash123");
@@ -159,11 +159,11 @@ mod tests {
         let file_path = dir.path().join("test.bin");
         let mut file = File::create(&file_path).unwrap();
         file.write_all(b"hello world").unwrap();
-        
+
         let mut hasher = Sha256::new();
         hasher.update(b"hello world");
         let hash = format!("{:x}", hasher.finalize());
-        
+
         let manifest = PackageManifest {
             version: sample_version(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
@@ -172,16 +172,16 @@ mod tests {
             total_size_bytes: 11,
         };
         let manifest_json = serde_json::to_string(&manifest).unwrap();
-        
+
         let mut checksums = HashMap::new();
         checksums.insert("test.bin".to_string(), hash);
-        
+
         let pkg = IndexPackage {
             manifest,
             manifest_json,
             checksums,
         };
-        
+
         assert!(pkg.verify_checksums(dir.path()).unwrap());
     }
 }

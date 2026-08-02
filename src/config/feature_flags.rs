@@ -1,5 +1,5 @@
+use crate::config::profiles::{FusionStrategy, RankingProfile, SearchProfile};
 use serde::{Deserialize, Serialize};
-use crate::config::profiles::{SearchProfile, RankingProfile, FusionStrategy};
 
 /// Fine-grained feature flags to optionally override tuning parameters.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -37,7 +37,7 @@ impl FeatureFlags {
         if let Some(threshold) = self.semantic_threshold_override {
             profile.semantic_threshold = threshold;
         }
-        
+
         if let Some(bonus) = self.agreement_bonus_override {
             profile.agreement_bonus = bonus;
         }
@@ -77,7 +77,7 @@ impl FeatureFlags {
         if let Some(enabled) = self.telemetry_enabled {
             profile.telemetry_enabled = enabled;
         }
-        
+
         if let Some(true) = self.bm25_adaptive_normalization {
             // Adaptive normalization implicitly enforces adaptive fusion strategy if weighted was selected
             if profile.fusion_strategy == FusionStrategy::Weighted {
@@ -103,7 +103,10 @@ mod tests {
     fn test_resolve_empty_flags() {
         let flags = FeatureFlags::default();
         let profile = FeatureFlags::resolve(SearchProfile::Balanced, &flags);
-        assert_eq!(profile, RankingProfile::from_profile(SearchProfile::Balanced));
+        assert_eq!(
+            profile,
+            RankingProfile::from_profile(SearchProfile::Balanced)
+        );
     }
 
     #[test]
@@ -123,7 +126,7 @@ mod tests {
         assert_eq!(profile.phrase_match_bonus, 0.0);
         assert!(profile.metadata_ranking_enabled);
     }
-    
+
     #[test]
     fn test_resolve_with_partial_overrides() {
         let flags = FeatureFlags {
@@ -131,7 +134,7 @@ mod tests {
             agreement_bonus_override: Some(0.5),
             ..Default::default()
         };
-        
+
         let profile = FeatureFlags::resolve(SearchProfile::Fast, &flags);
         assert_eq!(profile.fusion_strategy, FusionStrategy::Weighted);
         assert_eq!(profile.agreement_bonus, 0.5);

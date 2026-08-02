@@ -17,21 +17,23 @@ impl HebrewNormalizer {
     pub fn normalize_for_embedding(&self, query: &str) -> String {
         let mut text = strip_nikud(query);
         text = strip_taamim(&text);
-        
+
         // Normalize geresh/gershayim
         let mut normalized = String::with_capacity(text.len());
         let mut chars = text.chars().peekable();
-        
+
         while let Some(c) = chars.next() {
-            if c == '׳' { // U+05F3
+            if c == '׳' {
+                // U+05F3
                 normalized.push('\'');
-            } else if c == '״' { // U+05F4
+            } else if c == '״' {
+                // U+05F4
                 normalized.push('"');
             } else {
                 normalized.push(c);
             }
         }
-        
+
         // Collapse whitespace and trim
         let words: Vec<&str> = normalized.split_whitespace().collect();
         words.join(" ")
@@ -57,11 +59,11 @@ impl HebrewNormalizer {
         for c in text.chars() {
             if c.is_alphabetic() {
                 total_alpha += 1;
-                
+
                 // Hebrew/Aramaic block
                 if c >= '\u{05D0}' && c <= '\u{05EA}' {
                     hebrew_chars += 1;
-                    
+
                     // Simple heuristic for Aramaic suffixes (approximate since characters are identical)
                     // e.g., ending in Aleph or containing specific patterns
                     // For character-by-character analysis it's hard, we'll look for characteristic
@@ -82,7 +84,8 @@ impl HebrewNormalizer {
             if word.ends_with('א') && word.len() > 2 {
                 aramaic_indicators += 1;
             }
-            if word == "די" || word == "קא" || word == "לאו" || word == "הכי" || word == "האי" {
+            if word == "די" || word == "קא" || word == "לאו" || word == "הכי" || word == "האי"
+            {
                 aramaic_indicators += 1;
             }
         }
@@ -93,7 +96,9 @@ impl HebrewNormalizer {
         if latin_ratio > 0.0 && hebrew_ratio > 0.0 {
             QueryLanguage::Mixed
         } else if hebrew_ratio > 0.8 {
-            if aramaic_indicators > 1 || (aramaic_indicators > 0 && text.split_whitespace().count() <= 3) {
+            if aramaic_indicators > 1
+                || (aramaic_indicators > 0 && text.split_whitespace().count() <= 3)
+            {
                 QueryLanguage::Aramaic
             } else {
                 QueryLanguage::Hebrew
@@ -113,8 +118,8 @@ pub fn strip_nikud(text: &str) -> String {
             // Niqqud Unicode block: U+0591 to U+05C7
             // Exclude non-nikud in this range if any, but standard nikud are mostly:
             // U+05B0 to U+05BD, U+05BF, U+05C1 to U+05C2, U+05C4 to U+05C5, U+05C7
-            !((c >= '\u{0591}' && c <= '\u{05BD}') 
-                || c == '\u{05BF}' 
+            !((c >= '\u{0591}' && c <= '\u{05BD}')
+                || c == '\u{05BF}'
                 || (c >= '\u{05C1}' && c <= '\u{05C2}')
                 || (c >= '\u{05C4}' && c <= '\u{05C5}')
                 || c == '\u{05C7}')
@@ -176,23 +181,38 @@ mod tests {
     #[test]
     fn test_language_detection() {
         let normalizer = HebrewNormalizer;
-        
-        assert_eq!(normalizer.detect_language("שלום עולם"), QueryLanguage::Hebrew);
-        assert_eq!(normalizer.detect_language("hello world"), QueryLanguage::Other);
-        assert_eq!(normalizer.detect_language("hello שלום"), QueryLanguage::Mixed);
-        
+
+        assert_eq!(
+            normalizer.detect_language("שלום עולם"),
+            QueryLanguage::Hebrew
+        );
+        assert_eq!(
+            normalizer.detect_language("hello world"),
+            QueryLanguage::Other
+        );
+        assert_eq!(
+            normalizer.detect_language("hello שלום"),
+            QueryLanguage::Mixed
+        );
+
         // Aramaic indicators
-        assert_eq!(normalizer.detect_language("מאי קא משמע לן"), QueryLanguage::Aramaic);
-        assert_eq!(normalizer.detect_language("האי דינא"), QueryLanguage::Aramaic);
+        assert_eq!(
+            normalizer.detect_language("מאי קא משמע לן"),
+            QueryLanguage::Aramaic
+        );
+        assert_eq!(
+            normalizer.detect_language("האי דינא"),
+            QueryLanguage::Aramaic
+        );
     }
 
     #[test]
     fn test_empty_and_idempotent() {
         let normalizer = HebrewNormalizer;
-        
+
         assert_eq!(normalizer.normalize_for_embedding(""), "");
         assert_eq!(normalizer.detect_language(""), QueryLanguage::Other);
-        
+
         let already_normalized = "שלום עולם";
         assert_eq!(
             normalizer.normalize_for_embedding(already_normalized),
