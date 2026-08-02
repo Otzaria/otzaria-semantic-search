@@ -209,6 +209,9 @@ impl HybridCoordinator {
         let sem_len = semantic.candidates.len() as u32;
         let fused = self.fuse_candidates(lexical_candidates, semantic.candidates, alpha, mode);
 
+        let scores: Vec<f32> = fused.iter().map(|c| c.fused_score).collect();
+        let confidence = crate::hybrid::fusion::compute_confidence(&scores);
+
         let (results, total_count, group_count) = match params.grouping {
             Some(grouping_mode) => {
                 let grouped = group_results(fused, grouping_mode);
@@ -251,11 +254,8 @@ impl HybridCoordinator {
             }
         };
 
-        let fusion_latency = start_time.elapsed().as_millis() as u64; // approximate
-
-        let confidence = crate::hybrid::fusion::compute_confidence(
-            &fused.iter().map(|c| c.fused_score).collect::<Vec<_>>(),
-        );
+        let fusion_latency_ms = start_time.elapsed().as_millis() as u64;
+        telemetry_record.fusion_latency_ms = fusion_latency_ms;
 
         let final_result = HybridSearchResult {
             results,
