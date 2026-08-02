@@ -25,6 +25,10 @@ impl CloudIndexBuilder {
         Self { config }
     }
 
+    pub fn config(&self) -> &BuildConfig {
+        &self.config
+    }
+
     /// Build a cloud index package from a set of books.
     ///
     /// The intended flow is:
@@ -37,8 +41,7 @@ impl CloudIndexBuilder {
     /// 7. Create an IndexPackage with a PackageManifest.
     /// 8. Write the package to `config.output_path`.
     pub fn build(&self, _books: &[BookForIndexing]) -> io::Result<BuildResult> {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             "CloudIndexBuilder::build is not yet implemented",
         ))
     }

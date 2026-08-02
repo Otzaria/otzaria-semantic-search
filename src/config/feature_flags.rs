@@ -111,12 +111,14 @@ mod tests {
 
     #[test]
     fn test_apply_overrides() {
-        let mut flags = FeatureFlags::default();
-        flags.force_rrf = Some(true);
-        flags.rrf_k = Some(100);
-        flags.semantic_threshold_override = Some(0.9);
-        flags.phrase_match_enabled = Some(false);
-        flags.metadata_ranking_enabled = Some(true);
+        let flags = FeatureFlags {
+            force_rrf: Some(true),
+            rrf_k: Some(100),
+            semantic_threshold_override: Some(0.9),
+            phrase_match_enabled: Some(false),
+            metadata_ranking_enabled: Some(true),
+            ..Default::default()
+        };
 
         let mut profile = RankingProfile::from_profile(SearchProfile::Balanced);
         flags.apply(&mut profile);

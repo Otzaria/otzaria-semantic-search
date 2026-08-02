@@ -150,8 +150,10 @@ mod tests {
 
     #[test]
     fn test_disabled_config() {
-        let mut config = MetadataRankingConfig::default();
-        config.enabled = false;
+        let config = MetadataRankingConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let ranker = MetadataRanker::new(config);
 
         let signal =

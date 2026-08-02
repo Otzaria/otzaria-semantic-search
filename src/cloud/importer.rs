@@ -35,13 +35,11 @@ impl IndexImporter {
 
         let package = IndexPackage::read(&self.config.source_path)?;
 
-        if self.config.verify_checksums {
-            if !package.verify_checksums(&self.config.source_path)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Checksum verification failed",
-                ));
-            }
+        if self.config.verify_checksums && !package.verify_checksums(&self.config.source_path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Checksum verification failed",
+            ));
         }
 
         if !package.manifest.version.is_compatible(current_version) {

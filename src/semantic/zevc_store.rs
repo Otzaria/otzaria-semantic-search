@@ -122,7 +122,7 @@ impl ZevcStore {
                 })?,
             );
 
-        for (_, record) in &state.records {
+        for record in state.records.values() {
             let meta_json = serde_json::to_string(&record.metadata).map_err(|e| {
                 VectorStoreError::CommitFailed {
                     reason: e.to_string(),

@@ -585,6 +585,14 @@ impl HybridCoordinator {
         self.telemetry.reset();
     }
 
+    pub fn embedding_cache_stats(&self) -> crate::semantic::embedding_cache::EmbeddingCacheStats {
+        self.embedding_cache.stats()
+    }
+
+    pub fn metadata_ranker(&self) -> &crate::hybrid::metadata_ranker::MetadataRanker {
+        &self.metadata_ranker
+    }
+
     pub fn clear_query_cache(&self) {
         self.query_cache.clear();
     }

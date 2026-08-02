@@ -29,9 +29,8 @@ impl HebrewNormalizer {
 
         // Normalize geresh/gershayim
         let mut normalized = String::with_capacity(text.len());
-        let mut chars = text.chars().peekable();
 
-        while let Some(c) = chars.next() {
+        for c in text.chars() {
             if c == '׳' {
                 // U+05F3
                 normalized.push('\'');
@@ -70,7 +69,7 @@ impl HebrewNormalizer {
                 total_alpha += 1;
 
                 // Hebrew/Aramaic block
-                if c >= '\u{05D0}' && c <= '\u{05EA}' {
+                if ('\u{05D0}'..='\u{05EA}').contains(&c) {
                     hebrew_chars += 1;
 
                     // Simple heuristic for Aramaic suffixes (approximate since characters are identical)
@@ -112,8 +111,6 @@ impl HebrewNormalizer {
             } else {
                 QueryLanguage::Hebrew
             }
-        } else if latin_ratio > 0.8 {
-            QueryLanguage::Other
         } else {
             QueryLanguage::Other
         }
@@ -127,10 +124,10 @@ pub fn strip_nikud(text: &str) -> String {
             // Niqqud Unicode block: U+0591 to U+05C7
             // Exclude non-nikud in this range if any, but standard nikud are mostly:
             // U+05B0 to U+05BD, U+05BF, U+05C1 to U+05C2, U+05C4 to U+05C5, U+05C7
-            !((c >= '\u{0591}' && c <= '\u{05BD}')
+            !(('\u{0591}'..='\u{05BD}').contains(&c)
                 || c == '\u{05BF}'
-                || (c >= '\u{05C1}' && c <= '\u{05C2}')
-                || (c >= '\u{05C4}' && c <= '\u{05C5}')
+                || ('\u{05C1}'..='\u{05C2}').contains(&c)
+                || ('\u{05C4}'..='\u{05C5}').contains(&c)
                 || c == '\u{05C7}')
         })
         .collect()
@@ -141,7 +138,7 @@ pub fn strip_taamim(text: &str) -> String {
     text.chars()
         .filter(|&c| {
             // Taamim Unicode block: U+0591 to U+05AF
-            !(c >= '\u{0591}' && c <= '\u{05AF}')
+            !('\u{0591}'..='\u{05AF}').contains(&c)
         })
         .collect()
 }

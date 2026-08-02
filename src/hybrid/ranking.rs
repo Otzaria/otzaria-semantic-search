@@ -72,7 +72,7 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
         for c in t.chars() {
             if c.is_ascii_alphabetic() {
                 latin_chars += 1;
-            } else if c >= '\u{0590}' && c <= '\u{05FF}' {
+            } else if ('\u{0590}'..='\u{05FF}').contains(&c) {
                 hebrew_chars += 1;
             }
         }
