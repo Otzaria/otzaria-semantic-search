@@ -57,6 +57,63 @@ pub fn normalize_semantic_scores(scores: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+pub fn normalize_bm25_adaptive(scores: &[f32], k: f32) -> Vec<f32> {
+    if scores.is_empty() {
+        return Vec::new();
+    }
+    
+    let mut max_score = f32::NEG_INFINITY;
+    let mut min_score = f32::INFINITY;
+    
+    for &score in scores {
+        if !score.is_nan() && score > 0.0 {
+            if score > max_score { max_score = score; }
+            if score < min_score { min_score = score; }
+        }
+    }
+    
+    if max_score > 2.0 * k && max_score > min_score {
+        // Use min-max normalization
+        scores
+            .iter()
+            .map(|&x| {
+                if x.is_nan() || x <= 0.0 {
+                    0.0
+                } else {
+                    ((x - min_score) / (max_score - min_score)).clamp(0.0, 1.0)
+                }
+            })
+            .collect()
+    } else {
+        // Fall back to saturating curve
+        normalize_bm25_scores(scores, k)
+    }
+}
+
+pub fn normalize_semantic_with_threshold(scores: &[f32], threshold: f32) -> Vec<f32> {
+    let normalized = normalize_semantic_scores(scores);
+    normalized
+        .into_iter()
+        .map(|x| if x < threshold { 0.0 } else { x })
+        .collect()
+}
+
+pub fn compute_confidence(sorted_scores: &[f32]) -> Option<f32> {
+    if sorted_scores.len() < 2 {
+        return None;
+    }
+    
+    let top = sorted_scores[0];
+    let second = sorted_scores[1];
+    
+    if top.is_nan() || second.is_nan() || top <= 0.0 {
+        return None;
+    }
+    
+    let confidence = (top - second) / top.max(1e-6);
+    Some(confidence.clamp(0.0, 1.0))
+}
+
 /// Which retrieval paths produced a candidate.
 ///
 /// Returns `None` for a candidate present in neither, which cannot happen for an
@@ -266,5 +323,43 @@ mod tests {
 
         let fused_rrf = fuse_rrf(&empty, &empty, 60);
         assert!(fused_rrf.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_bm25_adaptive() {
+        let scores = vec![0.0, 10.0, 25.0];
+        // max_score is 25.0, which is > 2*10.0 (20.0), so it uses min-max.
+        // min is 10.0, max is 25.0. 
+        // 10.0 -> 0.0
+        // 25.0 -> 1.0
+        let normalized = normalize_bm25_adaptive(&scores, 10.0);
+        assert_eq!(normalized, vec![0.0, 0.0, 1.0]);
+        
+        let scores2 = vec![0.0, 5.0, 15.0];
+        // max is 15.0, not > 20.0, so it uses saturating curve.
+        let normalized2 = normalize_bm25_adaptive(&scores2, 10.0);
+        assert_eq!(normalized2, vec![0.0, 5.0 / 15.0, 15.0 / 25.0]);
+    }
+
+    #[test]
+    fn test_normalize_semantic_with_threshold() {
+        let scores = vec![-1.0, 0.0, 1.0];
+        // normalizes to 0.0, 0.5, 1.0
+        let normalized = normalize_semantic_with_threshold(&scores, 0.6);
+        assert_eq!(normalized, vec![0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_compute_confidence() {
+        let scores = vec![1.0, 0.8, 0.5];
+        let conf = compute_confidence(&scores);
+        assert_eq!(conf, Some(0.2)); // (1.0 - 0.8) / 1.0
+        
+        let scores2 = vec![0.5, 0.5];
+        let conf2 = compute_confidence(&scores2);
+        assert_eq!(conf2, Some(0.0));
+        
+        let scores3 = vec![1.0];
+        assert_eq!(compute_confidence(&scores3), None);
     }
 }

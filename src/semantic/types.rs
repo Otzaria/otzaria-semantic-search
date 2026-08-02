@@ -598,6 +598,9 @@ pub struct HybridSearchResult {
     /// BM25". This field makes it observable.
     pub fallback_reason: Option<String>,
     pub latency_ms: u64,
+    pub confidence: Option<f32>,
+    pub profile: Option<String>,
+    pub telemetry: Option<crate::telemetry::SearchTelemetry>,
 }
 
 /// Filters applied during the search process.

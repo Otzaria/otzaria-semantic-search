@@ -9,7 +9,10 @@
 //! - Grouping: post-fusion result grouping (SameSection, IdenticalText)
 //! - Coordinator: top-level orchestrator
 
+pub mod cache;
 pub mod coordinator;
 pub mod fusion;
 pub mod grouping;
+pub mod hebrew_normalizer;
+pub mod metadata_ranker;
 pub mod ranking;

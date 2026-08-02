@@ -10,6 +10,17 @@ pub enum QueryType {
     Unknown,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RankingSignals {
+    pub agreement_bonus: f32,
+    pub section_coverage_bonus: f32,
+    pub duplicate_penalty: f32,
+    pub rare_term_bonus: f32,
+    pub phrase_match_bonus: f32,
+    pub metadata_bonus: f32,
+    pub total: f32,
+}
+
 impl fmt::Display for QueryType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -30,6 +41,10 @@ pub struct QueryFeatures {
     pub has_quoted_phrase: bool,
     pub avg_token_length: f32,
     pub estimated_type: QueryType,
+    pub has_numbers: bool,
+    pub detected_language: String,
+    pub rare_tokens: Vec<String>,
+    pub quoted_phrases: Vec<String>,
 }
 
 /// Analyzes a query string to extract features useful for ranking
@@ -47,6 +62,53 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
 
     // Basic heuristic for exact references: containing numbers or specific format
     let has_numbers = tokens.iter().any(|t| t.chars().any(|c| c.is_ascii_digit()));
+
+    let mut hebrew_chars = 0;
+    let mut latin_chars = 0;
+    let mut rare_tokens = Vec::new();
+    
+    for t in &tokens {
+        let char_count = t.chars().count();
+        for c in t.chars() {
+            if c.is_ascii_alphabetic() {
+                latin_chars += 1;
+            } else if c >= '\u{0590}' && c <= '\u{05FF}' {
+                hebrew_chars += 1;
+            }
+        }
+        if char_count > 5 {
+            rare_tokens.push(t.to_string());
+        }
+    }
+    
+    let detected_language = if hebrew_chars > 0 && latin_chars == 0 {
+        "hebrew".to_string()
+    } else if latin_chars > 0 && hebrew_chars == 0 {
+        "other".to_string()
+    } else if hebrew_chars > 0 && latin_chars > 0 {
+        "mixed".to_string()
+    } else {
+        "other".to_string()
+    };
+    
+    let mut quoted_phrases = Vec::new();
+    let mut in_quotes = false;
+    let mut current_phrase = String::new();
+    for c in query.chars() {
+        if c == '"' {
+            if in_quotes {
+                if !current_phrase.trim().is_empty() {
+                    quoted_phrases.push(current_phrase.trim().to_string());
+                }
+                current_phrase.clear();
+                in_quotes = false;
+            } else {
+                in_quotes = true;
+            }
+        } else if in_quotes {
+            current_phrase.push(c);
+        }
+    }
 
     let estimated_type = if token_count == 0 {
         QueryType::Unknown
@@ -69,6 +131,10 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
         has_quoted_phrase,
         avg_token_length,
         estimated_type,
+        has_numbers,
+        detected_language,
+        rare_tokens,
+        quoted_phrases,
     }
 }
 
@@ -116,6 +182,32 @@ impl Default for BonusConfig {
             section_coverage_bonus: 0.03,
         }
     }
+}
+
+pub fn compute_phrase_match_bonus(text: &str, phrases: &[String]) -> f32 {
+    if phrases.is_empty() {
+        return 0.0;
+    }
+    let mut matches = 0;
+    for phrase in phrases {
+        if text.contains(phrase) {
+            matches += 1;
+        }
+    }
+    (matches as f32) / (phrases.len() as f32)
+}
+
+pub fn compute_rare_term_bonus(text: &str, rare_tokens: &[String]) -> f32 {
+    if rare_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut matches = 0;
+    for token in rare_tokens {
+        if text.contains(token) {
+            matches += 1;
+        }
+    }
+    (matches as f32) / (rare_tokens.len() as f32)
 }
 
 #[cfg(test)]
@@ -200,5 +292,25 @@ mod tests {
         ] {
             assert!(!query_type.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn test_compute_phrase_match_bonus() {
+        let text = "בראשית ברא אלהים את השמים ואת הארץ";
+        let phrases = vec!["בראשית ברא".to_string(), "השמים ואת".to_string()];
+        let bonus = compute_phrase_match_bonus(text, &phrases);
+        assert_eq!(bonus, 1.0);
+        
+        let phrases_partial = vec!["בראשית ברא".to_string(), "לא קיים".to_string()];
+        let bonus_partial = compute_phrase_match_bonus(text, &phrases_partial);
+        assert_eq!(bonus_partial, 0.5);
+    }
+
+    #[test]
+    fn test_compute_rare_term_bonus() {
+        let text = "המולקולה מסובכת";
+        let rare_tokens = vec!["המולקולה".to_string()];
+        let bonus = compute_rare_term_bonus(text, &rare_tokens);
+        assert_eq!(bonus, 1.0);
     }
 }

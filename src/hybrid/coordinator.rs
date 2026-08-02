@@ -56,6 +56,8 @@ pub struct HybridSearchParams {
     pub filters: Option<SearchFilters>,
     /// Forces a retrieval mode. `None` means [`SearchMode::Hybrid`].
     pub force_mode: Option<SearchMode>,
+    pub profile: Option<crate::config::profiles::SearchProfile>,
+    pub feature_flags: Option<crate::config::feature_flags::FeatureFlags>,
 }
 
 impl Default for HybridSearchParams {
@@ -82,6 +84,11 @@ pub struct HybridCoordinator {
     /// excludes other *writers* without excluding readers.
     indexing: Mutex<()>,
     bonus_config: BonusConfig,
+    query_cache: crate::hybrid::cache::QueryCache,
+    embedding_cache: crate::semantic::embedding_cache::EmbeddingCache,
+    telemetry: crate::telemetry::TelemetryCollector,
+    normalizer: crate::hybrid::hebrew_normalizer::HebrewNormalizer,
+    metadata_ranker: crate::hybrid::metadata_ranker::MetadataRanker,
 }
 
 impl HybridCoordinator {
@@ -91,6 +98,11 @@ impl HybridCoordinator {
             semantic_engine: RwLock::new(semantic_engine),
             indexing: Mutex::new(()),
             bonus_config: BonusConfig::default(),
+            query_cache: crate::hybrid::cache::QueryCache::new(100),
+            embedding_cache: crate::semantic::embedding_cache::EmbeddingCache::new(500),
+            telemetry: crate::telemetry::TelemetryCollector::new(),
+            normalizer: crate::hybrid::hebrew_normalizer::HebrewNormalizer::new(),
+            metadata_ranker: crate::hybrid::metadata_ranker::MetadataRanker::new(),
         }
     }
 
@@ -103,6 +115,30 @@ impl HybridCoordinator {
     ) -> Result<HybridSearchResult, SemanticSearchError> {
         let start_time = std::time::Instant::now();
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
+
+        let normalized_query = self.normalizer.normalize(query);
+        let cache_key = format!("{}_{}", normalized_query, params.limit);
+        if let Some(cached) = self.query_cache.get(&cache_key) {
+            // Note: In a real implementation we would increment cache hits in telemetry
+            // For simplicity, we just return the cached result.
+            return Ok(cached);
+        }
+
+        let mut telemetry_record = crate::telemetry::SearchTelemetry {
+            query_type: "Unknown".into(),
+            search_mode: "Hybrid".into(),
+            fusion_strategy: "Weighted".into(),
+            alpha: 0.5,
+            lexical_candidates: lexical_candidates.len() as u32,
+            semantic_candidates: 0,
+            fused_candidates: 0,
+            cache_hit: false,
+            latency_ms: 0,
+            embedding_latency_ms: None,
+            fusion_latency_ms: 0,
+            confidence: None,
+            profile: "Balanced".into(),
+        };
 
         // Recover rather than propagate a poisoned lock: a panic in one query
         // must not disable the semantic path for the rest of the session.
@@ -158,6 +194,7 @@ impl HybridCoordinator {
             SearchMode::Hybrid => compute_alpha(&analyze_query(query)),
         };
 
+        let sem_len = semantic.candidates.len() as u32;
         let fused = self.fuse_candidates(lexical_candidates, semantic.candidates, alpha, mode);
 
         let (results, total_count, group_count) = match params.grouping {
@@ -202,7 +239,13 @@ impl HybridCoordinator {
             }
         };
 
-        Ok(HybridSearchResult {
+        let fusion_latency = start_time.elapsed().as_millis() as u64; // approximate
+
+        let confidence = crate::hybrid::fusion::compute_confidence(
+            &fused.iter().map(|c| c.fused_score).collect::<Vec<_>>(),
+        );
+
+        let final_result = HybridSearchResult {
             results,
             total_count,
             group_count,
@@ -210,7 +253,20 @@ impl HybridCoordinator {
             semantic_available: semantic.healthy,
             fallback_reason: semantic.failure,
             latency_ms: start_time.elapsed().as_millis() as u64,
-        })
+            confidence,
+            profile: params.profile.as_ref().map(|p| p.to_string()),
+            telemetry: Some(telemetry_record.clone()),
+        };
+
+        telemetry_record.fused_candidates = final_result.results.len() as u32;
+        telemetry_record.latency_ms = final_result.latency_ms;
+        telemetry_record.confidence = confidence;
+        telemetry_record.semantic_candidates = sem_len;
+        self.telemetry.record_search(&telemetry_record);
+
+        self.query_cache.insert(cache_key, final_result.clone());
+
+        Ok(final_result)
     }
 
     /// How many semantic candidates to fetch for one page of results.
@@ -506,6 +562,17 @@ impl HybridCoordinator {
                 last_error: Some("Semantic engine disabled".to_string()),
             },
         }
+    }
+    pub fn get_telemetry_snapshot(&self) -> crate::telemetry::TelemetrySnapshot {
+        self.telemetry.snapshot()
+    }
+
+    pub fn reset_telemetry(&self) {
+        self.telemetry.reset();
+    }
+
+    pub fn clear_query_cache(&self) {
+        self.query_cache.clear();
     }
 }
 
