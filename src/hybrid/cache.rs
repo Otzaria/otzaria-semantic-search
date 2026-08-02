@@ -33,6 +33,12 @@ pub struct QueryCache {
     evictions: AtomicU64,
 }
 
+impl Default for QueryCache {
+    fn default() -> Self {
+        Self::new(256, Duration::from_secs(300))
+    }
+}
+
 impl QueryCache {
     /// Create a new QueryCache with the specified capacity and TTL.
     pub fn new(capacity: usize, ttl: Duration) -> Self {
@@ -91,6 +97,14 @@ impl QueryCache {
     /// Invalidate all entries by bumping the generation counter.
     pub fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clear all entries and bump generation.
+    pub fn clear(&self) {
+        self.invalidate();
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
     }
 
     /// Compute a cache key based on query parameters using FNV-1a.

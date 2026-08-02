@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 /// Represents the detected language of a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryLanguage {
@@ -10,9 +8,20 @@ pub enum QueryLanguage {
 }
 
 /// Stateless utility for normalizing Hebrew and Aramaic text.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct HebrewNormalizer;
 
 impl HebrewNormalizer {
+    /// Constructs a new normalizer instance.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Alias for normalize_for_embedding.
+    pub fn normalize(&self, query: &str) -> String {
+        self.normalize_for_embedding(query)
+    }
+
     /// Normalizes text for semantic embedding by stripping diacritics and compacting whitespace.
     pub fn normalize_for_embedding(&self, query: &str) -> String {
         let mut text = strip_nikud(query);

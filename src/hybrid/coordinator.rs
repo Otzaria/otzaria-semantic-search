@@ -68,6 +68,8 @@ impl Default for HybridSearchParams {
             grouping: None,
             filters: None,
             force_mode: None,
+            profile: None,
+            feature_flags: None,
         }
     }
 }
@@ -98,11 +100,14 @@ impl HybridCoordinator {
             semantic_engine: RwLock::new(semantic_engine),
             indexing: Mutex::new(()),
             bonus_config: BonusConfig::default(),
-            query_cache: crate::hybrid::cache::QueryCache::new(100),
+            query_cache: crate::hybrid::cache::QueryCache::new(
+                100,
+                std::time::Duration::from_secs(300),
+            ),
             embedding_cache: crate::semantic::embedding_cache::EmbeddingCache::new(500),
             telemetry: crate::telemetry::TelemetryCollector::new(),
             normalizer: crate::hybrid::hebrew_normalizer::HebrewNormalizer::new(),
-            metadata_ranker: crate::hybrid::metadata_ranker::MetadataRanker::new(),
+            metadata_ranker: crate::hybrid::metadata_ranker::MetadataRanker::default(),
         }
     }
 
@@ -117,11 +122,18 @@ impl HybridCoordinator {
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
 
         let normalized_query = self.normalizer.normalize(query);
-        let cache_key = format!("{}_{}", normalized_query, params.limit);
-        if let Some(cached) = self.query_cache.get(&cache_key) {
-            // Note: In a real implementation we would increment cache hits in telemetry
-            // For simplicity, we just return the cached result.
-            return Ok(cached);
+        let cache_key = crate::hybrid::cache::QueryCache::compute_key(
+            &normalized_query,
+            0,
+            &requested.to_string(),
+            &format!("{:?}", params.grouping),
+            params.limit,
+            params.offset,
+        );
+        if let Some(cached_json) = self.query_cache.get(cache_key) {
+            if let Ok(cached_result) = serde_json::from_str::<HybridSearchResult>(&cached_json) {
+                return Ok(cached_result);
+            }
         }
 
         let mut telemetry_record = crate::telemetry::SearchTelemetry {
@@ -264,7 +276,9 @@ impl HybridCoordinator {
         telemetry_record.semantic_candidates = sem_len;
         self.telemetry.record_search(&telemetry_record);
 
-        self.query_cache.insert(cache_key, final_result.clone());
+        if let Ok(json) = serde_json::to_string(&final_result) {
+            self.query_cache.insert(cache_key, json);
+        }
 
         Ok(final_result)
     }

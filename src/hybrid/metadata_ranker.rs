@@ -40,7 +40,15 @@ impl MetadataRanker {
     pub fn new(config: MetadataRankingConfig) -> Self {
         Self { config }
     }
+}
 
+impl Default for MetadataRanker {
+    fn default() -> Self {
+        Self::new(MetadataRankingConfig::default())
+    }
+}
+
+impl MetadataRanker {
     pub fn compute_signal(
         &self,
         file_path: &str,

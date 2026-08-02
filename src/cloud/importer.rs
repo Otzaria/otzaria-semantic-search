@@ -5,12 +5,16 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportConfig {
     pub source_path: PathBuf,
     pub target_store_path: PathBuf,
     pub verify_checksums: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportResult {
     pub books_imported: u32,
     pub vectors_imported: u32,
