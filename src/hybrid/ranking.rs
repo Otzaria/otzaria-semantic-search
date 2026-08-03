@@ -144,7 +144,11 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
 /// Mixed -> 0.5
 pub fn compute_alpha(features: &QueryFeatures) -> f32 {
     match features.estimated_type {
-        QueryType::ExactReference => 0.8,
+        // §3.1: A quoted phrase is a verbatim lookup — the lexical engine is
+        // authoritative and the semantic embedding adds only latency.
+        // Returning 1.0 lets the coordinator skip the semantic path entirely.
+        QueryType::ExactReference if features.has_quoted_phrase => 1.0,
+        QueryType::ExactReference => 0.85,
         QueryType::Short => 0.7,
         QueryType::Mixed => 0.5,
         QueryType::Conceptual => 0.3,
@@ -236,7 +240,8 @@ mod tests {
         assert_eq!(features.estimated_type, QueryType::ExactReference);
         assert!(features.has_quoted_phrase);
         let alpha = compute_alpha(&features);
-        assert!((0.7..=0.9).contains(&alpha));
+        // Quoted phrases return 1.0 to let the coordinator skip semantic entirely.
+        assert_eq!(alpha, 1.0);
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //! whether to retry in another mode.
 
 use crate::errors::SemanticSearchError;
-use crate::hybrid::fusion::{normalize_bm25_scores, normalize_semantic_scores};
+use crate::hybrid::fusion::{normalize_bm25_adaptive, normalize_semantic_with_threshold};
 use crate::hybrid::grouping::group_results;
 use crate::hybrid::ranking::{analyze_query, compute_alpha, BonusConfig};
 use crate::semantic::engine::SemanticEngine;
@@ -46,6 +46,22 @@ const BM25_SATURATION_K: f32 = 10.0;
 /// `limit`/`offset` from the caller would size an allocation from user input.
 /// Hitting the cap is logged rather than silently truncating.
 const MAX_SEMANTIC_CANDIDATES: usize = 10_000;
+
+/// Normalized cosine threshold below which semantic candidates contribute zero.
+///
+/// Without a threshold, an orthogonal vector (cosine ≈ 0) normalizes to 0.5 and
+/// gives irrelevant semantic results a mid-range score. This maps everything
+/// below the threshold to 0. The value 0.55 corresponds to a raw cosine of
+/// approximately 0.1; below that the embedding model considers the texts
+/// essentially unrelated.
+///
+/// Overridable via `RankingProfile` once profile-driven fusion lands.
+const SEMANTIC_RELEVANCE_THRESHOLD: f32 = 0.55;
+
+/// Minimum normalized query length (in characters) to store a result in the
+/// query cache. Single-character queries from live typing pollute the cache
+/// with entries that are almost never reused.
+const MIN_CACHEABLE_QUERY_LEN: usize = 2;
 
 /// Configuration for hybrid search execution.
 #[derive(Debug, Clone)]
@@ -122,17 +138,32 @@ impl HybridCoordinator {
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
 
         let normalized_query = self.normalizer.normalize(query);
+
+        // §1.1 + §3.4: Do not read from or write to the cache for empty or
+        // very short queries. Empty queries cannot be embedded and will always
+        // degrade to lexical-only; caching that would poison future lookups.
+        // Single-character queries from live typing are almost never reused.
+        let cacheable = normalized_query.chars().count() >= MIN_CACHEABLE_QUERY_LEN;
+
+        // §1.5: Include actual filter content in the cache key. The previous
+        // hardcoded `0` caused queries with different filters to share a cache
+        // entry, returning wrong results.
+        let filters_hash = hash_filters(&params.filters);
         let cache_key = crate::hybrid::cache::QueryCache::compute_key(
             &normalized_query,
-            0,
+            filters_hash,
             &requested.to_string(),
             &format!("{:?}", params.grouping),
             params.limit,
             params.offset,
         );
-        if let Some(cached_json) = self.query_cache.get(cache_key) {
-            if let Ok(cached_result) = serde_json::from_str::<HybridSearchResult>(&cached_json) {
-                return Ok(cached_result);
+        if cacheable {
+            if let Some(cached_json) = self.query_cache.get(cache_key) {
+                if let Ok(cached_result) =
+                    serde_json::from_str::<HybridSearchResult>(&cached_json)
+                {
+                    return Ok(cached_result);
+                }
             }
         }
 
@@ -159,8 +190,16 @@ impl HybridCoordinator {
             .read()
             .unwrap_or_else(|e| e.into_inner());
 
-        let semantic = if requested == SearchMode::LexicalOnly {
-            // Not consulted — this is the caller's choice, not a degradation.
+        // §3.1: Analyze the query early so we can skip the semantic path when
+        // the query is a verbatim lookup (alpha >= 1.0). This avoids the
+        // embedding computation entirely for quoted-phrase searches.
+        let query_features = analyze_query(query);
+        let skip_semantic_for_exact =
+            requested == SearchMode::Hybrid && compute_alpha(&query_features) >= 1.0;
+
+        let semantic = if requested == SearchMode::LexicalOnly || skip_semantic_for_exact {
+            // Not consulted — this is the caller's choice (or an optimization),
+            // not a degradation.
             SemanticOutcome::skipped()
         } else {
             match semantic_guard.as_ref() {
@@ -203,7 +242,9 @@ impl HybridCoordinator {
         let alpha = match mode {
             SearchMode::LexicalOnly => 1.0,
             SearchMode::SemanticOnly => 0.0,
-            SearchMode::Hybrid => compute_alpha(&analyze_query(query)),
+            // Re-use the features computed before the semantic search so we
+            // do not tokenize the query twice.
+            SearchMode::Hybrid => compute_alpha(&query_features),
         };
 
         let sem_len = semantic.candidates.len() as u32;
@@ -237,7 +278,7 @@ impl HybridCoordinator {
                             .collect();
                         into_result_item(group.representative, group.group_count, merged)
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
 
                 (results, total, Some(group_count))
             }
@@ -248,14 +289,23 @@ impl HybridCoordinator {
                     .skip(params.offset)
                     .take(params.limit)
                     .map(|candidate| into_result_item(candidate, 1, Vec::new()))
-                    .collect();
+                    .collect::<Vec<_>>();
 
                 (results, total, None)
             }
         };
 
-        let fusion_latency_ms = start_time.elapsed().as_millis() as u64;
-        telemetry_record.fusion_latency_ms = fusion_latency_ms;
+        let latency_ms = start_time.elapsed().as_millis() as u64;
+
+        // §2.4: Populate telemetry fields BEFORE cloning into the result, so
+        // the client-visible telemetry carries the final values instead of the
+        // initial defaults (zeroes).
+        let results_len = results.len() as u32;
+        telemetry_record.fusion_latency_ms = latency_ms;
+        telemetry_record.fused_candidates = results_len;
+        telemetry_record.latency_ms = latency_ms;
+        telemetry_record.confidence = confidence;
+        telemetry_record.semantic_candidates = sem_len;
 
         let final_result = HybridSearchResult {
             results,
@@ -264,20 +314,19 @@ impl HybridCoordinator {
             search_mode: mode,
             semantic_available: semantic.healthy,
             fallback_reason: semantic.failure,
-            latency_ms: start_time.elapsed().as_millis() as u64,
+            latency_ms,
             confidence,
             profile: params.profile.as_ref().map(|p| p.to_string()),
             telemetry: Some(telemetry_record.clone()),
         };
 
-        telemetry_record.fused_candidates = final_result.results.len() as u32;
-        telemetry_record.latency_ms = final_result.latency_ms;
-        telemetry_record.confidence = confidence;
-        telemetry_record.semantic_candidates = sem_len;
         self.telemetry.record_search(&telemetry_record);
 
-        if let Ok(json) = serde_json::to_string(&final_result) {
-            self.query_cache.insert(cache_key, json);
+        // §1.1 + §3.4: Only cache queries with enough substance to be reused.
+        if cacheable {
+            if let Ok(json) = serde_json::to_string(&final_result) {
+                self.query_cache.insert(cache_key, json);
+            }
         }
 
         Ok(final_result)
@@ -317,36 +366,58 @@ impl HybridCoordinator {
         mode: SearchMode,
     ) -> Vec<FusedCandidate> {
         let bm25_scores: Vec<f32> = lexical.iter().map(|l| l.bm25_score).collect();
-        let norm_bm25 = normalize_bm25_scores(&bm25_scores, BM25_SATURATION_K);
+        // §2.3: Adaptive normalization switches to min-max when the score range
+        // is wide, avoiding the saturating curve's tendency to flatten high
+        // scores against each other.
+        let norm_bm25 = normalize_bm25_adaptive(&bm25_scores, BM25_SATURATION_K);
 
         let sem_scores: Vec<f32> = semantic.iter().map(|s| s.similarity_score).collect();
-        let norm_sem = normalize_semantic_scores(&sem_scores);
+        // §4.2: Apply a relevance threshold so orthogonal (unrelated) vectors
+        // score 0 instead of 0.5. Without this, an irrelevant semantic result
+        // with cosine ≈ 0 gets a normalized score of 0.5, enough to push it
+        // above good lexical matches.
+        let norm_sem = normalize_semantic_with_threshold(&sem_scores, SEMANTIC_RELEVANCE_THRESHOLD);
 
         let mut fused_map: HashMap<u64, FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
 
         for (candidate, &normalized) in lexical.into_iter().zip(norm_bm25.iter()) {
-            let item = FusedCandidate {
-                title: candidate.title,
-                reference: candidate.reference,
-                text: candidate.text,
-                line_id: candidate.line_id,
-                section_id: candidate.section_id,
-                line_hash: candidate.line_hash,
-                segment: candidate.segment,
-                is_pdf: candidate.is_pdf,
-                file_path: candidate.file_path,
-                needs_hydration: false,
-                source: ResultSource::Lexical,
-                raw_bm25_score: Some(candidate.bm25_score),
-                normalized_bm25: Some(normalized),
-                raw_semantic_score: None,
-                normalized_semantic: None,
-                fused_score: alpha * normalized,
-                lexical_weight: alpha,
-                semantic_weight: 1.0 - alpha,
-            };
-            fused_map.insert(item.line_id, item);
+            let fused_score = alpha * normalized;
+            let line_id = candidate.line_id;
+
+            // §1.4: When Tantivy returns the same line_id more than once (e.g.
+            // from a multi-field query), keep the entry with the higher BM25
+            // score rather than silently overwriting.
+            if fused_map
+                .get(&line_id)
+                .map_or(false, |e| e.fused_score >= fused_score)
+            {
+                continue;
+            }
+
+            fused_map.insert(
+                line_id,
+                FusedCandidate {
+                    title: candidate.title,
+                    reference: candidate.reference,
+                    text: candidate.text,
+                    line_id,
+                    section_id: candidate.section_id,
+                    line_hash: candidate.line_hash,
+                    segment: candidate.segment,
+                    is_pdf: candidate.is_pdf,
+                    file_path: candidate.file_path,
+                    needs_hydration: false,
+                    source: ResultSource::Lexical,
+                    raw_bm25_score: Some(candidate.bm25_score),
+                    normalized_bm25: Some(normalized),
+                    raw_semantic_score: None,
+                    normalized_semantic: None,
+                    fused_score,
+                    lexical_weight: alpha,
+                    semantic_weight: 1.0 - alpha,
+                },
+            );
         }
 
         for (candidate, &normalized) in semantic.into_iter().zip(norm_sem.iter()) {
@@ -658,6 +729,27 @@ fn into_result_item(
         needs_hydration: candidate.needs_hydration,
         source: candidate.source,
         provenance: Some(candidate),
+    }
+}
+
+/// Compute a deterministic hash of the search filters for use in cache keys.
+///
+/// Two queries that differ only in their filters must not share a cache entry.
+/// Using `format!("{:?}")` is stable across calls within one process — the
+/// `Debug` output of `Vec<String>` is deterministic — and cheap enough for a
+/// per-query helper.
+fn hash_filters(filters: &Option<SearchFilters>) -> u64 {
+    match filters {
+        None => 0,
+        Some(f) => {
+            let repr = format!("{:?}", f);
+            let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+            for byte in repr.as_bytes() {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        }
     }
 }
 

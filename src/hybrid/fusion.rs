@@ -31,6 +31,11 @@ pub fn normalize_bm25_scores(scores: &[f32], k: f32) -> Vec<f32> {
         .map(|&x| {
             if x.is_nan() || x <= 0.0 {
                 0.0
+            } else if x.is_infinite() {
+                // §1.2: An infinite BM25 score (corrupt data or division edge
+                // case) would propagate through the fused score and break
+                // downstream confidence computation.
+                1.0
             } else {
                 (x / (k + x)).clamp(0.0, 1.0)
             }
@@ -356,8 +361,8 @@ mod tests {
     #[test]
     fn test_compute_confidence() {
         let scores = vec![1.0, 0.8, 0.5];
-        let conf = compute_confidence(&scores);
-        assert_eq!(conf, Some(0.2)); // (1.0 - 0.8) / 1.0
+        let conf = compute_confidence(&scores).unwrap();
+        assert!((conf - 0.2).abs() < 1e-6); // (1.0 - 0.8) / 1.0
 
         let scores2 = vec![0.5, 0.5];
         let conf2 = compute_confidence(&scores2);
