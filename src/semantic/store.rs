@@ -355,6 +355,13 @@ impl VectorStore {
             .map_or(0, |ids| ids.len())
     }
 
+    /// List book keys deterministically for backend-neutral lifecycle code.
+    pub fn book_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.read_state().book_index.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     pub fn contains(&self, semantic_id: &str) -> bool {
         self.read_state().records.contains_key(semantic_id)
     }
@@ -384,6 +391,53 @@ impl VectorStore {
             log::warn!("VectorStore lock was poisoned; recovering state");
             poisoned.into_inner()
         })
+    }
+}
+
+impl crate::semantic::store_backend::VectorStoreBackend for VectorStore {
+    fn backend_id(&self) -> &'static str {
+        VectorStore::backend_id(self)
+    }
+
+    fn is_persistent(&self) -> bool {
+        VectorStore::is_persistent(self)
+    }
+
+    fn embedding_dim(&self) -> u32 {
+        VectorStore::embedding_dim(self)
+    }
+
+    fn count(&self) -> u32 {
+        VectorStore::vector_count(self).min(u32::MAX as usize) as u32
+    }
+
+    fn insert_batch(
+        &self,
+        records: Vec<(VectorMetadata, Vec<f32>)>,
+    ) -> Result<u32, VectorStoreError> {
+        VectorStore::insert_batch(self, &records)?;
+        Ok(records.len().min(u32::MAX as usize) as u32)
+    }
+
+    fn search(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
+        VectorStore::search(self, query_vector, top_k, filters)
+    }
+
+    fn remove_by_book(&self, source_book_key: &str) -> Result<u32, VectorStoreError> {
+        VectorStore::delete_book(self, source_book_key)
+    }
+
+    fn clear(&self) -> Result<u32, VectorStoreError> {
+        VectorStore::clear(self)
+    }
+
+    fn book_keys(&self) -> Vec<String> {
+        VectorStore::book_keys(self)
     }
 }
 

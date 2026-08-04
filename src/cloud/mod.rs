@@ -1,4 +1,3 @@
-//! Cloud index builder: server-side embedding and client-side import.
-pub mod builder;
+//! Cloud index package validation and atomic client-side import.
 pub mod importer;
 pub mod package;

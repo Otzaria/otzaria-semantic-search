@@ -3,9 +3,10 @@ use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 
 /// Trait defining the contract for vector storage backends.
 ///
-/// Both the in-memory backend and the persistent Zevc backend implement
-/// this trait, allowing the engine to swap backends without changing
-/// its indexing or search logic.
+/// Both the in-memory backend and the persistent Zevc backend implement this
+/// trait. The current [`SemanticEngine`](crate::semantic::engine::SemanticEngine)
+/// still selects the in-memory store directly; this is the common contract a
+/// future backend-selection layer can use.
 pub trait VectorStoreBackend: Send + Sync {
     /// Stable identifier persisted in the manifest.
     fn backend_id(&self) -> &'static str;
@@ -19,7 +20,7 @@ pub trait VectorStoreBackend: Send + Sync {
     /// Number of vectors currently stored.
     fn count(&self) -> u32;
 
-    /// Insert or replace a batch of pre-normalized vectors.
+    /// Validate, normalize, and insert or replace a batch of vectors.
     fn insert_batch(
         &self,
         records: Vec<(VectorMetadata, Vec<f32>)>,
