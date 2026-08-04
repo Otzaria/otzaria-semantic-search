@@ -1,24 +1,18 @@
-//! Benchmark framework for the hybrid search pipeline.
+//! Measurement helpers for hybrid-search benchmarks.
 //!
-//! Provides structured measurement of search latency, throughput, and memory
-//! usage across configurable dimensions: query types, corpus sizes, retrieval
-//! modes, and configuration profiles.
+//! Provides query sets, timing helpers, percentile aggregation and serial
+//! throughput estimates. The caller supplies the search closure and corpus.
 //!
 //! # Usage
 //!
 //! ```no_run
-//! use otzaria_semantic_search::benchmark::{BenchmarkRunner, BenchmarkConfig, QuerySet};
+//! use otzaria_semantic_search::benchmark::{aggregate, measure};
+//! use std::time::Duration;
 //!
-//! let runner = BenchmarkRunner::new(BenchmarkConfig::default());
-//! let results = runner.run_suite();
-//! for result in &results {
-//!     println!("{}", result.summary());
-//! }
+//! let (_, latency) = measure(|| 2 + 2);
+//! let result = aggregate("example", 1_000, "short", vec![latency, Duration::from_micros(5)]);
+//! println!("{}", result.summary());
 //! ```
-//!
-//! The benchmark does **not** depend on a live model or index — it uses the mock
-//! embedding backend and a synthetic corpus, so it measures the *pipeline*
-//! overhead, not inference latency.
 
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
