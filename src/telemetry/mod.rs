@@ -13,6 +13,8 @@ pub struct SearchTelemetry {
     pub lexical_candidates: u32,
     pub semantic_candidates: u32,
     pub fused_candidates: u32,
+    /// Whether this search actually consulted the result cache.
+    pub cache_lookup: bool,
     pub cache_hit: bool,
     pub latency_ms: u64,
     pub embedding_latency_ms: Option<u64>,
@@ -65,13 +67,15 @@ impl TelemetryCollector {
     pub fn record_search(&self, telemetry: &SearchTelemetry) {
         self.total_searches.fetch_add(1, Ordering::Relaxed);
 
-        if telemetry.cache_hit {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            if telemetry.embedding_latency_ms.is_some() {
-                self.embedding_calls.fetch_add(1, Ordering::Relaxed);
+        if telemetry.cache_lookup {
+            if telemetry.cache_hit {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if telemetry.embedding_latency_ms.is_some() {
+            self.embedding_calls.fetch_add(1, Ordering::Relaxed);
         }
 
         // Convert latency to microseconds to retain precision in total
@@ -151,6 +155,7 @@ mod tests {
             lexical_candidates: 10,
             semantic_candidates: 10,
             fused_candidates: 10,
+            cache_lookup: true,
             cache_hit,
             latency_ms,
             embedding_latency_ms: if cache_hit {
@@ -201,6 +206,21 @@ mod tests {
         assert_eq!(snapshot.avg_latency_ms, 0.0);
         assert_eq!(snapshot.cache_hit_rate, 0.0);
         assert!(snapshot.strategy_distribution.is_empty());
+    }
+
+    #[test]
+    fn disabled_cache_is_not_reported_as_a_miss() {
+        let collector = TelemetryCollector::new();
+        let mut telemetry = make_telemetry(false, 5, "Weighted");
+        telemetry.cache_lookup = false;
+
+        collector.record_search(&telemetry);
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.cache_hits, 0);
+        assert_eq!(snapshot.cache_misses, 0);
+        assert_eq!(snapshot.embedding_calls, 1);
+        assert_eq!(snapshot.cache_hit_rate, 0.0);
     }
 
     #[test]

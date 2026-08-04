@@ -28,30 +28,38 @@ impl FeatureFlags {
     /// Apply any explicitly set feature flags as overrides onto a `RankingProfile`.
     pub fn apply(&self, profile: &mut RankingProfile) {
         if let Some(true) = self.force_rrf {
-            let k = self.rrf_k.unwrap_or(60);
+            let k = self.rrf_k.unwrap_or(60).max(1);
             profile.fusion_strategy = FusionStrategy::RRF { k };
         } else if let Some(true) = self.force_weighted {
             profile.fusion_strategy = FusionStrategy::Weighted;
         }
 
         if let Some(threshold) = self.semantic_threshold_override {
-            profile.semantic_threshold = threshold;
+            if threshold.is_finite() {
+                profile.semantic_threshold = threshold.clamp(0.0, 1.0);
+            }
         }
 
         if let Some(bonus) = self.agreement_bonus_override {
-            profile.agreement_bonus = bonus;
+            if bonus.is_finite() {
+                profile.agreement_bonus = bonus.clamp(0.0, 1.0);
+            }
         }
 
         if let Some(false) = self.phrase_match_enabled {
             profile.phrase_match_bonus = 0.0;
         } else if let Some(bonus) = self.phrase_match_bonus_override {
-            profile.phrase_match_bonus = bonus;
+            if bonus.is_finite() {
+                profile.phrase_match_bonus = bonus.clamp(0.0, 1.0);
+            }
         }
 
         if let Some(false) = self.rare_term_enabled {
             profile.rare_term_bonus = 0.0;
         } else if let Some(bonus) = self.rare_term_bonus_override {
-            profile.rare_term_bonus = bonus;
+            if bonus.is_finite() {
+                profile.rare_term_bonus = bonus.clamp(0.0, 1.0);
+            }
         }
 
         if let Some(false) = self.section_coverage_enabled {

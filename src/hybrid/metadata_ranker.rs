@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 /// Configuration for metadata-based ranking signals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,10 +95,16 @@ impl MetadataRanker {
         0.0
     }
 
-    fn compute_era_affinity_bonus(&self, _facets: &[String], _query_facets: &[String]) -> f32 {
-        // Placeholder for era affinity computation (future enhancement)
-        // Currently returns 0.0 as it requires specific era categorization logic
-        0.0
+    fn compute_era_affinity_bonus(&self, facets: &[String], query_facets: &[String]) -> f32 {
+        let matches = query_facets
+            .iter()
+            .filter(|facet| facet_dimension(facet) == Some("era"))
+            .any(|query| facets.iter().any(|value| facet_matches(value, query)));
+        if matches {
+            self.config.era_affinity_bonus
+        } else {
+            0.0
+        }
     }
 
     fn compute_category_match_bonus(&self, facets: &[String], query_facets: &[String]) -> f32 {
@@ -107,15 +112,29 @@ impl MetadataRanker {
             return 0.0;
         }
 
-        let query_set: HashSet<&String> = query_facets.iter().collect();
-        let match_count = facets.iter().filter(|f| query_set.contains(f)).count();
+        let matches = query_facets
+            .iter()
+            .filter(|facet| facet_dimension(facet).is_none())
+            .any(|query| facets.iter().any(|value| facet_matches(value, query)));
 
-        if match_count > 0 {
+        if matches {
             self.config.category_match_bonus
         } else {
             0.0
         }
     }
+}
+
+fn facet_dimension(path: &str) -> Option<&str> {
+    let first = path.trim_start_matches('/').split('/').next()?;
+    ["author", "era", "base"].contains(&first).then_some(first)
+}
+
+fn facet_matches(value: &str, query: &str) -> bool {
+    value == query
+        || value
+            .strip_prefix(query)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(test)]

@@ -577,6 +577,12 @@ impl SemanticEngine {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        let query_vec = self.embed_query(query)?;
+        self.search_vector(&query_vec, top_k, filters)
+    }
+
+    /// Embed a query separately so the coordinator can safely cache the vector.
+    pub(crate) fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
         self.ensure_index_usable()?;
 
         let Some(runtime) = &self.runtime else {
@@ -585,8 +591,18 @@ impl SemanticEngine {
             ));
         };
 
-        let query_vec = runtime.embed_one(query)?;
-        Ok(self.store.search(&query_vec, top_k, filters)?)
+        Ok(runtime.embed_one(query)?)
+    }
+
+    /// Search with a vector already produced by this engine's embedding runtime.
+    pub(crate) fn search_vector(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        self.ensure_index_usable()?;
+        Ok(self.store.search(query_vector, top_k, filters)?)
     }
 
     /// Compare the library's per-book fingerprints against the semantic index.

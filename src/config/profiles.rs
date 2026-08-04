@@ -31,7 +31,7 @@ impl fmt::Display for FusionStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FusionStrategy::Weighted => write!(f, "Weighted"),
-            FusionStrategy::RRF { k } => write!(f, "RRF(k={})", k),
+            FusionStrategy::RRF { k } => write!(f, "RRF(k={k})"),
             FusionStrategy::Adaptive => write!(f, "Adaptive"),
         }
     }
@@ -65,7 +65,7 @@ impl RankingProfile {
                 profile,
                 fusion_strategy: FusionStrategy::RRF { k: 60 },
                 alpha_override: None,
-                semantic_threshold: 0.5,
+                semantic_threshold: 0.55,
                 agreement_bonus: 0.05,
                 phrase_match_bonus: 0.0,
                 rare_term_bonus: 0.0,
@@ -81,12 +81,14 @@ impl RankingProfile {
                 profile,
                 fusion_strategy: FusionStrategy::Weighted,
                 alpha_override: None,
-                semantic_threshold: 0.3,
+                // Preserve the pre-profile ranking contract for callers that
+                // do not select a profile explicitly.
+                semantic_threshold: 0.0,
                 agreement_bonus: 0.10,
-                phrase_match_bonus: 0.08,
+                phrase_match_bonus: 0.0,
                 rare_term_bonus: 0.0,
                 section_coverage_bonus: 0.0,
-                duplicate_penalty: 0.05,
+                duplicate_penalty: 0.0,
                 metadata_ranking_enabled: false,
                 candidate_window_multiplier: 2.0,
                 query_cache_enabled: true,
@@ -97,7 +99,7 @@ impl RankingProfile {
                 profile,
                 fusion_strategy: FusionStrategy::Adaptive,
                 alpha_override: None,
-                semantic_threshold: 0.2,
+                semantic_threshold: 0.55,
                 agreement_bonus: 0.12,
                 phrase_match_bonus: 0.10,
                 rare_term_bonus: 0.05,
@@ -127,17 +129,17 @@ mod tests {
     fn test_profile_defaults() {
         let fast = RankingProfile::from_profile(SearchProfile::Fast);
         assert_eq!(fast.fusion_strategy, FusionStrategy::RRF { k: 60 });
-        assert_eq!(fast.semantic_threshold, 0.5);
+        assert_eq!(fast.semantic_threshold, 0.55);
         assert!(!fast.metadata_ranking_enabled);
 
         let balanced = RankingProfile::default();
         assert_eq!(balanced.profile, SearchProfile::Balanced);
         assert_eq!(balanced.fusion_strategy, FusionStrategy::Weighted);
-        assert_eq!(balanced.semantic_threshold, 0.3);
+        assert_eq!(balanced.semantic_threshold, 0.0);
 
         let best = RankingProfile::from_profile(SearchProfile::Best);
         assert_eq!(best.fusion_strategy, FusionStrategy::Adaptive);
-        assert_eq!(best.semantic_threshold, 0.2);
+        assert_eq!(best.semantic_threshold, 0.55);
         assert!(best.metadata_ranking_enabled);
     }
 

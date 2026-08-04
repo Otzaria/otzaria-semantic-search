@@ -1,4 +1,6 @@
+use crate::semantic::types::HybridSearchResult;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -16,21 +18,23 @@ pub struct QueryCacheStats {
 
 #[derive(Debug, Clone)]
 struct CachedEntry {
-    result_json: String,
+    result: HybridSearchResult,
     generation: u64,
     inserted: Instant,
+    last_access: u64,
 }
 
 /// A cache for search results, keyed by query parameters and using generation-based invalidation.
 #[derive(Debug)]
 pub struct QueryCache {
-    entries: Mutex<HashMap<u64, CachedEntry>>,
+    entries: Mutex<HashMap<[u8; 32], CachedEntry>>,
     generation: AtomicU64,
     capacity: usize,
     ttl: Duration,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    access_clock: AtomicU64,
 }
 
 impl Default for QueryCache {
@@ -50,18 +54,23 @@ impl QueryCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            access_clock: AtomicU64::new(0),
         }
     }
 
-    /// Retrieve a cached serialized result if it exists, is fresh, and matches the current generation.
-    pub fn get(&self, key: u64) -> Option<String> {
+    /// Retrieve a cached result if it is fresh and matches the current generation.
+    pub fn get(&self, key: [u8; 32]) -> Option<HybridSearchResult> {
         let current_gen = self.generation.load(Ordering::Relaxed);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| {
+            log::warn!("QueryCache lock was poisoned; recovering cached state");
+            poisoned.into_inner()
+        });
 
-        if let Some(entry) = entries.get(&key) {
+        if let Some(entry) = entries.get_mut(&key) {
             if entry.generation == current_gen && entry.inserted.elapsed() <= self.ttl {
+                entry.last_access = self.access_clock.fetch_add(1, Ordering::Relaxed);
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(entry.result_json.clone());
+                return Some(entry.result.clone());
             }
             // If invalid due to generation or TTL, we can remove it
             entries.remove(&key);
@@ -71,25 +80,46 @@ impl QueryCache {
         None
     }
 
-    /// Insert a new serialized result into the cache.
-    pub fn insert(&self, key: u64, result_json: String) {
-        let current_gen = self.generation.load(Ordering::Relaxed);
-        let mut entries = self.entries.lock().unwrap();
+    /// Insert a result into the cache.
+    pub fn insert(&self, key: [u8; 32], result: HybridSearchResult) {
+        self.insert_with_capacity(key, result, self.capacity);
+    }
 
-        if entries.len() >= self.capacity {
-            // Simple eviction: remove the oldest entry
-            if let Some((&oldest_key, _)) = entries.iter().min_by_key(|(_, entry)| entry.inserted) {
-                entries.remove(&oldest_key);
+    /// Insert with a request-specific upper bound, capped by the cache's capacity.
+    pub fn insert_with_capacity(
+        &self,
+        key: [u8; 32],
+        result: HybridSearchResult,
+        requested_capacity: usize,
+    ) {
+        let capacity = requested_capacity.min(self.capacity);
+        if capacity == 0 {
+            return;
+        }
+
+        let current_gen = self.generation.load(Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| {
+            log::warn!("QueryCache lock was poisoned; recovering cached state");
+            poisoned.into_inner()
+        });
+
+        while entries.len() >= capacity && !entries.contains_key(&key) {
+            if let Some((&lru_key, _)) = entries.iter().min_by_key(|(_, entry)| entry.last_access) {
+                entries.remove(&lru_key);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
+            } else {
+                break;
             }
         }
 
+        let last_access = self.access_clock.fetch_add(1, Ordering::Relaxed);
         entries.insert(
             key,
             CachedEntry {
-                result_json,
+                result,
                 generation: current_gen,
                 inserted: Instant::now(),
+                last_access,
             },
         );
     }
@@ -102,42 +132,45 @@ impl QueryCache {
     /// Clear all entries and bump generation.
     pub fn clear(&self) {
         self.invalidate();
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.clear();
-        }
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
-    /// Compute a cache key based on query parameters using FNV-1a.
+    /// Compute a collision-resistant cache key from all query parameters.
     pub fn compute_key(
         query: &str,
-        filters_hash: u64,
+        inputs_hash: [u8; 32],
         mode: &str,
         grouping: &str,
         limit: usize,
         offset: usize,
-    ) -> u64 {
-        let mut hash: u64 = 0xcbf29ce484222325;
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
 
-        let update_hash = |h: &mut u64, bytes: &[u8]| {
-            for &byte in bytes {
-                *h ^= byte as u64;
-                *h = h.wrapping_mul(0x100000001b3);
-            }
+        let update_hash = |hasher: &mut Sha256, bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
         };
 
-        update_hash(&mut hash, query.as_bytes());
-        update_hash(&mut hash, &filters_hash.to_le_bytes());
-        update_hash(&mut hash, mode.as_bytes());
-        update_hash(&mut hash, grouping.as_bytes());
-        update_hash(&mut hash, &limit.to_le_bytes());
-        update_hash(&mut hash, &offset.to_le_bytes());
+        update_hash(&mut hasher, query.as_bytes());
+        update_hash(&mut hasher, &inputs_hash);
+        update_hash(&mut hasher, mode.as_bytes());
+        update_hash(&mut hasher, grouping.as_bytes());
+        update_hash(&mut hasher, &(limit as u64).to_le_bytes());
+        update_hash(&mut hasher, &(offset as u64).to_le_bytes());
 
-        hash
+        hasher.finalize().into()
     }
 
     /// Retrieve cache statistics.
     pub fn stats(&self) -> QueryCacheStats {
-        let size = self.entries.lock().unwrap().len();
+        let size = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
         QueryCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -151,15 +184,35 @@ impl QueryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::types::SearchMode;
     use std::thread;
+
+    fn result(total_count: u32) -> HybridSearchResult {
+        HybridSearchResult {
+            results: Vec::new(),
+            total_count,
+            group_count: None,
+            search_mode: SearchMode::LexicalOnly,
+            semantic_available: false,
+            fallback_reason: None,
+            latency_ms: 0,
+            confidence: None,
+            profile: None,
+            telemetry: None,
+        }
+    }
+
+    fn key(value: u8) -> [u8; 32] {
+        [value; 32]
+    }
 
     #[test]
     fn test_insert_and_get() {
         let cache = QueryCache::new(10, Duration::from_secs(60));
-        let key = QueryCache::compute_key("query", 123, "Hybrid", "None", 10, 0);
+        let key = QueryCache::compute_key("query", key(123), "Hybrid", "None", 10, 0);
 
-        cache.insert(key, "{}".to_string());
-        assert_eq!(cache.get(key), Some("{}".to_string()));
+        cache.insert(key, result(1));
+        assert_eq!(cache.get(key).map(|r| r.total_count), Some(1));
 
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
@@ -169,35 +222,56 @@ mod tests {
     #[test]
     fn test_ttl_expiry() {
         let cache = QueryCache::new(10, Duration::from_millis(10));
-        cache.insert(1, "{}".to_string());
+        cache.insert(key(1), result(1));
         thread::sleep(Duration::from_millis(20));
 
-        assert_eq!(cache.get(1), None);
+        assert!(cache.get(key(1)).is_none());
     }
 
     #[test]
     fn test_generation_invalidation() {
         let cache = QueryCache::new(10, Duration::from_secs(60));
-        cache.insert(1, "{}".to_string());
+        cache.insert(key(1), result(1));
 
-        assert_eq!(cache.get(1), Some("{}".to_string()));
+        assert_eq!(cache.get(key(1)).map(|r| r.total_count), Some(1));
         cache.invalidate();
-        assert_eq!(cache.get(1), None); // Old generation
+        assert!(cache.get(key(1)).is_none()); // Old generation
     }
 
     #[test]
     fn test_capacity_eviction() {
         let cache = QueryCache::new(2, Duration::from_secs(60));
 
-        cache.insert(1, "1".to_string());
+        cache.insert(key(1), result(1));
         thread::sleep(Duration::from_millis(5));
-        cache.insert(2, "2".to_string());
+        cache.insert(key(2), result(2));
         thread::sleep(Duration::from_millis(5));
-        cache.insert(3, "3".to_string()); // Should evict 1
+        cache.insert(key(3), result(3)); // Should evict 1
 
-        assert_eq!(cache.get(1), None);
-        assert_eq!(cache.get(2), Some("2".to_string()));
-        assert_eq!(cache.get(3), Some("3".to_string()));
+        assert!(cache.get(key(1)).is_none());
+        assert_eq!(cache.get(key(2)).map(|r| r.total_count), Some(2));
+        assert_eq!(cache.get(key(3)).map(|r| r.total_count), Some(3));
         assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn zero_capacity_never_stores_an_entry() {
+        let cache = QueryCache::new(0, Duration::from_secs(60));
+        cache.insert(key(1), result(1));
+        assert!(cache.get(key(1)).is_none());
+        assert_eq!(cache.stats().size, 0);
+    }
+
+    #[test]
+    fn reads_refresh_lru_order() {
+        let cache = QueryCache::new(2, Duration::from_secs(60));
+        cache.insert(key(1), result(1));
+        cache.insert(key(2), result(2));
+        assert!(cache.get(key(1)).is_some());
+        cache.insert(key(3), result(3));
+
+        assert!(cache.get(key(1)).is_some());
+        assert!(cache.get(key(2)).is_none());
+        assert!(cache.get(key(3)).is_some());
     }
 }

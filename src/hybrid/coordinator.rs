@@ -21,16 +21,24 @@
 //! [`HybridSearchResult::fallback_reason`], which is what lets the caller decide
 //! whether to retry in another mode.
 
+use crate::config::feature_flags::FeatureFlags;
+use crate::config::profiles::{FusionStrategy, RankingProfile, SearchProfile};
 use crate::errors::SemanticSearchError;
-use crate::hybrid::fusion::{normalize_bm25_adaptive, normalize_semantic_with_threshold};
+use crate::hybrid::fusion::{
+    normalize_bm25_adaptive, normalize_bm25_scores, normalize_semantic_with_threshold,
+};
 use crate::hybrid::grouping::group_results;
-use crate::hybrid::ranking::{analyze_query, compute_alpha, BonusConfig};
+use crate::hybrid::ranking::{
+    analyze_query, compute_alpha, compute_phrase_match_bonus, compute_rare_term_bonus,
+    QueryFeatures,
+};
 use crate::semantic::engine::SemanticEngine;
 use crate::semantic::types::{
     BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling, HybridResultItem,
     HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate, ResultSource, SearchFilters,
     SearchMode, SemanticCandidate, SemanticStatus,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 
@@ -101,12 +109,19 @@ pub struct HybridCoordinator {
     /// This serializes them instead. Distinct from the engine lock on purpose: it
     /// excludes other *writers* without excluding readers.
     indexing: Mutex<()>,
-    bonus_config: BonusConfig,
     query_cache: crate::hybrid::cache::QueryCache,
     embedding_cache: crate::semantic::embedding_cache::EmbeddingCache,
     telemetry: crate::telemetry::TelemetryCollector,
     normalizer: crate::hybrid::hebrew_normalizer::HebrewNormalizer,
     metadata_ranker: crate::hybrid::metadata_ranker::MetadataRanker,
+}
+
+struct FusionContext<'a> {
+    alpha: f32,
+    mode: SearchMode,
+    profile: &'a RankingProfile,
+    query_features: &'a QueryFeatures,
+    query_facets: &'a [String],
 }
 
 impl HybridCoordinator {
@@ -115,7 +130,6 @@ impl HybridCoordinator {
         Self {
             semantic_engine: RwLock::new(semantic_engine),
             indexing: Mutex::new(()),
-            bonus_config: BonusConfig::default(),
             query_cache: crate::hybrid::cache::QueryCache::new(
                 100,
                 std::time::Duration::from_secs(300),
@@ -136,52 +150,87 @@ impl HybridCoordinator {
     ) -> Result<HybridSearchResult, SemanticSearchError> {
         let start_time = std::time::Instant::now();
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
-
+        let flags = params.feature_flags.clone().unwrap_or_default();
+        let selected_profile = params.profile.unwrap_or(SearchProfile::Balanced);
+        let ranking_profile = FeatureFlags::resolve(selected_profile, &flags);
         let normalized_query = self.normalizer.normalize(query);
+        let query_features = analyze_query(&normalized_query);
+        let requested_alpha = ranking_profile
+            .alpha_override
+            .unwrap_or_else(|| compute_alpha(&query_features))
+            .clamp(0.0, 1.0);
+        let telemetry_per_query = flags.telemetry_per_query.unwrap_or(true);
+
+        let mut telemetry_record = crate::telemetry::SearchTelemetry {
+            query_type: query_features.estimated_type.to_string(),
+            search_mode: requested.to_string(),
+            fusion_strategy: ranking_profile.fusion_strategy.to_string(),
+            alpha: requested_alpha,
+            lexical_candidates: lexical_candidates.len().min(u32::MAX as usize) as u32,
+            semantic_candidates: 0,
+            fused_candidates: 0,
+            cache_lookup: false,
+            cache_hit: false,
+            latency_ms: 0,
+            embedding_latency_ms: None,
+            fusion_latency_ms: 0,
+            confidence: None,
+            profile: ranking_profile.profile.to_string(),
+        };
 
         // §1.1 + §3.4: Do not read from or write to the cache for empty or
         // very short queries. Empty queries cannot be embedded and will always
         // degrade to lexical-only; caching that would poison future lookups.
         // Single-character queries from live typing are almost never reused.
-        let cacheable = normalized_query.chars().count() >= MIN_CACHEABLE_QUERY_LEN;
+        let cacheable = ranking_profile.query_cache_enabled
+            && normalized_query.chars().count() >= MIN_CACHEABLE_QUERY_LEN;
+        telemetry_record.cache_lookup = cacheable;
 
-        // §1.5: Include actual filter content in the cache key. The previous
-        // hardcoded `0` caused queries with different filters to share a cache
-        // entry, returning wrong results.
-        let filters_hash = hash_filters(&params.filters);
+        // The lexical candidates are inputs, not state owned by this coordinator.
+        // Hashing them prevents a cache hit after Tantivy produced a new window.
+        let inputs_hash = hash_search_inputs(
+            &params.filters,
+            &lexical_candidates,
+            &ranking_profile,
+            &params.feature_flags,
+        );
         let cache_key = crate::hybrid::cache::QueryCache::compute_key(
-            &normalized_query,
-            filters_hash,
+            query,
+            inputs_hash,
             &requested.to_string(),
             &format!("{:?}", params.grouping),
             params.limit,
             params.offset,
         );
         if cacheable {
-            if let Some(cached_json) = self.query_cache.get(cache_key) {
-                if let Ok(cached_result) =
-                    serde_json::from_str::<HybridSearchResult>(&cached_json)
-                {
-                    return Ok(cached_result);
+            if let Some(mut cached_result) = self.query_cache.get(cache_key) {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                cached_result.latency_ms = latency_ms;
+                telemetry_record.cache_hit = true;
+                telemetry_record.search_mode = cached_result.search_mode.to_string();
+                if cached_result.search_mode != SearchMode::Hybrid {
+                    telemetry_record.fusion_strategy = "SingleSource".to_string();
                 }
+                telemetry_record.semantic_candidates = cached_result
+                    .telemetry
+                    .as_ref()
+                    .map_or(0, |record| record.semantic_candidates);
+                telemetry_record.fused_candidates = cached_result
+                    .telemetry
+                    .as_ref()
+                    .map_or(cached_result.total_count, |record| record.fused_candidates);
+                telemetry_record.latency_ms = latency_ms;
+                telemetry_record.confidence = cached_result.confidence;
+
+                if ranking_profile.telemetry_enabled {
+                    self.telemetry.record_search(&telemetry_record);
+                }
+                cached_result.telemetry = (ranking_profile.telemetry_enabled
+                    && telemetry_per_query)
+                    .then_some(telemetry_record);
+                return Ok(cached_result);
             }
         }
-
-        let mut telemetry_record = crate::telemetry::SearchTelemetry {
-            query_type: "Unknown".into(),
-            search_mode: "Hybrid".into(),
-            fusion_strategy: "Weighted".into(),
-            alpha: 0.5,
-            lexical_candidates: lexical_candidates.len() as u32,
-            semantic_candidates: 0,
-            fused_candidates: 0,
-            cache_hit: false,
-            latency_ms: 0,
-            embedding_latency_ms: None,
-            fusion_latency_ms: 0,
-            confidence: None,
-            profile: "Balanced".into(),
-        };
 
         // Recover rather than propagate a poisoned lock: a panic in one query
         // must not disable the semantic path for the rest of the session.
@@ -190,12 +239,7 @@ impl HybridCoordinator {
             .read()
             .unwrap_or_else(|e| e.into_inner());
 
-        // §3.1: Analyze the query early so we can skip the semantic path when
-        // the query is a verbatim lookup (alpha >= 1.0). This avoids the
-        // embedding computation entirely for quoted-phrase searches.
-        let query_features = analyze_query(query);
-        let skip_semantic_for_exact =
-            requested == SearchMode::Hybrid && compute_alpha(&query_features) >= 1.0;
+        let skip_semantic_for_exact = requested == SearchMode::Hybrid && requested_alpha >= 1.0;
 
         let semantic = if requested == SearchMode::LexicalOnly || skip_semantic_for_exact {
             // Not consulted — this is the caller's choice (or an optimization),
@@ -205,14 +249,41 @@ impl HybridCoordinator {
             match semantic_guard.as_ref() {
                 None => SemanticOutcome::failed("no semantic engine is configured".to_string()),
                 Some(engine) => {
-                    match engine.search(query, self.semantic_top_k(params), params.filters.as_ref())
-                    {
+                    let embedding_start = std::time::Instant::now();
+                    let cached_vector = ranking_profile
+                        .embedding_cache_enabled
+                        .then(|| self.embedding_cache.get(&normalized_query))
+                        .flatten();
+
+                    let query_vector = match cached_vector {
+                        Some(vector) => Ok(vector),
+                        None => {
+                            let result = engine.embed_query(&normalized_query);
+                            telemetry_record.embedding_latency_ms =
+                                Some(embedding_start.elapsed().as_millis() as u64);
+                            if ranking_profile.embedding_cache_enabled {
+                                if let Ok(vector) = &result {
+                                    self.embedding_cache
+                                        .insert(&normalized_query, vector.clone());
+                                }
+                            }
+                            result
+                        }
+                    };
+
+                    match query_vector.and_then(|vector| {
+                        engine.search_vector(
+                            &vector,
+                            self.semantic_top_k(params, &ranking_profile),
+                            params.filters.as_ref(),
+                        )
+                    }) {
                         Ok(candidates) => SemanticOutcome::ok(candidates),
-                        Err(e) => {
+                        Err(error) => {
                             log::warn!(
-                                "Semantic search path failed: {e}. Serving the lexical results."
+                                "Semantic search path failed: {error}. Serving the lexical results."
                             );
-                            SemanticOutcome::failed(e.to_string())
+                            SemanticOutcome::failed(error.to_string())
                         }
                     }
                 }
@@ -242,13 +313,28 @@ impl HybridCoordinator {
         let alpha = match mode {
             SearchMode::LexicalOnly => 1.0,
             SearchMode::SemanticOnly => 0.0,
-            // Re-use the features computed before the semantic search so we
-            // do not tokenize the query twice.
-            SearchMode::Hybrid => compute_alpha(&query_features),
+            SearchMode::Hybrid => requested_alpha,
         };
 
-        let sem_len = semantic.candidates.len() as u32;
-        let fused = self.fuse_candidates(lexical_candidates, semantic.candidates, alpha, mode);
+        let sem_len = semantic.candidates.len().min(u32::MAX as usize) as u32;
+        let fusion_start = std::time::Instant::now();
+        let query_facets = params
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.facets.as_deref())
+            .unwrap_or_default();
+        let fused = self.fuse_candidates(
+            lexical_candidates,
+            semantic.candidates,
+            FusionContext {
+                alpha,
+                mode,
+                profile: &ranking_profile,
+                query_features: &query_features,
+                query_facets,
+            },
+        );
+        let fused_count = fused.len().min(u32::MAX as usize) as u32;
 
         let scores: Vec<f32> = fused.iter().map(|c| c.fused_score).collect();
         let confidence = crate::hybrid::fusion::compute_confidence(&scores);
@@ -295,14 +381,19 @@ impl HybridCoordinator {
             }
         };
 
+        let fusion_latency_ms = fusion_start.elapsed().as_millis() as u64;
         let latency_ms = start_time.elapsed().as_millis() as u64;
 
         // §2.4: Populate telemetry fields BEFORE cloning into the result, so
         // the client-visible telemetry carries the final values instead of the
         // initial defaults (zeroes).
-        let results_len = results.len() as u32;
-        telemetry_record.fusion_latency_ms = latency_ms;
-        telemetry_record.fused_candidates = results_len;
+        telemetry_record.search_mode = mode.to_string();
+        if mode != SearchMode::Hybrid {
+            telemetry_record.fusion_strategy = "SingleSource".to_string();
+        }
+        telemetry_record.alpha = alpha;
+        telemetry_record.fusion_latency_ms = fusion_latency_ms;
+        telemetry_record.fused_candidates = fused_count;
         telemetry_record.latency_ms = latency_ms;
         telemetry_record.confidence = confidence;
         telemetry_record.semantic_candidates = sem_len;
@@ -316,17 +407,27 @@ impl HybridCoordinator {
             fallback_reason: semantic.failure,
             latency_ms,
             confidence,
-            profile: params.profile.as_ref().map(|p| p.to_string()),
-            telemetry: Some(telemetry_record.clone()),
+            profile: Some(ranking_profile.profile.to_string()),
+            telemetry: (ranking_profile.telemetry_enabled && telemetry_per_query)
+                .then_some(telemetry_record.clone()),
         };
 
-        self.telemetry.record_search(&telemetry_record);
+        if ranking_profile.telemetry_enabled {
+            self.telemetry.record_search(&telemetry_record);
+        }
 
         // §1.1 + §3.4: Only cache queries with enough substance to be reused.
         if cacheable {
-            if let Ok(json) = serde_json::to_string(&final_result) {
-                self.query_cache.insert(cache_key, json);
-            }
+            // Keep the complete telemetry record internally even when the
+            // caller opted out of per-query telemetry.  A later cache hit
+            // still needs the original candidate counts for aggregate stats.
+            let mut cached_result = final_result.clone();
+            cached_result.telemetry = Some(telemetry_record.clone());
+            self.query_cache.insert_with_capacity(
+                cache_key,
+                cached_result,
+                flags.query_cache_capacity.unwrap_or(100),
+            );
         }
 
         Ok(final_result)
@@ -336,11 +437,16 @@ impl HybridCoordinator {
     ///
     /// Over-fetches relative to `limit` because fusion, grouping and dedup all
     /// discard candidates, so the page must be filled from a wider window.
-    fn semantic_top_k(&self, params: &HybridSearchParams) -> usize {
-        let requested = params
-            .offset
-            .saturating_add(params.limit.saturating_mul(2))
-            .max(1);
+    fn semantic_top_k(&self, params: &HybridSearchParams, profile: &RankingProfile) -> usize {
+        let multiplier = if profile.candidate_window_multiplier.is_finite() {
+            profile.candidate_window_multiplier.clamp(1.0, 10.0)
+        } else {
+            2.0
+        };
+        let window = ((params.limit as f64) * multiplier as f64)
+            .ceil()
+            .min(usize::MAX as f64) as usize;
+        let requested = params.offset.saturating_add(window).max(1);
 
         if requested > MAX_SEMANTIC_CANDIDATES {
             log::warn!(
@@ -362,38 +468,90 @@ impl HybridCoordinator {
         &self,
         lexical: Vec<LexicalCandidate>,
         semantic: Vec<SemanticCandidate>,
-        alpha: f32,
-        mode: SearchMode,
+        context: FusionContext<'_>,
     ) -> Vec<FusedCandidate> {
-        let bm25_scores: Vec<f32> = lexical.iter().map(|l| l.bm25_score).collect();
-        // §2.3: Adaptive normalization switches to min-max when the score range
-        // is wide, avoiding the saturating curve's tendency to flatten high
-        // scores against each other.
-        let norm_bm25 = normalize_bm25_adaptive(&bm25_scores, BM25_SATURATION_K);
+        let FusionContext {
+            alpha,
+            mode,
+            profile,
+            query_features,
+            query_facets,
+        } = context;
+        let mut lexical_by_id: HashMap<u64, (usize, LexicalCandidate)> = HashMap::new();
+        for (rank, candidate) in lexical.into_iter().enumerate() {
+            match lexical_by_id.entry(candidate.line_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((rank, candidate));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if candidate
+                        .bm25_score
+                        .total_cmp(&entry.get().1.bm25_score)
+                        .is_gt()
+                    {
+                        entry.insert((rank, candidate));
+                    }
+                }
+            }
+        }
+        let mut lexical: Vec<(usize, LexicalCandidate)> = lexical_by_id.into_values().collect();
+        lexical.sort_by_key(|(rank, _)| *rank);
 
-        let sem_scores: Vec<f32> = semantic.iter().map(|s| s.similarity_score).collect();
-        // §4.2: Apply a relevance threshold so orthogonal (unrelated) vectors
-        // score 0 instead of 0.5. Without this, an irrelevant semantic result
-        // with cosine ≈ 0 gets a normalized score of 0.5, enough to push it
-        // above good lexical matches.
-        let norm_sem = normalize_semantic_with_threshold(&sem_scores, SEMANTIC_RELEVANCE_THRESHOLD);
+        let mut semantic_by_id: HashMap<u64, (usize, SemanticCandidate)> = HashMap::new();
+        for (rank, candidate) in semantic.into_iter().enumerate() {
+            match semantic_by_id.entry(candidate.metadata.line_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((rank, candidate));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if candidate
+                        .similarity_score
+                        .total_cmp(&entry.get().1.similarity_score)
+                        .is_gt()
+                    {
+                        entry.insert((rank, candidate));
+                    }
+                }
+            }
+        }
+        let mut semantic: Vec<(usize, SemanticCandidate)> = semantic_by_id.into_values().collect();
+        semantic.sort_by_key(|(rank, _)| *rank);
+
+        let bm25_scores: Vec<f32> = lexical
+            .iter()
+            .map(|(_, candidate)| candidate.bm25_score)
+            .collect();
+        let norm_bm25 = match profile.fusion_strategy {
+            FusionStrategy::Adaptive => normalize_bm25_adaptive(&bm25_scores, BM25_SATURATION_K),
+            FusionStrategy::Weighted | FusionStrategy::RRF { .. } => {
+                normalize_bm25_scores(&bm25_scores, BM25_SATURATION_K)
+            }
+        };
+
+        let sem_scores: Vec<f32> = semantic
+            .iter()
+            .map(|(_, candidate)| candidate.similarity_score)
+            .collect();
+        let threshold = if profile.semantic_threshold.is_finite() {
+            profile.semantic_threshold.clamp(0.0, 1.0)
+        } else {
+            SEMANTIC_RELEVANCE_THRESHOLD
+        };
+        let norm_sem = normalize_semantic_with_threshold(&sem_scores, threshold);
+        let rrf_k = match profile.fusion_strategy {
+            FusionStrategy::RRF { k } if mode == SearchMode::Hybrid => Some(k.max(1)),
+            _ => None,
+        };
 
         let mut fused_map: HashMap<u64, FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
 
-        for (candidate, &normalized) in lexical.into_iter().zip(norm_bm25.iter()) {
-            let fused_score = alpha * normalized;
+        for ((_, candidate), &normalized) in lexical.into_iter().zip(norm_bm25.iter()) {
+            let lexical_rank = fused_map.len() as u32 + 1;
+            let fused_score = rrf_k
+                .map(|k| 1.0 / (k as f32 + lexical_rank as f32))
+                .unwrap_or(alpha * normalized);
             let line_id = candidate.line_id;
-
-            // §1.4: When Tantivy returns the same line_id more than once (e.g.
-            // from a multi-field query), keep the entry with the higher BM25
-            // score rather than silently overwriting.
-            if fused_map
-                .get(&line_id)
-                .map_or(false, |e| e.fused_score >= fused_score)
-            {
-                continue;
-            }
 
             fused_map.insert(
                 line_id,
@@ -420,9 +578,30 @@ impl HybridCoordinator {
             );
         }
 
-        for (candidate, &normalized) in semantic.into_iter().zip(norm_sem.iter()) {
+        for (semantic_rank, ((_, candidate), &normalized)) in
+            semantic.into_iter().zip(norm_sem.iter()).enumerate()
+        {
+            // RRF ignores score magnitudes, so a threshold only has meaning if
+            // candidates below it are excluded. Weighted/adaptive fusion keeps
+            // them at zero to preserve semantic-only paging and grouping.
+            if normalized <= 0.0 && rrf_k.is_some() {
+                continue;
+            }
             let line_id = candidate.metadata.line_id;
-            let contribution = (1.0 - alpha) * normalized;
+            let contribution = rrf_k
+                .map(|k| 1.0 / (k as f32 + semantic_rank as f32 + 1.0))
+                .unwrap_or((1.0 - alpha) * normalized);
+            let metadata_bonus = if profile.metadata_ranking_enabled && rrf_k.is_none() {
+                self.metadata_ranker
+                    .compute_signal(
+                        &candidate.metadata.source_book_key,
+                        &candidate.metadata.facets,
+                        query_facets,
+                    )
+                    .total
+            } else {
+                0.0
+            };
 
             match fused_map.get_mut(&line_id) {
                 // Found by both engines: keep the lexical text and record both
@@ -431,9 +610,9 @@ impl HybridCoordinator {
                     existing.source = ResultSource::Both;
                     existing.raw_semantic_score = Some(candidate.similarity_score);
                     existing.normalized_semantic = Some(normalized);
-                    existing.fused_score += contribution;
-                    if mode == SearchMode::Hybrid {
-                        existing.fused_score += self.bonus_config.agreement_bonus;
+                    existing.fused_score += contribution + metadata_bonus;
+                    if mode == SearchMode::Hybrid && rrf_k.is_none() {
+                        existing.fused_score += profile.agreement_bonus.max(0.0);
                     }
                 }
                 // Semantic-only: the vector store holds metadata but no line
@@ -458,7 +637,7 @@ impl HybridCoordinator {
                             normalized_bm25: None,
                             raw_semantic_score: Some(candidate.similarity_score),
                             normalized_semantic: Some(normalized),
-                            fused_score: contribution,
+                            fused_score: contribution + metadata_bonus,
                             lexical_weight: alpha,
                             semantic_weight: 1.0 - alpha,
                         },
@@ -468,13 +647,50 @@ impl HybridCoordinator {
         }
 
         let mut results: Vec<FusedCandidate> = fused_map.into_values().collect();
+        if rrf_k.is_none() {
+            let mut section_counts: HashMap<(String, u64), usize> = HashMap::new();
+            for candidate in &results {
+                *section_counts
+                    .entry((candidate.file_path.clone(), candidate.section_id))
+                    .or_default() += 1;
+            }
+
+            for candidate in &mut results {
+                candidate.fused_score += profile.phrase_match_bonus.max(0.0)
+                    * compute_phrase_match_bonus(&candidate.text, &query_features.quoted_phrases);
+                candidate.fused_score += profile.rare_term_bonus.max(0.0)
+                    * compute_rare_term_bonus(&candidate.text, &query_features.rare_tokens);
+                if section_counts
+                    .get(&(candidate.file_path.clone(), candidate.section_id))
+                    .copied()
+                    .unwrap_or(0)
+                    > 1
+                {
+                    candidate.fused_score += profile.section_coverage_bonus.max(0.0);
+                }
+            }
+        }
+
         // Ties break on line_id so pagination is stable across calls; `HashMap`
         // iteration order is not.
-        results.sort_by(|a, b| {
-            b.fused_score
-                .total_cmp(&a.fused_score)
-                .then_with(|| a.line_id.cmp(&b.line_id))
-        });
+        let sort_results = |results: &mut Vec<FusedCandidate>| {
+            results.sort_by(|a, b| {
+                b.fused_score
+                    .total_cmp(&a.fused_score)
+                    .then_with(|| a.line_id.cmp(&b.line_id))
+            });
+        };
+        sort_results(&mut results);
+
+        if rrf_k.is_none() && profile.duplicate_penalty > 0.0 {
+            let mut seen = std::collections::HashSet::new();
+            for candidate in &mut results {
+                if candidate.line_hash != 0 && !seen.insert(candidate.line_hash) {
+                    candidate.fused_score -= profile.duplicate_penalty;
+                }
+            }
+            sort_results(&mut results);
+        }
         results
     }
 
@@ -503,10 +719,14 @@ impl HybridCoordinator {
             .semantic_engine
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
+        let result = match guard.as_mut() {
             Some(engine) => engine.reset_index().map(Some),
             None => Ok(None),
+        };
+        if result.is_ok() {
+            self.query_cache.invalidate();
         }
+        result
     }
 
     /// Remove books that disappeared from the library.
@@ -523,10 +743,14 @@ impl HybridCoordinator {
             .semantic_engine
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
+        let result = match guard.as_mut() {
             Some(engine) => engine.remove_books(source_book_keys).map(Some),
             None => Ok(None),
+        };
+        if matches!(&result, Ok(Some(removed)) if *removed > 0) {
+            self.query_cache.invalidate();
         }
+        result
     }
 
     /// Index books into the semantic index, replacing anything held for them.
@@ -598,6 +822,7 @@ impl HybridCoordinator {
                              ({flush_error}); completed changes may be re-indexed"
                         );
                     }
+                    self.query_cache.invalidate();
                     return Err(indexing_error);
                 }
             }
@@ -612,6 +837,7 @@ impl HybridCoordinator {
                 return Ok(None);
             };
             engine.flush_manifest()?;
+            self.query_cache.invalidate();
         }
         Ok(Some(summary))
     }
@@ -732,25 +958,38 @@ fn into_result_item(
     }
 }
 
-/// Compute a deterministic hash of the search filters for use in cache keys.
-///
-/// Two queries that differ only in their filters must not share a cache entry.
-/// Using `format!("{:?}")` is stable across calls within one process — the
-/// `Debug` output of `Vec<String>` is deterministic — and cheap enough for a
-/// per-query helper.
-fn hash_filters(filters: &Option<SearchFilters>) -> u64 {
-    match filters {
-        None => 0,
-        Some(f) => {
-            let repr = format!("{:?}", f);
-            let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-            for byte in repr.as_bytes() {
-                hash ^= *byte as u64;
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-            hash
-        }
+/// Hash every input that can change a search result. Length-prefixing fields
+/// prevents adjacent strings from producing the same byte stream.
+fn hash_search_inputs(
+    filters: &Option<SearchFilters>,
+    lexical: &[LexicalCandidate],
+    profile: &RankingProfile,
+    flags: &Option<FeatureFlags>,
+) -> [u8; 32] {
+    fn feed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
+
+    let mut hasher = Sha256::new();
+    feed(&mut hasher, format!("{filters:?}").as_bytes());
+    feed(&mut hasher, format!("{profile:?}").as_bytes());
+    feed(&mut hasher, format!("{flags:?}").as_bytes());
+
+    for candidate in lexical {
+        feed(&mut hasher, &candidate.line_id.to_le_bytes());
+        feed(&mut hasher, &candidate.section_id.to_le_bytes());
+        feed(&mut hasher, &candidate.line_hash.to_le_bytes());
+        feed(&mut hasher, &candidate.segment.to_le_bytes());
+        feed(&mut hasher, &candidate.bm25_score.to_bits().to_le_bytes());
+        feed(&mut hasher, &[u8::from(candidate.is_pdf)]);
+        feed(&mut hasher, candidate.title.as_bytes());
+        feed(&mut hasher, candidate.reference.as_bytes());
+        feed(&mut hasher, candidate.text.as_bytes());
+        feed(&mut hasher, candidate.file_path.as_bytes());
+    }
+
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -910,7 +1149,13 @@ mod tests {
             .search(
                 LINE_ONE,
                 vec![lexical(1, LINE_ONE, 15.5)],
-                &HybridSearchParams::default(),
+                &HybridSearchParams {
+                    feature_flags: Some(FeatureFlags {
+                        semantic_threshold_override: Some(0.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -1275,6 +1520,10 @@ mod tests {
                 vec![lexical(1, LINE_ONE, 10.0), lexical(2, LINE_TWO, 8.0)],
                 &HybridSearchParams {
                     grouping: Some(GroupingMode::SameSection),
+                    feature_flags: Some(FeatureFlags {
+                        semantic_threshold_override: Some(0.0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             )
@@ -1345,19 +1594,23 @@ mod tests {
     #[test]
     fn the_semantic_candidate_window_is_capped() {
         let coordinator = HybridCoordinator::new(None);
+        let profile = RankingProfile::default();
         let huge = HybridSearchParams {
             limit: usize::MAX,
             offset: usize::MAX,
             ..Default::default()
         };
-        assert_eq!(coordinator.semantic_top_k(&huge), MAX_SEMANTIC_CANDIDATES);
+        assert_eq!(
+            coordinator.semantic_top_k(&huge, &profile),
+            MAX_SEMANTIC_CANDIDATES
+        );
 
         let normal = HybridSearchParams {
             limit: 20,
             offset: 40,
             ..Default::default()
         };
-        assert_eq!(coordinator.semantic_top_k(&normal), 80);
+        assert_eq!(coordinator.semantic_top_k(&normal, &profile), 80);
 
         // Never zero: a zero window would make the store return nothing.
         let nothing = HybridSearchParams {
@@ -1365,7 +1618,7 @@ mod tests {
             offset: 0,
             ..Default::default()
         };
-        assert_eq!(coordinator.semantic_top_k(&nothing), 1);
+        assert_eq!(coordinator.semantic_top_k(&nothing, &profile), 1);
     }
 
     /// Indexing and searching cannot overlap — indexing needs `&mut`, searching
@@ -1621,6 +1874,82 @@ mod tests {
             .index_books(&[])
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_query_cache_hit_is_observable_and_recorded() {
+        let coordinator = HybridCoordinator::new(None);
+        let candidates = vec![lexical(1, LINE_ONE, 10.0)];
+
+        let first = coordinator
+            .search(LINE_ONE, candidates.clone(), &HybridSearchParams::default())
+            .unwrap();
+        let second = coordinator
+            .search(LINE_ONE, candidates, &HybridSearchParams::default())
+            .unwrap();
+
+        assert!(!first.telemetry.unwrap().cache_hit);
+        assert!(second.telemetry.unwrap().cache_hit);
+        let snapshot = coordinator.get_telemetry_snapshot();
+        assert_eq!(snapshot.total_searches, 2);
+        assert_eq!(snapshot.cache_hits, 1);
+        assert_eq!(snapshot.cache_misses, 1);
+    }
+
+    #[test]
+    fn changed_lexical_inputs_cannot_reuse_a_cached_result() {
+        let coordinator = HybridCoordinator::new(None);
+        let first = coordinator
+            .search(
+                LINE_ONE,
+                vec![lexical(1, LINE_ONE, 10.0)],
+                &HybridSearchParams::default(),
+            )
+            .unwrap();
+        let second = coordinator
+            .search(
+                LINE_ONE,
+                vec![lexical(2, LINE_TWO, 9.0)],
+                &HybridSearchParams::default(),
+            )
+            .unwrap();
+
+        assert_eq!(first.results[0].id, 1);
+        assert_eq!(second.results[0].id, 2);
+        assert!(!second.telemetry.unwrap().cache_hit);
+    }
+
+    #[test]
+    fn indexing_invalidates_cached_search_results() {
+        let dir = TempDir::new("cache_invalidation");
+        let coordinator = semantic_coordinator(&dir);
+        let params = HybridSearchParams {
+            force_mode: Some(SearchMode::LexicalOnly),
+            ..Default::default()
+        };
+        let candidates = vec![lexical(1, LINE_ONE, 10.0)];
+
+        coordinator
+            .search(LINE_ONE, candidates.clone(), &params)
+            .unwrap();
+        assert!(
+            coordinator
+                .search(LINE_ONE, candidates.clone(), &params)
+                .unwrap()
+                .telemetry
+                .unwrap()
+                .cache_hit
+        );
+
+        coordinator.index_books(&[mock_book()]).unwrap().unwrap();
+        assert!(
+            !coordinator
+                .search(LINE_ONE, candidates, &params)
+                .unwrap()
+                .telemetry
+                .unwrap()
+                .cache_hit
+        );
     }
 
     #[test]
