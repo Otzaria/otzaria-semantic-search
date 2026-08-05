@@ -116,6 +116,8 @@ fn main() {
                 grouping: None,
                 filters: None,
                 force_mode,
+                profile: None,
+                feature_flags: None,
             };
 
             match hybrid.search(req) {

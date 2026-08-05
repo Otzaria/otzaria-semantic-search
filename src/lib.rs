@@ -18,6 +18,9 @@
 //! the existing lexical search.
 
 pub mod api;
+pub mod cloud;
+pub mod config;
 pub mod errors;
 pub mod hybrid;
 pub mod semantic;
+pub mod telemetry;

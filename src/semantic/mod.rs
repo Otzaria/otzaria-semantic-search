@@ -13,6 +13,7 @@
 pub mod backend;
 pub mod chunker;
 pub mod embedding;
+pub mod embedding_cache;
 pub mod engine;
 // Real GGUF inference (roadmap P2 stage 3). Compiled only with
 // `--features llama-backend`, which is what keeps a default build from pulling
@@ -30,4 +31,7 @@ pub mod engine;
 pub mod llama_backend;
 pub mod manifest;
 pub mod store;
+pub mod store_backend;
 pub mod types;
+pub mod versioning;
+pub mod zevc_store;

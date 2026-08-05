@@ -36,6 +36,8 @@ pub struct SearchRequest {
     /// describes how the *query* is interpreted, this describes where the
     /// candidates come from.
     pub force_mode: Option<crate::semantic::types::SearchMode>,
+    pub profile: Option<crate::config::profiles::SearchProfile>,
+    pub feature_flags: Option<crate::config::feature_flags::FeatureFlags>,
 }
 
 /// Opaque handle over the hybrid coordinator.
@@ -64,6 +66,8 @@ impl OtzariaHybridEngine {
             grouping: request.grouping,
             filters: request.filters,
             force_mode: request.force_mode,
+            profile: request.profile,
+            feature_flags: request.feature_flags,
         };
 
         self.coordinator
@@ -74,6 +78,21 @@ impl OtzariaHybridEngine {
     /// Query the current status of the semantic sidecar.
     pub fn get_semantic_status(&self) -> SemanticStatus {
         self.coordinator.status()
+    }
+
+    /// Retrieve the current telemetry snapshot.
+    pub fn get_telemetry_snapshot(&self) -> crate::telemetry::TelemetrySnapshot {
+        self.coordinator.get_telemetry_snapshot()
+    }
+
+    /// Reset the telemetry data.
+    pub fn reset_telemetry(&self) {
+        self.coordinator.reset_telemetry()
+    }
+
+    /// Clear the query cache.
+    pub fn clear_query_cache(&self) {
+        self.coordinator.clear_query_cache()
     }
 
     /// Diff the library's per-book fingerprints against the semantic index.
