@@ -69,26 +69,30 @@ struct StoreState {
 }
 
 /// Bounded-heap entry for top-k selection.
-struct ScoredEntry {
+///
+/// The id is borrowed from the record: the scan visits every vector, so an owned `String`
+/// here would be one allocation per stored vector per query — cost the full scan does not
+/// require. The records are behind the read lock for the whole scan, so they outlive it.
+struct ScoredEntry<'a> {
     score: f32,
-    semantic_id: String,
+    semantic_id: &'a str,
 }
 
-impl PartialEq for ScoredEntry {
+impl PartialEq for ScoredEntry<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for ScoredEntry {}
+impl Eq for ScoredEntry<'_> {}
 
-impl PartialOrd for ScoredEntry {
+impl PartialOrd for ScoredEntry<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ScoredEntry {
+impl Ord for ScoredEntry<'_> {
     /// Orders candidates **worst first**, making a max-heap a bounded min-heap: `peek`
     /// yields the candidate to evict. Among equal scores a larger `semantic_id` is
     /// "greater" — randomized `HashMap` order would otherwise return a different top-k
@@ -97,7 +101,7 @@ impl Ord for ScoredEntry {
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| self.semantic_id.cmp(&other.semantic_id))
+            .then_with(|| self.semantic_id.cmp(other.semantic_id))
     }
 }
 
@@ -293,7 +297,7 @@ impl VectorStore {
 
             let entry = ScoredEntry {
                 score,
-                semantic_id: record.metadata.semantic_id.clone(),
+                semantic_id: &record.metadata.semantic_id,
             };
             if heap.len() < top_k {
                 heap.push(entry);
@@ -311,7 +315,7 @@ impl VectorStore {
             .filter_map(|entry| {
                 state
                     .records
-                    .get(&entry.semantic_id)
+                    .get(entry.semantic_id)
                     .map(|record| SemanticCandidate {
                         metadata: record.metadata.clone(),
                         similarity_score: entry.score,

@@ -105,28 +105,31 @@ struct StoreState {
     book_index: HashMap<String, Vec<String>>,
 }
 
-struct ScoredEntry {
+/// Borrows its id from the record it scores: the scan visits every vector, and cloning a
+/// `String` per visit would add millions of allocations per query to work that is supposed
+/// to be arithmetic. The records outlive the scan, so there is nothing to own.
+struct ScoredEntry<'a> {
     score: f32,
-    semantic_id: String,
+    semantic_id: &'a str,
 }
 
-impl PartialEq for ScoredEntry {
+impl PartialEq for ScoredEntry<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
-impl Eq for ScoredEntry {}
-impl PartialOrd for ScoredEntry {
+impl Eq for ScoredEntry<'_> {}
+impl PartialOrd for ScoredEntry<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ScoredEntry {
+impl Ord for ScoredEntry<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| self.semantic_id.cmp(&other.semantic_id))
+            .then_with(|| self.semantic_id.cmp(other.semantic_id))
     }
 }
 
@@ -1107,7 +1110,7 @@ fn search_records(
 
         let entry = ScoredEntry {
             score,
-            semantic_id: record.metadata.semantic_id.clone(),
+            semantic_id: &record.metadata.semantic_id,
         };
         if heap.len() < top_k {
             heap.push(entry);
@@ -1124,7 +1127,7 @@ fn search_records(
         .into_iter()
         .filter_map(|entry| {
             records
-                .get(&entry.semantic_id)
+                .get(entry.semantic_id)
                 .map(|record| SemanticCandidate {
                     metadata: record.metadata.clone(),
                     similarity_score: entry.score,

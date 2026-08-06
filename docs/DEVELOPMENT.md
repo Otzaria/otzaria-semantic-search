@@ -1396,8 +1396,10 @@ bad input
 brute-force scan, O(N·D)
 ```
 
-נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה ריצה, אותה מכונה). בהערכה
-**ליניארית** — לא במדידה — זה ~2.5–3.2s על 6.1 מיליון שורות באותו ממד ודיוק. זה מספר
+נמדד: 79–132ms לשאילתה על 200k×1024 (min/max באותה ריצה, אותה מכונה; לפני S2a נמדדו
+84–208ms על אותו קוד פחות הקצאת ה־`String` לכל רשומה שהוסרה שם — הפער בין שתי המדידות
+בתוך רעש המכונה, ואין לייחס אותו כולו לשינוי). בהערכה **ליניארית** — לא במדידה — זה
+~2.4s על 6.1 מיליון שורות באותו ממד ודיוק. זה מספר
 שמחייב או ממד/דיוק קטנים יותר (S1), או backend אחזור אחר (S2b) — ולא אופטימיזציה נקודתית.
 
 ---
@@ -1580,8 +1582,8 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [x] persistence **במסלול שהאפליקציה פותחת** — ארטיפקט מותקן, `vectors_persisted=true` (S2a)
 * [x] מצב official-read-only ללא delete/upsert בזמן ריצה — טיפוס שאין עליו כתיבה (S2a)
 * [x] ה־engine תלוי ב־trait ולא ב־store קונקרטי, וה־manifest רושם את ה־backend שנפתח (S2a)
-* [ ] ANN או הוכחה שאין בו צורך (S2b) — נמדד: 84–208ms לשאילתה על 200k×1024 (min/max
-  באותה ריצה), כלומר ~2.5–3.2s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה
+* [ ] ANN או הוכחה שאין בו צורך (S2b) — נמדד: 79–132ms לשאילתה על 200k×1024 (min/max
+  באותה ריצה), כלומר ~2.4s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה
   (`cargo bench`)
 * [ ] cold-open, peak RSS וגודל דיסק ב־1M וב־6M רשומות (S2b) — הפתיחה קוראת כל בייט,
   מגבבת כל רשומה וטוענת הכול ל־RAM
@@ -1971,9 +1973,9 @@ proven is the cost — opening reads every byte, hashes every record and holds e
 vector in RAM.
 
 **ANN retrieval:** 🔴 Missing — and both stores scan everything. Brute force measures
-84–208ms per query over 200k×1024 on one machine (`cargo bench` prints
+79–132ms per query over 200k×1024 on one machine (`cargo bench` prints
 min/median/max; the spread is the machine, not the code). Extrapolated linearly, that
-is ~2.5–3.2s over the 6,058,210-line library — an extrapolation, not a measurement.
+is ~2.4s over the 6,058,210-line library — an extrapolation, not a measurement.
 Whether ANN is needed at all is an S2b decision that depends on the S1 dimension
 choice.
 
