@@ -7,10 +7,12 @@
 סביבן שלוש תת-מערכות תומכות שנוספו ב-PR #3: `config` (פרופילים ודגלים), `telemetry`
 (מוני ריצה בתוך התהליך) ו-`distribution` (אריזה והתקנה של אינדקס מוכן).
 
-> היקף המוצר מוגדר ב-[`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md). שני דברים שכדאי
+> היקף המוצר מוגדר ב-[`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md). שלושה דברים שכדאי
 > לדעת לפני קריאת המפה: האינדקס הרשמי נבנה מראש ונפתח read-only, ולכן API האינדוקס
-> שמתואר כאן הוא **פיגום אב-טיפוס** ולא המסלול של האפליקציה; ו-`ZevcStore` הוא
-> snapshot לדיסק עם סריקה מלאה — לא ANN, לא mmap ולא הספרייה `zvec`.
+> שמתואר כאן הוא **פיגום אב-טיפוס** ולא המסלול של האפליקציה; מסלול האפליקציה הוא
+> [`OfficialSemanticIndex`](../src/semantic/official_index.rs), שאין עליו אינדוקס
+> לקרוא; ופורמט ה-payload הוא snapshot לדיסק עם סריקה מלאה — לא ANN, לא mmap ולא
+> הספרייה `zvec`.
 
 ---
 
@@ -31,6 +33,7 @@ otzaria-semantic-search/
 │   └── vector_search.rs                    # מדידת latency של VectorStore::search
 ├── tests/
 │   ├── artifact_contract.rs                # זהות הארטיפקט ושער ההתקנה, דרך ה-API הציבורי בלבד
+│   ├── official_runtime.rs                 # התקנה→פתיחה→שאילתה על ארטיפקט (דורש --features mock-embedding)
 │   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
 │   └── production_backend_gate.rs          # מאמת שבנייה רגילה מסרבת לייצר embeddings
 └── src/
@@ -64,11 +67,12 @@ otzaria-semantic-search/
     │   ├── embedding_cache.rs              # cache לווקטורים של טקסטים שהוטמעו
     │   ├── backend.rs                      # חוזה ה-backend ובחירתו
     │   ├── llama_backend.rs                # inference אמיתי (feature `llama-backend`)
-    │   ├── engine.rs                       # מתאם תת-המערכת הסמנטית
+    │   ├── engine.rs                       # מתאם צד ה-build: chunk → embed → כתיבה
+    │   ├── official_index.rs               # מסלול האפליקציה: פתיחת ארטיפקט מאומת, read-only
     │   ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
     │   ├── store.rs                        # Vector DB בזיכרון (Pre-normalized + Heap)
-    │   ├── store_backend.rs                # trait משותף לשני ה-stores
-    │   ├── zevc_store.rs                   # snapshot לדיסק; סריקה מלאה, לא ANN, לא מחובר
+    │   ├── store_backend.rs                # שני חוזים: הקורא שהריצה מקבלת, והכותב של builder
+    │   ├── zevc_store.rs                   # פורמט ה-payload: פותח כותב ופותח read-only; סריקה מלאה, לא ANN
     │   ├── versioning.rs                   # זהות הארטיפקט ודחייה מפורשת לפי שדה
     │   └── types.rs                        # הגדרות טיפוסים ומבני נתונים
     └── telemetry/
@@ -91,6 +95,9 @@ otzaria-semantic-search/
   - `EmbeddingError` — שגיאות טעינת מודל ואינפרנס.
   - `VectorStoreError` — שגיאות חיפוש, הכנסה ומחיקה ב-Vector DB.
   - `ManifestError` — שגיאות תואמות מודל וגרסאות אינדקס.
+  - `SemanticSearchError::ReadOnlyIndex` — פעולה בונה שנתבקשה מארטיפקט מותקן. **לא**
+    „אין אינדקס”: יש, הוא פתוח, והוא read-only. מי שיקרא את הסירוב כ„שום דבר לא
+    מוגדר” יציע למשתמש לאנדקס את הספרייה — בדיוק מה שחוזה המוצר שולל.
   - `ArtifactError` — דחיית ארטיפקט רשמי: גרסת metadata זרה, זהות חסרה, אי-התאמת זהות
     (עם רשימת השדות), digest שאינו זה שפורסם, payload חסר/לא-רגיל/פגום, שם payload לא
     פורטבילי (עם הסיבה), manifest שאינו מסכים עם ה-payload, יעד התקנה פסול, והתקנה
@@ -110,6 +117,8 @@ otzaria-semantic-search/
     המועדפת: הקורא מחליט מה החתימה של ספר, וזו הדרך היחידה שבה PDF יכול להגיע
     ל"מעודכן". `get_semantic_index_diff_from_lexical_hashes()` היא הצורה הידידותית
     ל-FFI (`u64` גולמי), כי enum ש-Dart יכול לבנות הוא enum ש-Dart יכול לבנות שגוי.
+    מחזיר `Result`: `Ok(None)` הוא „אין אינדקס סמנטי”, ושגיאה היא ארטיפקט מותקן —
+    השאלה „אילו ספרים צריך לאנדקס” מניחה שהמכשיר מאנדקס.
   - `get_telemetry_snapshot()` / `reset_telemetry()` / `clear_query_cache()` —
     מוני ריצה ופסילת cache. הכול בתוך התהליך; שום דבר לא נשלח לשום מקום.
   - `index_books()` — אינדוקס ספרים (manifest נשמר פעם אחת בסוף, לא פר-ספר).
@@ -120,7 +129,8 @@ otzaria-semantic-search/
   > **ארבע הפעולות האחרונות הן פיגום אב-טיפוס.** לפי חוזה המוצר האפליקציה מתקינה
   > ארטיפקט מוכן ואינה מאנדקסת, ולכן ב-S5 המסלול הרשמי הוא
   > `open`/`install_official_semantic_index` ולא `semantic_index_books(Vec<...>)`.
-  > נכון להיום זהו ה-API שהבדיקות והבנייה משתמשות בו, ולכן הוא מתועד ולא מוסתר.
+  > נכון להיום זהו ה-API שהבדיקות והבנייה משתמשות בו, ולכן הוא מתועד ולא מוסתר —
+  > וכשהמנוע נבנה מעל ארטיפקט מותקן, כל אחת מהן **נדחית בשם** ואינה מדווחת הצלחה ריקה.
   > *מה שלא יהיה כאן לעולם:* progress stream ו-cancel/resume של אינדוקס — אין
   > אינדוקס באפליקציה.
 
@@ -131,6 +141,12 @@ otzaria-semantic-search/
 * [`src/hybrid/coordinator.rs`](../src/hybrid/coordinator.rs)
   - `HybridCoordinator` — מתאם החיפוש הראשי. מריץ חיפוש סמנטי לצד מועמדי BM25, מפעיל ניתוח שאילתא, מיזוג ציונים, קיבוץ, ומבצע Fallback ל-BM25 אם ה-Semantic Engine נכשל.
   - `HybridSearchParams` — פרמטרי חיפוש (גבולות, Offset, Grouping, Filters, Force Mode).
+  - `SemanticSide` — איזה אינדקס סמנטי מוגש: `Official` (ארטיפקט מותקן, read-only —
+    מסלול האפליקציה) או `SelfBuilt` (`SemanticEngine`, צד ה-build והאב-טיפוס). הצד
+    הקורא זהה בשניהם, ולכן החיפוש אינו יודע במה הוא מחזיק. כל פעולה בונה עוברת
+    ב-accessor שרק `SelfBuilt` מקיים, ולכן ארטיפקט מותקן נדחה בשם
+    (`ReadOnlyIndex`) — ולא ב-`None`, שמשמעותו „אין אינדקס סמנטי בכלל”.
+  - `with_official_index()` — הבנייה של מסלול האפליקציה; `new()` נשאר מסלול ה-build.
   - **שלושת המצבים ממומשים**: `LexicalOnly` אינו נוגע במסלול הסמנטי, `SemanticOnly`
     מזניח את מועמדי BM25 שהועברו, ו-`Hybrid` מתדרדר ל-`LexicalOnly` כשהסמנטי נכשל.
     ה-`alpha` נקבע לפי המצב שרץ בפועל (1.0 / 0.0 / דינמי), כדי שציון ממנוע אחד
@@ -142,7 +158,8 @@ otzaria-semantic-search/
     כך שגם checkpoints של מסמך מלא מוסיפים כתיבה סופר־ליניארית. ה-store הנוכחי
     נדיף, ולכן checkpoint של manifest ממילא אינו יכול לשמר עבודה אחרי קריסה.
     backend persistent יצטרך journal מצטבר או פורמט checkpoint דלתאי.
-    `indexing: Mutex` מסדר בתור אינדוקס, reset וגריעת ספרים.
+    `indexing: Mutex` מסדר בתור אינדוקס, reset וגריעת ספרים. על ארטיפקט מותקן כל
+    אלה נדחים לפני שנעשה משהו.
 
 * [`src/hybrid/fusion.rs`](../src/hybrid/fusion.rs)
   - `normalize_bm25_scores()` — נורמליזציית רוויה $x / (k + x)$ לציוני BM25 לטווח $[0,1]$.
@@ -289,7 +306,8 @@ otzaria-semantic-search/
     מקבל `GGML_ASSERT` ב-destructor סטטי של ggml **אחרי** עבודה מוצלחת — crash
     reporter מדווח על זה כקריסה. atexit רץ בסדר הפוך לרישום, ולכן ההקדמה מובטחת.
 
-* [`src/semantic/store.rs`](../src/semantic/store.rs) — **ה-store שהמנוע פותח בפועל.**
+* [`src/semantic/store.rs`](../src/semantic/store.rs) — **ה-store שברירת המחדל של
+  המנוע פותחת** (אב-טיפוס ובדיקות; מסלול הריצה פותח ארטיפקט).
   - `VectorStore` & `VectorStoreConfig` — מנגנון האחסון והשליפה הוקטורי.
   - **Pre-normalization**: נורמליזציה בוקטורים בעת ההכנסה המאפשרת חישוב דמיון קוסינוס בעזרת Dot Product בלבד ($O(dim)$).
   - **BinaryHeap Top-K**: שליפת $k$ התוצאות המובילות בסיבוכיות $O(N \log k)$ ללא שכפול מטא-דאטה של כל המאגר. שוויון ציונים נשבר לפי `semantic_id` — בלי זה `HashMap` עם סדר איטרציה מקרי היה מחזיר top-k שונה בכל ריצה.
@@ -299,20 +317,35 @@ otzaria-semantic-search/
     (101ms מול 145ms על 200k וקטורים בממד 1024).
 
 * [`src/semantic/store_backend.rs`](../src/semantic/store_backend.rs)
-  - `VectorStoreBackend` — החוזה המשותף: `backend_id`, `is_persistent`,
-    `embedding_dim`, `count`, `insert_batch`, `search`, `remove_by_book`, `clear`,
-    `book_keys`. שני ה-stores מקיימים אותו.
-  - **ה-engine עדיין אינו תלוי בו** אלא ב-`VectorStore` הקונקרטי. החלפת התלות היא
-    העבודה הראשונה ב-S2, ובלעדיה ה-trait הוא הכנה ולא נקודת החלפה.
+  - `VectorSearchBackend` — הצד הקורא, וכל מה שמסלול הריצה מקבל: `backend_id`,
+    `is_persistent`, `embedding_dim`, `count`, `search`, `book_keys`,
+    `book_vector_count`.
+  - `VectorStoreBackend: VectorSearchBackend` — מוסיף `insert_batch`,
+    `remove_by_book`, `clear` ו-`commit`. זה מה ש-builder מקבל.
+  - **הפיצול הוא החוזה, לא נוחות:** האפליקציה פותחת ארטיפקט שנבנה במכונה אחרת ואסור
+    לה לכתוב אליו, ולכן היא מחזיקה טיפוס שאין עליו insert לקרוא. זה מונע כתיבה
+    בקומפילציה, ולא בכלל שמישהו צריך לזכור.
+  - `SemanticEngine` תלוי בצד הכותב כ-`Box<dyn VectorStoreBackend>`, ולכן בחירת
+    ה-backend היא של הקורא (`SemanticEngine::with_store`) ולא קבועה במודול.
 
 * [`src/semantic/zevc_store.rs`](../src/semantic/zevc_store.rs)
-  - `ZevcStore` & `ZevcStoreConfig` — snapshot מתמיד לדיסק: payload לכל ספר,
-    SHA-256 למטא-דאטה ולווקטורים, אינדקס ספרים, ופתיחה מחדש שמאמתת checksums.
-  - **מה זה לא:** לא הספרייה `zvec`, לא ANN, לא mmap. הפתיחה טוענת את **כל**
-    הווקטורים ל-`HashMap` והחיפוש סורק את כולם, `O(N·D)` — בדיוק כמו ה-store
-    בזיכרון. השם דומה למה שמפת הדרכים המקורית ייעדה, המימוש אינו אותו דבר.
-  - לכן S2 מגדיר אותו כ-baseline נכונות שנמדד ב-1M וב-6M רשומות, ולא כפתרון סקייל
-    מוכח.
+  - הפורמט שבו payload של ארטיפקט נכתב: `vectors.bin` (רשומות `f32` little-endian),
+    `metadata.jsonl` (אובייקט לרשומה, באותו סדר, עם SHA-256 למטא-דאטה ולווקטור)
+    ו-`book_index.json` (כותרת + ספר→ids). השמות חשופים כ-`SNAPSHOT_FILENAMES`, כי
+    הם שמות ה-payload שה-packer חייב לכתוב.
+  - `ZevcStore` — הפותח הכותב, לצד ה-build. `commit()` הוא נקודת השמירה.
+  - `ReadOnlyZevcStore` — התצוגה של מסלול הריצה. מקיים `VectorSearchBackend` בלבד,
+    והרשומות אינן משתנות אחרי הפתיחה — ולכן אין גם lock במסלול השאילתה. שם ה-collection
+    **מאומץ** מה-payload ולא נדרש: הוא אינו חלק מזהות הארטיפקט, ואין לקורא מול מה
+    להשוות אותו.
+  - שניהם קוראים דרך פונקציה אחת, כדי שהבדיקות של הקורא לא ייסחפו ביניהן: גרסת
+    פורמט, ממד, SHA-256 **לכל רשומה** (זה מה שתופס עריכה באותו אורך), אורך מדויק בלי
+    בייטים עודפים, `semantic_id` שאינו כפול, וקטור שיש לו כיוון, ואינדקס הספרים מול
+    המטא-דאטה.
+  - **מה זה לא:** לא הספרייה `zvec`, לא ANN, לא mmap. הפתיחה קוראת כל בייט, מגבבת כל
+    רשומה וטוענת את **כל** הווקטורים ל-`HashMap`; החיפוש סורק את כולם, `O(N·D)`. זו
+    העלות של פורמט בלי אינדקס ובלי גישה עצלה — תכונה של ה-backend, לא של חוזה
+    הארטיפקט — וזאת המדידה של S2b.
 
 * [`src/semantic/versioning.rs`](../src/semantic/versioning.rs)
   - `IndexVersion` — זהות הארטיפקט בשלוש קבוצות: `CorpusIdentity` (digest של
@@ -367,7 +400,12 @@ otzaria-semantic-search/
     `clear_books_with_vectors()` מוחק רק רשומות שמצהירות על וקטורים.
 
 * [`src/semantic/engine.rs`](../src/semantic/engine.rs)
-  - `SemanticEngine` & `SemanticConfig` — המנוע הסמנטי המרכזי המאגד את ה-Chunker, ה-Runtime, ה-VectorStore וה-Manifest.
+  - `SemanticEngine` & `SemanticConfig` — מנוע **צד ה-build**: מאגד את ה-Chunker,
+    ה-Runtime, store כותב וה-Manifest. מסלול האפליקציה הוא `official_index.rs`.
+  - `with_store()` — פתיחה מעל backend שהקורא מספק. זה מה שהופך ריצת אינדוקס למשהו
+    שאפשר לארוז ממנו ארטיפקט: עם store מתמיד הווקטורים שורדים restart. ה-manifest
+    רושם את ה-backend שנפתח **בפועל**, ולכן פתיחה מחדש עם backend אחר היא אי-תאימות
+    מדווחת ולא תשובה מ-store ריק.
   - `SemanticConfig::validate()` — פוסל קונפיגורציה שלא תעבוד, ובראשה אי-התאמה בין
     `embedding_dim` ל-`store.embedding_dim` (שקודם התגלתה רק באמצע האינדוקס).
   - `open()` — מפייס את ה-manifest מול הקונפיגורציה: שימוש חוזר, גריעת רשומות
@@ -383,6 +421,30 @@ otzaria-semantic-search/
     האינדוקס ייבדק ולא יונח.
   - `reset_index()` — מסלול ההתאוששות מ-`IncompatibleIndex`.
   - `diff_against_tantivy()` — דגלי אי-התאימות אמיתיים; פלט בסדר דטרמיניסטי.
+
+* [`src/semantic/official_index.rs`](../src/semantic/official_index.rs) —
+  **מסלול האפליקציה.**
+  - `OfficialSemanticIndex::open()` — הצרכן של `VerifiedPackage`. הסדר כפוי ולא נבחר:
+    recovery של התקנה שנקטעה → טעינת המודל → אימות → פתיחת ה-payload **מהטוקן**.
+    המודל קודם לאימות מפני ש-`model_checksum` ו-`embedding_backend` הם שני שדות זהות
+    שאף ארטיפקט אינו יכול לספק; לכן אי-התאמה עולה טעינת מודל אחת, וההשוואה נשארת
+    במקום אחד.
+  - הזהות מורכבת משלושה מקורות שכל אחד יודע חלק ממנה: **corpus** מ-Tantivy שהקורא
+    פתח, **model** מהקובץ הנטען + המתכון שה-build מממש (`LocalModel`), ו-**store**
+    ממה ש-build הזה יודע לקרוא (`readable_store_identity`). ה-crate אינו ממציא אף
+    אחד מהם.
+  - `verify_counts_against_payload()` — הבדיקה שרק קורא יכול לעשות: `vector_count`
+    הוא מספר הרשומות, `book_count` מספר ה-`source_book_key` הנפרדים. זו ההגדרה
+    שה-packer (S4a) חייב לעמוד בה.
+  - `search()` / `status()` — `status` מדווח `vectors_persisted = true` ו-
+    `needs_full_reindex = None`, ולא כטענה ריקה: ארטיפקט הוא או הנכון או נדחה בפתיחה,
+    ואין במכשיר מה לבנות מחדש.
+  - `LocalModel` — מה שההתקנה **מצהירה**: נתיב, `model_id`, quantization, ממד,
+    pooling, `max_tokens`, ושלוש גרסאות המתכון. הקורא אינו גוזר את השלוש האחרונות —
+    שאילתה אינה עוברת chunking — אבל הן מושוות, כי ארטיפקט שנבנה ממתכון אחר הוא
+    ארטיפקט אחר, והתוצאה תהיה סבירה למראה ושגויה.
+  - **הכתיבה היחידה שיש כאן** היא recovery של ההתקנה: rename של תיקיות שה-importer
+    השאיר, לא נגיעה ב-payload, ובמצב נקי — כלום. `recovery()` מדווח מה נמצא.
 
 ---
 
@@ -415,8 +477,8 @@ otzaria-semantic-search/
     בתקציב, ובדיקה שאי אפשר להרשות היא בדיקה שמכבים.
   - `VerificationDepth` + `VerifiedPackage::depth()` — הטוקן נושא **מה נבדק בו**. קורא
     שמדווח „מאומת” בלי להסתכל בזה טוען שה-payload גובב כשאולי רק נעשה עליו `stat`.
-    מה שהעומק הרזה אינו תופס: עריכה באותו אורך בדיוק. זו בדיקה של קורא ה-store (S2a),
-    ויש בדיקה שמתעדת את הגבול.
+    מה שהעומק הרזה אינו תופס: עריכה באותו אורך בדיוק. זו בדיקה של קורא ה-store, שמאמת
+    SHA-256 לכל רשומה — ושתי בדיקות מתעדות את שני צידי הגבול.
   - `digest()` — SHA-256 מעל טקסט קנוני (גרסת metadata, כל שדות הזהות בסדר `ALL`, ספירות,
     גודל, ו-checksum+גודל לכל payload). זה **עוגן האמון**: `payloads.json` נוסע בתוך החבילה,
     ולכן payload שהוחלף יחד עם ה-checksum שלו עובר כל בדיקה פנימית. רק digest שפורסם
@@ -424,11 +486,11 @@ otzaria-semantic-search/
     בייטי JSON, כדי שכתיבה מחדש של ה-metadata בהתקנה לא תשנה אותו; `created_at` מוחרג.
   - `ArtifactExpectation` — `with_published_digest` מול `without_published_digest`. אין
     ברירת מחדל שקטה: מי שמוותר על העוגן קורא לפונקציה ששמה אומר זאת.
-  - `VerifiedPackage` — טוקן שאין לו constructor ציבורי אחר. מסלול הקריאה (S2a) יקבל
-    אותו במקום נתיב, ואז „לאמת לפני שנוגעים בווקטורים” הוא תכונה של הטיפוסים.
+  - `VerifiedPackage` — טוקן שאין לו constructor ציבורי אחר, ו-`OfficialSemanticIndex`
+    מקבל אותו במקום נתיב. „לאמת לפני שנוגעים בווקטורים” הוא לכן תכונה של הטיפוסים.
   - `verify_integrity()` / `walk_payloads()` — מהלך אחד לשני העומקים, כדי שהבדיקה הזולה
-    לא תפסיק בשקט לכסות משהו שהיקרה כן מכסה. ספירות אפס נדחות; ספירה מול **תוכן**
-    ה-payload דורשת קורא של פורמט ה-store וזה S2a/S4a.
+    לא תפסיק בשקט לכסות משהו שהיקרה כן מכסה. ספירות אפס נדחות; ההשוואה מול **תוכן**
+    ה-payload נעשית בקורא (`OfficialSemanticIndex`), כי היא דורשת פורמט store.
   - `IndexPackage::write()` — מסרב לכתוב metadata שהקורא היה דוחה (זהות חסרה, payload
     חסר, גודל שאינו מסתכם). חבילה שנכתבה „בהצלחה” בלי לאמת היא בדיוק זו שתיכשל אצל
     המשתמש.
@@ -460,8 +522,10 @@ otzaria-semantic-search/
     אינם מצבים שאפשר לייצר בסידור קבצים, ומסלול התאוששות שלא נבדק הוא זה שייכשל כשיידרש.
   - מסרב שהיעד יהיה תיקיית החבילה או צאצא שלה — ייבוא כזה היה מוחק את המקור.
   - **מה שמחוץ להיקף ומתועד:** שתי התקנות במקביל לאותו target. אין lock.
+  - `OfficialSemanticIndex::open` קורא ל-recovery בעצמו, ולכן מסלול הריצה נכון מעצם
+    מבנהו ולא בזכות סדר קריאות שהקורא זוכר.
   - **מה שאינו כאן:** ה-importer אינו חשוף דרך `OtzariaHybridEngine`, ה-FFI או
-    אוצריא, ואף מסלול ריצה אינו פותח את מה שהותקן. זה S2a ו-S5.
+    אוצריא. ההתקנה עצמה עדיין אינה מופעלת מהאפליקציה — זה S5 ו-S6.
 
 * [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
   - `measure()` / `aggregate()` / `QuerySet` / `BenchmarkConfig` — תזמון, אחוזונים
@@ -480,6 +544,17 @@ otzaria-semantic-search/
     PDF: תיקון מחבר בקובץ שלא השתנה מדווח כשינוי, וחתימה שמכסה תוכן בלבד לא מוכרזת
     כמעודכנת.
   - דורש `--features mock-embedding` (אין backend inference בבנייה רגילה).
+* [`tests/official_runtime.rs`](../tests/official_runtime.rs)
+  - מסלול הריצה הרשמי דרך ה-API הציבורי בלבד, כמו שה-`otzaria_search_engine` יראה
+    אותו: בניית ארטיפקט כמו שה-packer יבנה (ה-store כותב את ה-payload, ואז ה-metadata
+    מתאר אותו), התקנה, פתיחה, ושאילתה שמחזירה את ה-`line_id` שממנו נבנה הווקטור —
+    ב-`SemanticOnly` וב-`Hybrid`. בנוסף: כל פעולה בונה נדחית בשם והארטיפקט אינו משתנה,
+    ופתיחה חוזרת (restart) מחזירה את אותה תשובה בלי לבנות דבר.
+  - דורש `--features mock-embedding`.
+* [`tests/artifact_contract.rs`](../tests/artifact_contract.rs)
+  - חוזה הארטיפקט מבחוץ: התקנה ואימות חוזר, digest מפורסם מול חבילה עקבית-עם-עצמה,
+    שחזור מקריסה בין שני ה-renames, דחייה לפי שם שדה, והפרדת „פגום” מ„לא תואם”.
+    ה-payload שם הוא בייטים חסרי משמעות בכוונה — מי שקורא אותו הוא `official_runtime`.
 * [`tests/production_backend_gate.rs`](../tests/production_backend_gate.rs)
   - התמונה ההופכית, מתקמפל **רק בלי** ה-feature: מאמת שבנייה רגילה מסרבת לטעון
     מודל ולייצר וקטורים. זו הערובה שקוד production לא יגיש וקטורים מזויפים —

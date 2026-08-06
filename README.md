@@ -23,9 +23,14 @@ launch is not a check anyone keeps. A digest published outside the package is wh
 separates the official artifact from a self-consistent rebuild, and declining that anchor
 has an explicit name ([docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md)).
 
-Still roadmap work: a persistent read-only backend wired into the engine so that
-verified artifact actually gets opened, the builder that produces the official
-artifact from Tantivy, and application integration.
+That verified artifact now gets opened. `OfficialSemanticIndex` takes the token rather
+than a path, opens the payload through a store type that has no write on it, checks the
+manifest's counts against what the payload actually holds, and answers a query with the
+`line_id` the caller hydrates from Tantivy. An installed artifact reopens after a restart
+without indexing anything.
+
+Still roadmap work: measuring that path at library scale, the builder that produces the
+official artifact from Tantivy, and application integration.
 
 > **Scope, in one line:** the official vector index is built ahead of time on a
 > build machine and opened **read-only** on the user's device. The app does not
@@ -98,18 +103,19 @@ cmake on every downstream build.
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Two things the diagram deliberately does not show, because they are not on the
-active path yet:
+Two things the diagram deliberately does not show:
 
-- **`ZevcStore`** ([`src/semantic/zevc_store.rs`](src/semantic/zevc_store.rs)) — a
-  snapshot-persisting backend with checksummed payloads. It exists and is tested,
-  but `SemanticEngine` still opens the in-memory `VectorStore`. It is also **not**
-  an ANN index and not the `zvec` library: it loads every vector into a `HashMap`
-  and scans them all, exactly like the in-memory store. Wiring it in and deciding
-  whether a full scan can meet the budget at library scale is S2.
+- **The official read path** ([`src/semantic/official_index.rs`](src/semantic/official_index.rs))
+  — the diagram is the *builder* path, which chunks, embeds and writes. The
+  application's path holds no chunker and no manifest: it opens an installed artifact
+  through `ReadOnlyZevcStore` and searches it. That store is **not** an ANN index and
+  not the `zvec` library — opening reads every byte, verifies a checksum per record and
+  loads every vector into a `HashMap`, and the search scans all of them. Whether a full
+  scan and that open can meet the budget at library scale is S2b, and it is unmeasured.
 - **The FFI boundary** — this crate stays an `rlib`. The native library, the
   `flutter_rust_bridge` bindings and Tantivy hydration live in
-  `otzaria_search_engine`, which depends on this crate.
+  `otzaria_search_engine`, which depends on this crate. Nothing in Otzaria reaches the
+  read path yet; that is S5.
 
 ---
 
@@ -133,6 +139,7 @@ otzaria-semantic-search/
 │   └── vector_search.rs                ➜ Vector-search latency benchmark (harness = false)
 ├── tests/
 │   ├── artifact_contract.rs            ➜ Artifact identity & install gate, through the public API
+│   ├── official_runtime.rs             ➜ Install → open → query an artifact, through the public API
 │   ├── hybrid_integration_test.rs      ➜ End-to-end integration test suite
 │   └── production_backend_gate.rs      ➜ Proves a default build refuses to embed
 └── src/
@@ -166,11 +173,12 @@ otzaria-semantic-search/
     │   ├── embedding_cache.rs          ➜ LRU cache of recently embedded texts
     │   ├── backend.rs                  ➜ EmbeddingBackend contract & backend selection
     │   ├── llama_backend.rs            ➜ Real llama.cpp inference (feature `llama-backend`)
-    │   ├── engine.rs                   ➜ SemanticEngine sidecar orchestrator
+    │   ├── engine.rs                   ➜ SemanticEngine: the build-side orchestrator
+    │   ├── official_index.rs           ➜ The application's read path over a verified artifact
     │   ├── manifest.rs                 ➜ Atomic JSON manifest versioning & Tantivy diff tracker
     │   ├── store.rs                    ➜ Pre-normalized vector database & BinaryHeap Top-K search
-    │   ├── store_backend.rs            ➜ VectorStoreBackend trait shared by both stores
-    │   ├── zevc_store.rs               ➜ Snapshot-persisting store (full scan, not ANN, not wired)
+    │   ├── store_backend.rs            ➜ Two contracts: the read side the runtime gets, the write side a builder gets
+    │   ├── zevc_store.rs               ➜ The payload format: a writable opener and a read-only one (full scan, not ANN)
     │   ├── versioning.rs               ➜ Artifact identity (corpus/model/store) & typed rejection
     │   └── types.rs                    ➜ Domain models & data transfer objects (DTOs)
     └── telemetry/
@@ -192,9 +200,10 @@ otzaria-semantic-search/
 | **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | GGUF structure/checksum validation; the primary choke point that normalizes and validates every vector |
 | **Backend Contract** | [`src/semantic/backend.rs`](src/semantic/backend.rs) | `EmbeddingBackend`, `Pooling`, `select_backend` | `Send + Sync` trait every backend implements; backends return **raw** vectors |
 | **Real Inference** | [`src/semantic/llama_backend.rs`](src/semantic/llama_backend.rs) | `LlamaCppBackend`, `ContextPool`, `truncate_with_eos` | llama.cpp GGUF inference behind `--features llama-backend`: Qwen2-BPE tokenizer, EOS appended, last-token pooling, real multi-sequence batching |
-| **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **The store the engine actually opens today** |
-| **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorStoreBackend` | The trait both stores implement. The engine does not depend on it yet (S2) |
-| **Persistent Store** | [`src/semantic/zevc_store.rs`](src/semantic/zevc_store.rs) | `ZevcStore`, `ZevcStoreConfig` | Checksummed disk snapshots that reopen. **Full scan, not ANN; not `zvec`; not wired into the engine** |
+| **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **Volatile**, and what the builder path opens by default |
+| **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorSearchBackend`, `VectorStoreBackend` | Split in two on purpose: the runtime is handed the read side and so has no `insert` to call; the write side is what a builder gets |
+| **Payload Format** | [`src/semantic/zevc_store.rs`](src/semantic/zevc_store.rs) | `ZevcStore`, `ReadOnlyZevcStore` | Checksummed disk snapshots, opened writable by a builder and read-only by the runtime. A checksum **per record** is what catches a same-length edit. **Full scan, not ANN, not `zvec`** |
+| **Official Read Path** | [`src/semantic/official_index.rs`](src/semantic/official_index.rs) | `OfficialSemanticIndex`, `LocalModel` | Opens a `VerifiedPackage` — never a path — checks the manifest's counts against the payload's content, and refuses every build-side operation by name |
 | **Artifact Identity** | [`src/semantic/versioning.rs`](src/semantic/versioning.rs) | `IndexVersion`, `IdentityField`, `verify_matches` | Corpus, Tantivy schema, id scheme, model file, backend and store format an artifact declares. Every field compared, all mismatches named |
 | **Index Manifest** | [`src/semantic/manifest.rs`](src/semantic/manifest.rs) | `SemanticManifest`, `BookManifestEntry`, `validate` | Atomic JSON tracking (`.tmp` write + rename) & Tantivy incremental diffing |
 | **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Master sidecar engine orchestrating chunking, embedding & storage |
@@ -209,6 +218,7 @@ otzaria-semantic-search/
 | **Package Install** | [`src/distribution/importer.rs`](src/distribution/importer.rs) | `IndexImporter`, `recover_interrupted_install` | Verify the source, copy to staging, verify the copy, swap. The swap is two renames with a window in between, so the intermediate names are deterministic and recovery is a documented step |
 | **Benchmark Harness** | [`src/benchmark/mod.rs`](src/benchmark/mod.rs) | `measure`, `aggregate`, `QuerySet` | Timing and percentile helpers. A measurement tool, **not** a relevance dataset |
 | **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | feature-gated integration tests | End-to-end public-API suite using the explicit mock backend |
+| **Official Runtime Test** | [`tests/official_runtime.rs`](tests/official_runtime.rs) | feature-gated integration tests | Builds an artifact the way the packer will, installs it, opens it, and asserts a query returns the `line_id` it was built from — plus that every build-side call is refused and the artifact is never written to |
 | **CI Workflow** | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | `check-and-test` | Multi-platform GitHub Actions CI workflow (Linux, Windows, macOS) |
 
 ---
@@ -232,8 +242,9 @@ The stages below are the plan of record from
 ├──────────────────────────────────────────────────────────────────────────────────┤
 │ [✔] S0  Product contract alignment (this section, and the docs around it)        │
 │ [ ] S1  Representation quality & dimension/precision decision                    │
-│ [ ] S2  Persistent, read-only, scale-capable backend behind VectorStoreBackend   │
-│ [~] S3  Artifact contract: identity + verification done; runtime open path open  │
+│ [✔] S2a Read-only runtime path: the artifact's reader, read/write store split    │
+│ [ ] S2b Scale: cold-open, latency, RSS and disk at 1M/6M — then the ANN decision │
+│ [✔] S3  Artifact contract: identity, two depths, recoverable install, reader     │
 │ [ ] S4  Builder that reads the final Tantivy index (otzaria_search_engine)       │
 │ [ ] S5  Repin, open/install API, explicit statuses, FFI (otzaria_search_engine)  │
 │ [ ] S6  Artifact & model management in the app (otzaria)                         │
@@ -248,14 +259,13 @@ The stages below are the plan of record from
    - Measure `line` versus `title + reference + line` versus neighbour context on a labelled rabbinic query set.
    - Choose 1024/512/256/128 dimensions and f32/f16/int8 on measured Recall@K, MRR and nDCG — the size arithmetic (~23.1 GiB at f32/1024 for 6.1M lines) is why this matters.
    - Freeze `embedding_text_version`, dimension, precision, `max_tokens`, pooling and normalization into the index identity.
-2. **Persistent read-only backend (S2)**:
-   - Make `SemanticEngine` depend on `VectorStoreBackend` instead of the concrete `VectorStore`.
-   - Add an `official-read-only` mode that does not expose delete/upsert at application runtime.
-   - Run `ZevcStore` as a correctness baseline at 1M and 6M records, and measure cold-open, p50/p95/p99, peak RSS and disk. Move to a real on-disk ANN only if the measurement says a full scan cannot meet the budget — not because "ANN" sounds faster.
-3. **Official artifact contract (S3)** — identity, two verification depths, the
-   published-digest anchor and a recoverable install landed; see
+2. **Scale measurement (S2b)** — the read-only path exists; what it costs is unknown:
+   - Run `ZevcStore` as a correctness baseline at 1M and 6M records, and measure cold-open, p50/p95/p99, peak RSS and disk. Opening currently reads every byte, verifies a checksum per record and holds every vector in RAM.
+   - Move to a real on-disk ANN only if the measurement says a full scan cannot meet the budget — not because "ANN" sounds faster. `VectorSearchBackend` is the seam either answer slots into.
+3. **Official artifact contract (S3) and its reader (S2a)** — identity, two verification
+   depths, the published-digest anchor, a recoverable install, and a runtime path that
+   opens the verified token landed; see
    [docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md). What is left:
-   - Check `book_count`/`vector_count` against the payload's actual content, and catch a same-length payload edit at open time — both need a reader of the store format (S2a).
    - Publish the artifact digest (and sign it): the check exists, the anchor does not (S6).
    - Decide whether the distributed artifact is a single archive rather than a directory (packer-side, S4).
    - Measure open and install against a budget on a representative artifact (S2b/S8).
