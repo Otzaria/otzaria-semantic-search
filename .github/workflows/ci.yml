@@ -150,6 +150,17 @@ jobs:
       #
       # The URL is public; only the token is secret, and it reaches curl through a
       # config on stdin rather than argv — no process listing, no `set -x`.
+      #
+      # `--retry` because HuggingFace answered 429 on a run whose token was valid and
+      # whose download was unchanged: a rate limit, not a refusal. Since the file is
+      # not cached, every run fetches 396 MB, so an occasional 429 is expected rather
+      # than exceptional — and without a retry it reads as a failed gate. curl counts
+      # 429 as transient and backs off exponentially; `--retry-all-errors` extends that
+      # to a dropped connection mid-transfer. `-f` is what makes the HTTP status
+      # visible to the retry logic at all.
+      #
+      # Deliberately not raised further: a genuine 401 must still fail fast and loudly,
+      # and five attempts cannot turn a revoked token into a pass.
       - name: Fetch the model
         id: model
         env:
@@ -160,7 +171,7 @@ jobs:
             exit 1
           fi
           printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
-            curl -fSL --output model.gguf -K - \
+            curl -fSL --retry 5 --retry-all-errors --output model.gguf -K - \
               https://huggingface.co/EMD123/Otzaria-Embedding-V1-Flash-0.6B-GGUF/resolve/main/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
           # A mismatch must read as "wrong model" rather than as confusing vector diffs.
           expected=$(python3 -c "import json;print(json.load(open('tests/data/golden_vectors.json'))['header']['model_sha256'])")
