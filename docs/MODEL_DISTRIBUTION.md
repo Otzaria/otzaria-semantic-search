@@ -27,25 +27,52 @@
 
 ### 2.2 ה־crate לעולם אינו מוריד את המודל
 
-המאגר הזה מקבל **נתיב** לקובץ ו־checksum צפוי. הוא מאמת ומשתמש. הורדה, מדיניות רשת,
-הצגת רישיון והתקנה — כולן באחריות האפליקציה המארחת.
+המאגר הזה מקבל **נתיב** לקובץ ([`SemanticConfig::model_path`](../src/semantic/engine.rs)).
+הורדה, מדיניות רשת, הצגת רישיון והתקנה — כולן באחריות האפליקציה המארחת.
 
-זו לא הקפדה תיאורטית: [`validate_and_checksum_gguf`](../src/semantic/embedding.rs)
-מאמת את הקונטיינר ומחשב SHA-256 במעבר אחד, וה־manifest משווה את הערך בין הרצות. אבל
-checksum שמחושב **מהקובץ עצמו** אינו יכול להעיד על נכונות ההורדה — הוא רק מגלה
-שהבייטים מאחורי הנתיב השתנו. אימות מול SHA-256 מפורסם שייך לצד ההפצה.
+**מה שהאימות המקומי כן עושה היום:** [`validate_and_checksum_gguf`](../src/semantic/embedding.rs)
+מאמת את הקונטיינר ומחשב SHA-256 במעבר אחד, וה־[`SemanticManifest`](../src/semantic/manifest.rs)
+משווה את הערך למה שנשמר **בהרצה קודמת על אותה מכונה**. זה מגלה שהבייטים מאחורי הנתיב
+השתנו, ולכן מבטל וקטורים שנוצרו מקובץ אחר.
+
+**מה שהוא אינו עושה:** `SemanticConfig` **אינו מקבל checksum צפוי**, ואין השוואה מול
+SHA-256 מפורסם. כלומר קובץ מודל שהתקבל שגוי בהורדה הראשונה ייחשב תקין, כל עוד הוא
+GGUF תקין ועקבי עם עצמו. אימות מול hash רשמי הוא חלק מחוזה ההתקנה, והוא **טרם קיים** —
+S3 (זהות הארטיפקט) ו־S6 (התקנה באפליקציה).
 
 ### 2.3 מודל חסר הוא מצב מפורש
 
 אין נפילה שקטה ואין וקטורים מזויפים. בבנייה רגילה אין backend inference כלל
-(`EmbeddingError::BackendUnavailable`), וכשהקובץ חסר או אינו תואם, הסטטוס שמוצג הוא
-`model_missing` / `model_incompatible` — והחיפוש הלקסיקלי ממשיך לעבוד כרגיל.
+(`EmbeddingError::BackendUnavailable`), וכשהמודל אינו נטען המסלול הסמנטי אינו זמין
+והחיפוש הלקסיקלי ממשיך לעבוד כרגיל.
+
+**המצב היום:** [`SemanticStatus`](../src/semantic/types.rs) מדווח `available`,
+`model_loaded`, `embedding_backend`, `needs_full_reindex` ו־`last_error`. ניתן להסיק
+מהם ש„אין מודל”, אך זהו דגל ומחרוזת שגיאה — לא מצב ממוין.
+
+**היעד:** מערך המצבים המפורש מ־[`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §7 —
+`missing`, `installing`, `ready`, `incompatible`, `corrupt`, `model_missing`,
+`model_incompatible`, `unsupported_platform`. הוא **אינו קיים בקוד**, ונכתב ב־S5.
+עד אז אין להסתמך עליו בתכנון של אוצריא.
 
 ### 2.4 זהות המודל היא חלק מזהות האינדקס
 
-ארטיפקט שנבנה עם מודל מסוים נפתח רק עם אותו מודל: `model_id`, checksum, backend,
-pooling, ממדים, precision ו־normalization נכנסים ל־[`IndexVersion`](../src/semantic/versioning.rs)
-ונבדקים לפני פתיחה. מודל „דומה” אינו מודל תואם — הווקטורים לא יהיו באותו מרחב.
+הכוונה: ארטיפקט שנבנה עם מודל מסוים ייפתח רק עם אותו מודל. מודל „דומה” אינו מודל
+תואם — הווקטורים לא יהיו באותו מרחב.
+
+מה שקיים היום, וחשוב לא לבלבל בין שני מקומות שונים:
+
+| | מה נשמר | האם נשלח עם חבילה |
+|---|---|---|
+| [`SemanticManifest`](../src/semantic/manifest.rs) | model id, **SHA-256 של קובץ המודל**, embedding backend, ממדים, pooling, quantization, vector precision, vector backend, chunking, normalization | ❌ מצב מקומי של המכונה |
+| [`IndexVersion`](../src/semantic/versioning.rs) | `schema_version`, `model_id`, `embedding_dim`, `pooling`, `max_tokens`, `normalization_version`, `chunking_identity`, `store_backend`, `vector_precision` | ✅ בתוך `PackageManifest` |
+
+כלומר **ה־checksum של המודל וזהות ה־backend נבדקים מקומית בלבד ואינם חלק מזהות
+החבילה.** חבילה שנבנתה במכונת build עם קובץ מודל מסוים תיפתח היום גם מול קובץ אחר
+שנושא אותו `model_id`. הוספת `model_checksum` ו־embedding backend ל־`IndexVersion` —
+יחד עם זהות ה־corpus, סכמת Tantivy וסכמת ה־ID — היא **S3**.
+
+עד שזה נסגר, אין לתאר את הזהות הזו כמאובטחת, ואין ל־S3/S5 להסתמך עליה.
 
 ### 2.5 ה־gate ייפתח לקובץ הריצה
 
