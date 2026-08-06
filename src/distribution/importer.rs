@@ -621,6 +621,11 @@ mod tests {
 
     struct TempDir(PathBuf);
     impl TempDir {
+        /// Canonicalized at creation, because the install reports the paths it derived from
+        /// a *canonical* parent, and the tests derive the same names from this root. The
+        /// two must be the same string: `%TEMP%` on a Windows runner is an 8.3 short path
+        /// (`C:\Users\RUNNER~1\...`), and `/var` on macOS is a symlink, so an unresolved
+        /// fixture root names the same directory differently than the code does.
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "otzaria_test_imp_{name}_{}",
@@ -629,8 +634,8 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
-            let _ = std::fs::create_dir_all(&path);
-            Self(path)
+            std::fs::create_dir_all(&path).unwrap();
+            Self(std::fs::canonicalize(&path).unwrap())
         }
         fn path(&self) -> &Path {
             &self.0
