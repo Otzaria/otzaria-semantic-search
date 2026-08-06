@@ -3,6 +3,7 @@
 //! Design: errors are categorized by subsystem so callers can decide
 //! whether to propagate, log, or gracefully degrade.
 
+use crate::semantic::versioning::{describe_identity_mismatches, IdentityField, IdentityMismatch};
 use thiserror::Error;
 
 /// Top-level error for the semantic search subsystem.
@@ -16,6 +17,9 @@ pub enum SemanticSearchError {
 
     #[error("Manifest error: {0}")]
     Manifest(#[from] ManifestError),
+
+    #[error("Semantic artifact error: {0}")]
+    Artifact(#[from] ArtifactError),
 
     #[error("Chunking error: {0}")]
     Chunking(#[from] ChunkingError),
@@ -181,6 +185,108 @@ pub enum ManifestError {
 
     #[error("Write failed: {reason}")]
     WriteFailed { reason: String },
+}
+
+/// Why an official artifact was refused.
+///
+/// Every variant is a refusal to proceed, never a degradation: a package that fails
+/// any of these checks is the wrong package or a damaged one, and there is nothing the
+/// device can repair. The distinctions are kept because the host application has to
+/// tell the user which of them happened — `incompatible` is answered by fetching the
+/// matching artifact, `corrupt` by downloading this one again.
+#[derive(Error, Debug)]
+pub enum ArtifactError {
+    /// `manifest.json` or `payloads.json` is missing, unreadable or not the JSON it
+    /// claims to be.
+    #[error("Artifact metadata is unusable ({path}): {reason}")]
+    MetadataUnusable { path: String, reason: String },
+
+    /// The metadata is a document this build does not read. Refused rather than
+    /// parsed leniently: filling in a field the writer never recorded would be a
+    /// guess presented as agreement.
+    #[error("Unsupported artifact metadata version {found} (this build reads {supported})")]
+    UnsupportedMetadataVersion { found: u32, supported: u32 },
+
+    /// An identity field exists but carries no value — a blank string, a zero
+    /// version. Checked before any comparison, because two unfilled identities agree
+    /// with each other.
+    #[error("Artifact identity is incomplete: {field} {reason}")]
+    IncompleteIdentity {
+        field: IdentityField,
+        reason: String,
+    },
+
+    /// The artifact describes a different corpus, model or store format than this
+    /// installation. Lists every disagreement, not the first.
+    #[error(
+        "Artifact does not match this installation: {}",
+        describe_identity_mismatches(mismatches)
+    )]
+    IdentityMismatch { mismatches: Vec<IdentityMismatch> },
+
+    /// The artifact's metadata digest is not the one that was published for it.
+    ///
+    /// This is the only check that distinguishes *the official artifact* from a
+    /// self-consistent impostor: `payloads.json` travels inside the package, so a
+    /// payload replaced together with its checksum passes every other check here.
+    #[error("Artifact digest is {actual}, but {expected} was published for it")]
+    UnexpectedArtifactDigest { expected: String, actual: String },
+
+    /// A package with no payload. Not an empty index — an incomplete package.
+    #[error("Artifact has no checksummed payload files")]
+    NoPayload,
+
+    /// A payload name that is not a portable single file name, or one that would
+    /// overwrite the metadata. What blocks `../` escaping the package directory — and
+    /// what keeps a package written on one platform readable on another.
+    #[error("Unsafe artifact payload name {name:?}: {reason}")]
+    UnsafePayloadName { name: String, reason: String },
+
+    #[error("Artifact payload {payload:?} has no valid SHA-256 in payloads.json")]
+    MalformedPayloadChecksum { payload: String },
+
+    #[error("Artifact payload {payload:?} is missing")]
+    PayloadMissing { payload: String },
+
+    /// A symlink or a directory where a payload should be. Refused rather than
+    /// followed: the checksum would then describe a file outside the package.
+    #[error("Artifact payload {payload:?} is not a regular file")]
+    PayloadNotRegularFile { payload: String },
+
+    #[error(
+        "Artifact payload {payload:?} failed its checksum (expected {expected}, got {actual})"
+    )]
+    PayloadChecksumFailed {
+        payload: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// The manifest and the payload describe different packages — declared sizes or
+    /// counts that the files do not support. A manifest is a claim about the payload,
+    /// so it has to be checked against it and not only for being present.
+    #[error("Artifact manifest disagrees with its payload: {reason}")]
+    ManifestDisagreesWithPayload { reason: String },
+
+    /// The install target cannot be used — no parent directory, an existing
+    /// non-directory, or a path inside the package itself.
+    #[error("Invalid install target: {reason}")]
+    InvalidInstallTarget { reason: String },
+
+    /// A crash interrupted an install and the leftovers could not be resolved.
+    ///
+    /// Distinct from [`Self::Io`] because the caller's next step is different: the
+    /// previous artifact may be sitting under a recovery name, and overwriting it
+    /// would destroy the only good copy on the device.
+    #[error("An interrupted install could not be recovered: {reason}")]
+    InterruptedInstall { reason: String },
+
+    #[error("Artifact IO error ({context}): {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Errors from the chunking subsystem.

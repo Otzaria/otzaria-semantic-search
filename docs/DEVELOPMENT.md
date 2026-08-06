@@ -156,8 +156,9 @@ BM25 עדיין עובד
 | עמידות ה-manifest                | אטומי בכל פלטפורמה; durable ב-Unix, best-effort ב-Windows |
 | כתיבת manifest באינדוקס מלא      | פעם אחת בסוף (לא פר-ספר) |
 | Rust API seam ל-Flutter/FFI      | קיים; bindings אמיתיים נבנים ב־`otzaria_search_engine` |
-| חבילת אינדקס + ייבוא אטומי       | ממומשים כאב־טיפוס (`distribution`), **לא חשופים ב־API** |
-| `IndexVersion`                   | קיים; **חסרות** זהות corpus, סכמת Tantivy וסכמת ה־ID |
+| חבילת אינדקס + התקנה              | ממומשים ומאמתים במלואם (`distribution`), עם שחזור התקנה שנקטעה ו־`fsync`; **לא חשופים ב־API** |
+| עוגן אמון לארטיפקט               | המכניזם קיים (digest מפורסם); **אין מי שמפרסם ואין חתימה** (S6) |
+| זהות ארטיפקט (`IndexVersion`)     | מלאה — corpus/Tantivy/ID scheme/מודל+checksum/store; נדחית לפי שדה. **אף מסלול ריצה עוד אינו קורא לה** (S2a) |
 | builder של הארטיפקט הרשמי        | **לא קיים** (S4)           |
 | Production persistence במסלול הפעיל | **עדיין חסרה** (S2)     |
 | אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד); האם נדרש — הכרעת S2 לפי מדידה |
@@ -284,10 +285,12 @@ BM25 עדיין עובד
    הווקטורים ל־`HashMap` והחיפוש סורק את כולם. השם מטעה, המימוש לא.
 3. **`distribution`** (לפני S0: `cloud`) — `IndexPackage` עם manifest ו־SHA-256 לכל
    payload, ו־`IndexImporter` שמעתיק ל־staging, מאמת שוב אחרי ההעתקה, ומחליף תיקייה
-   עם גיבוי ו־rollback. אינו חשוף דרך ה־API.
-4. **`IndexVersion`** — זהות מודל/chunking/backend/precision. **חסרות** זהות
-   corpus, `tantivy_schema_version` ו־`document_id_scheme_version`; בלעדיהן אפשר
-   לפתוח חבילה שמצביעה ל־`line_id` של קטלוג אחר. S3.
+   עם גיבוי ו־rollback. אינו חשוף דרך ה־API. הורחב ב־S3 לשער אימות מלא — ראו
+   [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md).
+4. **`IndexVersion`** — זהות מודל/chunking/backend/precision. במצב של PR #3 חסרו זהות
+   corpus, `tantivy_schema_version` ו־`document_id_scheme_version`, ולכן היה אפשר
+   לפתוח חבילה שמצביעה ל־`line_id` של קטלוג אחר. **נסגר ב־S3:** שלוש קבוצות זהות
+   (corpus/model/store), 17 שדות, כולם נבדקים ונדחים בשם.
 5. **פרופילים ודגלים** — `Fast`/`Balanced`/`Best`, `Weighted`/`RRF`/`Adaptive`,
    ו־`FeatureFlags` שדורסים פרופיל קיים במקום להחזיק העתק שני של ברירות המחדל.
 6. **Caches ו־telemetry** — cache תוצאות עם פסילה לפי `generation`, cache embeddings,
@@ -1448,9 +1451,11 @@ golden vectors. מאחורי `--features llama-backend`.
 |---|---|
 | **S1** — ייצוג, ממד ודיוק | [`chunker.rs`](../src/semantic/chunker.rs) (טקסט ההטמעה) ו־[`benchmark/`](../src/benchmark/) (המדידה). התוצר מקפיא שדות בזהות האינדקס |
 | **S2** — backend מתמיד read-only | להחליף את `store: VectorStore` ב־[`engine.rs`](../src/semantic/engine.rs) בתלות ב־[`VectorStoreBackend`](../src/semantic/store_backend.rs), ואז למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M |
-| **S3** — חוזה ארטיפקט | להרחיב [`IndexVersion`](../src/semantic/versioning.rs), ולחשוף את [`IndexImporter`](../src/distribution/importer.rs) |
+| **S2a** — מסלול ריצה read-only | אותה החלפה כמו S2, ובנוסף: לתת ל־[`VerifiedPackage`](../src/distribution/package.rs) קורא. `open` יקבל טוקן מאומת ולא נתיב, ולא יחשוף insert/delete |
+| **S3** — חוזה ארטיפקט | ✅ הזהות והאימות ב־[`versioning.rs`](../src/semantic/versioning.rs) וב־[`package.rs`](../src/distribution/package.rs); מה שנשאר הוא ספירה מול תוכן ה־payload וחשיפת [`IndexImporter`](../src/distribution/importer.rs) ב־API |
 
-S1 לפני S2, או במקביל — אך בלי לקפוא על פורמט ארטיפקט לפני שהמדידה בידיים.
+הסדר בפועל: S3 (חוזה) נעשה לפני S1/S2, מפני שהוא קובע אילו שדות מוצהרים ולא אילו ערכים
+נבחרים. הבא בתור הוא S2a. S1 לפני S2b — אך בלי לקפוא על ערכים לפני שהמדידה בידיים.
 
 ---
 
@@ -1574,11 +1579,24 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 ### Artifact / Distribution
 
 * [x] manifest חבילה + SHA-256 לכל payload
-* [x] התקנה אטומית עם staging, גיבוי ו־rollback
+* [x] התקנה בשני renames עם staging, גיבוי, שחזור מהפרעה ו־`fsync` — **לא** החלפה אטומית אחת
 * [x] אימות מחדש של ה־payload **אחרי** ההעתקה, לא רק במקור
-* [ ] זהות corpus, `tantivy_schema_version`, `document_id_scheme_version` (S3)
-* [ ] התאמת ספירות ספרים/וקטורים וגודל מול ה־manifest (S3)
-* [ ] חשיפת ה־importer דרך ה־API / FFI (S3–S5)
+* [x] זהות corpus, `tantivy_schema_version`, `document_id_scheme_version` (S3)
+* [x] זהות מודל בתוך החבילה — `model_checksum`, backend, quantization (S3)
+* [x] דחייה מפורשת לפי שדה, עם כל אי־ההתאמות ולא הראשונה (S3)
+* [x] `metadata_version` עם probe לפני פרסור המסמך (S3)
+* [x] התאמת **גודל** מול ה־manifest, ודחיית ספירות אפס (S3)
+* [x] שני עומקי אימות — עמוק בהתקנה, metadata+נוכחות בפתיחה, והטוקן מדווח באיזה (S3)
+* [x] digest מפורסם כעוגן אמון, ו־`without_published_digest` כוויתור מוצהר (S3)
+* [x] שמות payload פורטביליים, נבדקים על המחרוזת ולא דרך `Path` (S3)
+* [x] שחזור התקנה שנקטעה, `fsync` לקבצים ולתיקיית האב, ובדיקות הזרקת־כשל (S3)
+* [ ] התאמת ספירות ספרים/וקטורים מול **תוכן** ה־payload — דורש קורא של פורמט ה־store (S2a/S4a)
+* [ ] קורא שמפעיל את האימות: `VerifiedPackage` עדיין ללא צרכן (S2a)
+* [ ] זיהוי עריכה באותו אורך בזמן פתיחה — בדיקה של קורא ה־store (S2a)
+* [ ] צינור שמפרסם digest, וחתימה (S6)
+* [ ] lock לשתי התקנות במקביל לאותו יעד — מתועד כמחוץ להיקף (S6, אם יידרש)
+* [ ] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי (S2b/S8)
+* [ ] חשיפת ה־importer דרך ה־API / FFI (S5)
 * [ ] builder שמפיק את הארטיפקט מ־Tantivy הסופי (S4)
 
 ### Indexing (צד ה־build בלבד)
@@ -1699,10 +1717,11 @@ Architecture
      │        └── אין ANN/mmap, וסקייל 6M לא נמדד                  (S2)
      │
      ├── IndexVersion
-     │        └── חסרות זהות corpus / Tantivy / ID scheme          (S3)
+     │        └── ✅ זהות corpus / Tantivy / ID / מודל / store מלאה  (S3)
      │
      └── distribution (package + importer)
-              └── קיים ונבדק — אך לא חשוף ב-API, ואין builder      (S3–S4)
+              ├── ✅ שער אימות מלא, דחייה לפי שדה                   (S3)
+              └── אין קורא שמפעיל אותו, ואין builder               (S2a, S4)
 ```
 
 זה דווקא מצב טוב יחסית: החוזים במקום, וכל פער הוא חיבור או הרחבה ולא שכתוב.
@@ -1725,7 +1744,8 @@ Architecture
    ↓
    6. S2 — persistent read-only backend, measured at 1M and 6M
    ↓
-   7. S3 — artifact identity contract & atomic install
+✅ 7. S3 — artifact identity contract & recoverable install (זהות, אימות בשני עומקים,
+      עוגן digest; ספירה מול תוכן ה-payload נשארה ל-S2a/S4)
    ↓
    8. S4 — builder from the final Tantivy index   (otzaria_search_engine)
    ↓
@@ -1739,6 +1759,12 @@ Architecture
 S1 לפני S2 בכוונה: ממד ודיוק קובעים אם סריקה מלאה בכלל קבילה, ולכן בחירת backend לפני
 בחירת ממד היא בחירה בעיניים עצומות. שני השלבים יכולים לרוץ במקביל, אבל אין לקפוא על
 פורמט ארטיפקט לפני שה־מדידה של S1 בידיים.
+
+**הסדר בפועל שונה מהמספור, במכוון:** S3 (חוזה הזהות) נעשה לפני S1 ו־S2, מפני שאינו
+תלוי בהם — הממד, הדיוק ופורמט ה־store הם **נתונים בתוך** ה־manifest ולא קבועים בקוד,
+ולכן הכרעות S1/S2 ממלאות שדות קיימים ואינן משנות את החוזה. הבא בתור הוא מסלול ריצה
+read-only שפותח ארטיפקט מאומת (S2a), ואחריו packer לווקטורים מוכנים (S4a). S1 חוזר
+לפני יצירת הארטיפקט האמיתי והכרעת backend ה־production.
 
 כיול עדין של fusion נשאר אחרון: הוא כיוון ההגה, לא המנוע.
 
@@ -1787,10 +1813,11 @@ Tantivy/BM25
 book diff, חוזה backend ל־embedding עם **inference אמיתי** מאחורי feature ומאומת מול
 golden vectors, חוזה backend ל־store, שני stores (בזיכרון ו־snapshot לדיסק), hybrid
 fusion עם פרופילים ו־RRF בשימוש, thresholds, grouping, caches, telemetry, אב־טיפוס של
-אריזה וייבוא אטומי, ו־Rust API seam ל־FFI. הוא עדיין אינו מוצר: ה־engine פותח את
-ה־store שבזיכרון ולכן במסלול הפעיל אין persistence; אין ANN ואין הוכחת סקייל על ~6.1
-מיליון שורות; `IndexVersion` אינו קושר את הארטיפקט ל־corpus מסוים; אין builder שמפיק
-ארטיפקט מ־Tantivy; ובאוצריא ה־BLoC וה־UI אינם מפעילים את המסלול.
+אריזה והתקנה עם שחזור, חוזה זהות ארטיפקט מלא עם אימות שדוחה לפי שדה, ו־Rust API seam
+ל־FFI. הוא עדיין אינו מוצר: ה־engine פותח את ה־store שבזיכרון ולכן במסלול הפעיל אין
+persistence ואף אחד אינו פותח ארטיפקט מאומת; אין ANN ואין הוכחת סקייל על ~6.1 מיליון
+שורות; אין builder שמפיק ארטיפקט מ־Tantivy; ובאוצריא ה־BLoC וה־UI אינם מפעילים את
+המסלול.
 
 ---
 
@@ -1851,7 +1878,7 @@ src/
 │
 ├── distribution/
 │   ├── package.rs        → package manifest + payload checksums
-│   └── importer.rs       → staged atomic install
+│   └── importer.rs       → staged install + interruption recovery
 │
 ├── telemetry/            → in-process counters (no network)
 └── benchmark/            → timing & percentile helpers
@@ -1925,11 +1952,23 @@ is ~2.5–3.2s over the 6,058,210-line library — an extrapolation, not a measu
 Whether ANN is needed at all is an S2 decision that depends on the S1 dimension
 choice.
 
-**Artifact identity:** 🟡 `IndexVersion` covers model/chunking/backend; corpus id,
-Tantivy schema version and ID-scheme version are missing (S3).
+**Artifact identity:** 🟢 `IndexVersion` carries corpus digest, library version,
+Tantivy schema version, id-scheme version, model file checksum, inference backend,
+dimension, precision, pooling, token cap, embedding-text version, normalization,
+chunking and store format version. Every field is compared and every mismatch is
+named (`docs/ARTIFACT_CONTRACT.md`).
 
-**Packaging & atomic install:** 🟡 Implemented and tested, not exposed through the
-API, and no builder produces an official artifact yet.
+**Artifact authenticity:** 🟡 A published digest can be required and is checked, and
+declining one has an explicit name — but nothing publishes it yet and there is no
+signature. A package that arrived over a network is currently verified against damage,
+not against forgery.
+
+**Packaging & install:** 🟡 Verification is complete and tested at two depths — full
+hashing for install, metadata plus presence for open — and the install recovers from
+both crash windows, flushes what it writes, and is tested with injected rename
+failures. What is missing: nothing in a runtime path calls any of it, it is not exposed
+through the API, no builder produces an official artifact, and no timing budget has been
+measured.
 
 **Hybrid fusion:** 🟢 Implemented — weighted / RRF / adaptive, chosen by profile
 

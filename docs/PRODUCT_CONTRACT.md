@@ -55,8 +55,9 @@ Tantivy הרשמי  ─┐
 אין תהליך רקע שמאנדקס את הספרייה, אין `progress stream`, ואין `cancel`/`resume` של
 אינדוקס. המשתמש לא ממתין לאינדוקס ולא רואה אחוזי התקדמות של embedding.
 
-מה שכן יש למשתמש הוא **התקנה** של ארטיפקט מוכן: הורדה/העתקה, אימות checksum, החלפה
-אטומית. זו פעולת קבצים, לא inference.
+מה שכן יש למשתמש הוא **התקנה** של ארטיפקט מוכן: הורדה/העתקה, אימות, והחלפה שניתן
+להשתחזר ממנה (שני renames עם שחזור מפורש — §8 והחוזה, לא „החלפה אטומית”). זו פעולת
+קבצים, לא inference.
 
 ## 5. אין שירות ענן בזמן חיפוש
 
@@ -100,10 +101,13 @@ Tantivy הרשמי  ─┐
 |---|---|---|
 | backend read-only מתמיד | [`SemanticEngine`](../src/semantic/engine.rs) מחזיק `VectorStore` בזיכרון; `ZevcStore` קיים אך אינו מחובר למנוע | S2 |
 | אחזור שעומד בתקציב זמן/RAM בקנה מידה | שני ה־stores סורקים הכול, `O(N·D)`; אין mmap ואין ANN, והסקייל לא נמדד. **החוזה אינו אוסר ANN ואינו מחייב אותו** — הוא מחייב לעמוד בתקציב, וההכרעה נעשית לפי מדידה | S2 |
-| זהות corpus/Tantivy מלאה | [`IndexVersion`](../src/semantic/versioning.rs) נושא רק זהות מודל/chunking/backend; אין `corpus_id` ואין גרסאות סכמה של Tantivy | S3 |
-| זהות מודל בתוך החבילה | ה־SHA-256 של קובץ המודל וזהות ה־backend נשמרים ב־`SemanticManifest` **המקומי** בלבד ואינם ב־`IndexVersion`. בדיקת התאימות של `IndexImporter` אינה מסוגלת להבחין בין קובץ המודל שהחבילה נבנתה ממנו לבין קובץ אחר בעל אותו `model_id`; אין היום מסלול שפותח חבילה מול מודל, ולכן זה פער בכושר הזיהוי ולא באג פעיל. ראו [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §2.4 | S3 |
-| אימות מול checksum מפורסם | ה־crate אינו מקבל checksum צפוי; הוא משווה את הקובץ למה שראה בהרצה קודמת | S3, S6 |
-| ארטיפקט רשמי מוגדר | החבילה היא תיקייה עם payloads ו־JSON; אין חוזה `.oix` סגור ואין builder | S3–S4 |
+| זהות corpus/Tantivy מלאה | ✅ **קיים.** [`IndexVersion`](../src/semantic/versioning.rs) נושא `corpus_id`, גרסת ספרייה, `tantivy_schema_version` ו־`document_id_scheme_version`, וכל שדה נבדק ב־[`IndexPackage::verify_for_install`/`verify_for_open`](../src/distribution/package.rs). מה שאין: מסלול ריצה שקורא לזה — ראו השורה הבאה. חוזה השדות: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) | S3 ✅ |
+| זהות מודל בתוך החבילה | ✅ **קיים.** `model_checksum` (SHA-256 של קובץ המודל), `embedding_backend`, quantization, pooling, ממד ו־`max_tokens` הם חלק מזהות החבילה, וקובץ מודל אחר מאחורי אותו `model_id` נדחה בשם. ראו [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §2.4 | S3 ✅ |
+| אכיפה במסלול שהמשתמש מפעיל | **פער.** האימות נאכף ב־`IndexPackage::verify_*` וב־`IndexImporter::import`, אך שום מסלול ריצה אינו קורא להם: `SemanticEngine` עדיין פותח store בזיכרון, ואין חשיפה ב־FFI. כלומר יש כושר זיהוי ובדיקות, ואכיפה רק בהתקנה שאיש עדיין אינו מפעיל | S2, S5 |
+| אימות מול digest מפורסם | 🟡 המכניזם קיים: `ArtifactExpectation::with_published_digest` משווה את החבילה ל־digest שהגיע מחוץ לה, ו־`without_published_digest` מצהירה במפורש על הוויתור. **מה שאין הוא מי שמפרסם** — ואין חתימה. עד אז חבילה שהגיעה מהרשת אומתה נגד נזק, לא נגד זיוף. ראו [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §5.3 | S6 |
+| התקנה עם שחזור (לא „אטומית”) | 🟡 החלפת תיקייה היא בהכרח שני renames, ובין השניים אין תיקיית יעד. החלון הזה **מזוהה ומשוחזר**: שמות דטרמיניסטיים, `recover_interrupted_install`, `fsync` לקבצים ולתיקיית האב, ובדיקות הזרקת־כשל לשני חלונות הקריסה. מה שאין: lock לשתי התקנות במקביל, ותקציב זמן נמדד | S3 🟡, S6 |
+| אימות בפתיחה לעומת בהתקנה | 🟡 שני עומקים: `verify_for_install` מגבב כל בייט, `verify_for_open` בודק metadata, זהות, digest ונוכחות/גודל בלי לקרוא payload — כי גיבוב של גיגה־בייטים בכל עלייה אינו בתקציב. עריכה באותו אורך אינה נתפסת בפתיחה; זו בדיקה של קורא ה־store | S2a |
+| ארטיפקט רשמי מוגדר | 🟡 מבנה התיקייה, ה־metadata וסדר האימות מוגדרים ב־[`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md); ספירות הספרים/הווקטורים נבדקות רק כ„לא אפס” ולא מול תוכן ה־payload, ההכרעה על ארכיון בודד נדחתה, ואין builder | S3 🟡, S4 |
 | אין אינדוקס בזמן ריצה | `index_books()` עדיין חשוף ב־API ומקבל ספרים מהקורא — מסלול אב־טיפוס, **לא** המסלול הרשמי | S5 |
 | מצבי סטטוס מפורשים | `SemanticStatus` מדווח דגלים ומחרוזת שגיאה; מערך המצבים מסעיף 7 **אינו קיים בקוד** | S5 |
 | UI סמנטי באוצריא | **לא קיים.** ה־gateway/repository חושפים API, ה־BLoC וה־UI אינם מפעילים אותו | S7 |
