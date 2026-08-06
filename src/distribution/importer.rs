@@ -1070,10 +1070,19 @@ mod tests {
     #[test]
     fn a_target_without_a_name_of_its_own_is_refused_by_both_paths() {
         let dir = TempDir::new("nameless");
+
+        // An existing directory named only by its parent, built as text rather than with
+        // `join("..")`: `PathBuf::push` strips `..` from a *verbatim* Windows path, and the
+        // fixture root is canonical, so joining would hand over that root's parent — a
+        // perfectly nameable directory, and this case would prove nothing.
+        let mut nameless = dir.path().as_os_str().to_os_string();
+        nameless.push(std::path::MAIN_SEPARATOR_STR);
+        nameless.push("..");
+
         for target in [
             PathBuf::from("."),
             PathBuf::from(".."),
-            dir.path().join(".."),
+            PathBuf::from(nameless),
             PathBuf::from("/"),
         ] {
             assert!(
