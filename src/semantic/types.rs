@@ -373,10 +373,10 @@ pub struct SemanticChunk {
 
 /// Metadata stored alongside each vector in the vector database.
 ///
-/// Note that the facet list is duplicated per chunk. That is a known cost of the
-/// current in-memory backend; how metadata is laid out (shared per book, or
-/// hydrated from Tantivy instead of stored at all) is decided with the
-/// persistent read-only backend in stage S2.
+/// Note that the facet list is duplicated per chunk, in memory and in the payload. How
+/// metadata should be laid out — shared per book, or hydrated from Tantivy instead of
+/// stored at all — is a question about size and open cost at library scale, so it is
+/// decided by the S2b measurement rather than by the read path that exists now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorMetadata {
     pub semantic_id: String,
