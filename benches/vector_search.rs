@@ -16,12 +16,15 @@
 //! # What it is for
 //!
 //! Whether brute-force scanning can serve the real library at all, and the baseline
-//! any retrieval backend chosen in S2 has to improve on — while meeting its own
-//! recall budget, if it is an approximate one. The full-library figure is *extrapolated*
-//! from the measured rate — the linear cost of a brute-force scan is exactly what
-//! makes the extrapolation sound, and exactly why it stops holding the moment a
-//! real index is introduced. Run it before and after any change to
-//! `VectorStore::search`.
+//! every S2 candidate is compared against. Note what the comparison is *not*: the
+//! chosen backend does not have to win on every metric — it has to meet the latency,
+//! memory and (if approximate) recall budgets. If the measurement shows a full scan
+//! already meets them, the full scan is a legitimate answer.
+//!
+//! The full-library figure is *extrapolated* from the measured rate — the linear cost
+//! of a brute-force scan is exactly what makes the extrapolation sound, and exactly
+//! why it stops holding the moment a real index is introduced. Run it before and
+//! after any change to `VectorStore::search`.
 //!
 //! Numbers are single-threaded and machine-specific. Compare runs on one machine;
 //! never quote them as absolutes.
