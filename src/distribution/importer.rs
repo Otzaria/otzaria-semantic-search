@@ -492,9 +492,20 @@ fn restore_parked(
 
 /// Copy a payload and flush it, so the swap cannot make a file durable that has no
 /// contents yet.
+///
+/// The destination is written through a handle this function owns, rather than by
+/// `fs::copy` followed by reopening the result. Two reasons, both Windows:
+///
+/// * `sync_all` is `FlushFileBuffers` there, which refuses a handle opened for reading —
+///   `ERROR_ACCESS_DENIED`, on a file this process just created.
+/// * `fs::copy` carries the source's permission bits across, so a package delivered
+///   read-only would install read-only, and `remove_dir_all` cannot delete a read-only
+///   file on Windows. The superseded artifact would then be undeletable.
 fn copy_and_sync(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::copy(source, destination)?;
-    File::open(destination)?.sync_all()
+    let mut source = File::open(source)?;
+    let mut destination = File::create(destination)?;
+    io::copy(&mut source, &mut destination)?;
+    destination.sync_all()
 }
 
 /// Remove a directory tree, with a test-only failure injection point.
