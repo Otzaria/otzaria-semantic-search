@@ -30,6 +30,7 @@ otzaria-semantic-search/
 ├── benches/
 │   └── vector_search.rs                    # מדידת latency של VectorStore::search
 ├── tests/
+│   ├── artifact_contract.rs                # זהות הארטיפקט ושער ההתקנה, דרך ה-API הציבורי בלבד
 │   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
 │   └── production_backend_gate.rs          # מאמת שבנייה רגילה מסרבת לייצר embeddings
 └── src/
@@ -46,7 +47,7 @@ otzaria-semantic-search/
     │   └── feature_flags.rs                # דריסות נקודתיות מעל פרופיל
     ├── distribution/
     │   ├── package.rs                      # manifest של חבילה + SHA-256 לכל payload
-    │   └── importer.rs                     # התקנה אטומית עם staging וגיבוי
+    │   └── importer.rs                     # התקנה בשני renames, עם שחזור מהפרעה
     ├── hybrid/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Hybrid
     │   ├── coordinator.rs                  # מתאם החיפוש ההיברידי הראשי
@@ -68,7 +69,7 @@ otzaria-semantic-search/
     │   ├── store.rs                        # Vector DB בזיכרון (Pre-normalized + Heap)
     │   ├── store_backend.rs                # trait משותף לשני ה-stores
     │   ├── zevc_store.rs                   # snapshot לדיסק; סריקה מלאה, לא ANN, לא מחובר
-    │   ├── versioning.rs                   # IndexVersion ודיווח אי-תאימות
+    │   ├── versioning.rs                   # זהות הארטיפקט ודחייה מפורשת לפי שדה
     │   └── types.rs                        # הגדרות טיפוסים ומבני נתונים
     └── telemetry/
         └── mod.rs                          # מוני חיפוש בתוך התהליך (ללא רשת)
@@ -90,6 +91,11 @@ otzaria-semantic-search/
   - `EmbeddingError` — שגיאות טעינת מודל ואינפרנס.
   - `VectorStoreError` — שגיאות חיפוש, הכנסה ומחיקה ב-Vector DB.
   - `ManifestError` — שגיאות תואמות מודל וגרסאות אינדקס.
+  - `ArtifactError` — דחיית ארטיפקט רשמי: גרסת metadata זרה, זהות חסרה, אי-התאמת זהות
+    (עם רשימת השדות), digest שאינו זה שפורסם, payload חסר/לא-רגיל/פגום, שם payload לא
+    פורטבילי (עם הסיבה), manifest שאינו מסכים עם ה-payload, יעד התקנה פסול, והתקנה
+    שנקטעה ולא הצליחה להשתחזר. כל וריאנט הוא סירוב, לא התדרדרות — וההבחנה ביניהם קיימת
+    כדי שהאפליקציה תוכל להציג „לא מתאים” לעומת „פגום”, שהם שני תיקונים שונים.
   - `ChunkingError` — שגיאות חלוקת ספר לקטעים.
 
 ---
@@ -309,14 +315,30 @@ otzaria-semantic-search/
     מוכח.
 
 * [`src/semantic/versioning.rs`](../src/semantic/versioning.rs)
-  - `IndexVersion` — זהות האינדקס שנשמרת בחבילה: `schema_version`, `model_id`,
-    `embedding_dim`, `pooling`, `max_tokens`, `normalization_version`,
-    `chunking_identity`, `store_backend`, `vector_precision`.
-  - `describe_incompatibilities()` — מחזיר את **כל** ההבדלים, לא רק את הראשון;
-    `is_compatible()` מוגדר כ"אין הבדלים". שגיאת ייבוא מצטטת את הרשימה.
-  - **מה חסר:** `corpus_id`, `tantivy_schema_version` ו-`document_id_scheme_version`.
-    בלעדיהם אפשר לפתוח חבילה שמצביעה ל-`line_id` של קטלוג אחר. זה S3, וזו הסיבה
-    שהוא חוסם את S4–S5.
+  - `IndexVersion` — זהות הארטיפקט בשלוש קבוצות: `CorpusIdentity` (digest של
+    הספרייה, גרסת קטלוג, `tantivy_schema_version`, `document_id_scheme_version`),
+    `ModelIdentity` (`model_id`, **`model_checksum`**, quantization, backend, ממד,
+    pooling, `max_tokens`, `embedding_text_version`, normalization, chunking) ו-
+    `StoreIdentity` (`backend_id`, `store_format_version`, `vector_precision`).
+    החוזה המלא: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md).
+  - `IdentityField::ALL` — רשימה אחת שההשוואה, ה-digest והודעות הדחייה הולכות לפיה.
+    **הכיסוי אינו מובטח על ידי הטיפוס** — `IndexVersion` הוא struct רגיל — אלא על ידי שתי
+    בדיקות שנגזרות מה-JSON המסוריאלי: `every_serialized_identity_field_is_comparable`
+    (שדה שנשמר ואינו מושווה) ו-`every_serialized_identity_field_is_refused_when_left_unfilled`
+    (שדה שוולידציית השלמות שכחה). הוספת שדה בלי וריאנט מפילה את שתיהן.
+  - `library_version` **קטלני כמו כל שדה אחר**, לא „אבחון בלבד”: הערך הצפוי בא מאותו
+    ארטיפקט Tantivy שממנו בא ה-`corpus_id`, ולכן אי-התאמה היא תקלה בצינור ה-build.
+  - `document_id_scheme_version` — גרסה 1 היא `((catalogue_order + 1) << 32) + (ordinal + 1)`,
+    בדיוק כמו `otzaria_search_engine`. הנוסחה מדויקת בכוונה: ה-builder ב-S4 צריך לשחזר
+    אותה, לא לקרב אותה.
+  - `mismatches_against()` / `verify_matches()` — **כל** ההבדלים ברשימה טיפוסית
+    (`IdentityMismatch`), לא הראשון ולא `bool`: דחייה שהצטמקה ל-`false` היא מה
+    שחוזה המוצר קורא לו ניחוש.
+  - `validate_complete()` — מחרוזת ריקה, גרסה 0, checksum שאינו 64 hex קטנות, או תו בקרה
+    בתוך ערך זהות — נדחים **לפני** ההשוואה, כי שתי זהויות שלא מולאו משוות שוות זו לזו.
+    תו בקרה נדחה גם כדי שהטקסט הקנוני שמאחורי ה-digest יישאר חד-משמעי.
+  - כל שדה כאן קטלני: אין „אי-תאימות שדורשת רק chunking מחדש” כמו ב-manifest המקומי,
+    כי במכשיר אין מה לבנות מחדש.
 
 * [`src/semantic/embedding_cache.rs`](../src/semantic/embedding_cache.rs)
   - `EmbeddingCache` — cache בגודל חסום לווקטורים של טקסטים שהוטמעו, עם החלפה
@@ -384,21 +406,62 @@ otzaria-semantic-search/
   - **אין כאן רשת.** אלה מונים בזיכרון התהליך; המאגר אינו שולח דבר לשום שרת.
 
 * [`src/distribution/package.rs`](../src/distribution/package.rs)
-  - `PackageManifest` — `IndexVersion` + `created_at` + ספירות ספרים/וקטורים + גודל.
-  - `IndexPackage::write()` — מסרב לכתוב חבילה שה-payload שלה חסר או לא תואם את
-    ה-checksums. חבילה שנכתבה „בהצלחה” בלי לאמת היא בדיוק החבילה שתיכשל אצל המשתמש.
-  - `validate_payload_name()` — שם payload חייב להיות רכיב נתיב יחיד ולא
-    `manifest.json`/`checksums.json`. זה מה שחוסם `../` ושמות שדורסים את המניפסט.
-  - `verify_checksums()` — symlink או משהו שאינו קובץ רגיל נדחה, לא נעקב.
+  - `PackageManifest` — `metadata_version` + `IndexVersion` + `created_at` + ספירות
+    ספרים/וקטורים + גודל מוצהר. `metadata_version` נקרא ב-probe **לפני** המסמך, כדי
+    שפורמט זר ידווח על גרסתו ולא ייפול על שגיאת פרסור של שדה בודד.
+  - `verify_for_install()` / `verify_for_open()` — שני עומקים, כי אחד מהם רץ בכל עלייה
+    של האפליקציה. שניהם: גרסת metadata, שלמות הזהות, הזהות מול ההתקנה, ה-digest המפורסם,
+    ונוכחות+גודל של כל payload. רק הראשון מגבב כל בייט. גיבוב גיגה-בייטים בכל פתיחה אינו
+    בתקציב, ובדיקה שאי אפשר להרשות היא בדיקה שמכבים.
+  - `VerificationDepth` + `VerifiedPackage::depth()` — הטוקן נושא **מה נבדק בו**. קורא
+    שמדווח „מאומת” בלי להסתכל בזה טוען שה-payload גובב כשאולי רק נעשה עליו `stat`.
+    מה שהעומק הרזה אינו תופס: עריכה באותו אורך בדיוק. זו בדיקה של קורא ה-store (S2a),
+    ויש בדיקה שמתעדת את הגבול.
+  - `digest()` — SHA-256 מעל טקסט קנוני (גרסת metadata, כל שדות הזהות בסדר `ALL`, ספירות,
+    גודל, ו-checksum+גודל לכל payload). זה **עוגן האמון**: `payloads.json` נוסע בתוך החבילה,
+    ולכן payload שהוחלף יחד עם ה-checksum שלו עובר כל בדיקה פנימית. רק digest שפורסם
+    מחוץ לחבילה מבדיל בין הארטיפקט הרשמי לחבילה עקבית-עם-עצמה. מעל טקסט קנוני ולא מעל
+    בייטי JSON, כדי שכתיבה מחדש של ה-metadata בהתקנה לא תשנה אותו; `created_at` מוחרג.
+  - `ArtifactExpectation` — `with_published_digest` מול `without_published_digest`. אין
+    ברירת מחדל שקטה: מי שמוותר על העוגן קורא לפונקציה ששמה אומר זאת.
+  - `VerifiedPackage` — טוקן שאין לו constructor ציבורי אחר. מסלול הקריאה (S2a) יקבל
+    אותו במקום נתיב, ואז „לאמת לפני שנוגעים בווקטורים” הוא תכונה של הטיפוסים.
+  - `verify_integrity()` / `walk_payloads()` — מהלך אחד לשני העומקים, כדי שהבדיקה הזולה
+    לא תפסיק בשקט לכסות משהו שהיקרה כן מכסה. ספירות אפס נדחות; ספירה מול **תוכן**
+    ה-payload דורשת קורא של פורמט ה-store וזה S2a/S4a.
+  - `IndexPackage::write()` — מסרב לכתוב metadata שהקורא היה דוחה (זהות חסרה, payload
+    חסר, גודל שאינו מסתכם). חבילה שנכתבה „בהצלחה” בלי לאמת היא בדיוק זו שתיכשל אצל
+    המשתמש.
+  - `validate_payload_name()` — allowlist על ה**מחרוזת**: `A-Z a-z 0-9 . _ -`, עד 255
+    בתים, בלי נקודה בהתחלה/בסוף, לא שמות ה-metadata, ולא שם מכשיר שמור של Windows.
+    **לא דרך `Path`** — `Path::components` מפרש `a\b.bin` כשם קובץ אחד ב-Unix וכנתיב
+    ב-Windows, כך שחבילה שנכתבה ב-macOS הייתה יכולה להיפרש אחרת ב-Windows. symlink או
+    משהו שאינו קובץ רגיל נדחה, לא נעקב.
+  - `write_and_sync()` / `sync_dir()` — כתיבת metadata עם `fsync`, ושטיפת רשומת התיקייה
+    (Unix; ב-Windows אין מקבילה ווה מתועד). בלי זה הפסקת חשמל מבטלת כתיבה שדווחה כהצלחה.
 
 * [`src/distribution/importer.rs`](../src/distribution/importer.rs)
-  - `IndexImporter::import()` — קריאת חבילה, אימות checksums, בדיקת תאימות
-    `IndexVersion`, העתקה ל-staging, אימות **שוב על ה-staging**, ואז החלפת תיקייה.
-  - `replace_directory()` — היעד עובר לגיבוי, ה-staging נכנס במקומו, וכשל בהחלפה
-    מחזיר את הגיבוי. אין מצב ביניים שבו אין תיקיית יעד.
+  - `IndexImporter::import()` — אימות **מלא של המקור** לפני שמועתק משהו, העתקה ל-staging
+    עם `fsync` לכל קובץ, אימות **שוב על ה-staging** (הכתיבה מגַבּבת מחדש את מה שהועתק),
+    ואז ההחלפה. חבילה שתידחה אינה יוצרת תיקיית יעד.
+  - **אין יותר `verify_checksums: bool`.** דגל שמדלג על אימות הוא בדיוק החור שהחוזה
+    אוסר; התקנה היא הרגע שבו קריאת כל בייט עוד זולה.
+  - `swap_into_place()` — היעד עובר ל-`.<name>.previous`, ה-staging נכנס במקומו, ורשומת
+    תיקיית האב נשטפת אחרי כל rename. **יש חלון שבו אין תיקיית יעד** — `rename` מסרב
+    להחליף תיקייה לא-ריקה בשתי המערכות, ולכן ההחלפה היא בהכרח שני renames. אי אפשר לבטל
+    את החלון; אפשר להפוך אותו למזוהה.
+  - `recover_interrupted_install()` — בגלל אותו חלון. שמות דטרמיניסטיים (`.previous`,
+    `.staging`) ולא nonce, כדי שיהיה מה למצוא: `previous` בלי target = קריסה בתוך החלון,
+    העותק הקודם מוחזר; `previous` **וגם** target = ההחלפה הצליחה והניקוי לא, המיושן נמחק.
+    `import` קורא לו לפני שהוא נוגע ביעד, כי כתיבה מעל הפרעה לא-פתורה מוחקת את העותק
+    היחיד שיש למכשיר. מי שפותח את היעד חייב לקרוא לו לפני הפתיחה.
+  - כשל בהחזרה **אינו נבלע**: `InterruptedInstall` אומר באיזו תיקייה נמצא העותק הטוב.
+  - `failpoints` — הזרקת כשל ל-rename, thread-local. „החלפה שנכשלה” ו„גם ההחזרה נכשלה”
+    אינם מצבים שאפשר לייצר בסידור קבצים, ומסלול התאוששות שלא נבדק הוא זה שייכשל כשיידרש.
   - מסרב שהיעד יהיה תיקיית החבילה או צאצא שלה — ייבוא כזה היה מוחק את המקור.
+  - **מה שמחוץ להיקף ומתועד:** שתי התקנות במקביל לאותו target. אין lock.
   - **מה שאינו כאן:** ה-importer אינו חשוף דרך `OtzariaHybridEngine`, ה-FFI או
-    אוצריא. חשיפתו היא S3–S5.
+    אוצריא, ואף מסלול ריצה אינו פותח את מה שהותקן. זה S2a ו-S5.
 
 * [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
   - `measure()` / `aggregate()` / `QuerySet` / `BenchmarkConfig` — תזמון, אחוזונים

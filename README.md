@@ -15,9 +15,17 @@ prototype persistence and packaging, and — behind the non-default `llama-backe
 feature — **real GGUF inference** against the Otzaria Qwen3 embedding model,
 verified against committed golden reference vectors.
 
-Still roadmap work: a persistent read-only backend wired into the engine, an
-artifact identity contract that pins the index to a specific corpus, the builder
-that produces the official artifact from Tantivy, and application integration.
+The artifact identity contract is in place: a package declares which corpus, Tantivy
+schema, id scheme, model file, inference backend and store format it was built from, and
+it is refused by name before a vector is read. Verification comes at two depths — full
+hashing at install, metadata and presence at open — because re-hashing gigabytes at every
+launch is not a check anyone keeps. A digest published outside the package is what
+separates the official artifact from a self-consistent rebuild, and declining that anchor
+has an explicit name ([docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md)).
+
+Still roadmap work: a persistent read-only backend wired into the engine so that
+verified artifact actually gets opened, the builder that produces the official
+artifact from Tantivy, and application integration.
 
 > **Scope, in one line:** the official vector index is built ahead of time on a
 > build machine and opened **read-only** on the user's device. The app does not
@@ -115,6 +123,7 @@ otzaria-semantic-search/
 ├── README.md                            ➜ Master project documentation & guide
 ├── docs/
 │   ├── PRODUCT_CONTRACT.md             ➜ Binding scope definition (read-only index, no overlay)
+│   ├── ARTIFACT_CONTRACT.md            ➜ Artifact identity fields & the pre-open verification gate
 │   ├── MODEL_DISTRIBUTION.md           ➜ How the embedding model reaches the device
 │   ├── CODE_MAP.md                     ➜ Comprehensive code map & module breakdown
 │   └── DEVELOPMENT.md                  ➜ Developer guide, architecture invariants & status
@@ -123,6 +132,7 @@ otzaria-semantic-search/
 ├── benches/
 │   └── vector_search.rs                ➜ Vector-search latency benchmark (harness = false)
 ├── tests/
+│   ├── artifact_contract.rs            ➜ Artifact identity & install gate, through the public API
 │   ├── hybrid_integration_test.rs      ➜ End-to-end integration test suite
 │   └── production_backend_gate.rs      ➜ Proves a default build refuses to embed
 └── src/
@@ -139,7 +149,7 @@ otzaria-semantic-search/
     │   └── feature_flags.rs            ➜ Per-run overrides onto a RankingProfile
     ├── distribution/
     │   ├── package.rs                  ➜ Index package manifest & SHA-256 payload checksums
-    │   └── importer.rs                 ➜ Staged, atomic install of a package into place
+    │   └── importer.rs                 ➜ Staged install, with recovery from an interrupted swap
     ├── hybrid/
     │   ├── mod.rs                      ➜ Hybrid search module declaration
     │   ├── coordinator.rs              ➜ Hybrid search coordinator & fallback logic
@@ -161,7 +171,7 @@ otzaria-semantic-search/
     │   ├── store.rs                    ➜ Pre-normalized vector database & BinaryHeap Top-K search
     │   ├── store_backend.rs            ➜ VectorStoreBackend trait shared by both stores
     │   ├── zevc_store.rs               ➜ Snapshot-persisting store (full scan, not ANN, not wired)
-    │   ├── versioning.rs               ➜ IndexVersion identity & incompatibility reporting
+    │   ├── versioning.rs               ➜ Artifact identity (corpus/model/store) & typed rejection
     │   └── types.rs                    ➜ Domain models & data transfer objects (DTOs)
     └── telemetry/
         └── mod.rs                      ➜ In-process search metrics aggregation (no network)
@@ -185,7 +195,7 @@ otzaria-semantic-search/
 | **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **The store the engine actually opens today** |
 | **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorStoreBackend` | The trait both stores implement. The engine does not depend on it yet (S2) |
 | **Persistent Store** | [`src/semantic/zevc_store.rs`](src/semantic/zevc_store.rs) | `ZevcStore`, `ZevcStoreConfig` | Checksummed disk snapshots that reopen. **Full scan, not ANN; not `zvec`; not wired into the engine** |
-| **Index Identity** | [`src/semantic/versioning.rs`](src/semantic/versioning.rs) | `IndexVersion`, `describe_incompatibilities` | Model/chunking/backend identity carried by a package. Corpus and Tantivy identity are still missing (S3) |
+| **Artifact Identity** | [`src/semantic/versioning.rs`](src/semantic/versioning.rs) | `IndexVersion`, `IdentityField`, `verify_matches` | Corpus, Tantivy schema, id scheme, model file, backend and store format an artifact declares. Every field compared, all mismatches named |
 | **Index Manifest** | [`src/semantic/manifest.rs`](src/semantic/manifest.rs) | `SemanticManifest`, `BookManifestEntry`, `validate` | Atomic JSON tracking (`.tmp` write + rename) & Tantivy incremental diffing |
 | **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Master sidecar engine orchestrating chunking, embedding & storage |
 | **Embedding Cache** | [`src/semantic/embedding_cache.rs`](src/semantic/embedding_cache.rs) | `EmbeddingCache` | LRU cache over recently embedded query texts |
@@ -195,8 +205,8 @@ otzaria-semantic-search/
 | **Metadata Ranking** | [`src/hybrid/metadata_ranker.rs`](src/hybrid/metadata_ranker.rs) | `MetadataRanker`, `MetadataSignal` | Small facet-derived bonuses (primary source, era, category) |
 | **Hebrew Normalizer** | [`src/hybrid/hebrew_normalizer.rs`](src/hybrid/hebrew_normalizer.rs) | `HebrewNormalizer`, `QueryLanguage` | Nikud/taamim stripping and geresh normalization before embedding |
 | **Telemetry** | [`src/telemetry/mod.rs`](src/telemetry/mod.rs) | `TelemetryCollector`, `SearchTelemetry` | In-process counters only — nothing is transmitted anywhere |
-| **Index Package** | [`src/distribution/package.rs`](src/distribution/package.rs) | `IndexPackage`, `PackageManifest` | Package manifest plus a SHA-256 per payload; rejects traversal-shaped names |
-| **Package Import** | [`src/distribution/importer.rs`](src/distribution/importer.rs) | `IndexImporter`, `ImportConfig` | Copy to staging, verify, swap directories atomically, roll back on failure |
+| **Index Package** | [`src/distribution/package.rs`](src/distribution/package.rs) | `IndexPackage`, `ArtifactExpectation`, `VerifiedPackage`, `VerificationDepth` | Metadata plus a SHA-256 per payload, and the artifact digest that a published value can be compared against. `verify_for_install` hashes everything; `verify_for_open` does not, and the token records which ran |
+| **Package Install** | [`src/distribution/importer.rs`](src/distribution/importer.rs) | `IndexImporter`, `recover_interrupted_install` | Verify the source, copy to staging, verify the copy, swap. The swap is two renames with a window in between, so the intermediate names are deterministic and recovery is a documented step |
 | **Benchmark Harness** | [`src/benchmark/mod.rs`](src/benchmark/mod.rs) | `measure`, `aggregate`, `QuerySet` | Timing and percentile helpers. A measurement tool, **not** a relevance dataset |
 | **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | feature-gated integration tests | End-to-end public-API suite using the explicit mock backend |
 | **CI Workflow** | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | `check-and-test` | Multi-platform GitHub Actions CI workflow (Linux, Windows, macOS) |
@@ -223,7 +233,7 @@ The stages below are the plan of record from
 │ [✔] S0  Product contract alignment (this section, and the docs around it)        │
 │ [ ] S1  Representation quality & dimension/precision decision                    │
 │ [ ] S2  Persistent, read-only, scale-capable backend behind VectorStoreBackend   │
-│ [ ] S3  Official artifact contract: corpus identity, atomic install, rollback    │
+│ [~] S3  Artifact contract: identity + verification done; runtime open path open  │
 │ [ ] S4  Builder that reads the final Tantivy index (otzaria_search_engine)       │
 │ [ ] S5  Repin, open/install API, explicit statuses, FFI (otzaria_search_engine)  │
 │ [ ] S6  Artifact & model management in the app (otzaria)                         │
@@ -242,10 +252,13 @@ The stages below are the plan of record from
    - Make `SemanticEngine` depend on `VectorStoreBackend` instead of the concrete `VectorStore`.
    - Add an `official-read-only` mode that does not expose delete/upsert at application runtime.
    - Run `ZevcStore` as a correctness baseline at 1M and 6M records, and measure cold-open, p50/p95/p99, peak RSS and disk. Move to a real on-disk ANN only if the measurement says a full scan cannot meet the budget — not because "ANN" sounds faster.
-3. **Official artifact contract (S3)**:
-   - Extend `IndexVersion` with corpus, Tantivy schema, ID-scheme, model and backend identity.
-   - Decide whether `.oix` is a defined directory or a single archive, and document it.
-   - Separate the writing builder from the reading runtime; define staging → verify → swap → rollback.
+3. **Official artifact contract (S3)** — identity, two verification depths, the
+   published-digest anchor and a recoverable install landed; see
+   [docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md). What is left:
+   - Check `book_count`/`vector_count` against the payload's actual content, and catch a same-length payload edit at open time — both need a reader of the store format (S2a).
+   - Publish the artifact digest (and sign it): the check exists, the anchor does not (S6).
+   - Decide whether the distributed artifact is a single archive rather than a directory (packer-side, S4).
+   - Measure open and install against a budget on a representative artifact (S2b/S8).
 4. **Quality evaluation suite**:
    - Build the rabbinic relevance dataset behind S1 and report against BM25-only and semantic-only baselines.
 
@@ -344,6 +357,7 @@ gate is a reason the model's distribution route matters — see
 
 For detailed architectural invariants, subsystem separation rules, and development guidelines, refer to:
 - [docs/PRODUCT_CONTRACT.md](docs/PRODUCT_CONTRACT.md) — **Binding scope definition** (Hebrew); outranks every other document here
+- [docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md) — Artifact identity fields, verification order and what is not yet enforced (Hebrew)
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — Comprehensive developer guide & status (Hebrew)
 - [docs/CODE_MAP.md](docs/CODE_MAP.md) — Detailed code map and component descriptions
 - [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md) — How the embedding model reaches the device (Hebrew)
