@@ -57,9 +57,10 @@ pub enum EmbeddingError {
     #[error("Not a valid GGUF model file ({path}): {reason}")]
     InvalidModelFile { path: String, reason: String },
 
-    /// No inference backend is compiled in. Returned by release builds until a
-    /// real GGUF backend lands, so a production binary can never fall back to
-    /// the hash-based stand-in embedder.
+    /// No inference backend is compiled in. A default build has none by choice, so
+    /// a production binary can never fall back to the hash-based stand-in embedder;
+    /// real inference is opt-in through `--features llama-backend`, which compiles
+    /// llama.cpp and ggml through cmake.
     #[error("No embedding backend is available in this build: {reason}")]
     BackendUnavailable { reason: String },
 
@@ -111,9 +112,9 @@ pub enum EmbeddingError {
     /// The backend has no tokenizer to answer with.
     ///
     /// Distinct from a failed tokenization: the hash stand-in has no token ids at
-    /// all, and inventing plausible ones would turn the roadmap P2 stage 4 parity
-    /// check against a reference tokenizer into a comparison between two
-    /// fabrications.
+    /// all, and inventing plausible ones would turn the parity check against a
+    /// reference tokenizer — the `golden` tests, which assert exact token-id equality
+    /// — into a comparison between two fabrications.
     #[error("Backend '{backend}' cannot tokenize: {reason}")]
     TokenizationUnsupported { backend: String, reason: String },
 

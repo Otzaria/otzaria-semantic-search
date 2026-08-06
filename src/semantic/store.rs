@@ -1,10 +1,15 @@
 //! Vector store: similarity search over the semantic index, isolated from Tantivy —
 //! its own directory, lifecycle and failure domain.
 //!
-//! The current backend keeps vectors in memory and scans them exhaustively
-//! (`O(N·D)`). It is **not persistent**, which [`VectorStore::is_persistent`]
-//! reports so callers never treat a stale manifest as a populated index. A
-//! persistent ANN backend is roadmap P4; this API is the seam it slots into.
+//! This backend keeps vectors in memory and scans them exhaustively (`O(N·D)`). It
+//! is **not persistent**, which [`VectorStore::is_persistent`] reports so callers
+//! never treat a stale manifest as a populated index.
+//!
+//! The official path needs a persistent read-only backend, which is stage S2.
+//! Whether that backend also needs to be approximate is a question the S2
+//! measurement answers — a full scan may or may not fit the latency and memory
+//! budget once the dimension and precision are chosen in S1. This API is the seam
+//! either answer slots into.
 
 use crate::errors::VectorStoreError;
 // One threshold for the whole crate, so no two layers can disagree about it.

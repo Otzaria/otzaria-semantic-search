@@ -2047,18 +2047,22 @@ mod tests {
     }
 }
 
-/// Verification against the golden reference vectors.
+/// Verification against the golden reference vectors. **This is the parity gate**,
+/// not a placeholder for one.
 ///
-/// These need the real 396 MB GGUF, which is gitignored and absent from CI, so each is
-/// `#[ignore]`d *and* skips loudly when `OTZARIA_TEST_MODEL` is unset. Run them with:
+/// These need the real 396 MB GGUF, which is gitignored, so each is `#[ignore]`d
+/// *and* skips loudly when `OTZARIA_TEST_MODEL` is unset — that keeps the ordinary
+/// CI matrix green on machines with no model. The dedicated `golden-vectors` CI job
+/// does fetch the model and run them; when its token secret is missing it fails
+/// rather than reporting the skip as a pass. Run them locally with:
 ///
 /// ```sh
 /// OTZARIA_TEST_MODEL=./Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf \
 ///   cargo test --lib --features llama-backend golden -- --ignored --nocapture
 /// ```
 ///
-/// Thresholds are read from the goldens' own `recommended_tolerances`, so that when
-/// roadmap P2 stage 4 brings the formal parity test the two cannot drift apart.
+/// Thresholds are read from the goldens' own `recommended_tolerances`, so the file
+/// and the assertions cannot drift apart.
 #[cfg(test)]
 mod golden {
     use super::*;

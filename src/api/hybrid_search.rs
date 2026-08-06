@@ -7,10 +7,15 @@
 //! # Scope
 //!
 //! This is the seam the bridge will be generated over, not the finished bridge.
-//! Progress streams, cancellation and model-download management are roadmap P7;
-//! what is here is what the correctness work needs to be reachable — searching,
+//! What is here is what the correctness work needs to be reachable — searching,
 //! status, the index diff, indexing and the reset that recovers from an
 //! incompatible index.
+//!
+//! The indexing operations are **prototype and build-side**: tests and the future
+//! artifact builder use them. The application path is installing a prebuilt
+//! read-only index, so no progress stream and no cancel/resume will be added here
+//! — see `docs/PRODUCT_CONTRACT.md` §4. Model download management is the host
+//! application's job (§5).
 
 use crate::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
 use crate::semantic::types::{
@@ -148,8 +153,11 @@ impl OtzariaHybridEngine {
     /// if the semantic path is disabled. Synchronous and potentially
     /// long-running; searches stall for at most one book at a time, the manifest
     /// is committed once rather than per book, and two concurrent calls
-    /// are serialized — see [`HybridCoordinator::index_books`]. Scheduling it off
-    /// the UI thread is the caller's job until the progress API lands in P7.
+    /// are serialized — see [`HybridCoordinator::index_books`].
+    ///
+    /// Build-side and test-side only: the application installs a prebuilt index
+    /// rather than calling this. Scheduling it off any UI thread is the caller's
+    /// job, and stays that way — there is no progress API coming.
     pub fn index_books(
         &self,
         books: &[BookForIndexing],

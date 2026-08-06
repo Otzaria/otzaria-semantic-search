@@ -768,11 +768,12 @@ impl HybridCoordinator {
     /// concurrency.
     ///
     /// Making indexing genuinely concurrent with search needs more than a lock
-    /// change: either finer-grained interior mutability inside the engine, or
-    /// building into a staging index and swapping it in atomically. That belongs
-    /// with the Otzaria integration (roadmap P6/P7), where the threading model is
-    /// decided — a long full index on the UI thread's engine is a blocker there,
-    /// and it should be solved once, properly.
+    /// change: either finer-grained interior mutability inside the engine, or building
+    /// into a staging index and swapping it in atomically.
+    ///
+    /// It is no longer a blocker for the application, though. The app installs a
+    /// prebuilt read-only index and never indexes, so the only caller that can be
+    /// blocked here is the artifact builder (S4) — a batch tool with no UI thread.
     ///
     /// # The manifest is written once, not per book
     ///
