@@ -58,7 +58,8 @@ use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::store_backend::VectorSearchBackend;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, SemanticStatus};
 use crate::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity, StoreIdentity};
-use crate::semantic::zevc_store::{self, ReadOnlyZevcStore};
+use crate::semantic::zevc_store::{self, ReadOnlyZevcStore, SNAPSHOT_FILENAMES};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The payload layout this build can read.
@@ -229,11 +230,15 @@ impl OfficialSemanticIndex {
         };
 
         let verified = IndexPackage::verify_for_open(&artifact_path, &expected)?;
-        // The width the *artifact* declares, which verification has just proved equal to
-        // the model's. Reading it off the token rather than off the configuration keeps
-        // the reader decoding what the payload says it holds.
-        let store =
-            ReadOnlyZevcStore::open(verified.root(), verified.identity().model.embedding_dim)?;
+        // Everything the reader gets comes off the token: the payload set it is allowed to
+        // read, the hash each of those files must have, and the record width — which
+        // verification has just proved equal to the model's. Nothing here is a path or a
+        // number the caller could have supplied.
+        let store = ReadOnlyZevcStore::open(
+            verified.root(),
+            verified.identity().model.embedding_dim,
+            snapshot_payloads(&verified)?,
+        )?;
         let book_count = verify_counts_against_payload(&verified, &store)?;
         let index = Self {
             verified,
@@ -353,6 +358,40 @@ impl OfficialSemanticIndex {
     }
 }
 
+/// The payload table this backend's reader is allowed to read, taken from the token.
+///
+/// Refuses anything that is not exactly this backend's layout. Two different faults would
+/// otherwise slip through: a package that declares payloads under other names while
+/// shipping snapshot files beside them — the reader would then load files the token covers
+/// nothing about — and a package that omits one of the three, which is an incomplete
+/// snapshot rather than a smaller one.
+///
+/// The names are compared as a set: [`SNAPSHOT_FILENAMES`] is in read order, and the token's
+/// table is sorted.
+fn snapshot_payloads(
+    verified: &VerifiedPackage,
+) -> Result<BTreeMap<String, String>, ArtifactError> {
+    let declared: BTreeSet<&str> = verified.payload_names().into_iter().collect();
+    let required: BTreeSet<&str> = SNAPSHOT_FILENAMES.into_iter().collect();
+    if declared != required {
+        return Err(ArtifactError::ManifestDisagreesWithPayload {
+            reason: format!(
+                "an artifact of store backend '{}' must declare exactly {:?}, and this one \
+                 declares {:?}",
+                zevc_store::BACKEND_ID,
+                required,
+                declared
+            ),
+        });
+    }
+
+    Ok(verified
+        .payloads()
+        .iter()
+        .map(|(name, descriptor)| (name.clone(), descriptor.sha256.clone()))
+        .collect())
+}
+
 /// Check the manifest's counts against what the payload actually holds, and return the
 /// book count so nothing has to list every key again.
 ///
@@ -396,7 +435,7 @@ mod tests {
     use crate::semantic::types::VectorMetadata;
     use crate::semantic::versioning::IdentityField;
     use crate::semantic::zevc_store::{
-        ZevcStore, ZevcStoreConfig, SNAPSHOT_FILENAMES, VECTORS_FILENAME,
+        ZevcStore, ZevcStoreConfig, METADATA_FILENAME, SNAPSHOT_FILENAMES, VECTORS_FILENAME,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -707,34 +746,103 @@ mod tests {
     /// this edit, and the reader can — so the claim "an artifact that is tampered with
     /// stops opening" holds for the *runtime* path even though it does not hold for
     /// `verify_for_open` alone.
+    ///
+    /// Both forms are exercised, because they are caught by different things. A raw edit is
+    /// caught by the record's own checksum. An edit that also repairs that checksum — the
+    /// one a payload's internal checks are structurally unable to see — is caught only
+    /// because the reader compares each file against the hash `payloads.json` declares, and
+    /// that declaration is what a published digest pins.
     #[test]
     fn a_same_length_payload_edit_passes_verification_and_is_caught_by_the_reader() {
-        let dir = TempDir::new("tamper");
-        let (model_path, target, _) = installed(&dir);
+        for forge_the_checksum_too in [false, true] {
+            let dir = TempDir::new("tamper");
+            let (model_path, target, _) = installed(&dir);
 
-        let vectors_path = target.join(VECTORS_FILENAME);
-        let mut bytes = fs::read(&vectors_path).unwrap();
-        let before = bytes.len();
-        bytes[0] ^= 0xff;
-        fs::write(&vectors_path, &bytes).unwrap();
-        assert_eq!(fs::metadata(&vectors_path).unwrap().len() as usize, before);
+            let vectors_path = target.join(VECTORS_FILENAME);
+            let mut bytes = fs::read(&vectors_path).unwrap();
+            let before = bytes.len();
+            bytes[0] ^= 0xff;
+            fs::write(&vectors_path, &bytes).unwrap();
+            assert_eq!(fs::metadata(&vectors_path).unwrap().len() as usize, before);
 
-        assert!(
-            IndexPackage::verify_for_open(
-                &target,
-                &ArtifactExpectation::without_published_digest(built_identity(&model_path))
-            )
-            .is_ok(),
-            "a same-length edit is invisible without hashing the payload"
+            if forge_the_checksum_too {
+                let metadata_path = target.join(METADATA_FILENAME);
+                let text = fs::read_to_string(&metadata_path).unwrap();
+                let before = text.len();
+                let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+                first["vector_sha256"] = serde_json::Value::String(format!(
+                    "{:x}",
+                    Sha256::digest(&bytes[..DIM as usize * 4])
+                ));
+                lines[0] = serde_json::to_string(&first).unwrap();
+                fs::write(&metadata_path, format!("{}\n", lines.join("\n"))).unwrap();
+                assert_eq!(
+                    fs::read_to_string(&metadata_path).unwrap().len(),
+                    before,
+                    "a forgery that changes a length would be caught by the cheap depth"
+                );
+            }
+
+            assert!(
+                IndexPackage::verify_for_open(
+                    &target,
+                    &ArtifactExpectation::without_published_digest(built_identity(&model_path))
+                )
+                .is_ok(),
+                "a same-length edit is invisible without hashing the payload"
+            );
+
+            match OfficialSemanticIndex::open(config_for(&target, &model_path))
+                .map(|index| index.vector_count())
+            {
+                Err(SemanticSearchError::VectorStore(VectorStoreError::Corrupted { .. })) => {}
+                other => panic!(
+                    "the reader must refuse an edited payload \
+                     (checksum forged: {forge_the_checksum_too}), got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// An artifact of this backend is exactly three payload files. A package that declares
+    /// anything else — while shipping snapshot files beside them — would have the reader
+    /// loading bytes the token covers nothing about.
+    #[test]
+    fn a_package_that_does_not_declare_this_backends_payloads_is_refused() {
+        let dir = TempDir::new("payload_set");
+        let model_path = dir.path().join("model.gguf");
+        mock::write_stub_gguf(&model_path, 3).unwrap();
+
+        let source = dir.path().join("build-output");
+        build_artifact(&source, &model_path, |_| {});
+
+        // Re-declare the package over a decoy payload, leaving the real snapshot in place.
+        let decoy = "decoy.bin";
+        fs::write(source.join(decoy), b"not a snapshot").unwrap();
+        let payloads = BTreeMap::from([(
+            decoy.to_string(),
+            PayloadDescriptor::of_file(&source.join(decoy)).unwrap(),
+        )]);
+        let manifest = PackageManifest::new(
+            built_identity(&model_path),
+            "2026-08-06T00:00:00Z".to_string(),
+            2,
+            LINES.len() as u32,
+            payloads[decoy].size_bytes,
         );
+        IndexPackage::write(&source, &IndexPackage { manifest, payloads }).unwrap();
 
-        match OfficialSemanticIndex::open(config_for(&target, &model_path))
+        match OfficialSemanticIndex::open(config_for(&source, &model_path))
             .map(|index| index.vector_count())
         {
-            Err(SemanticSearchError::VectorStore(VectorStoreError::Corrupted { reason })) => {
-                assert!(reason.contains("checksum mismatch"), "{reason}")
-            }
-            other => panic!("the reader must refuse an edited payload, got {other:?}"),
+            Err(SemanticSearchError::Artifact(ArtifactError::ManifestDisagreesWithPayload {
+                reason,
+            })) => assert!(
+                reason.contains(decoy) || reason.contains(VECTORS_FILENAME),
+                "{reason}"
+            ),
+            other => panic!("a foreign payload set must be refused, got {other:?}"),
         }
     }
 

@@ -36,9 +36,9 @@ use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -292,6 +292,9 @@ impl ZevcStore {
                 embedding_dim: self.config.embedding_dim,
                 format_version: STORE_FORMAT_VERSION,
                 collection_name: Some(self.config.collection_name.clone()),
+                // A store reopening its own directory has nothing external to compare
+                // against; the per-record checksums are all it has.
+                declared_sha256: None,
             },
         )?
         else {
@@ -312,8 +315,8 @@ impl ZevcStore {
 ///
 /// Implements [`VectorSearchBackend`] and not [`VectorStoreBackend`], which is the whole
 /// point — the type a query holds has no way to modify what a build machine produced.
-/// The records are immutable after [`Self::open`], so there is no lock to take on the
-/// query path either.
+/// The records are immutable once opened, so there is no lock to take on the query path
+/// either.
 pub struct ReadOnlyZevcStore {
     records: HashMap<String, StoredVectorRecord>,
     book_index: HashMap<String, Vec<String>>,
@@ -324,9 +327,19 @@ pub struct ReadOnlyZevcStore {
 impl ReadOnlyZevcStore {
     /// Open the snapshot in `dir`.
     ///
+    /// **Deliberately not public.** A public opener over a bare path would be a way to read
+    /// an artifact nobody verified, which is exactly the property S2a exists to make
+    /// impossible;
+    /// [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex) is
+    /// the only way in, and it derives every argument here from a
+    /// [`VerifiedPackage`](crate::distribution::package::VerifiedPackage).
+    ///
     /// `embedding_dim` is the artifact's declared dimension — the record width this
     /// reader will decode, so a payload that holds a different one is caught as a
-    /// truncated or trailing read rather than misparsed.
+    /// truncated or trailing read rather than misparsed. `declared_sha256` is what the
+    /// artifact says each of its payload files hashes to; see
+    /// [`SnapshotExpectation::declared_sha256`] for why a reader that skips it leaves a
+    /// published digest unable to protect the payload.
     ///
     /// The collection name is **adopted from the payload**, not required: it is not part
     /// of an artifact's identity, so a reader has nothing to compare it against and must
@@ -336,13 +349,18 @@ impl ReadOnlyZevcStore {
     ///
     /// An empty directory is a rejection here, unlike for [`ZevcStore`]: a builder may
     /// legitimately start from nothing, an artifact may not be nothing.
-    pub fn open(dir: &Path, embedding_dim: u32) -> Result<Self, VectorStoreError> {
+    pub(crate) fn open(
+        dir: &Path,
+        embedding_dim: u32,
+        declared_sha256: BTreeMap<String, String>,
+    ) -> Result<Self, VectorStoreError> {
         let snapshot = read_snapshot(
             dir,
             &SnapshotExpectation {
                 embedding_dim,
                 format_version: STORE_FORMAT_VERSION,
                 collection_name: None,
+                declared_sha256: Some(declared_sha256),
             },
         )?
         .ok_or_else(|| VectorStoreError::Corrupted {
@@ -368,8 +386,8 @@ impl ReadOnlyZevcStore {
         })
     }
 
-    /// Collection name the payload declares. Reported, never enforced — see
-    /// [`Self::open`].
+    /// Collection name the payload declares. Reported, never enforced: it is not part of an
+    /// artifact's identity, so a reader has nothing to compare it against.
     pub fn collection_name(&self) -> &str {
         &self.collection_name
     }
@@ -421,14 +439,84 @@ impl VectorSearchBackend for ReadOnlyZevcStore {
 }
 
 /// What a snapshot must agree with to be readable.
-struct SnapshotExpectation {
+pub(crate) struct SnapshotExpectation {
     /// Record width, in `f32`s.
-    embedding_dim: u32,
-    format_version: u32,
+    pub(crate) embedding_dim: u32,
+    pub(crate) format_version: u32,
     /// `Some` for a store reopening its own directory, where a different collection means
     /// the caller is pointing at someone else's data. `None` adopts what the payload
     /// declares — see [`ReadOnlyZevcStore::open`].
-    collection_name: Option<String>,
+    pub(crate) collection_name: Option<String>,
+    /// SHA-256 the *artifact* declares for each snapshot file, checked against the bytes
+    /// while they are read.
+    ///
+    /// This is what makes a published digest reach the payload. The digest pins the hashes
+    /// in `payloads.json`; without comparing those hashes to the files, an attacker who
+    /// edits a vector and the matching per-record checksum — both fixed-length, so no size
+    /// changes — passes every check the cheap open path and this reader would otherwise
+    /// make. See [`read_snapshot`].
+    ///
+    /// `None` for [`ZevcStore`] reopening a directory it wrote itself: there is no external
+    /// declaration to compare against, and the per-record checksums are all it has.
+    pub(crate) declared_sha256: Option<BTreeMap<String, String>>,
+}
+
+impl SnapshotExpectation {
+    /// Compare one file's computed hash against what the artifact declared, when there is a
+    /// declaration to compare against.
+    ///
+    /// A file the artifact does not declare is a fault rather than a pass: the reader is
+    /// about to load it, so "not covered by the token" means the token proves nothing about
+    /// what will be in memory.
+    fn verify_file(&self, filename: &str, computed: &str) -> Result<(), VectorStoreError> {
+        let Some(declared) = &self.declared_sha256 else {
+            return Ok(());
+        };
+        let Some(expected) = declared.get(filename) else {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!("{filename} is not one of the payloads this artifact declares"),
+            });
+        };
+        if computed != expected {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!(
+                    "{filename} does not match the SHA-256 the artifact declares for it \
+                     (declared {expected}, found {computed})"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Wraps a reader and hashes every byte that passes through it, so a file can be
+/// authenticated by the same pass that parses it.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// The hash of everything read so far, as 64 hex digits. Meaningful only once the caller
+    /// has read to the end of the file — see [`read_snapshot`].
+    fn finalize(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
+    }
 }
 
 /// A snapshot's contents, checked but not yet owned by a store.
@@ -444,12 +532,16 @@ struct Snapshot {
 /// than a fault. A *partial* one is corruption: the three files are written as one commit,
 /// so two out of three means an interrupted write, not an empty index.
 ///
-/// What is checked, in the order a reader can afford it:
+/// What is checked:
 ///
 /// * the header's format version, dimension and (optionally) collection name;
-/// * a SHA-256 per record over the metadata **and** over the vector's stored bytes — this
-///   is what catches an edit that kept the file's length, which the artifact contract's
-///   cheap open path cannot see;
+/// * **the SHA-256 of each file against what the artifact declared**, when
+///   [`SnapshotExpectation::declared_sha256`] is given. Computed from the same bytes this
+///   pass already reads, so it costs no extra I/O — and it is the only check that makes a
+///   digest published outside the package protect the payload at *open*: everything else
+///   here is a checksum that travels inside the bytes it guards;
+/// * a SHA-256 per record over the metadata and over the vector's stored bytes, which
+///   localizes damage to one record rather than one file;
 /// * exactly `embedding_dim` values per record and no trailing bytes, so the two files
 ///   describe the same number of records;
 /// * no duplicate `semantic_id`;
@@ -457,9 +549,14 @@ struct Snapshot {
 ///   record that exists and can never be returned;
 /// * the stored book index against the one rebuilt from the metadata.
 ///
-/// What it cannot catch: a payload edited **together with** its per-record checksums.
-/// That is self-consistent, and the only thing that separates it from the published
-/// artifact is a digest published outside the package — see
+/// The per-record and per-file hashes cover the same bytes twice, which is a real cost and
+/// kept anyway: the first tells the user *which* record broke, and the second is the only
+/// one an attacker cannot update from inside the payload.
+///
+/// What no check here can catch: a payload edited together with its per-record checksums
+/// **and** `payloads.json` re-stamped to match, in a package that was verified without a
+/// published digest. That is self-consistent at every layer, and only an external digest
+/// separates it from the real artifact — see
 /// [`ArtifactExpectation`](crate::distribution::package::ArtifactExpectation).
 fn read_snapshot(
     dir: &Path,
@@ -492,12 +589,18 @@ fn read_snapshot(
     }
 
     // The header first: a foreign format version must not be parsed as if it were this
-    // one, and a dimension disagreement decides how every record is decoded.
-    let b_file = File::open(&b_path).map_err(|e| VectorStoreError::OpenFailed {
+    // one, and a dimension disagreement decides how every record is decoded. Read as bytes
+    // rather than streamed into `serde`, so the declared hash covers the file even when
+    // parsing fails.
+    let book_index_bytes = fs::read(&b_path).map_err(|e| VectorStoreError::OpenFailed {
         reason: e.to_string(),
     })?;
-    let persisted_book_index: PersistedBookIndex =
-        serde_json::from_reader(b_file).map_err(|e| {
+    expected.verify_file(
+        BOOK_INDEX_FILENAME,
+        &format!("{:x}", Sha256::digest(&book_index_bytes)),
+    )?;
+    let persisted_book_index: PersistedBookIndex = serde_json::from_slice(&book_index_bytes)
+        .map_err(|e| {
             log::warn!("Corrupted book index: {e}");
             VectorStoreError::Corrupted {
                 reason: e.to_string(),
@@ -531,19 +634,25 @@ fn read_snapshot(
         }
     }
 
+    // Both payloads are hashed through the reader, so the declared hash covers exactly the
+    // bytes the parser consumed — in order, whatever the line endings, without a second
+    // pass over the file.
     let m_file = File::open(&m_path).map_err(|e| VectorStoreError::OpenFailed {
         reason: e.to_string(),
     })?;
-    let mut v_file = File::open(&v_path).map_err(|e| VectorStoreError::OpenFailed {
-        reason: e.to_string(),
-    })?;
-    let m_reader = BufReader::new(m_file);
+    let mut v_file =
+        HashingReader::new(
+            File::open(&v_path).map_err(|e| VectorStoreError::OpenFailed {
+                reason: e.to_string(),
+            })?,
+        );
+    let mut m_reader = BufReader::new(HashingReader::new(m_file));
 
     let dim = expected.embedding_dim as usize;
     let vec_byte_size = dim * 4;
     let mut records: HashMap<String, StoredVectorRecord> = HashMap::new();
 
-    for line in m_reader.lines() {
+    for line in m_reader.by_ref().lines() {
         let line = line.map_err(|e| VectorStoreError::OpenFailed {
             reason: e.to_string(),
         })?;
@@ -582,8 +691,8 @@ fn read_snapshot(
             });
         }
 
-        // Over the bytes as stored, before they are decoded: this is the check that sees
-        // an edit which kept the file's length.
+        // Over the bytes as stored, before they are decoded: this names the record that
+        // broke, where the per-file hash names only the file.
         let actual_hash = format!("{:x}", Sha256::digest(&buf));
         if actual_hash != persisted.vector_sha256 {
             return Err(VectorStoreError::Corrupted {
@@ -637,6 +746,13 @@ fn read_snapshot(
             ),
         });
     }
+
+    // Both files have now been read to their end, so the hashes cover them whole. Checked
+    // after the structural pass rather than before it, because that pass is what proves the
+    // reader consumed every byte — a hash over a file nobody finished reading proves
+    // nothing about what was loaded.
+    expected.verify_file(METADATA_FILENAME, &m_reader.into_inner().finalize())?;
+    expected.verify_file(VECTORS_FILENAME, &v_file.finalize())?;
 
     let mut rebuilt_book_index: HashMap<String, Vec<String>> = HashMap::new();
     for record in records.values() {
@@ -1263,12 +1379,33 @@ mod tests {
         4
     }
 
+    /// What an artifact declares about its payload files, as they are on disk *right now*.
+    ///
+    /// Which moment a test calls this at is the whole point: captured before a tamper, it
+    /// stands for `payloads.json` as the packer wrote it; captured after, it stands for an
+    /// attacker who re-stamped it — and then only the checks inside the payload are left.
+    fn declared(dir: &TempDir) -> BTreeMap<String, String> {
+        SNAPSHOT_FILENAMES
+            .iter()
+            .filter(|name| dir.path().join(name).exists())
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    format!(
+                        "{:x}",
+                        Sha256::digest(fs::read(dir.path().join(name)).unwrap())
+                    ),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn a_read_only_store_answers_the_same_query_as_the_writable_one() {
         let dir = TempDir::new("read_only_open");
         let dim = write_snapshot(&dir);
 
-        let reader = ReadOnlyZevcStore::open(dir.path(), dim).unwrap();
+        let reader = ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).unwrap();
         assert_eq!(reader.count(), 3);
         assert_eq!(reader.book_keys(), ["book_a", "book_b"]);
         assert_eq!(reader.book_vector_count("book_a"), 2);
@@ -1282,25 +1419,96 @@ mod tests {
         assert!((hits[0].similarity_score - 1.0).abs() < 1e-6);
     }
 
-    /// The check the artifact contract's cheap open path cannot make: this edit keeps the
-    /// file's length, so only a per-record checksum sees it.
+    /// Rewrite the first record's vector, and the checksum that record carries for it, so
+    /// the payload is internally consistent about a vector nobody published. Both edits keep
+    /// their length: the vector is fixed-width, and a SHA-256 is 64 hex digits either way.
+    fn forge_first_record(dir: &TempDir, dim: u32) {
+        let vectors_path = dir.path().join(VECTORS_FILENAME);
+        let mut bytes = fs::read(&vectors_path).unwrap();
+        let length_before = bytes.len();
+        bytes[0] ^= 0xff;
+        fs::write(&vectors_path, &bytes).unwrap();
+        assert_eq!(
+            fs::metadata(&vectors_path).unwrap().len() as usize,
+            length_before
+        );
+
+        let metadata_path = dir.path().join(METADATA_FILENAME);
+        let text = fs::read_to_string(&metadata_path).unwrap();
+        let length_before = text.len();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut first: PersistedMetadata = serde_json::from_str(&lines[0]).unwrap();
+        first.vector_sha256 = format!("{:x}", Sha256::digest(&bytes[..dim as usize * 4]));
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&metadata_path, format!("{}\n", lines.join("\n"))).unwrap();
+        assert_eq!(
+            fs::read_to_string(&metadata_path).unwrap().len(),
+            length_before,
+            "the forgery must not change the file's length, or a size check would catch it"
+        );
+    }
+
+    /// The attack the per-record checksums cannot see, because they travel inside the bytes
+    /// they guard: a vector edited *together with* its own checksum. What catches it is the
+    /// hash the artifact declared for the whole file — the one an attacker can only change
+    /// in `payloads.json`, which a published digest pins.
     #[test]
-    fn a_same_length_edit_of_the_payload_is_refused_at_open() {
+    fn a_vector_forged_together_with_its_own_checksum_is_refused_by_the_declared_hash() {
+        let dir = TempDir::new("read_only_forgery");
+        let dim = write_snapshot(&dir);
+        let as_published = declared(&dir);
+
+        forge_first_record(&dir, dim);
+
+        // Named for `metadata.jsonl`, and that is not incidental: a record's checksum lives
+        // in a *different file* from the bytes it covers, so forging a vector always
+        // disturbs two files, and the metadata file is the one read to its end first.
+        match ReadOnlyZevcStore::open(dir.path(), dim, as_published).map(|store| store.count()) {
+            Err(VectorStoreError::Corrupted { reason }) => assert!(
+                reason.contains(METADATA_FILENAME) && reason.contains("SHA-256"),
+                "{reason}"
+            ),
+            other => panic!("a forged record must be refused, got {other:?}"),
+        }
+    }
+
+    /// The honest limit of the same attack: re-stamp the declaration too, and every layer
+    /// agrees. Nothing inside the artifact can tell — only a digest published outside it,
+    /// which is checked before the reader ever runs.
+    #[test]
+    fn a_forgery_that_also_restamps_the_declaration_is_beyond_what_the_reader_can_see() {
+        let dir = TempDir::new("read_only_restamped");
+        let dim = write_snapshot(&dir);
+
+        forge_first_record(&dir, dim);
+
+        let store = ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir))
+            .expect("a self-consistent forgery is indistinguishable from here");
+        assert_eq!(store.count(), 3);
+    }
+
+    /// And the inner layer still earns its place: an edit that does *not* fix the record's
+    /// checksum is named per record, which is what tells the user where the damage is.
+    #[test]
+    fn a_same_length_edit_of_one_vector_is_named_by_its_record() {
         let dir = TempDir::new("read_only_edit");
         let dim = write_snapshot(&dir);
 
         let vectors_path = dir.path().join(VECTORS_FILENAME);
         let mut bytes = fs::read(&vectors_path).unwrap();
-        let before = bytes.len();
+        let length_before = bytes.len();
         bytes[0] ^= 0xff;
         fs::write(&vectors_path, &bytes).unwrap();
-        assert_eq!(fs::metadata(&vectors_path).unwrap().len() as usize, before);
+        assert_eq!(
+            fs::metadata(&vectors_path).unwrap().len() as usize,
+            length_before
+        );
 
-        match ReadOnlyZevcStore::open(dir.path(), dim).map(|store| store.count()) {
+        match ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).map(|store| store.count()) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains("checksum mismatch"), "{reason}")
             }
-            other => panic!("expected a checksum rejection, got {other:?}"),
+            other => panic!("expected a per-record checksum rejection, got {other:?}"),
         }
     }
 
@@ -1311,7 +1519,9 @@ mod tests {
 
         // A width this build does not read: the header says otherwise, so nothing is
         // decoded at the wrong offset.
-        match ReadOnlyZevcStore::open(dir.path(), dim + 1).map(|store| store.count()) {
+        match ReadOnlyZevcStore::open(dir.path(), dim + 1, declared(&dir))
+            .map(|store| store.count())
+        {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains("dimensional"), "{reason}")
             }
@@ -1321,7 +1531,7 @@ mod tests {
         // Two of three files: the snapshot is written as one commit, so this is an
         // interrupted write and not an empty index.
         fs::remove_file(dir.path().join(BOOK_INDEX_FILENAME)).unwrap();
-        match ReadOnlyZevcStore::open(dir.path(), dim).map(|store| store.count()) {
+        match ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).map(|store| store.count()) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains(BOOK_INDEX_FILENAME), "{reason}")
             }
@@ -1347,7 +1557,7 @@ mod tests {
         );
 
         assert!(matches!(
-            ReadOnlyZevcStore::open(dir.path(), 4),
+            ReadOnlyZevcStore::open(dir.path(), 4, BTreeMap::new()),
             Err(VectorStoreError::Corrupted { .. })
         ));
     }
@@ -1387,7 +1597,7 @@ mod tests {
         )
         .unwrap();
 
-        match ReadOnlyZevcStore::open(dir.path(), dim).map(|store| store.count()) {
+        match ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).map(|store| store.count()) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains("no search could return it"), "{reason}")
             }

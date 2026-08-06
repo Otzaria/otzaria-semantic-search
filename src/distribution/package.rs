@@ -8,11 +8,11 @@
 //! the identity so a reader refuses a layout it cannot read.
 //!
 //! [`IndexPackage::verify_for_install`] and [`IndexPackage::verify_for_open`] are the only
-//! ways to obtain a [`VerifiedPackage`]. The planned read-only runtime path **will** take
-//! that token rather than a path, which is what will make "verify before reading a vector"
-//! a property of the types rather than a call order someone has to remember. That reader
-//! does not exist yet — connecting it is S2a — so today the token is a contract with no
-//! consumer, and nothing here enforces anything at query time.
+//! ways to obtain a [`VerifiedPackage`], and
+//! [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex) is what
+//! consumes one: it opens the payload from the token — never from a path a caller supplied —
+//! which is what makes "verify before reading a vector" a property of the types rather than
+//! a call order someone has to remember.
 //!
 //! # Two depths, because one of them runs at every startup
 //!
@@ -30,6 +30,12 @@
 //! separates the official artifact from a self-consistent impostor is a digest published
 //! **outside** the package, which is why [`ArtifactExpectation`] carries one and why
 //! omitting it has an explicit name.
+//!
+//! That anchor only reaches the payload because the reader completes the chain: this layer
+//! pins the *declared* hashes at open without recomputing them, and the store reader
+//! compares each file it loads against them while reading it. Neither half is sufficient
+//! alone — a digest over declarations nobody checks proves nothing about the bytes, and
+//! checks over bytes with no external anchor prove only self-consistency.
 //!
 //! See `docs/ARTIFACT_CONTRACT.md`.
 
