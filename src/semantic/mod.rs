@@ -7,7 +7,9 @@
 //! - Embedding backend contract (what an inference implementation must provide)
 //! - Embedding runtime (model validation, batching, normalization)
 //! - Real GGUF inference through llama.cpp (behind the `llama-backend` feature)
-//! - Vector store (zvec persistence and retrieval)
+//! - Vector store backend contract, plus an in-memory and a snapshot-persisting
+//!   implementation. The engine still opens the in-memory one; neither is an ANN
+//!   index, and neither is the `zvec` library.
 //! - Semantic engine (orchestration)
 
 pub mod backend;

@@ -7,6 +7,12 @@ use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 /// trait. The current [`SemanticEngine`](crate::semantic::engine::SemanticEngine)
 /// still selects the in-memory store directly; this is the common contract a
 /// future backend-selection layer can use.
+///
+/// Note what this trait does *not* imply: neither implementation is an
+/// approximate-nearest-neighbour index. Both scan every stored vector. The
+/// official read-only backend that the product contract calls for — and the
+/// measurement that decides whether a full scan can meet the budget at library
+/// scale — is stage S2.
 pub trait VectorStoreBackend: Send + Sync {
     /// Stable identifier persisted in the manifest.
     fn backend_id(&self) -> &'static str;

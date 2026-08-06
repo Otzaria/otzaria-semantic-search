@@ -124,7 +124,7 @@ pub enum EmbeddingError {
     NotLoaded,
 }
 
-/// Errors from the vector store (zvec).
+/// Errors from the vector store, whichever backend is in use.
 #[derive(Error, Debug)]
 pub enum VectorStoreError {
     #[error("Store not initialized at path: {path}")]
