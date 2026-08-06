@@ -16,6 +16,14 @@
 //! read-only index, so no progress stream and no cancel/resume will be added here
 //! — see `docs/PRODUCT_CONTRACT.md` §4. Model download management is the host
 //! application's job (§5).
+//!
+//! On a coordinator built over an installed official artifact
+//! ([`HybridCoordinator::with_official_index`]) every one of those operations refuses
+//! by name, with
+//! [`SemanticSearchError::ReadOnlyIndex`](crate::errors::SemanticSearchError::ReadOnlyIndex).
+//! They are still on this type because the builder needs them and it has no other seam;
+//! what the *application* may call is search and status. Dropping them from the surface
+//! the app links against belongs to the FFI layer, in S5.
 
 use crate::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
 use crate::semantic::types::{
@@ -122,12 +130,16 @@ impl OtzariaHybridEngine {
     /// [`Self::get_semantic_index_diff_from_lexical_hashes`] or a plain
     /// `u64` DTO: an enum Dart can construct is an enum Dart can construct wrongly.
     ///
-    /// `None` when no semantic engine is configured.
+    /// `Ok(None)` when no semantic index is configured. An error when the index is an
+    /// installed official artifact: the question only makes sense for an index this
+    /// device builds.
     pub fn get_semantic_index_diff(
         &self,
         books: &HashMap<String, ContentFingerprint>,
-    ) -> Option<IndexDiff> {
-        self.coordinator.semantic_index_diff(books)
+    ) -> Result<Option<IndexDiff>, String> {
+        self.coordinator
+            .semantic_index_diff(books)
+            .map_err(|e| e.to_string())
     }
 
     /// Diff raw lexical `contentHash` values against the semantic index.
@@ -139,12 +151,14 @@ impl OtzariaHybridEngine {
     pub fn get_semantic_index_diff_from_lexical_hashes(
         &self,
         tantivy_books: &HashMap<String, u64>,
-    ) -> Option<IndexDiff> {
+    ) -> Result<Option<IndexDiff>, String> {
         let fingerprints = tantivy_books
             .iter()
             .map(|(key, &hash)| (key.clone(), ContentFingerprint::from_lexical_hash(hash)))
             .collect();
-        self.coordinator.semantic_index_diff(&fingerprints)
+        self.coordinator
+            .semantic_index_diff(&fingerprints)
+            .map_err(|e| e.to_string())
     }
 
     /// Index books into the semantic index, replacing anything held for them.
@@ -156,8 +170,9 @@ impl OtzariaHybridEngine {
     /// are serialized — see [`HybridCoordinator::index_books`].
     ///
     /// Build-side and test-side only: the application installs a prebuilt index
-    /// rather than calling this. Scheduling it off any UI thread is the caller's
-    /// job, and stays that way — there is no progress API coming.
+    /// rather than calling this, and an official artifact refuses it. Scheduling it off
+    /// any UI thread is the caller's job, and stays that way — there is no progress API
+    /// coming.
     pub fn index_books(
         &self,
         books: &[BookForIndexing],

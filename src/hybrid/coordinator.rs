@@ -33,6 +33,7 @@ use crate::hybrid::ranking::{
     QueryFeatures,
 };
 use crate::semantic::engine::SemanticEngine;
+use crate::semantic::official_index::OfficialSemanticIndex;
 use crate::semantic::types::{
     BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling, HybridResultItem,
     HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate, ResultSource, SearchFilters,
@@ -98,9 +99,91 @@ impl Default for HybridSearchParams {
     }
 }
 
+/// Which semantic path a coordinator is serving.
+///
+/// Two variants because they are two different things, not two configurations of one.
+/// [`Self::Official`] is the application path: an artifact built elsewhere, verified,
+/// opened read-only, with no library to compare against and nothing to re-index.
+/// [`Self::SelfBuilt`] is the builder and prototype path, which owns a
+/// [`SemanticEngine`] and can still write.
+///
+/// The read side is served identically by both, which is why hybrid search does not care
+/// which one it has. Every build-side request goes through an accessor only the self-built
+/// variant satisfies, so an official artifact refuses it by name — a
+/// [`SemanticSearchError::ReadOnlyIndex`] rather than the `None` that means "no semantic
+/// path at all".
+// Both variants are large and the difference between them is 216 bytes, of which exactly
+// one exists per coordinator, behind a lock, read by reference. Boxing to even them out
+// would buy that once and pay an indirection on every query.
+#[allow(clippy::large_enum_variant)]
+pub enum SemanticSide {
+    SelfBuilt(SemanticEngine),
+    Official(OfficialSemanticIndex),
+}
+
+impl From<SemanticEngine> for SemanticSide {
+    fn from(engine: SemanticEngine) -> Self {
+        Self::SelfBuilt(engine)
+    }
+}
+
+impl From<OfficialSemanticIndex> for SemanticSide {
+    fn from(index: OfficialSemanticIndex) -> Self {
+        Self::Official(index)
+    }
+}
+
+impl SemanticSide {
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
+        match self {
+            Self::SelfBuilt(engine) => engine.embed_query(query),
+            Self::Official(index) => index.embed_query(query),
+        }
+    }
+
+    fn search_vector(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        match self {
+            Self::SelfBuilt(engine) => engine.search_vector(query_vector, top_k, filters),
+            Self::Official(index) => index.search_vector(query_vector, top_k, filters),
+        }
+    }
+
+    fn status(&self) -> SemanticStatus {
+        match self {
+            Self::SelfBuilt(engine) => engine.status(),
+            Self::Official(index) => index.status(),
+        }
+    }
+
+    /// The engine behind a self-built index, or a refusal naming the operation.
+    fn builder(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<&mut SemanticEngine, SemanticSearchError> {
+        match self {
+            Self::SelfBuilt(engine) => Ok(engine),
+            Self::Official(_) => Err(SemanticSearchError::ReadOnlyIndex { operation }),
+        }
+    }
+
+    /// As [`Self::builder`], for a build-side question that only reads — so asking it does
+    /// not need the writer's lock and does not stall searches.
+    fn builder_ref(&self, operation: &'static str) -> Result<&SemanticEngine, SemanticSearchError> {
+        match self {
+            Self::SelfBuilt(engine) => Ok(engine),
+            Self::Official(_) => Err(SemanticSearchError::ReadOnlyIndex { operation }),
+        }
+    }
+}
+
 /// Main hybrid search coordinator.
 pub struct HybridCoordinator {
-    semantic_engine: RwLock<Option<SemanticEngine>>,
+    semantic: RwLock<Option<SemanticSide>>,
     /// Held for the whole of [`HybridCoordinator::index_books`].
     ///
     /// The engine lock is released between books so searches can run, which also
@@ -125,10 +208,24 @@ struct FusionContext<'a> {
 }
 
 impl HybridCoordinator {
-    /// Create a new coordinator. Passing `None` disables the semantic path.
+    /// Create a coordinator over a self-built index. Passing `None` disables the semantic
+    /// path.
+    ///
+    /// The builder and prototype path — see [`SemanticSide`]. The application uses
+    /// [`Self::with_official_index`].
     pub fn new(semantic_engine: Option<SemanticEngine>) -> Self {
+        Self::with_semantic_side(semantic_engine.map(SemanticSide::from))
+    }
+
+    /// Create a coordinator over an installed official artifact: read-only, with every
+    /// build-side operation refused by name.
+    pub fn with_official_index(index: OfficialSemanticIndex) -> Self {
+        Self::with_semantic_side(Some(SemanticSide::from(index)))
+    }
+
+    fn with_semantic_side(semantic: Option<SemanticSide>) -> Self {
         Self {
-            semantic_engine: RwLock::new(semantic_engine),
+            semantic: RwLock::new(semantic),
             indexing: Mutex::new(()),
             query_cache: crate::hybrid::cache::QueryCache::new(
                 100,
@@ -234,10 +331,7 @@ impl HybridCoordinator {
 
         // Recover rather than propagate a poisoned lock: a panic in one query
         // must not disable the semantic path for the rest of the session.
-        let semantic_guard = self
-            .semantic_engine
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let semantic_guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
 
         let skip_semantic_for_exact = requested == SearchMode::Hybrid && requested_alpha >= 1.0;
 
@@ -247,8 +341,8 @@ impl HybridCoordinator {
             SemanticOutcome::skipped()
         } else {
             match semantic_guard.as_ref() {
-                None => SemanticOutcome::failed("no semantic engine is configured".to_string()),
-                Some(engine) => {
+                None => SemanticOutcome::failed("no semantic index is configured".to_string()),
+                Some(side) => {
                     let embedding_start = std::time::Instant::now();
                     let cached_vector = ranking_profile
                         .embedding_cache_enabled
@@ -258,7 +352,7 @@ impl HybridCoordinator {
                     let query_vector = match cached_vector {
                         Some(vector) => Ok(vector),
                         None => {
-                            let result = engine.embed_query(&normalized_query);
+                            let result = side.embed_query(&normalized_query);
                             telemetry_record.embedding_latency_ms =
                                 Some(embedding_start.elapsed().as_millis() as u64);
                             if ranking_profile.embedding_cache_enabled {
@@ -272,7 +366,7 @@ impl HybridCoordinator {
                     };
 
                     match query_vector.and_then(|vector| {
-                        engine.search_vector(
+                        side.search_vector(
                             &vector,
                             self.semantic_top_k(params, &ranking_profile),
                             params.filters.as_ref(),
@@ -696,16 +790,19 @@ impl HybridCoordinator {
 
     /// Compare the library's per-book fingerprints against the semantic index.
     ///
-    /// `None` when no semantic engine is configured — there is nothing to index.
+    /// `Ok(None)` when no semantic index is configured — there is nothing to index. An
+    /// installed official artifact is a refusal, not `None`: asking which books need
+    /// indexing presumes this device indexes, and the answer would be a list nobody may
+    /// act on.
     pub fn semantic_index_diff(
         &self,
         books: &HashMap<String, crate::semantic::types::ContentFingerprint>,
-    ) -> Option<IndexDiff> {
-        let guard = self
-            .semantic_engine
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|engine| engine.diff(books))
+    ) -> Result<Option<IndexDiff>, SemanticSearchError> {
+        let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            None => Ok(None),
+            Some(side) => Ok(Some(side.builder_ref("semantic_index_diff")?.diff(books))),
+        }
     }
 
     /// Discard the semantic index and start over for the current configuration.
@@ -715,12 +812,12 @@ impl HybridCoordinator {
     /// Returns the number of vectors discarded, or `None` if there is no engine.
     pub fn reset_semantic_index(&self) -> Result<Option<u32>, SemanticSearchError> {
         let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
-        let mut guard = self
-            .semantic_engine
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.semantic.write().unwrap_or_else(|e| e.into_inner());
         let result = match guard.as_mut() {
-            Some(engine) => engine.reset_index().map(Some),
+            Some(side) => side
+                .builder("reset_semantic_index")
+                .and_then(SemanticEngine::reset_index)
+                .map(Some),
             None => Ok(None),
         };
         if result.is_ok() {
@@ -739,12 +836,12 @@ impl HybridCoordinator {
         source_book_keys: &[String],
     ) -> Result<Option<u32>, SemanticSearchError> {
         let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
-        let mut guard = self
-            .semantic_engine
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.semantic.write().unwrap_or_else(|e| e.into_inner());
         let result = match guard.as_mut() {
-            Some(engine) => engine.remove_books(source_book_keys).map(Some),
+            Some(side) => side
+                .builder("remove_semantic_books")?
+                .remove_books(source_book_keys)
+                .map(Some),
             None => Ok(None),
         };
         if matches!(&result, Ok(Some(removed)) if *removed > 0) {
@@ -790,7 +887,15 @@ impl HybridCoordinator {
         books: &[BookForIndexing],
     ) -> Result<Option<IndexingSummary>, SemanticSearchError> {
         if books.is_empty() {
-            return Ok(self.has_semantic_engine().then(IndexingSummary::default));
+            let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+            return match guard.as_ref() {
+                None => Ok(None),
+                // Refused even with nothing to do: the request itself is the error, and
+                // reporting "indexed 0 books" would tell the caller it may index.
+                Some(side) => side
+                    .builder_ref("index_books")
+                    .map(|_| Some(IndexingSummary::default())),
+            };
         }
 
         let _indexing = self.indexing.lock().unwrap_or_else(|e| e.into_inner());
@@ -799,13 +904,11 @@ impl HybridCoordinator {
         let mut dirty = false;
 
         for book in books {
-            let mut guard = self
-                .semantic_engine
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let Some(engine) = guard.as_mut() else {
+            let mut guard = self.semantic.write().unwrap_or_else(|e| e.into_inner());
+            let Some(side) = guard.as_mut() else {
                 return Ok(None);
             };
+            let engine = side.builder("index_books")?;
 
             match engine.index_book_deferred(book) {
                 Ok(outcome) => {
@@ -830,36 +933,30 @@ impl HybridCoordinator {
         }
 
         if dirty {
-            let mut guard = self
-                .semantic_engine
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let Some(engine) = guard.as_mut() else {
+            let mut guard = self.semantic.write().unwrap_or_else(|e| e.into_inner());
+            let Some(side) = guard.as_mut() else {
                 return Ok(None);
             };
-            engine.flush_manifest()?;
+            side.builder("index_books")?.flush_manifest()?;
             self.query_cache.invalidate();
         }
         Ok(Some(summary))
     }
 
-    /// Whether a semantic engine is configured at all.
-    pub fn has_semantic_engine(&self) -> bool {
-        self.semantic_engine
+    /// Whether a semantic index is configured at all — of either kind.
+    pub fn has_semantic_index(&self) -> bool {
+        self.semantic
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
     }
 
-    /// Retrieve semantic engine status.
+    /// Retrieve semantic status, in the same shape for both kinds of index.
     pub fn status(&self) -> SemanticStatus {
-        let guard = self
-            .semantic_engine
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
 
         match guard.as_ref() {
-            Some(engine) => engine.status(),
+            Some(side) => side.status(),
             None => SemanticStatus {
                 available: false,
                 model_loaded: false,
@@ -1075,9 +1172,11 @@ mod tests {
 
     /// How many times the coordinator's engine has written its manifest.
     fn manifest_save_count(coordinator: &HybridCoordinator) -> u32 {
-        let guard = coordinator.semantic_engine.read().unwrap();
+        let guard = coordinator.semantic.read().unwrap();
         guard
             .as_ref()
+            .expect("the coordinator must have a semantic index")
+            .builder_ref("manifest_save_count")
             .expect("the coordinator must have an engine")
             .manifest_save_count()
     }
@@ -1362,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn a_coordinator_without_a_semantic_engine_still_serves_lexical_search() {
+    fn a_coordinator_without_a_semantic_index_still_serves_lexical_search() {
         let coordinator = HybridCoordinator::new(None);
 
         let result = coordinator
@@ -1377,7 +1476,7 @@ mod tests {
         assert!(!result.semantic_available);
         assert_eq!(
             result.fallback_reason.as_deref(),
-            Some("no semantic engine is configured")
+            Some("no semantic index is configured")
         );
         assert_eq!(result.results.len(), 1);
 

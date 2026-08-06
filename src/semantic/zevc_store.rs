@@ -1,5 +1,37 @@
+//! The snapshot format the official artifact's payload is written in, and the two ways
+//! it is opened.
+//!
+//! A snapshot is three files in one directory: `vectors.bin` (dense `f32` little-endian
+//! records), `metadata.jsonl` (one JSON object per record, in the same order, carrying a
+//! SHA-256 of the metadata and of the vector) and `book_index.json` (the header, plus
+//! book key → its `semantic_id`s).
+//!
+//! Two openers, one reader:
+//!
+//! * [`ZevcStore`] — writable, for a builder. It scans every vector and holds all of
+//!   them in memory.
+//! * [`ReadOnlyZevcStore`] — the runtime's view of an installed artifact. It implements
+//!   [`VectorSearchBackend`] only, so there is no mutation to call on it.
+//!
+//! Both read through one function, so the checks a reader performs cannot drift between
+//! them.
+//!
+//! # This is a reference backend, not a scale answer
+//!
+//! Opening reads every byte of the payload, verifies a SHA-256 per record, and keeps
+//! every vector in RAM; searching scans all of them, `O(N·D)`. That is the honest cost of
+//! a format with no index and no lazy access, and it is what makes
+//! [`VerificationDepth::MetadataAndPresence`](crate::distribution::package::VerificationDepth)
+//! cheap and this open expensive. Both facts are true at once, and the second one is
+//! this backend's, not the artifact contract's. S2b measures it and decides what
+//! replaces it — see `docs/DEVELOPMENT.md`. Nothing here is an ANN index, and this
+//! module is not the `zvec` library.
+
 use crate::errors::VectorStoreError;
-use crate::semantic::store_backend::VectorStoreBackend;
+// One threshold for the whole crate, so no two layers can disagree about which vector
+// has "no direction".
+use crate::semantic::embedding::MIN_VECTOR_NORM;
+use crate::semantic::store_backend::{VectorSearchBackend, VectorStoreBackend};
 use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,6 +41,33 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
+
+/// Identifier of this backend, recorded as `store.backend_id` in an artifact's identity.
+pub const BACKEND_ID: &str = "zevc-persistent-v1";
+
+/// Version of the on-disk layout, recorded as `store.store_format_version` and written
+/// into the snapshot header. Separate from [`BACKEND_ID`] so a format change inside one
+/// backend is a rejection rather than a misread payload.
+pub const STORE_FORMAT_VERSION: u32 = 1;
+
+/// Precision this format stores vectors at, recorded as `store.vector_precision`. The
+/// records are dense `f32`; there is no other layout this reader can decode, which is
+/// why the value is a constant here and data in the manifest.
+pub const VECTOR_PRECISION: &str = "f32";
+
+/// The vectors, laid out as `embedding_dim` little-endian `f32` per record.
+pub const VECTORS_FILENAME: &str = "vectors.bin";
+
+/// One JSON object per record, in the same order as [`VECTORS_FILENAME`].
+pub const METADATA_FILENAME: &str = "metadata.jsonl";
+
+/// Header and book → ids map.
+pub const BOOK_INDEX_FILENAME: &str = "book_index.json";
+
+/// Every file a snapshot is made of — the payload names an artifact of this backend
+/// declares, and exactly the names a packer has to write.
+pub const SNAPSHOT_FILENAMES: [&str; 3] =
+    [VECTORS_FILENAME, METADATA_FILENAME, BOOK_INDEX_FILENAME];
 
 #[derive(Debug, Clone)]
 pub struct ZevcStoreConfig {
@@ -111,15 +170,15 @@ impl ZevcStore {
     }
 
     fn vectors_path(&self) -> PathBuf {
-        self.config.db_path.join("vectors.bin")
+        self.config.db_path.join(VECTORS_FILENAME)
     }
 
     fn metadata_path(&self) -> PathBuf {
-        self.config.db_path.join("metadata.jsonl")
+        self.config.db_path.join(METADATA_FILENAME)
     }
 
     fn book_index_path(&self) -> PathBuf {
-        self.config.db_path.join("book_index.json")
+        self.config.db_path.join(BOOK_INDEX_FILENAME)
     }
 
     pub fn save_to_disk(&self) -> Result<(), VectorStoreError> {
@@ -189,7 +248,7 @@ impl ZevcStore {
             reason: e.to_string(),
         })?;
         let persisted_book_index = PersistedBookIndex {
-            format_version: 1,
+            format_version: STORE_FORMAT_VERSION,
             embedding_dim: self.config.embedding_dim,
             collection_name: self.config.collection_name.clone(),
             books: state.book_index.clone(),
@@ -227,165 +286,420 @@ impl ZevcStore {
     }
 
     fn load_from_disk(&self) -> Result<(), VectorStoreError> {
-        let v_path = self.vectors_path();
-        let m_path = self.metadata_path();
-        let b_path = self.book_index_path();
-
-        let present = [v_path.exists(), m_path.exists(), b_path.exists()];
-        if present.iter().all(|exists| !exists) {
+        let Some(snapshot) = read_snapshot(
+            &self.config.db_path,
+            &SnapshotExpectation {
+                embedding_dim: self.config.embedding_dim,
+                format_version: STORE_FORMAT_VERSION,
+                collection_name: Some(self.config.collection_name.clone()),
+            },
+        )?
+        else {
             return Ok(());
-        }
-        if !present.iter().all(|exists| *exists) {
-            return Err(VectorStoreError::Corrupted {
-                reason: "persistent store is incomplete".to_string(),
-            });
-        }
-
-        let m_file = File::open(&m_path).map_err(|e| VectorStoreError::OpenFailed {
-            reason: e.to_string(),
-        })?;
-        let mut v_file = File::open(&v_path).map_err(|e| VectorStoreError::OpenFailed {
-            reason: e.to_string(),
-        })?;
-
-        let m_reader = BufReader::new(m_file);
+        };
 
         let mut state = self
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.records.clear();
-        state.book_index.clear();
-
-        let dim = self.config.embedding_dim as usize;
-        let vec_byte_size = dim * 4;
-
-        for line in m_reader.lines() {
-            let line = line.map_err(|e| VectorStoreError::OpenFailed {
-                reason: e.to_string(),
-            })?;
-            if line.is_empty() {
-                continue;
-            }
-            let persisted: PersistedMetadata = serde_json::from_str(&line).map_err(|e| {
-                log::warn!("Corrupted metadata: {e}");
-                VectorStoreError::Corrupted {
-                    reason: e.to_string(),
-                }
-            })?;
-
-            let metadata_hash = format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&persisted.metadata).map_err(|e| {
-                    VectorStoreError::Corrupted {
-                        reason: e.to_string(),
-                    }
-                })?)
-            );
-            if metadata_hash != persisted.metadata_sha256 {
-                return Err(VectorStoreError::Corrupted {
-                    reason: format!(
-                        "metadata checksum mismatch for {}",
-                        persisted.metadata.semantic_id
-                    ),
-                });
-            }
-
-            let mut buf = vec![0u8; vec_byte_size];
-            if let Err(e) = v_file.read_exact(&mut buf) {
-                log::warn!("Corrupted vectors file: {e}");
-                return Err(VectorStoreError::Corrupted {
-                    reason: e.to_string(),
-                });
-            }
-
-            let actual_hash = format!("{:x}", Sha256::digest(&buf));
-            if actual_hash != persisted.vector_sha256 {
-                return Err(VectorStoreError::Corrupted {
-                    reason: format!(
-                        "vector checksum mismatch for {}",
-                        persisted.metadata.semantic_id
-                    ),
-                });
-            }
-
-            let mut vector = Vec::with_capacity(dim);
-            for i in 0..dim {
-                let bytes: [u8; 4] = buf[i * 4..i * 4 + 4].try_into().unwrap();
-                vector.push(f32::from_le_bytes(bytes));
-            }
-
-            let semantic_id = persisted.metadata.semantic_id.clone();
-            if state.records.contains_key(&semantic_id) {
-                return Err(VectorStoreError::Corrupted {
-                    reason: format!("duplicate semantic id in metadata: {semantic_id}"),
-                });
-            }
-            state.records.insert(
-                semantic_id,
-                StoredVectorRecord {
-                    metadata: persisted.metadata,
-                    vector,
-                },
-            );
-        }
-
-        let mut trailing = [0u8; 1];
-        if v_file
-            .read(&mut trailing)
-            .map_err(|e| VectorStoreError::OpenFailed {
-                reason: e.to_string(),
-            })?
-            != 0
-        {
-            return Err(VectorStoreError::Corrupted {
-                reason: "vectors file contains trailing data".to_string(),
-            });
-        }
-
-        let b_file = File::open(&b_path).map_err(|e| VectorStoreError::OpenFailed {
-            reason: e.to_string(),
-        })?;
-        let persisted_book_index: PersistedBookIndex =
-            serde_json::from_reader(b_file).map_err(|e| {
-                log::warn!("Corrupted book index: {e}");
-                VectorStoreError::Corrupted {
-                    reason: e.to_string(),
-                }
-            })?;
-
-        if persisted_book_index.format_version != 1
-            || persisted_book_index.embedding_dim != self.config.embedding_dim
-            || persisted_book_index.collection_name != self.config.collection_name
-        {
-            return Err(VectorStoreError::Corrupted {
-                reason: "store configuration does not match its persisted header".to_string(),
-            });
-        }
-
-        let mut rebuilt_book_index: HashMap<String, Vec<String>> = HashMap::new();
-        for record in state.records.values() {
-            rebuilt_book_index
-                .entry(record.metadata.source_book_key.clone())
-                .or_default()
-                .push(record.metadata.semantic_id.clone());
-        }
-        for ids in rebuilt_book_index.values_mut() {
-            ids.sort();
-        }
-        let mut stored_book_index = persisted_book_index.books;
-        for ids in stored_book_index.values_mut() {
-            ids.sort();
-        }
-        if stored_book_index != rebuilt_book_index {
-            return Err(VectorStoreError::Corrupted {
-                reason: "book index disagrees with vector metadata".to_string(),
-            });
-        }
-        state.book_index = rebuilt_book_index;
-
+        state.records = snapshot.records;
+        state.book_index = snapshot.book_index;
         Ok(())
     }
+}
+
+/// A snapshot opened read-only: the runtime's view of an installed artifact's payload.
+///
+/// Implements [`VectorSearchBackend`] and not [`VectorStoreBackend`], which is the whole
+/// point — the type a query holds has no way to modify what a build machine produced.
+/// The records are immutable after [`Self::open`], so there is no lock to take on the
+/// query path either.
+pub struct ReadOnlyZevcStore {
+    records: HashMap<String, StoredVectorRecord>,
+    book_index: HashMap<String, Vec<String>>,
+    embedding_dim: u32,
+    collection_name: String,
+}
+
+impl ReadOnlyZevcStore {
+    /// Open the snapshot in `dir`.
+    ///
+    /// `embedding_dim` is the artifact's declared dimension — the record width this
+    /// reader will decode, so a payload that holds a different one is caught as a
+    /// truncated or trailing read rather than misparsed.
+    ///
+    /// The collection name is **adopted from the payload**, not required: it is not part
+    /// of an artifact's identity, so a reader has nothing to compare it against and must
+    /// not invent a value to demand. What is compared is everything that *is* identity —
+    /// by [`IndexPackage::verify_for_open`](crate::distribution::package::IndexPackage::verify_for_open),
+    /// before this is called.
+    ///
+    /// An empty directory is a rejection here, unlike for [`ZevcStore`]: a builder may
+    /// legitimately start from nothing, an artifact may not be nothing.
+    pub fn open(dir: &Path, embedding_dim: u32) -> Result<Self, VectorStoreError> {
+        let snapshot = read_snapshot(
+            dir,
+            &SnapshotExpectation {
+                embedding_dim,
+                format_version: STORE_FORMAT_VERSION,
+                collection_name: None,
+            },
+        )?
+        .ok_or_else(|| VectorStoreError::Corrupted {
+            reason: format!(
+                "{} holds no {BACKEND_ID} snapshot: none of {} is there",
+                dir.display(),
+                SNAPSHOT_FILENAMES.join(", ")
+            ),
+        })?;
+
+        log::info!(
+            "Opened {} vector(s) read-only from {} (collection '{}')",
+            snapshot.records.len(),
+            dir.display(),
+            snapshot.collection_name
+        );
+
+        Ok(Self {
+            records: snapshot.records,
+            book_index: snapshot.book_index,
+            embedding_dim,
+            collection_name: snapshot.collection_name,
+        })
+    }
+
+    /// Collection name the payload declares. Reported, never enforced — see
+    /// [`Self::open`].
+    pub fn collection_name(&self) -> &str {
+        &self.collection_name
+    }
+}
+
+impl VectorSearchBackend for ReadOnlyZevcStore {
+    fn backend_id(&self) -> &'static str {
+        BACKEND_ID
+    }
+
+    fn is_persistent(&self) -> bool {
+        true
+    }
+
+    fn embedding_dim(&self) -> u32 {
+        self.embedding_dim
+    }
+
+    fn count(&self) -> u32 {
+        self.records.len().min(u32::MAX as usize) as u32
+    }
+
+    fn search(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
+        search_records(
+            &self.records,
+            self.embedding_dim,
+            query_vector,
+            top_k,
+            filters,
+        )
+    }
+
+    fn book_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.book_index.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    fn book_vector_count(&self, source_book_key: &str) -> usize {
+        self.book_index
+            .get(source_book_key)
+            .map_or(0, |ids| ids.len())
+    }
+}
+
+/// What a snapshot must agree with to be readable.
+struct SnapshotExpectation {
+    /// Record width, in `f32`s.
+    embedding_dim: u32,
+    format_version: u32,
+    /// `Some` for a store reopening its own directory, where a different collection means
+    /// the caller is pointing at someone else's data. `None` adopts what the payload
+    /// declares — see [`ReadOnlyZevcStore::open`].
+    collection_name: Option<String>,
+}
+
+/// A snapshot's contents, checked but not yet owned by a store.
+struct Snapshot {
+    records: HashMap<String, StoredVectorRecord>,
+    book_index: HashMap<String, Vec<String>>,
+    collection_name: String,
+}
+
+/// Read and check the snapshot in `dir`, or report that there is none.
+///
+/// `Ok(None)` means the directory holds no snapshot at all, which is a fresh store rather
+/// than a fault. A *partial* one is corruption: the three files are written as one commit,
+/// so two out of three means an interrupted write, not an empty index.
+///
+/// What is checked, in the order a reader can afford it:
+///
+/// * the header's format version, dimension and (optionally) collection name;
+/// * a SHA-256 per record over the metadata **and** over the vector's stored bytes — this
+///   is what catches an edit that kept the file's length, which the artifact contract's
+///   cheap open path cannot see;
+/// * exactly `embedding_dim` values per record and no trailing bytes, so the two files
+///   describe the same number of records;
+/// * no duplicate `semantic_id`;
+/// * every vector finite and with a usable direction, because an unscorable vector is a
+///   record that exists and can never be returned;
+/// * the stored book index against the one rebuilt from the metadata.
+///
+/// What it cannot catch: a payload edited **together with** its per-record checksums.
+/// That is self-consistent, and the only thing that separates it from the published
+/// artifact is a digest published outside the package — see
+/// [`ArtifactExpectation`](crate::distribution::package::ArtifactExpectation).
+fn read_snapshot(
+    dir: &Path,
+    expected: &SnapshotExpectation,
+) -> Result<Option<Snapshot>, VectorStoreError> {
+    let v_path = dir.join(VECTORS_FILENAME);
+    let m_path = dir.join(METADATA_FILENAME);
+    let b_path = dir.join(BOOK_INDEX_FILENAME);
+
+    let present = [v_path.exists(), m_path.exists(), b_path.exists()];
+    if present.iter().all(|exists| !exists) {
+        return Ok(None);
+    }
+    if !present.iter().all(|exists| *exists) {
+        return Err(VectorStoreError::Corrupted {
+            reason: format!(
+                "{} holds an incomplete snapshot: {}",
+                dir.display(),
+                SNAPSHOT_FILENAMES
+                    .iter()
+                    .zip(present)
+                    .map(|(name, exists)| format!(
+                        "{name} is {}",
+                        if exists { "present" } else { "missing" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+
+    // The header first: a foreign format version must not be parsed as if it were this
+    // one, and a dimension disagreement decides how every record is decoded.
+    let b_file = File::open(&b_path).map_err(|e| VectorStoreError::OpenFailed {
+        reason: e.to_string(),
+    })?;
+    let persisted_book_index: PersistedBookIndex =
+        serde_json::from_reader(b_file).map_err(|e| {
+            log::warn!("Corrupted book index: {e}");
+            VectorStoreError::Corrupted {
+                reason: e.to_string(),
+            }
+        })?;
+
+    if persisted_book_index.format_version != expected.format_version {
+        return Err(VectorStoreError::Corrupted {
+            reason: format!(
+                "snapshot is format version {}, and this build reads {}",
+                persisted_book_index.format_version, expected.format_version
+            ),
+        });
+    }
+    if persisted_book_index.embedding_dim != expected.embedding_dim {
+        return Err(VectorStoreError::Corrupted {
+            reason: format!(
+                "snapshot holds {}-dimensional vectors, and {} were expected",
+                persisted_book_index.embedding_dim, expected.embedding_dim
+            ),
+        });
+    }
+    if let Some(required) = &expected.collection_name {
+        if &persisted_book_index.collection_name != required {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!(
+                    "snapshot holds collection '{}', and '{required}' was expected",
+                    persisted_book_index.collection_name
+                ),
+            });
+        }
+    }
+
+    let m_file = File::open(&m_path).map_err(|e| VectorStoreError::OpenFailed {
+        reason: e.to_string(),
+    })?;
+    let mut v_file = File::open(&v_path).map_err(|e| VectorStoreError::OpenFailed {
+        reason: e.to_string(),
+    })?;
+    let m_reader = BufReader::new(m_file);
+
+    let dim = expected.embedding_dim as usize;
+    let vec_byte_size = dim * 4;
+    let mut records: HashMap<String, StoredVectorRecord> = HashMap::new();
+
+    for line in m_reader.lines() {
+        let line = line.map_err(|e| VectorStoreError::OpenFailed {
+            reason: e.to_string(),
+        })?;
+        if line.is_empty() {
+            continue;
+        }
+        let persisted: PersistedMetadata = serde_json::from_str(&line).map_err(|e| {
+            log::warn!("Corrupted metadata: {e}");
+            VectorStoreError::Corrupted {
+                reason: e.to_string(),
+            }
+        })?;
+
+        let metadata_hash = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&persisted.metadata).map_err(|e| {
+                VectorStoreError::Corrupted {
+                    reason: e.to_string(),
+                }
+            })?)
+        );
+        if metadata_hash != persisted.metadata_sha256 {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!(
+                    "metadata checksum mismatch for {}",
+                    persisted.metadata.semantic_id
+                ),
+            });
+        }
+
+        let mut buf = vec![0u8; vec_byte_size];
+        if let Err(e) = v_file.read_exact(&mut buf) {
+            log::warn!("Corrupted vectors file: {e}");
+            return Err(VectorStoreError::Corrupted {
+                reason: e.to_string(),
+            });
+        }
+
+        // Over the bytes as stored, before they are decoded: this is the check that sees
+        // an edit which kept the file's length.
+        let actual_hash = format!("{:x}", Sha256::digest(&buf));
+        if actual_hash != persisted.vector_sha256 {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!(
+                    "vector checksum mismatch for {}",
+                    persisted.metadata.semantic_id
+                ),
+            });
+        }
+
+        let mut vector = Vec::with_capacity(dim);
+        for i in 0..dim {
+            let bytes: [u8; 4] = buf[i * 4..i * 4 + 4].try_into().unwrap();
+            vector.push(f32::from_le_bytes(bytes));
+        }
+        normalize_for_scoring(&mut vector).map_err(|reason| VectorStoreError::Corrupted {
+            reason: format!(
+                "vector for {} {reason}; no search could return it",
+                persisted.metadata.semantic_id
+            ),
+        })?;
+
+        let semantic_id = persisted.metadata.semantic_id.clone();
+        if records.contains_key(&semantic_id) {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!("duplicate semantic id in metadata: {semantic_id}"),
+            });
+        }
+        records.insert(
+            semantic_id,
+            StoredVectorRecord {
+                metadata: persisted.metadata,
+                vector,
+            },
+        );
+    }
+
+    let mut trailing = [0u8; 1];
+    if v_file
+        .read(&mut trailing)
+        .map_err(|e| VectorStoreError::OpenFailed {
+            reason: e.to_string(),
+        })?
+        != 0
+    {
+        return Err(VectorStoreError::Corrupted {
+            reason: format!(
+                "{VECTORS_FILENAME} holds more bytes than the {} record(s) in \
+                 {METADATA_FILENAME} account for",
+                records.len()
+            ),
+        });
+    }
+
+    let mut rebuilt_book_index: HashMap<String, Vec<String>> = HashMap::new();
+    for record in records.values() {
+        rebuilt_book_index
+            .entry(record.metadata.source_book_key.clone())
+            .or_default()
+            .push(record.metadata.semantic_id.clone());
+    }
+    for ids in rebuilt_book_index.values_mut() {
+        ids.sort();
+    }
+    let mut stored_book_index = persisted_book_index.books;
+    for ids in stored_book_index.values_mut() {
+        ids.sort();
+    }
+    if stored_book_index != rebuilt_book_index {
+        return Err(VectorStoreError::Corrupted {
+            reason: "book index disagrees with vector metadata".to_string(),
+        });
+    }
+
+    Ok(Some(Snapshot {
+        records,
+        book_index: rebuilt_book_index,
+        collection_name: persisted_book_index.collection_name,
+    }))
+}
+
+/// Normalize a vector for scoring, and refuse one no search could ever return.
+///
+/// Returns the reason it is unusable, for the caller to wrap in the error its own layer
+/// reports — an insert rejects a caller's vector, a read rejects a payload's.
+///
+/// Rejected: a non-finite component (scores `NaN`), a norm that overflowed to `inf`
+/// (whose reciprocal silently zeroes the vector), and a norm at or below
+/// [`MIN_VECTOR_NORM`] (no direction to compare). Either way the record would exist and
+/// be unreachable, which is worse than a rejection — the counts agree and the result is
+/// simply missing.
+///
+/// Normalizing on the way *out* of the file as well as on the way in is deliberate: the
+/// query is normalized too, so scoring is one dot product, and an artifact whose builder
+/// did not normalize still scores as a cosine rather than by magnitude. It is an
+/// in-memory change; nothing is written back.
+fn normalize_for_scoring(vector: &mut [f32]) -> Result<(), String> {
+    if let Some(position) = vector.iter().position(|value| !value.is_finite()) {
+        return Err(format!(
+            "has a non-finite component at {position} ({})",
+            vector[position]
+        ));
+    }
+    let norm = crate::semantic::embedding::l2_normalize(vector);
+    if !norm.is_finite() {
+        return Err(format!(
+            "has a non-finite norm ({norm}); its magnitudes overflowed f32"
+        ));
+    }
+    // `<=`: a vector exactly on the threshold is rejected, as in every layer.
+    if norm <= MIN_VECTOR_NORM {
+        return Err(format!(
+            "has a norm of {norm}, at or below the minimum {MIN_VECTOR_NORM}"
+        ));
+    }
+    Ok(())
 }
 
 fn replace_snapshot(files: &[(&Path, &Path)]) -> Result<(), VectorStoreError> {
@@ -441,9 +755,9 @@ fn replace_snapshot(files: &[(&Path, &Path)]) -> Result<(), VectorStoreError> {
     Ok(())
 }
 
-impl VectorStoreBackend for ZevcStore {
+impl VectorSearchBackend for ZevcStore {
     fn backend_id(&self) -> &'static str {
-        "zevc-persistent-v1"
+        BACKEND_ID
     }
 
     fn is_persistent(&self) -> bool {
@@ -463,6 +777,49 @@ impl VectorStoreBackend for ZevcStore {
             .min(u32::MAX as usize) as u32
     }
 
+    fn search(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        search_records(
+            &state.records,
+            self.config.embedding_dim,
+            query_vector,
+            top_k,
+            filters,
+        )
+    }
+
+    fn book_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .book_index
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn book_vector_count(&self, source_book_key: &str) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .book_index
+            .get(source_book_key)
+            .map_or(0, |ids| ids.len())
+    }
+}
+
+impl VectorStoreBackend for ZevcStore {
     fn insert_batch(
         &self,
         mut batch: Vec<(VectorMetadata, Vec<f32>)>,
@@ -474,28 +831,9 @@ impl VectorStoreBackend for ZevcStore {
                     vector_dim: vector.len() as u32,
                 });
             }
-            if let Some(position) = vector.iter().position(|value| !value.is_finite()) {
-                return Err(VectorStoreError::InsertFailed {
-                    reason: format!(
-                        "vector for {} has a non-finite component at {position}",
-                        meta.semantic_id
-                    ),
-                });
-            }
-            let norm = vector
-                .iter()
-                .map(|value| f64::from(*value) * f64::from(*value))
-                .sum::<f64>()
-                .sqrt();
-            if !norm.is_finite() || norm <= f64::EPSILON {
-                return Err(VectorStoreError::InsertFailed {
-                    reason: format!("vector for {} has no usable direction", meta.semantic_id),
-                });
-            }
-            let reciprocal = (1.0 / norm) as f32;
-            for value in vector {
-                *value *= reciprocal;
-            }
+            normalize_for_scoring(vector).map_err(|reason| VectorStoreError::InsertFailed {
+                reason: format!("vector for {} {reason}", meta.semantic_id),
+            })?;
         }
 
         let inserted = batch.len().min(u32::MAX as usize) as u32;
@@ -545,93 +883,6 @@ impl VectorStoreBackend for ZevcStore {
         }
 
         Ok(inserted)
-    }
-
-    fn search(
-        &self,
-        query_vector: &[f32],
-        top_k: usize,
-        filters: Option<&SearchFilters>,
-    ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
-        if query_vector.len() as u32 != self.config.embedding_dim {
-            return Err(VectorStoreError::DimensionMismatch {
-                store_dim: self.config.embedding_dim,
-                vector_dim: query_vector.len() as u32,
-            });
-        }
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        if query_vector.iter().any(|value| !value.is_finite()) {
-            return Ok(Vec::new());
-        }
-        let norm = query_vector
-            .iter()
-            .map(|value| f64::from(*value) * f64::from(*value))
-            .sum::<f64>()
-            .sqrt();
-        if !norm.is_finite() || norm <= f64::EPSILON {
-            return Ok(Vec::new());
-        }
-        let reciprocal = (1.0 / norm) as f32;
-        let query_vector: Vec<f32> = query_vector
-            .iter()
-            .map(|value| value * reciprocal)
-            .collect();
-
-        let filters = filters.and_then(SearchFilters::compile);
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut heap: BinaryHeap<ScoredEntry> = BinaryHeap::with_capacity(top_k + 1);
-
-        for record in state.records.values() {
-            if let Some(compiled) = filters.as_ref() {
-                if !compiled.matches(&record.metadata) {
-                    continue;
-                }
-            }
-
-            let score = dot_product(&query_vector, &record.vector);
-            if score.is_nan() {
-                continue;
-            }
-
-            let entry = ScoredEntry {
-                score,
-                semantic_id: record.metadata.semantic_id.clone(),
-            };
-            if heap.len() < top_k {
-                heap.push(entry);
-            } else if let Some(weakest) = heap.peek() {
-                if entry < *weakest {
-                    heap.pop();
-                    heap.push(entry);
-                }
-            }
-        }
-
-        let mut candidates: Vec<SemanticCandidate> = heap
-            .into_iter()
-            .filter_map(|entry| {
-                state
-                    .records
-                    .get(&entry.semantic_id)
-                    .map(|record| SemanticCandidate {
-                        metadata: record.metadata.clone(),
-                        similarity_score: entry.score,
-                    })
-            })
-            .collect();
-
-        candidates.sort_by(|a, b| {
-            b.similarity_score
-                .total_cmp(&a.similarity_score)
-                .then_with(|| a.metadata.semantic_id.cmp(&b.metadata.semantic_id))
-        });
-
-        Ok(candidates)
     }
 
     fn remove_by_book(&self, source_book_key: &str) -> Result<u32, VectorStoreError> {
@@ -688,18 +939,90 @@ impl VectorStoreBackend for ZevcStore {
         Ok(removed)
     }
 
-    fn book_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .book_index
-            .keys()
-            .cloned()
-            .collect();
-        keys.sort();
-        keys
+    /// Write the snapshot. Unlike the volatile backend's no-op, this one is the commit
+    /// point: everything inserted since the last call is only in memory until it returns.
+    fn commit(&self) -> Result<(), VectorStoreError> {
+        self.save_to_disk()
     }
+}
+
+/// Scan every record and keep the best `top_k`, shared by the writable store and the
+/// read-only one so the two cannot answer the same query differently.
+///
+/// Both sides are normalized, so the dot product *is* the cosine. An incomparable query
+/// yields nothing rather than `NaN`-scoring the whole store, and ties break on
+/// `semantic_id` because `HashMap` order is randomized per run.
+fn search_records(
+    records: &HashMap<String, StoredVectorRecord>,
+    embedding_dim: u32,
+    query_vector: &[f32],
+    top_k: usize,
+    filters: Option<&SearchFilters>,
+) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
+    if query_vector.len() as u32 != embedding_dim {
+        return Err(VectorStoreError::DimensionMismatch {
+            store_dim: embedding_dim,
+            vector_dim: query_vector.len() as u32,
+        });
+    }
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+    let mut query = query_vector.to_vec();
+    if normalize_for_scoring(&mut query).is_err() {
+        return Ok(Vec::new());
+    }
+
+    // Group facet paths by dimension once per scan rather than per record.
+    let filters = filters.and_then(SearchFilters::compile);
+    let mut heap: BinaryHeap<ScoredEntry> = BinaryHeap::with_capacity(top_k + 1);
+
+    for record in records.values() {
+        if let Some(compiled) = filters.as_ref() {
+            if !compiled.matches(&record.metadata) {
+                continue;
+            }
+        }
+
+        let score = dot_product(&query, &record.vector);
+        if score.is_nan() {
+            continue;
+        }
+
+        let entry = ScoredEntry {
+            score,
+            semantic_id: record.metadata.semantic_id.clone(),
+        };
+        if heap.len() < top_k {
+            heap.push(entry);
+        } else if let Some(weakest) = heap.peek() {
+            // Worst-first ordering, so `<` reads as "better than the weakest kept".
+            if entry < *weakest {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+    }
+
+    let mut candidates: Vec<SemanticCandidate> = heap
+        .into_iter()
+        .filter_map(|entry| {
+            records
+                .get(&entry.semantic_id)
+                .map(|record| SemanticCandidate {
+                    metadata: record.metadata.clone(),
+                    similarity_score: entry.score,
+                })
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        b.similarity_score
+            .total_cmp(&a.similarity_score)
+            .then_with(|| a.metadata.semantic_id.cmp(&b.metadata.semantic_id))
+    });
+
+    Ok(candidates)
 }
 
 #[inline]
@@ -916,5 +1239,159 @@ mod tests {
         }
 
         assert_eq!(ZevcStore::open_or_create(config).unwrap().count(), 1);
+    }
+
+    // ── the read-only opener ──
+
+    /// Write a two-book snapshot into `dir` and return its dimension.
+    fn write_snapshot(dir: &TempDir) -> u32 {
+        let store = ZevcStore::open_or_create(ZevcStoreConfig {
+            db_path: dir.path().to_path_buf(),
+            embedding_dim: 4,
+            collection_name: "chunks".to_string(),
+            auto_persist: false,
+        })
+        .unwrap();
+        store
+            .insert_batch(vec![
+                (sample_metadata("a1", "book_a"), vec![1.0, 0.0, 0.0, 0.0]),
+                (sample_metadata("a2", "book_a"), vec![0.0, 1.0, 0.0, 0.0]),
+                (sample_metadata("b1", "book_b"), vec![0.0, 0.0, 1.0, 0.0]),
+            ])
+            .unwrap();
+        store.commit().unwrap();
+        4
+    }
+
+    #[test]
+    fn a_read_only_store_answers_the_same_query_as_the_writable_one() {
+        let dir = TempDir::new("read_only_open");
+        let dim = write_snapshot(&dir);
+
+        let reader = ReadOnlyZevcStore::open(dir.path(), dim).unwrap();
+        assert_eq!(reader.count(), 3);
+        assert_eq!(reader.book_keys(), ["book_a", "book_b"]);
+        assert_eq!(reader.book_vector_count("book_a"), 2);
+        assert_eq!(reader.book_vector_count("absent"), 0);
+        assert!(reader.is_persistent());
+        assert_eq!(reader.backend_id(), BACKEND_ID);
+        assert_eq!(reader.collection_name(), "chunks");
+
+        let hits = reader.search(&[0.0, 0.0, 1.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits[0].metadata.semantic_id, "b1");
+        assert!((hits[0].similarity_score - 1.0).abs() < 1e-6);
+    }
+
+    /// The check the artifact contract's cheap open path cannot make: this edit keeps the
+    /// file's length, so only a per-record checksum sees it.
+    #[test]
+    fn a_same_length_edit_of_the_payload_is_refused_at_open() {
+        let dir = TempDir::new("read_only_edit");
+        let dim = write_snapshot(&dir);
+
+        let vectors_path = dir.path().join(VECTORS_FILENAME);
+        let mut bytes = fs::read(&vectors_path).unwrap();
+        let before = bytes.len();
+        bytes[0] ^= 0xff;
+        fs::write(&vectors_path, &bytes).unwrap();
+        assert_eq!(fs::metadata(&vectors_path).unwrap().len() as usize, before);
+
+        match ReadOnlyZevcStore::open(dir.path(), dim).map(|store| store.count()) {
+            Err(VectorStoreError::Corrupted { reason }) => {
+                assert!(reason.contains("checksum mismatch"), "{reason}")
+            }
+            other => panic!("expected a checksum rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payload_the_reader_cannot_decode_is_refused_rather_than_misread() {
+        let dir = TempDir::new("read_only_shape");
+        let dim = write_snapshot(&dir);
+
+        // A width this build does not read: the header says otherwise, so nothing is
+        // decoded at the wrong offset.
+        match ReadOnlyZevcStore::open(dir.path(), dim + 1).map(|store| store.count()) {
+            Err(VectorStoreError::Corrupted { reason }) => {
+                assert!(reason.contains("dimensional"), "{reason}")
+            }
+            other => panic!("expected a dimension rejection, got {other:?}"),
+        }
+
+        // Two of three files: the snapshot is written as one commit, so this is an
+        // interrupted write and not an empty index.
+        fs::remove_file(dir.path().join(BOOK_INDEX_FILENAME)).unwrap();
+        match ReadOnlyZevcStore::open(dir.path(), dim).map(|store| store.count()) {
+            Err(VectorStoreError::Corrupted { reason }) => {
+                assert!(reason.contains(BOOK_INDEX_FILENAME), "{reason}")
+            }
+            other => panic!("expected an incompleteness rejection, got {other:?}"),
+        }
+    }
+
+    /// A builder may start from nothing; an artifact may not *be* nothing.
+    #[test]
+    fn an_empty_directory_opens_writable_and_is_refused_read_only() {
+        let dir = TempDir::new("read_only_empty");
+
+        assert_eq!(
+            ZevcStore::open_or_create(ZevcStoreConfig {
+                db_path: dir.path().to_path_buf(),
+                embedding_dim: 4,
+                collection_name: "chunks".to_string(),
+                auto_persist: false,
+            })
+            .unwrap()
+            .count(),
+            0
+        );
+
+        assert!(matches!(
+            ReadOnlyZevcStore::open(dir.path(), 4),
+            Err(VectorStoreError::Corrupted { .. })
+        ));
+    }
+
+    /// A vector no search could ever return is a record that exists and is unreachable,
+    /// which is worse than a rejection: the counts agree and the result is missing.
+    #[test]
+    fn a_stored_vector_with_no_usable_direction_is_refused_at_open() {
+        let dir = TempDir::new("read_only_direction");
+        let dim = 4;
+        let store = ZevcStore::open_or_create(ZevcStoreConfig {
+            db_path: dir.path().to_path_buf(),
+            embedding_dim: dim,
+            collection_name: "chunks".to_string(),
+            auto_persist: false,
+        })
+        .unwrap();
+        store
+            .insert_batch(vec![(
+                sample_metadata("a1", "book_a"),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )])
+            .unwrap();
+        store.commit().unwrap();
+
+        // Rewrite the one record as zeros, with the checksum the file's own metadata
+        // would carry, so the only thing left to catch it is the direction check.
+        let zeros = vec![0u8; dim as usize * 4];
+        fs::write(dir.path().join(VECTORS_FILENAME), &zeros).unwrap();
+        let metadata_path = dir.path().join(METADATA_FILENAME);
+        let line = fs::read_to_string(&metadata_path).unwrap();
+        let mut persisted: PersistedMetadata = serde_json::from_str(line.trim()).unwrap();
+        persisted.vector_sha256 = format!("{:x}", Sha256::digest(&zeros));
+        fs::write(
+            &metadata_path,
+            format!("{}\n", serde_json::to_string(&persisted).unwrap()),
+        )
+        .unwrap();
+
+        match ReadOnlyZevcStore::open(dir.path(), dim).map(|store| store.count()) {
+            Err(VectorStoreError::Corrupted { reason }) => {
+                assert!(reason.contains("no search could return it"), "{reason}")
+            }
+            other => panic!("expected a direction rejection, got {other:?}"),
+        }
     }
 }

@@ -106,7 +106,7 @@ pub struct ModelIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StoreIdentity {
     /// Backend that wrote the payload, matching
-    /// [`VectorStoreBackend::backend_id`](crate::semantic::store_backend::VectorStoreBackend::backend_id).
+    /// [`VectorSearchBackend::backend_id`](crate::semantic::store_backend::VectorSearchBackend::backend_id).
     pub backend_id: String,
     /// Version of that backend's on-disk format. Separate from `backend_id` so a
     /// format change inside one backend is a rejection and not a misread payload.
