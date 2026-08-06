@@ -3,10 +3,11 @@
 //! BM25 and cosine similarity live on different scales, so they are normalized
 //! into `[0, 1]` before being combined.
 //!
-//! Two fusion strategies exist side by side. Weighted fusion is what the
-//! coordinator uses today; [`fuse_rrf`] is rank-based and needs no score
-//! calibration at all, which may well make it the better default. Neither has
-//! been measured on Hebrew queries yet — that comparison is roadmap P5.
+//! Two fusion strategies exist side by side, and the coordinator picks between them
+//! per `FusionStrategy` in the active profile. [`fuse_rrf`] is rank-based and needs no
+//! score calibration at all, which may well make it the better default. Neither has
+//! been measured on Hebrew queries yet — that comparison needs the labelled relevance
+//! set from stage S1.
 
 use crate::semantic::types::ResultSource;
 use std::collections::HashMap;
@@ -46,9 +47,10 @@ pub fn normalize_bm25_scores(scores: &[f32], k: f32) -> Vec<f32> {
 /// Map cosine similarities from `[-1, 1]` into `[0, 1]`.
 ///
 /// Note what this implies: an orthogonal — that is, entirely unrelated — vector
-/// normalizes to 0.5, not 0. Combined with a relevance threshold's absence, a
-/// semantic path that finds nothing useful still contributes mid-range scores.
-/// Introducing a threshold is roadmap P5.
+/// normalizes to 0.5, not 0, so on its own this mapping lets a semantic path that
+/// found nothing useful contribute mid-range scores. That is why the coordinator
+/// calls [`normalize_semantic_with_threshold`] instead; this thresholdless form is
+/// kept for callers that want the raw mapping.
 pub fn normalize_semantic_scores(scores: &[f32]) -> Vec<f32> {
     scores
         .iter()

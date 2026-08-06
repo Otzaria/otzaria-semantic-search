@@ -1,7 +1,7 @@
 //! Hybrid search coordination layer.
 //!
 //! This module merges results from the lexical (Tantivy/BM25) and semantic
-//! (embedding/zvec) search paths into a single ranked result set.
+//! (embedding + vector store) search paths into a single ranked result set.
 //!
 //! Components:
 //! - Fusion: score normalization and combination

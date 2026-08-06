@@ -3,6 +3,14 @@
 > המסמך הזה אינו README למשתמשים. מטרתו היא לתת למפתח חדש תמונה מדויקת של מצב הפרויקט, הארכיטקטורה, ההחלטות שכבר התקבלו, מה ממומש בפועל, מה עדיין mock/placeholder, ומה צריך לעשות הלאה.
 >
 > **חשוב:** אין להסיק ממבנה שמות הקוד או מה־comments שמערכת מסוימת כבר ממומשת. במקומות שבהם הארכיטקטורה קיימת אך backend אמיתי עדיין לא מחובר, הדבר מצוין במפורש.
+>
+> **קראו קודם:** [`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) — היקף המוצר. הוא גובר על
+> המסמך הזה. בקצרה: האינדקס הרשמי נבנה מראש ונפתח read-only, אין overlay לספרי משתמש,
+> אין אינדוקס ברקע באפליקציה, ואין שירות מרוחק בזמן חיפוש. סדר העבודה נמצא ב־
+> [`שלבי ויעדי התקדמות.md`](../שלבי%20ויעדי%20התקדמות.md).
+>
+> חלק מהסעיפים כאן נכתבו לפני PR #2 ו־PR #3 ומתארים כוונות שהתממשו או שהשתנו. הם
+> עודכנו; אם נותרה סתירה — החוזה והמסמך המשלים גוברים.
 
 ---
 
@@ -122,12 +130,13 @@ BM25 עדיין עובד
 | Embedding abstraction            | קיים                       |
 | הגדרת GGUF                       | קיימת                      |
 | אימות קונטיינר GGUF + checksum   | ממומש (header לפני hash, פרסור descriptors, חסם תחתון על הגודל) |
-| GGUF inference אמיתי             | **לא ממומש עדיין**         |
+| GGUF inference אמיתי             | ממומש מאחורי `--features llama-backend`, מאומת מול golden vectors |
 | deterministic embedding fallback | ממומש, **מחוץ ל־production** (feature `mock-embedding`) |
 | Batch embedding                  | ממומש (האינדוקס משתמש בו)  |
 | VectorStore abstraction          | קיים                       |
-| zvec אמיתי                       | **לא מחובר עדיין**         |
-| In-memory vector store           | ממומש                      |
+| `VectorStoreBackend` trait       | קיים; **ה־engine עדיין אינו תלוי בו** |
+| In-memory vector store           | ממומש — וזה מה שה־engine פותח |
+| `ZevcStore` (snapshot לדיסק)     | ממומש ונבדק, **לא מחובר**; סריקה מלאה, לא ANN, לא `zvec` |
 | Cosine search                    | ממומש                      |
 | Metadata filtering               | ממומש (facets שטוחים + חלוקת ממדים כמו במנוע הלקסיקלי) |
 | זיהוי שינוי ב-PDF                | ממומש כאשר הקורא מספק source revision סמכותי + metadata; גודל+mtime לבדם אינם קנוניים |
@@ -135,21 +144,33 @@ BM25 עדיין עובד
 | Hybrid coordinator               | קיים                       |
 | Fusion                           | קיים                       |
 | Dynamic weighting                | קיים                       |
-| RRF                              | קיים כ־primitive, **לא בשימוש** |
+| RRF                              | ממומש **ובשימוש** — נבחר לפי `FusionStrategy` בפרופיל |
+| פרופילי Fast/Balanced/Best        | ממומשים (`config::profiles`) |
+| Feature flags                    | ממומשים כדריסות מעל פרופיל |
+| Query cache + embedding cache    | ממומשים                    |
+| Telemetry                        | ממומש — מוני תהליך, ללא רשת |
 | Grouping                         | ממומש                      |
 | שלושת מצבי החיפוש                | ממומש (כולל SemanticOnly)  |
 | זיהוי אי־תאימות אינדקס           | ממומש (משבית את המסלול הסמנטי) |
 | התאוששות מ־manifest פגום         | ממומש (quarantine + reset) |
 | עמידות ה-manifest                | אטומי בכל פלטפורמה; durable ב-Unix, best-effort ב-Windows |
 | כתיבת manifest באינדוקס מלא      | פעם אחת בסוף (לא פר-ספר) |
-| Rust API seam ל-Flutter/FFI      | קיים; bindings אמיתיים טרם נוצרו |
-| Production indexing pipeline     | **עדיין דורש integration** |
-| Production persistence           | **עדיין חסרה**             |
-| ANN retrieval                    | **חסר** (brute-force בלבד) |
+| Rust API seam ל-Flutter/FFI      | קיים; bindings אמיתיים נבנים ב־`otzaria_search_engine` |
+| חבילת אינדקס + ייבוא אטומי       | ממומשים כאב־טיפוס (`distribution`), **לא חשופים ב־API** |
+| `IndexVersion`                   | קיים; **חסרות** זהות corpus, סכמת Tantivy וסכמת ה־ID |
+| builder של הארטיפקט הרשמי        | **לא קיים** (S4)           |
+| Production persistence במסלול הפעיל | **עדיין חסרה** (S2)     |
+| אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד); האם נדרש — הכרעת S2 לפי מדידה |
+| UI סמנטי באוצריא                 | **לא קיים** (S7)           |
 
 הנקודה החשובה ביותר למפתח חדש:
 
 > **זהו כרגע skeleton ארכיטקטוני עובד חלקית, לא מנוע semantic production-complete.**
+>
+> מה שכן ממומש באמת: inference אמיתי מול המודל, שלושת מצבי החיפוש, fusion עם פרופילים,
+> caches, telemetry, ואב־טיפוס של persistence ואריזה. מה שחסר כדי שיהיה מוצר: backend
+> read-only שמחובר למנוע ונמדד בקנה מידה, חוזה זהות שקושר את הארטיפקט ל־corpus מסוים,
+> builder שמפיק אותו, והפעלה באפליקציה.
 
 ## מה השתנה ב־PR הראשון (Correctness baseline)
 
@@ -236,9 +257,44 @@ BM25 עדיין עובד
 16. **פעולות lifecycle כותבות מסודרות בתור** (`indexing: Mutex<()>`). אינדוקס,
     reset וגריעת `removed_books` אינם יכולים להשתלב זה בזה באמצע batch.
 
-מה שמכוון בכוונה **לא** נעשה שם, ומחכה ל־P5: כיול `BM25_SATURATION_K`, threshold
-לתוצאה סמנטית לא רלוונטית, מעבר ל־RRF, ו־`total_count` אמיתי (הוא כרגע מספר
-המועמדים שנכנסו ל־fusion, ומתועד ככזה).
+מה שמכוון בכוונה **לא** נעשה שם, ונסגר מאז ב־PR #3: threshold לתוצאה סמנטית לא
+רלוונטית ובחירת אסטרטגיית fusion (כולל RRF) לפי פרופיל. `total_count` עדיין מדווח את
+מספר המועמדים שנכנסו ל־fusion ולא את מספר התוצאות, ומתועד ככזה.
+
+## מה הוסיף PR #2 (Inference אמיתי)
+
+`--features llama-backend` מספק inference אמיתי מול קובץ GGUF, ולא stand-in. הפרטים
+המלאים ב־[`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md) ו־[`P2_REFERENCE_VECTORS.md`](P2_REFERENCE_VECTORS.md);
+מה שחשוב לדעת לפני שנוגעים בקוד:
+
+1. **בדיקת ה־parity הראשית היא שוויון `token_ids` מדויק, לא cosine.** נמדד ש־BOS
+   מוטעה מקבל cosine *גבוה יותר* (0.9947938) מרפרנס לגיטימי (0.9947909), ולכן אין סף
+   cosine שמפריד ביניהם.
+2. **בנייה רגילה נשארת בלי backend.** ה־feature אינו ברירת מחדל מפני שהוא בונה
+   llama.cpp ו־ggml דרך cmake בכל בנייה של תלוי.
+3. **הבחירה בין Candle ל־llama.cpp לא נמדדה.** הוכרעה llama.cpp לפני שנמדד משהו;
+   הקריטריונים לפתיחה מחדש רשומים באותו מסמך.
+
+## מה הוסיף PR #3 (Hybrid, פרופילים, אב־טיפוס persistence)
+
+1. **`VectorStoreBackend`** — חוזה משותף לשני ה־stores. ה־engine עדיין תלוי
+   ב־`VectorStore` הקונקרטי, ולכן ה־trait הוא הכנה ולא נקודת החלפה בפועל. S2.
+2. **`ZevcStore`** — snapshots לדיסק עם checksum לכל payload, ופתיחה מחדש שמאמתת
+   אותם. **הוא אינו הספרייה `zvec`, אינו ANN ואינו mmap:** הפתיחה טוענת את כל
+   הווקטורים ל־`HashMap` והחיפוש סורק את כולם. השם מטעה, המימוש לא.
+3. **`distribution`** (לפני S0: `cloud`) — `IndexPackage` עם manifest ו־SHA-256 לכל
+   payload, ו־`IndexImporter` שמעתיק ל־staging, מאמת שוב אחרי ההעתקה, ומחליף תיקייה
+   עם גיבוי ו־rollback. אינו חשוף דרך ה־API.
+4. **`IndexVersion`** — זהות מודל/chunking/backend/precision. **חסרות** זהות
+   corpus, `tantivy_schema_version` ו־`document_id_scheme_version`; בלעדיהן אפשר
+   לפתוח חבילה שמצביעה ל־`line_id` של קטלוג אחר. S3.
+5. **פרופילים ודגלים** — `Fast`/`Balanced`/`Best`, `Weighted`/`RRF`/`Adaptive`,
+   ו־`FeatureFlags` שדורסים פרופיל קיים במקום להחזיק העתק שני של ברירות המחדל.
+6. **Caches ו־telemetry** — cache תוצאות עם פסילה לפי `generation`, cache embeddings,
+   ומוני ריצה. ה־telemetry מבדיל `cache_lookup` מ־`cache_hit`, כדי ש"לא נבדק" לא
+   ייראה כ"פספוס". שום דבר מזה אינו יוצא מהתהליך.
+7. **benchmark helpers** — תזמון ואחוזונים. **אינם** dataset של רלוונטיות תורנית
+   ואינם הוכחת סקייל על ~6.1 מיליון שורות.
 
 ## מגבלה ידועה: אינדוקס חוסם חיפוש
 
@@ -306,46 +362,48 @@ max tokens: 512
 batch size: 32
 ```
 
-אבל כרגע אין inference אמיתי.
-
-`load()` מאמת את קונטיינר ה־GGUF (magic + version) ומחשב SHA-256 של הקובץ, ואז:
+`load()` מאמת את קונטיינר ה־GGUF ומחשב SHA-256 של הקובץ במעבר אחד, ואז הבחירה נעשית
+ב־`backend::select_backend`:
 
 ```text
-בנייה רגילה (production)      → Err(BackendUnavailable)
---features mock-embedding      → backend "mock-hash-v1"
+בנייה רגילה (production)               → Err(BackendUnavailable)
+--features mock-embedding               → backend "mock-hash-v1"  (אינו מודל)
+--features llama-backend                → inference אמיתי מול ה-GGUF
+שני ה-features יחד                      → ה-backend האמיתי מנצח
 ```
 
 ה־stand-in מבוסס SHA-256 ו־feature hashing (ואחריו L2 normalization). הוא **אינו
 זמין ב־production** — ראו "מה השתנה ב־PR הראשון" למעלה. וקטור באורך אפס נדחה
 בשגיאה במקום להיכנס לאינדקס.
 
-### לכן:
+### שני המסלולים
 
 ```text
-Current (with the mock feature only):
+--features mock-embedding (פיתוח/בדיקות):
 GGUF container validated + checksummed
        ↓
 fake deterministic embedding
        ↓
 vector
 
-Target:
+--features llama-backend (אמיתי):
 GGUF
  ↓
-Tokenizer
+Qwen2-BPE tokenizer (parse_special = false)
  ↓
-Actual model inference
+llama.cpp inference, EOS מצורף אחרי החיתוך
  ↓
 last-token pooling
  ↓
-L2 normalization
+L2 normalization (ב-EmbeddingRuntime, לא ב-backend)
  ↓
 1024-d vector
 ```
 
 **אסור להתייחס ל־feature hashing כמודל semantic.**
 
-הוא קיים רק כדי לאפשר לפתח ולבדוק את כל שאר ה־pipeline בלי שה־model runtime יהיה blocker.
+הוא קיים רק כדי לאפשר לפתח ולבדוק את כל שאר ה־pipeline בלי שה־model runtime יהיה
+blocker — ובפרט כדי שבדיקות ה־CI ירוצו גם במכונה שאין בה את קובץ המודל.
 
 ---
 
@@ -380,6 +438,12 @@ Batch size:
 ```
 
 ההגדרות נמצאות ב־`SemanticConfig` וב־`EmbeddingConfig`.
+
+הממד, הדיוק, `max_tokens`, pooling וה־normalization אינם „הגדרות” אלא **חלק מזהות
+האינדקס**: שינוי של אחד מהם פוסל כל וקטור שנשמר. הבחירה הסופית ביניהם היא S1, ורק
+אחריה נכון לקפוא על פורמט ארטיפקט גדול.
+
+כיצד קובץ המודל מגיע למכשיר, ומה כבר הוכרע בעניין: [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md).
 
 ---
 
@@ -535,13 +599,14 @@ segment
 
 ## היעד
 
-היעד הוא vector database מקומי, נפרד לחלוטין מ־Tantivy.
+היעד הוא אינדקס וקטורי מקומי, נפרד לחלוטין מ־Tantivy, ש**נבנה מראש ונפתח read-only**
+אצל המשתמש. פתיחה אינה כותבת, אינה מאנדקסת ואינה בונה מחדש.
 
 הקונפיגורציה כרגע:
 
 ```text
 db path:
-semantic_db/zvec
+semantic_db/zvec        ← שם היסטורי; הספרייה zvec אינה בשימוש
 
 embedding dimension:
 1024
@@ -550,55 +615,46 @@ collection:
 chunks
 ```
 
-`SemanticConfig` כבר מכוון ל־`semantic_db/zvec`.
-
 ---
 
-## אבל בפועל
-
-ה־`VectorStore` הנוכחי **אינו zvec אמיתי**.
-
-בפועל הוא:
-
-```rust
-RwLock<HashMap<String, StoredVectorRecord>>
-```
-
-ובנוסף:
-
-```rust
-RwLock<HashMap<String, Vec<String>>>
-```
-
-כלומר:
+## שני ה־stores שקיימים בקוד
 
 ```text
-Vectors
-  ↓
-RAM HashMap
+VectorStore (store.rs)          ← זה מה שה-engine פותח היום
+  └── RwLock<HashMap<String, StoredVectorRecord>>
+      + RwLock<HashMap<String, Vec<String>>>   (מפתחות לפי ספר)
+  is_persistent() == false — ומצהיר על כך, כדי שה-manifest לא ישקר
+
+ZevcStore (zevc_store.rs)       ← קיים, נבדק, לא מחובר
+  └── snapshots לדיסק: payload לכל ספר, SHA-256 למטא-דאטה ולווקטורים,
+      פתיחה מחדש שמאמתת checksums
+  is_persistent() == true
 ```
 
-אין כרגע persistence אמיתי של הווקטורים.
+**מה ש־`ZevcStore` אינו:** אינו הספרייה `zvec`, אינו ANN, אינו mmap. הפתיחה טוענת את
+**כל** הווקטורים ל־`HashMap` והחיפוש סורק את כולם ב־`O(N·D)` — אותה סיבוכיות בדיוק כמו
+ה־store בזיכרון. מה שהוא כן פותר: הווקטורים שורדים restart, והשלמות שלהם נבדקת.
 
-`open_or_create()` רק יוצר את התיקייה ומאתחל את ה־HashMaps.
-
-### לכן המשימה היא:
+### לכן המשימה (S2) היא:
 
 ```text
-Current:
-VectorStore
-  ↓
-HashMap
+עכשיו:
+SemanticEngine ──תלוי ישירות──▶ VectorStore (בזיכרון)
 
-Target:
-VectorStore
-  ↓
-zvec
-  ↓
-persistent local ANN index
+היעד:
+SemanticEngine ──תלוי ב──▶ VectorStoreBackend
+                             ├── in-memory   (בדיקות)
+                             └── official read-only (מסלול המוצר)
+                                  ללא delete/upsert בזמן ריצת האפליקציה
 ```
 
-ה־API של `VectorStore` צריך להישאר abstraction, כדי שהמעבר ל־zvec לא ידרוש לשכתב את ה־semantic engine.
+ולאחר מכן **למדוד** לפני שבוחרים: `ZevcStore` כ־baseline נכונות ב־1M וב־6M רשומות,
+cold-open, p50/p95/p99, peak RSS וגודל דיסק. ANN אמיתי על הדיסק נכנס רק אם המדידה
+מוכיחה שסריקה מלאה אינה עומדת בתקציב — ולא מפני ש"ANN" נשמע מהיר יותר. פתיחה שטוענת
+את כל הווקטורים ל־RAM אינה קבילה אלא אם מדידה מראה שהיא עומדת בתקציב בכל היעדים.
+
+ה־API של ה־store צריך להישאר abstraction, כדי שהחלפת backend לא תדרוש לשכתב את
+ה־semantic engine.
 
 ---
 
@@ -629,9 +685,12 @@ N = מספר הווקטורים
 D = 1024
 ```
 
-זה backend לצורך development/testing.
+זה נכון לשני ה־stores: גם `ZevcStore` סורק את כולם. הוא מוסיף persistence, לא אחזור
+תת־ליניארי.
 
-**זה אינו ה־production retrieval architecture הרצוי.**
+**האם זו הארכיטקטורה הסופית — לא ידוע, ומכוון שלא ידוע.** ההכרעה תלויה במדידה של S2
+ובממד/דיוק שייבחרו ב־S1: 6.1 מיליון וקטורים ב־128 ממדים int8 הם ~0.72 GiB, וב־1024
+ממדים f32 הם ~23.1 GiB. אלה שני עולמות שונים לחלוטין לשאלה "האם סריקה מלאה קבילה".
 
 ---
 
@@ -677,9 +736,22 @@ diff_against_tantivy()
 status()
 ```
 
+שתי הערות שנוגעות לחוזה המוצר:
+
+1. **`store: VectorStore` הוא תלות קונקרטית.** `open()` פותח את ה־store בזיכרון. זה
+   הפער המרכזי של S2, ולא פרט מימוש שאפשר לדחות: כל עוד התלות קונקרטית, `ZevcStore`
+   אינו יכול להיכנס למסלול הפעיל בלי שינוי חתימות.
+2. **`index_book`/`index_books`/`reset_index` הן פעולות אב־טיפוס.** הן משמשות את
+   הבדיקות ואת ה־builder העתידי, לא את האפליקציה. במסלול המוצר האפליקציה מתקינה
+   ארטיפקט מוכן ופותחת אותו read-only.
+
 ---
 
 # 15. Indexing Flow
+
+> **היכן זה רץ:** במכונת build, או בבדיקות. **לא** באפליקציה. אין באוצריא אינדוקס
+> ברקע, אין progress stream ואין cancel/resume — ראו [`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §4.
+> הזרימה כאן היא מה שה־builder של S4 יפעיל, ספר אחד בכל פעם, מתוך אינדקס Tantivy סופי.
 
 ה־flow הנוכחי:
 
@@ -735,6 +807,10 @@ checkpoint דלתאי, לא סריאליזציה חוזרת של כל המפה.
 ---
 
 # 16. Incremental Indexing
+
+> גם זה **צד ה־build**. אצל המשתמש אין diff ואין upsert פר־ספר: מהדורת ספרייה חדשה
+> מקבלת ארטיפקט חדש שמותקן במלואו. השימושיות של ה־diff היא לחסוך inference בבנייה
+> חוזרת של הארטיפקט, לא לעדכן אינדקס בזמן ריצה.
 
 אחד הדברים החשובים שכבר בנויים הוא manifest.
 
@@ -1175,6 +1251,10 @@ return BM25 results
 
 זה חלק מהארכיטקטורה ולא workaround.
 
+**אבל התדרדרות אינה רשות להסתיר.** `search_mode` הוא המצב שרץ בפועל ו־`fallback_reason`
+אומר למה. וב־`SemanticOnly` **אין** fallback ל־BM25: מצב שהמשתמש ביקש בו חיפוש סמנטי
+מחזיר כשל או תוצאה ריקה מפורשת, ולא תוצאות לקסיקליות שמתחזות לסמנטיות.
+
 ---
 
 # 31. FFI / Flutter
@@ -1195,11 +1275,17 @@ Flutter צריך לראות API ברמה של:
 
 ```text
 search()
-status()
-index/update lifecycle
+status()                     ← missing / installing / ready / incompatible /
+                               corrupt / model_missing / model_incompatible /
+                               unsupported_platform
+install_official_index()     ← התקנת ארטיפקט מוכן, לא אינדוקס
 ```
 
 ה־Rust layer מחזיק את ה־implementation details.
+
+שימו לב למה שאין ברשימה: `index_books` על מיליוני שורות מ־Dart. העברת הספרייה דרך FFI
+היא בדיוק מה שהחוזה שולל — הן מטעמי ביצועים והן מפני שה־metadata כבר שמור ב־Tantivy
+ואין לבנות אותו שוב בצד Dart.
 
 ---
 
@@ -1290,123 +1376,92 @@ bad input
 
 כרגע קיימים מספר bottlenecks ברורים.
 
-## Embedding
-
-כרגע:
-
-```text
-one chunk
-→ one embed_one()
-```
-
-במקום batching מלא.
-
----
-
 ## Vector search
 
 כרגע:
 
 ```text
-brute-force scan
+brute-force scan, O(N·D)
 ```
 
-במקום ANN.
+נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה ריצה, אותה מכונה). בהערכה
+**ליניארית** — לא במדידה — זה ~2.5–3.2s על 6.1 מיליון שורות באותו ממד ודיוק. זה מספר
+שמחייב או ממד/דיוק קטנים יותר (S1), או backend אחזור אחר (S2) — ולא אופטימיזציה נקודתית.
 
 ---
 
-## Persistence
+## Persistence במסלול הפעיל
 
-הווקטורים כרגע חיים ב־RAM.
-
-אין production persistence אמיתי.
+הווקטורים במסלול שה־engine פותח חיים ב־RAM ואינם שורדים restart. `ZevcStore` פותר את
+זה אך אינו מחובר, ופתיחה שלו טוענת בכל מקרה את הכול ל־RAM. S2.
 
 ---
 
-## Model inference
+## Cold-open ותקציב זיכרון
 
-אין עדיין inference אמיתי.
+לא נמדדו בכלל בקנה מידה של הספרייה. `cargo bench` מודד חיפוש, לא פתיחה. אלה מספרים
+שחייבים להיות בשער הקבלה של S2, כי הם מה שקובע אם ארטיפקט של מיליוני שורות בכלל
+נפתח על מכשיר של משתמש.
 
-לכן אין כרגע benchmark אמיתי של:
+---
 
-```text
-embedding latency
-tokens/sec
-memory usage
-CPU utilization
-```
+## Embedding latency ב־inference אמיתי
+
+ה־backend האמיתי קיים, וה־pipeline משתמש ב־`embed_batch()` (ברירת מחדל 32). מה שעדיין
+לא נמדד באופן שיטתי: tokens/sec, זיכרון ו־CPU לכל context, וזמן ההטמעה של שאילתה
+בודדת על מכשירי יעד. השאילתה היא ה־inference היחיד שרץ אצל המשתמש, ולכן ה־latency שלה
+הוא מדד מוצר ולא סקרנות.
 
 ---
 
 # 36. מה צריך להיות השלב הבא
 
-## Priority 1: Real Embedding Runtime
+הסדר המחייב הוא S0–S8 ב־[`שלבי ויעדי התקדמות.md`](../שלבי%20ויעדי%20התקדמות.md). מה
+שנוגע למאגר הזה:
 
-להחליף:
+## ✅ נעשה: Real Embedding Runtime (PR #2)
 
-```text
-deterministic feature hashing
-```
+inference אמיתי מול GGUF, tokenizer, EOS, last-token pooling ו־L2, מאומתים מול
+golden vectors. מאחורי `--features llama-backend`.
 
-ב:
+## ✅ נעשה: Batch Embeddings
 
-```text
-real GGUF inference
-```
+האינדוקס קורא ל־`embed_batch()`, וה־backend האמיתי מבצע batching מרובה־סדרות אמיתי.
 
-עם:
+## ✅ נעשה: Manifest Compatibility
 
-```text
-Tokenizer
-Model loading
-Q4 inference
-last-token pooling
-L2 normalization
-```
+עשרת הממדים נבדקים, כולל SHA-256 של קובץ המודל.
+
+## ✅ נעשה: S0 — יישור חוזה המוצר
+
+הגדרת האינדקס הרשמי כ־read-only, ביטול המונח `cloud`, יישור README/CODE_MAP/מפת
+דרכים והכרעת הפצת המודל.
 
 ---
 
-## Priority 2: Real Vector Backend
+## הבא בתור
 
-להחליף:
+העבודה עצמה ושערי הקבלה מוגדרים במסמך השלבים; לא משוכפלים כאן, כדי שלא יהיו שתי
+גרסאות שיכולות להיפרד. מה שכן שייך למסמך הזה הוא נקודת ההתחלה בקוד:
 
-```text
-HashMap
-```
+| שלב | מאיפה מתחילים בקוד |
+|---|---|
+| **S1** — ייצוג, ממד ודיוק | [`chunker.rs`](../src/semantic/chunker.rs) (טקסט ההטמעה) ו־[`benchmark/`](../src/benchmark/) (המדידה). התוצר מקפיא שדות בזהות האינדקס |
+| **S2** — backend מתמיד read-only | להחליף את `store: VectorStore` ב־[`engine.rs`](../src/semantic/engine.rs) בתלות ב־[`VectorStoreBackend`](../src/semantic/store_backend.rs), ואז למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M |
+| **S3** — חוזה ארטיפקט | להרחיב [`IndexVersion`](../src/semantic/versioning.rs), ולחשוף את [`IndexImporter`](../src/distribution/importer.rs) |
 
-ב־backend persistent/ANN.
-
-ה־VectorStore API צריך להישאר stable.
-
----
-
-## Priority 3: Batch Embeddings — ✅ נעשה
-
-האינדוקס קורא ל־`embed_batch()`. מה שנשאר הוא לוודא שה־backend האמיתי (P2) באמת
-מנצל את הקבוצה, ולא מפרק אותה בחזרה ל־inference בודד.
+S1 לפני S2, או במקביל — אך בלי לקפוא על פורמט ארטיפקט לפני שהמדידה בידיים.
 
 ---
 
-## Priority 4: Full Incremental Indexing
+## ❌ מה **אינו** בתור
 
-ליישם:
+- אינדוקס ברקע, progress stream, cancel/resume.
+- diff/upsert פר־ספר בזמן ריצת אוצריא, ו־chunk-level incremental indexing אצל המשתמש.
+- overlay ניתן לכתיבה לספרי משתמש.
 
-```text
-book-level diff
-+
-chunk-level diff
-```
-
-כדי לא לחשב embeddings מחדש עבור chunks שלא השתנו.
-
-ה־`chunk_hash` וה־semantic IDs שכבר קיימים נותנים בסיס טוב לזה.
-
----
-
-## Priority 5: Manifest Compatibility — ✅ נעשה
-
-שלושת הדגלים הם בדיקות אמיתיות, ו־`model SHA-256` הוא חלק מה־compatibility check —
-יחד עם pooling, quantization, vector precision, embedding backend ו־vector backend.
+`chunk_hash` וה־semantic IDs נשארים שימושיים לצד ה־build (בנייה חוזרת של ארטיפקט
+בלי לחשב מחדש מה שלא השתנה), לא לעדכון בזמן ריצה.
 
 ---
 
@@ -1442,15 +1497,23 @@ Flutter צריך לדבר מול API יציב.
 
 ---
 
-## ❌ לא להניח ש־zvec כבר מחובר
+## ❌ לא להניח ש־backend מתמיד כבר מחובר
 
-הקוד מוכן לכיוון הזה, אבל ה־implementation הנוכחי הוא in-memory.
+`ZevcStore` קיים ונבדק, אבל `SemanticEngine::open()` פותח את ה־store בזיכרון. ובנוסף:
+`ZevcStore` אינו ANN, אינו mmap ואינו הספרייה `zvec` — הוא סורק את כל הווקטורים.
 
 ---
 
-## ❌ לא לבצע re-index מלא בכל שינוי קטן
+## ❌ ארבעה איסורים שנובעים מחוזה המוצר
 
-המטרה היא incremental indexing.
+מוגדרים ומונמקים ב־[`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §§3–6 ו־§10; כאן רק
+בשורה, כדי שלא יהיו שני ניסוחים שיכולים להיפרד:
+
+1. אין overlay לספרי משתמש (§3).
+2. אין אינדוקס ברקע באפליקציה, ולכן גם אין progress/cancel (§4).
+3. „ענן” אינו תיאור של המסלול — אריזת קבצים אינה שירות (§5).
+4. ארטיפקט שזהותו אינה תואמת אינו נפתח. `line_id` נגזר מסדר הקטלוג, ולכן אינדקס
+   מגרסה אחרת מצביע לשורות **לא נכונות** ולא רק מפספס (§6).
 
 ---
 
@@ -1486,24 +1549,39 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 
 ### Embedding
 
-* [ ] GGUF model נטען באמת
-* [ ] tokenizer עובד
-* [ ] inference עובד
-* [ ] pooling תואם למודל
-* [ ] normalization תקין
-* [ ] Q4 inference נבדק
+* [x] GGUF model נטען באמת (`--features llama-backend`)
+* [x] tokenizer עובד — Qwen2-BPE, `parse_special = false`
+* [x] inference עובד
+* [x] pooling תואם למודל — last-token, EOS מצורף אחרי החיתוך
+* [x] normalization תקין — במעבר יחיד ב־`EmbeddingRuntime`
+* [x] Q4 inference נבדק מול golden vectors (`token_ids` מדויק, ואז סבילות וקטורית)
+* [ ] latency של הטמעת שאילתה על מכשירי היעד
 
 ### Vector Store
 
-* [ ] persistence
-* [ ] ANN — נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה ריצה), כלומר
-  ~2.5–3.2s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה (`cargo bench`)
+* [x] persistence — קיים ב־`ZevcStore`
+* [ ] persistence **במסלול שה־engine פותח** (S2)
+* [ ] מצב official-read-only ללא delete/upsert בזמן ריצה (S2)
+* [ ] ANN או הוכחה שאין בו צורך — נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה
+  ריצה), כלומר ~2.5–3.2s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה
+  (`cargo bench`)
+* [ ] cold-open, peak RSS וגודל דיסק ב־1M וב־6M רשומות (S2)
 * [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
 * [x] insert/update/delete
 * [x] filtering
 * [x] dimension validation
 
-### Indexing
+### Artifact / Distribution
+
+* [x] manifest חבילה + SHA-256 לכל payload
+* [x] התקנה אטומית עם staging, גיבוי ו־rollback
+* [x] אימות מחדש של ה־payload **אחרי** ההעתקה, לא רק במקור
+* [ ] זהות corpus, `tantivy_schema_version`, `document_id_scheme_version` (S3)
+* [ ] התאמת ספירות ספרים/וקטורים וגודל מול ה־manifest (S3)
+* [ ] חשיפת ה־importer דרך ה־API / FFI (S3–S5)
+* [ ] builder שמפיק את הארטיפקט מ־Tantivy הסופי (S4)
+
+### Indexing (צד ה־build בלבד)
 
 * [x] initial full index
 * [x] incremental book indexing (ברמת ספר, כולל PDF)
@@ -1518,9 +1596,12 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [x] BM25 + semantic
 * [x] score normalization
 * [x] dynamic weighting
-* [ ] RRF benchmark
+* [x] RRF בשימוש — נבחר לפי `FusionStrategy` בפרופיל
+* [ ] RRF benchmark — איזו אסטרטגיה טובה יותר עדיין לא נמדד
+* [x] threshold לתוצאה סמנטית לא רלוונטית
 * [x] grouping
 * [x] provenance
+* [ ] `total_count` אמיתי (כרגע מספר המועמדים שנכנסו ל־fusion)
 
 ### Reliability
 
@@ -1531,10 +1612,12 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 
 ### Performance
 
-* [ ] embedding benchmark — חסר backend אמיתי
-* [ ] indexing benchmark
+* [ ] embedding benchmark — ה־backend קיים; המדידה השיטתית עדיין לא נעשתה
+* [ ] indexing benchmark (צד ה־build)
 * [x] vector search benchmark — [`benches/vector_search.rs`](../benches/vector_search.rs)
+* [x] תשתית מדידה גנרית — [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
 * [ ] memory benchmark
+* [ ] cold-open benchmark
 * [ ] end-to-end query latency
 
 ### Quality
@@ -1602,23 +1685,29 @@ Memory
 
 # 41. Important Technical Debt
 
-ה־technical debt המרכזי כרגע הוא לא בארכיטקטורה, אלא בפער בין abstraction לבין backend אמיתי:
+ה־technical debt המרכזי כרגע הוא לא בארכיטקטורה, אלא בפער בין מה שקיים ב־crate לבין
+מה שנמצא במסלול הפעיל:
 
 ```text
 Architecture
      │
-     ├── EmbeddingRuntime abstraction
-     │        └── actual inference missing
+     ├── EmbeddingRuntime + backend contract
+     │        └── ✅ inference אמיתי קיים (feature)
      │
-     └── VectorStore abstraction
-              └── production zvec missing
+     ├── VectorStoreBackend contract
+     │        ├── ZevcStore קיים ונבדק — אך ה-engine לא תלוי בו   (S2)
+     │        └── אין ANN/mmap, וסקייל 6M לא נמדד                  (S2)
+     │
+     ├── IndexVersion
+     │        └── חסרות זהות corpus / Tantivy / ID scheme          (S3)
+     │
+     └── distribution (package + importer)
+              └── קיים ונבדק — אך לא חשוף ב-API, ואין builder      (S3–S4)
 ```
 
-זה דווקא מצב טוב יחסית.
+זה דווקא מצב טוב יחסית: החוזים במקום, וכל פער הוא חיבור או הרחבה ולא שכתוב.
 
-לא צריך לזרוק את הארכיטקטורה.
-
-צריך להשלים את ה־implementations מאחוריה.
+לא צריך לזרוק את הארכיטקטורה. צריך לחבר את מה שקיים ולמדוד אותו.
 
 ---
 
@@ -1627,30 +1716,31 @@ Architecture
 הסדר המומלץ:
 
 ```text
-1. Real GGUF inference
-        ↓
-2. Validate generated embeddings
-        ↓
-3. Batch inference
-        ↓
-4. Persistent vector backend
-        ↓
-5. ANN search
-        ↓
-6. Incremental indexing
-        ↓
-7. FFI integration
-        ↓
-8. Real Otzaria integration
-        ↓
-9. Benchmarking
-        ↓
-10. Ranking optimization
+✅ 1. Real GGUF inference
+✅ 2. Validate generated embeddings (golden vectors)
+✅ 3. Batch inference
+✅ 4. S0 — product contract alignment
+   ↓
+   5. S1 — quality dataset → dimension & precision decision
+   ↓
+   6. S2 — persistent read-only backend, measured at 1M and 6M
+   ↓
+   7. S3 — artifact identity contract & atomic install
+   ↓
+   8. S4 — builder from the final Tantivy index   (otzaria_search_engine)
+   ↓
+   9. S5 — repin, open/install API, FFI            (otzaria_search_engine)
+   ↓
+  10. S6–S7 — artifact/model management, BLoC & UI  (otzaria)
+   ↓
+  11. S8 — release gates on the full platform matrix
 ```
 
-לא כדאי להשקיע כרגע שעות בכיוון של tuning ל־fusion אם ה־embedding עצמו עדיין feature hashing.
+S1 לפני S2 בכוונה: ממד ודיוק קובעים אם סריקה מלאה בכלל קבילה, ולכן בחירת backend לפני
+בחירת ממד היא בחירה בעיניים עצומות. שני השלבים יכולים לרוץ במקביל, אבל אין לקפוא על
+פורמט ארטיפקט לפני שה־מדידה של S1 בידיים.
 
-אין הרבה טעם לכוון את ההגה כשעדיין לא התקנו את המנוע.
+כיול עדין של fusion נשאר אחרון: הוא כיוון ההגה, לא המנוע.
 
 ---
 
@@ -1693,13 +1783,14 @@ Tantivy/BM25
 
 # 44. Current State in One Paragraph
 
-הפרויקט כבר מחזיק שלד ארכיטקטוני רחב של Semantic Search: semantic sidecar עצמאי,
-chunking, stable IDs, manifest, incremental book diff, embedding abstraction,
-vector-store abstraction, semantic retrieval, hybrid fusion, dynamic weighting,
-RRF primitive, grouping ו־Rust API seam ל־FFI. הוא עדיין אינו מנוע production:
-בבנייה רגילה אין backend inference בכלל; deterministic feature hashing זמין רק
-כ־mock מפורש לבדיקות. ה־`VectorStore` הוא `HashMap` בזיכרון ולא backend
-persistent/ANN, וטרם נוצרו bindings או חיבור לאפליקציית אוצריא.
+הפרויקט מחזיק semantic sidecar עצמאי עם chunking, stable IDs, manifest, incremental
+book diff, חוזה backend ל־embedding עם **inference אמיתי** מאחורי feature ומאומת מול
+golden vectors, חוזה backend ל־store, שני stores (בזיכרון ו־snapshot לדיסק), hybrid
+fusion עם פרופילים ו־RRF בשימוש, thresholds, grouping, caches, telemetry, אב־טיפוס של
+אריזה וייבוא אטומי, ו־Rust API seam ל־FFI. הוא עדיין אינו מוצר: ה־engine פותח את
+ה־store שבזיכרון ולכן במסלול הפעיל אין persistence; אין ANN ואין הוכחת סקייל על ~6.1
+מיליון שורות; `IndexVersion` אינו קושר את הארטיפקט ל־corpus מסוים; אין builder שמפיק
+ארטיפקט מ־Tantivy; ובאוצריא ה־BLoC וה־UI אינם מפעילים את המסלול.
 
 ---
 
@@ -1725,90 +1816,81 @@ persistent/ANN, וטרם נוצרו bindings או חיבור לאפליקציי�
 ```text
 src/
 │
-├── lib.rs
-│   └── crate architecture / module exports
+├── lib.rs            → crate architecture, module exports, product contract
+├── main.rs           → development CLI
+├── errors.rs         → error taxonomy
 │
-├── errors.rs
-│   └── error taxonomy
-│
-├── api/
-│   └── Flutter / FFI boundary
+├── api/              → Flutter / FFI boundary
 │
 ├── semantic/
-│   ├── chunker.rs
-│   │   └── text → semantic chunks
-│   │
-│   ├── embedding.rs
-│   │   └── model runtime abstraction
-│   │
-│   ├── engine.rs
-│   │   └── semantic orchestration
-│   │
-│   ├── manifest.rs
-│   │   └── index compatibility + state
-│   │
-│   ├── store.rs
-│   │   └── vector backend abstraction
-│   │
-│   └── types.rs
-│       └── semantic domain types
+│   ├── chunker.rs        → text → semantic chunks
+│   ├── embedding.rs      → validation, batching, normalization (choke point)
+│   ├── embedding_cache.rs→ LRU over embedded texts
+│   ├── backend.rs        → EmbeddingBackend contract + selection
+│   ├── llama_backend.rs  → real inference (feature `llama-backend`)
+│   ├── engine.rs         → semantic orchestration
+│   ├── manifest.rs       → index compatibility + state
+│   ├── store.rs          → in-memory vector store (the active one)
+│   ├── store_backend.rs  → VectorStoreBackend contract
+│   ├── zevc_store.rs     → disk snapshots, full scan, not wired
+│   ├── versioning.rs     → IndexVersion identity
+│   └── types.rs          → semantic domain types
 │
-└── hybrid/
-    ├── coordinator.rs
-    │   └── complete search orchestration
-    │
-    ├── fusion.rs
-    │   └── score fusion / RRF
-    │
-    ├── ranking.rs
-    │   └── query classification + weighting
-    │
-    └── grouping.rs
-        └── result grouping/deduplication
+├── hybrid/
+│   ├── coordinator.rs    → complete search orchestration
+│   ├── fusion.rs         → score fusion / RRF
+│   ├── ranking.rs        → query classification + weighting
+│   ├── grouping.rs       → result grouping/deduplication
+│   ├── metadata_ranker.rs→ facet-derived bonuses
+│   ├── hebrew_normalizer.rs → nikud/taamim, query language
+│   └── cache.rs          → query result cache
+│
+├── config/
+│   ├── profiles.rs       → Fast/Balanced/Best + fusion strategy
+│   └── feature_flags.rs  → per-run overrides
+│
+├── distribution/
+│   ├── package.rs        → package manifest + payload checksums
+│   └── importer.rs       → staged atomic install
+│
+├── telemetry/            → in-process counters (no network)
+└── benchmark/            → timing & percentile helpers
 ```
 
 ---
 
 # 47. The Most Important Next Task
 
-### Replace the fake embedding implementation.
+### Decide the representation (S1), then wire a persistent read-only backend (S2).
 
-It is already fenced off from production (feature `mock-embedding`), which means a
-release build fails loudly instead of serving fake vectors — but it also means
-there is **no working semantic path in production at all** until a real backend
-lands. That is the next task.
+Replacing the fake embedding — the task this section used to name — is **done**:
+`--features llama-backend` runs real GGUF inference, verified against committed
+golden vectors. Semantic quality can now actually be measured, which is exactly why
+measuring it is the next task rather than an optional one.
 
-Current (test/dev builds only):
-
-```rust
-mock::hash_embedding(text, self.config.embedding_dim)
-```
-
-Target:
+The order matters and is not interchangeable:
 
 ```text
-text
- ↓
-tokenizer
- ↓
-GGUF model
- ↓
-Q4 inference
- ↓
-hidden states
- ↓
-last-token pooling
- ↓
-L2 normalization
- ↓
-1024-dimensional embedding
+S1  labelled rabbinic query set
+        ↓
+    Recall@K / MRR / nDCG per representation and per dimension
+        ↓
+    frozen: embedding_text_version, dim, precision, max_tokens, pooling, norm
+        ↓
+S2  SemanticEngine depends on VectorStoreBackend, not VectorStore
+        ↓
+    official-read-only mode (no delete/upsert at app runtime)
+        ↓
+    measured at 1M and 6M: cold-open, p50/p95/p99, peak RSS, disk
+        ↓
+    ANN on disk only if the measurement demands it
 ```
 
-Until this exists, **semantic quality cannot actually be evaluated**.
+Doing S2 first means choosing a storage strategy without knowing whether the
+vectors are 0.72 GiB or 23.1 GiB — a 32× spread that decides the answer for you.
 
-After that, replace the in-memory `HashMap` vector store with the intended persistent ANN backend.
-
-Only then does it make sense to benchmark the complete search system and tune hybrid ranking.
+Only after both does it make sense to freeze an artifact format (S3), build it from
+Tantivy (S4), and tune hybrid ranking against real relevance numbers.
 
 ---
 
@@ -1824,21 +1906,32 @@ Only then does it make sense to benchmark the complete search system and tune hy
 
 **Index-incompatibility handling:** 🟢 Implemented — disables the semantic path
 
-**Embedding abstraction:** 🟢 Ready for backend
+**Embedding abstraction:** 🟢 Implemented
 
-**Actual embedding inference:** 🔴 Missing (and unavailable in production builds)
+**Actual embedding inference:** 🟢 Implemented behind `--features llama-backend`,
+verified against golden vectors. A default build still has no backend at all, by
+design — it fails loudly rather than serving fake vectors.
 
-**Vector abstraction:** 🟢 Ready for backend
+**Vector abstraction:** 🟢 `VectorStoreBackend` exists
 
-**Persistent vector database:** 🔴 Missing
+**Persistent vector database:** 🟡 `ZevcStore` persists and reopens with verified
+checksums — but the engine still opens the in-memory store, so **the active path has
+no persistence**.
 
-**ANN retrieval:** 🔴 Missing — brute force measures 84–208ms per query over
-200k×1024 on one machine (`cargo bench` prints min/median/max; the spread is the
-machine, not the code). Extrapolated linearly, that is ~2.5–3.2s over the
-6,058,210-line library — an extrapolation, not a measurement. Load-bearing for P4,
-not an optimization.
+**ANN retrieval:** 🔴 Missing — and both stores scan everything. Brute force measures
+84–208ms per query over 200k×1024 on one machine (`cargo bench` prints
+min/median/max; the spread is the machine, not the code). Extrapolated linearly, that
+is ~2.5–3.2s over the 6,058,210-line library — an extrapolation, not a measurement.
+Whether ANN is needed at all is an S2 decision that depends on the S1 dimension
+choice.
 
-**Hybrid fusion:** 🟢 Implemented
+**Artifact identity:** 🟡 `IndexVersion` covers model/chunking/backend; corpus id,
+Tantivy schema version and ID-scheme version are missing (S3).
+
+**Packaging & atomic install:** 🟡 Implemented and tested, not exposed through the
+API, and no builder produces an official artifact yet.
+
+**Hybrid fusion:** 🟢 Implemented — weighted / RRF / adaptive, chosen by profile
 
 **Search modes (lexical / hybrid / semantic):** 🟢 Implemented
 
@@ -1848,11 +1941,15 @@ not an optimization.
 
 **Grouping:** 🟢 Implemented
 
-**FFI boundary:** 🟡 Skeleton/integration stage
+**Profiles / feature flags / caches / telemetry:** 🟢 Implemented
 
-**Production integration with Otzaria:** 🟡 In progress
+**FFI boundary:** 🟡 Seam only; bindings are built in `otzaria_search_engine`
 
-**Search-quality benchmark:** 🔴 Missing
+**Production integration with Otzaria:** 🔴 The gateway and repository expose the
+API; the BLoC and UI do not invoke it.
+
+**Search-quality benchmark:** 🔴 Missing — measurement helpers exist, a labelled
+rabbinic relevance dataset does not (S1)
 
 **Production readiness:** 🔴 Not yet
 
@@ -1874,29 +1971,25 @@ Hybrid ranking
 Flutter API
 ```
 
-The main work now is to turn the existing abstractions into real production implementations:
+The main work now is to connect and measure what already exists:
 
 ```text
-Fake embedding
-     ↓
-Real GGUF inference
+✅ Fake embedding              →  Real GGUF inference
+✅ Per-chunk inference         →  Batch inference
 
-HashMap vectors
-     ↓
-Persistent ANN backend
+Engine bound to VectorStore    →  Engine bound to VectorStoreBackend,
+                                  official-read-only, measured at 6M
 
-Per-chunk inference
-     ↓
-Batch inference
+Model-only index identity      →  Corpus + Tantivy + ID-scheme identity
 
-Book-level diff
-     ↓
-Chunk-level incremental indexing
+Package written by tests       →  Artifact built from the final Tantivy index
 
-Heuristic weights
-     ↓
-Benchmark-driven ranking
+Heuristic weights              →  Benchmark-driven ranking
 ```
+
+Two rows deliberately absent, because they are out of scope rather than pending:
+chunk-level incremental indexing at user runtime, and a writable overlay for
+personal books. See [`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §9.
 
 The most important principle remains:
 

@@ -7,7 +7,9 @@
 //! - Embedding backend contract (what an inference implementation must provide)
 //! - Embedding runtime (model validation, batching, normalization)
 //! - Real GGUF inference through llama.cpp (behind the `llama-backend` feature)
-//! - Vector store (zvec persistence and retrieval)
+//! - Vector store backend contract, plus an in-memory and a snapshot-persisting
+//!   implementation. The engine still opens the in-memory one; neither is an ANN
+//!   index, and neither is the `zvec` library.
 //! - Semantic engine (orchestration)
 
 pub mod backend;
@@ -15,7 +17,7 @@ pub mod chunker;
 pub mod embedding;
 pub mod embedding_cache;
 pub mod engine;
-// Real GGUF inference (roadmap P2 stage 3). Compiled only with
+// Real GGUF inference (delivered in PR #2). Compiled only with
 // `--features llama-backend`, which is what keeps a default build from pulling
 // llama.cpp and ggml through cmake on every `cargo build`. Which backend a build
 // actually gets is decided in `backend`, not here.

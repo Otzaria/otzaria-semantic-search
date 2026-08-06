@@ -5,8 +5,9 @@
 //! its neighbours within the same section.
 //!
 //! Whether prefixing the book title and reference helps retrieval, and whether
-//! neighbour context helps at all, is an open question measured in roadmap P3 —
-//! the current behaviour is the starting point, not a validated choice.
+//! neighbour context helps at all, is an open question that stage S1 measures on a
+//! labelled query set — the current behaviour is the starting point, not a validated
+//! choice.
 
 use crate::semantic::types::{BookForIndexing, SemanticChunk};
 use sha2::{Digest, Sha256};

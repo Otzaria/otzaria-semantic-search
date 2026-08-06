@@ -376,7 +376,7 @@ pub struct SemanticChunk {
 /// Note that the facet list is duplicated per chunk. That is a known cost of the
 /// current in-memory backend; how metadata is laid out (shared per book, or
 /// hydrated from Tantivy instead of stored at all) is decided with the
-/// persistent backend in roadmap P4.
+/// persistent read-only backend in stage S2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorMetadata {
     pub semantic_id: String,
@@ -482,8 +482,9 @@ pub struct FusedCandidate {
     ///
     /// The vector store deliberately does not duplicate line bodies, so a
     /// semantic-only hit carries metadata but no text. Rendering such a result
-    /// without hydrating it produces an empty card. Hydration itself is wired up
-    /// in roadmap P5; until then this flag is the contract that tells a caller
+    /// without hydrating it produces an empty card. Hydrating by `line_id` is the
+    /// host engine's job — `otzaria_search_engine` owns Tantivy — and S5 is where the
+    /// official path is wired to it. This flag is the contract that tells a caller
     /// the text is missing rather than genuinely blank.
     pub needs_hydration: bool,
     pub source: ResultSource,
@@ -577,7 +578,8 @@ pub struct HybridSearchResult {
     /// The coordinator only ever sees the candidate window it was handed
     /// (lexical candidates from Tantivy plus its own top-k semantic hits), so a
     /// corpus-wide total cannot be derived here. A truthful total has to come
-    /// from the lexical engine's own count; wiring that through is roadmap P5.
+    /// from the lexical engine's own count, so wiring it through belongs to the host
+    /// engine. Still open.
     pub total_count: u32,
     /// Number of groups when grouping was requested, otherwise `None`.
     pub group_count: Option<u32>,
@@ -943,19 +945,6 @@ impl IndexingSummary {
     pub fn books_processed(&self) -> u32 {
         self.books_indexed + self.books_skipped + self.books_empty
     }
-}
-
-/// Represents the current progress of an indexing operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexingProgress {
-    pub phase: String,
-    pub current_book: Option<String>,
-    pub books_processed: u32,
-    pub books_total: u32,
-    pub chunks_generated: u32,
-    pub vectors_written: u32,
-    pub is_complete: bool,
-    pub error: Option<String>,
 }
 
 #[cfg(test)]

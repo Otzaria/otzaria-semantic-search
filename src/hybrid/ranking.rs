@@ -158,8 +158,9 @@ pub fn compute_alpha(features: &QueryFeatures) -> f32 {
 
 /// Configuration for bonuses and penalties during ranking.
 ///
-/// These values are unmeasured heuristics. Calibrating them — or dropping
-/// weighted fusion for RRF, where they would not apply — is roadmap P5.
+/// These values are unmeasured heuristics. Calibrating them — or dropping weighted
+/// fusion for RRF, where they would not apply — needs the labelled relevance set
+/// that stage S1 produces. Until then, treat the numbers as placeholders.
 #[derive(Debug, Clone)]
 pub struct BonusConfig {
     /// Added to a candidate that both engines returned.

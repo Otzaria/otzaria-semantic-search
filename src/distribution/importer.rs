@@ -1,4 +1,4 @@
-use crate::cloud::package::{validate_payload_name, IndexPackage};
+use crate::distribution::package::{validate_payload_name, IndexPackage};
 use crate::semantic::versioning::IndexVersion;
 use std::fs;
 use std::io;
@@ -165,7 +165,7 @@ fn replace_directory(staging: &Path, target: &Path, backup: &Path) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloud::package::{IndexPackage, PackageManifest};
+    use crate::distribution::package::{IndexPackage, PackageManifest};
     use std::collections::HashMap;
 
     struct TempDir(PathBuf);
