@@ -172,6 +172,10 @@ pub struct OfficialSemanticIndex {
     store: Box<dyn VectorSearchBackend>,
     runtime: EmbeddingRuntime,
     recovery: InstallRecovery,
+    /// Counted once, at open, because the payload cannot change under a read-only store —
+    /// and because counting means listing every book key, which is not something
+    /// [`Self::status`] should allocate on every call.
+    book_count: u32,
 }
 
 impl OfficialSemanticIndex {
@@ -230,13 +234,14 @@ impl OfficialSemanticIndex {
         // the reader decoding what the payload says it holds.
         let store =
             ReadOnlyZevcStore::open(verified.root(), verified.identity().model.embedding_dim)?;
+        let book_count = verify_counts_against_payload(&verified, &store)?;
         let index = Self {
             verified,
             store: Box::new(store),
             runtime,
             recovery,
+            book_count,
         };
-        index.verify_counts_against_payload()?;
 
         log::info!(
             "Opened official semantic index at {}: {} vector(s) across {} book(s), \
@@ -248,36 +253,6 @@ impl OfficialSemanticIndex {
             index.artifact_digest()
         );
         Ok(index)
-    }
-
-    /// Check the manifest's counts against what the payload actually holds.
-    ///
-    /// [`PackageManifest`](crate::distribution::package::PackageManifest) can only refuse
-    /// a count of zero on its own — deciding that a payload holds exactly `vector_count`
-    /// vectors across `book_count` books needs a reader of the store format, which is
-    /// this type. The definition the packer has to match: `vector_count` is the number of
-    /// records, and `book_count` is the number of **distinct `source_book_key`s** among
-    /// them.
-    fn verify_counts_against_payload(&self) -> Result<(), ArtifactError> {
-        let disagrees = |reason: String| ArtifactError::ManifestDisagreesWithPayload { reason };
-
-        let vectors = self.store.count();
-        if vectors != self.verified.vector_count() {
-            return Err(disagrees(format!(
-                "the manifest declares {} vector(s) and the payload holds {vectors}",
-                self.verified.vector_count()
-            )));
-        }
-
-        let books = self.store.book_keys().len().min(u32::MAX as usize) as u32;
-        if books != self.verified.book_count() {
-            return Err(disagrees(format!(
-                "the manifest declares {} book(s) and the payload's vectors belong to \
-                 {books}",
-                self.verified.book_count()
-            )));
-        }
-        Ok(())
     }
 
     /// Embed a query and return the closest stored vectors.
@@ -367,15 +342,47 @@ impl OfficialSemanticIndex {
         self.store.count()
     }
 
-    /// Books the payload's vectors belong to.
+    /// Books the payload's vectors belong to, as counted at open.
     pub fn book_count(&self) -> u32 {
-        self.store.book_keys().len().min(u32::MAX as usize) as u32
+        self.book_count
     }
 
     /// Book keys the artifact holds vectors for, in a deterministic order.
     pub fn book_keys(&self) -> Vec<String> {
         self.store.book_keys()
     }
+}
+
+/// Check the manifest's counts against what the payload actually holds, and return the
+/// book count so nothing has to list every key again.
+///
+/// [`PackageManifest`](crate::distribution::package::PackageManifest) can only refuse a
+/// count of zero on its own — deciding that a payload holds exactly `vector_count` vectors
+/// across `book_count` books needs a reader of the store format. The definition the packer
+/// has to match: `vector_count` is the number of records, and `book_count` is the number of
+/// **distinct `source_book_key`s** among them.
+fn verify_counts_against_payload(
+    verified: &VerifiedPackage,
+    store: &dyn VectorSearchBackend,
+) -> Result<u32, ArtifactError> {
+    let disagrees = |reason: String| ArtifactError::ManifestDisagreesWithPayload { reason };
+
+    let vectors = store.count();
+    if vectors != verified.vector_count() {
+        return Err(disagrees(format!(
+            "the manifest declares {} vector(s) and the payload holds {vectors}",
+            verified.vector_count()
+        )));
+    }
+
+    let books = store.book_keys().len().min(u32::MAX as usize) as u32;
+    if books != verified.book_count() {
+        return Err(disagrees(format!(
+            "the manifest declares {} book(s) and the payload's vectors belong to {books}",
+            verified.book_count()
+        )));
+    }
+    Ok(books)
 }
 
 #[cfg(test)]
