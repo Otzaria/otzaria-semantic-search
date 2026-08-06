@@ -38,6 +38,7 @@ use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, IndexVersion
 use otzaria_semantic_search::semantic::zevc_store::{
     ZevcStore, ZevcStoreConfig, SNAPSHOT_FILENAMES,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -240,15 +241,21 @@ fn lexical(line_id: u64, text: &str, score: f32) -> LexicalCandidate {
     }
 }
 
-/// Name, length and SHA-256 of every file in `dir`.
-fn fingerprint(dir: &Path) -> Vec<(String, u64)> {
-    let mut entries: Vec<(String, u64)> = fs::read_dir(dir)
+/// Name, length **and SHA-256** of every file in `dir`.
+///
+/// The hash is the point. Without it, "opening changed nothing" would still hold after a
+/// rewrite that kept every length — which is precisely the class of change this stage is
+/// about, so a length-only fingerprint would assert the weakest version of the claim.
+fn fingerprint(dir: &Path) -> Vec<(String, u64, String)> {
+    let mut entries: Vec<(String, u64, String)> = fs::read_dir(dir)
         .unwrap()
         .map(|entry| {
             let entry = entry.unwrap();
+            let bytes = fs::read(entry.path()).unwrap();
             (
                 entry.file_name().to_string_lossy().into_owned(),
-                entry.metadata().unwrap().len(),
+                bytes.len() as u64,
+                format!("{:x}", Sha256::digest(&bytes)),
             )
         })
         .collect();
