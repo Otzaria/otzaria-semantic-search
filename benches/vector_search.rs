@@ -15,8 +15,9 @@
 //!
 //! # What it is for
 //!
-//! Whether brute-force scanning can serve the real library at all, and what an
-//! ANN backend (roadmap P4) has to beat. The full-library figure is *extrapolated*
+//! Whether brute-force scanning can serve the real library at all, and the baseline
+//! any retrieval backend chosen in S2 has to improve on — while meeting its own
+//! recall budget, if it is an approximate one. The full-library figure is *extrapolated*
 //! from the measured rate — the linear cost of a brute-force scan is exactly what
 //! makes the extrapolation sound, and exactly why it stops holding the moment a
 //! real index is introduced. Run it before and after any change to

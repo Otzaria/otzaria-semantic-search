@@ -17,7 +17,7 @@ pub mod chunker;
 pub mod embedding;
 pub mod embedding_cache;
 pub mod engine;
-// Real GGUF inference (roadmap P2 stage 3). Compiled only with
+// Real GGUF inference (delivered in PR #2). Compiled only with
 // `--features llama-backend`, which is what keeps a default build from pulling
 // llama.cpp and ggml through cmake on every `cargo build`. Which backend a build
 // actually gets is decided in `backend`, not here.

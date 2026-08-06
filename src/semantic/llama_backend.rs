@@ -1,4 +1,4 @@
-//! Real GGUF inference through llama.cpp (roadmap P2 stage 3).
+//! Real GGUF inference through llama.cpp (delivered in PR #2).
 //!
 //! Behind the non-default `llama-backend` feature; a default build keeps failing
 //! with [`EmbeddingError::BackendUnavailable`]. Vector measurements are recorded in

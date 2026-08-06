@@ -947,12 +947,6 @@ impl IndexingSummary {
     }
 }
 
-// `IndexingProgress` was removed in S0. It was the DTO for streaming indexing
-// progress to the application, and the application does not index — it installs a
-// prebuilt read-only artifact. Nothing constructed it. A build tool that wants to
-// report progress should define its own type next to the tool, rather than keep a
-// public DTO here for a cancelled feature.
-
 #[cfg(test)]
 mod tests {
     use super::*;
