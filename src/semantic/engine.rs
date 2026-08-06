@@ -2199,11 +2199,13 @@ mod tests {
         narrower.embedding_dim = config.embedding_dim / 2;
         let store = crate::semantic::zevc_store::ZevcStore::open_or_create(narrower).unwrap();
 
-        match SemanticEngine::with_store(config, Box::new(store)) {
+        // Mapped to a describable value: an engine is not `Debug`, and a panic message
+        // reading "got true" says nothing about what went wrong.
+        match SemanticEngine::with_store(config, Box::new(store)).map(|engine| engine.status()) {
             Err(SemanticSearchError::Config(message)) => {
                 assert!(message.contains("dimensional"), "{message}")
             }
-            other => panic!("a narrower store must be refused, got {}", other.is_ok()),
+            other => panic!("a narrower store must be refused, got {other:?}"),
         }
     }
 }
