@@ -4,6 +4,14 @@
 1. **Semantic Subsystem (Sidecar)** — מנהלת את ה-Embedding, ה-Vector Store, ה-Chunking, וה-Manifest.
 2. **Hybrid Coordinator** — מנהלת את ניתוח השאילתא, נורמליזציית הציונים, ה-Fusion (מיזוג ציוני BM25 וסמנטיקה), ה-Ranking, ה-Grouping (קיבוץ לפי קטע או טקסט זהה), וה-Fallback.
 
+סביבן שלוש תת-מערכות תומכות שנוספו ב-PR #3: `config` (פרופילים ודגלים), `telemetry`
+(מוני ריצה בתוך התהליך) ו-`distribution` (אריזה והתקנה של אינדקס מוכן).
+
+> היקף המוצר מוגדר ב-[`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md). שני דברים שכדאי
+> לדעת לפני קריאת המפה: האינדקס הרשמי נבנה מראש ונפתח read-only, ולכן API האינדוקס
+> שמתואר כאן הוא **פיגום אב-טיפוס** ולא המסלול של האפליקציה; ו-`ZevcStore` הוא
+> snapshot לדיסק עם סריקה מלאה — לא ANN, לא mmap ולא הספרייה `zvec`.
+
 ---
 
 ## 🏛️ מבנה העץ של המאגר
@@ -13,33 +21,57 @@ otzaria-semantic-search/
 ├── Cargo.toml                              # הגדרות תלויות והידור
 ├── README.md                                # מסמך ראשי ורישיון
 ├── docs/
+│   ├── PRODUCT_CONTRACT.md                 # חוזה המוצר — גובר על כל מסמך אחר
+│   ├── MODEL_DISTRIBUTION.md               # כיצד המודל מגיע למכשיר
 │   ├── CODE_MAP.md                         # מפת קוד זו
 │   └── DEVELOPMENT.md                      # מדריך ארכיטקטורה ופיתוח מקיף
 ├── .github/workflows/
-│   └── ci.yml                              # CI/CD אוטומטי (Linux, Windows, macOS × 2 קונפיגורציות features)
+│   └── ci.yml                              # CI/CD אוטומטי (מטריצת OS, backend inference, שער golden)
+├── benches/
+│   └── vector_search.rs                    # מדידת latency של VectorStore::search
 ├── tests/
 │   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
 │   └── production_backend_gate.rs          # מאמת שבנייה רגילה מסרבת לייצר embeddings
 └── src/
-    ├── lib.rs                              # נקודת הכניסה לספריה (Module root)
+    ├── lib.rs                              # נקודת הכניסה לספריה + חוזה המוצר
+    ├── main.rs                             # CLI פיתוח (audit / smoke)
     ├── errors.rs                           # מערכת השגיאות המרכזית (thiserror)
     ├── api/
     │   ├── mod.rs                          # ייצוא רכיבי ה-API
     │   └── hybrid_search.rs                # ממשק API נקי עבור Flutter / FFI
+    ├── benchmark/
+    │   └── mod.rs                          # query sets, תזמון ואגרגציית אחוזונים
+    ├── config/
+    │   ├── profiles.rs                     # Fast/Balanced/Best + אסטרטגיית fusion
+    │   └── feature_flags.rs                # דריסות נקודתיות מעל פרופיל
+    ├── distribution/
+    │   ├── package.rs                      # manifest של חבילה + SHA-256 לכל payload
+    │   └── importer.rs                     # התקנה אטומית עם staging וגיבוי
     ├── hybrid/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Hybrid
     │   ├── coordinator.rs                  # מתאם החיפוש ההיברידי הראשי
     │   ├── fusion.rs                       # מיזוג ציונים (Weighted & RRF)
     │   ├── grouping.rs                     # קיבוץ תוצאות (Section & Dedup)
-    │   └── ranking.rs                      # ניתוח שאילתא וחישוב משקל אלפא
-    └── semantic/
-        ├── mod.rs                          # ייצוא רכיבי ה-Semantic
-        ├── chunker.rs                      # Anchored Chunking & SHA256 IDs
-        ├── embedding.rs                    # GGUF Model Runtime Interface
-        ├── engine.rs                       # מתאם תת-המערכת הסמנטית
-        ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
-        ├── store.rs                        # Vector DB (Pre-normalized + Heap)
-        └── types.rs                        # הגדרות טיפוסים ומבני נתונים
+    │   ├── ranking.rs                      # ניתוח שאילתא וחישוב משקל אלפא
+    │   ├── metadata_ranker.rs              # בונוסים מתוך facets
+    │   ├── hebrew_normalizer.rs            # הסרת ניקוד/טעמים וזיהוי שפת השאילתה
+    │   └── cache.rs                        # cache תוצאות עם פסילה לפי generation
+    ├── semantic/
+    │   ├── mod.rs                          # ייצוא רכיבי ה-Semantic
+    │   ├── chunker.rs                      # Anchored Chunking & SHA256 IDs
+    │   ├── embedding.rs                    # אימות GGUF, batching ונרמול
+    │   ├── embedding_cache.rs              # cache לווקטורים של טקסטים שהוטמעו
+    │   ├── backend.rs                      # חוזה ה-backend ובחירתו
+    │   ├── llama_backend.rs                # inference אמיתי (feature `llama-backend`)
+    │   ├── engine.rs                       # מתאם תת-המערכת הסמנטית
+    │   ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
+    │   ├── store.rs                        # Vector DB בזיכרון (Pre-normalized + Heap)
+    │   ├── store_backend.rs                # trait משותף לשני ה-stores
+    │   ├── zevc_store.rs                   # snapshot לדיסק; סריקה מלאה, לא ANN, לא מחובר
+    │   ├── versioning.rs                   # IndexVersion ודיווח אי-תאימות
+    │   └── types.rs                        # הגדרות טיפוסים ומבני נתונים
+    └── telemetry/
+        └── mod.rs                          # מוני חיפוש בתוך התהליך (ללא רשת)
 ```
 
 ---
@@ -49,7 +81,10 @@ otzaria-semantic-search/
 ### 1. נקודת הכניסה ומערכת השגיאות
 
 * [`src/lib.rs`](../src/lib.rs)
-  - מייצא את המודולים הראשיים: `api`, `errors`, `hybrid`, `semantic`.
+  - מייצא את המודולים: `api`, `benchmark`, `config`, `distribution`, `errors`,
+    `hybrid`, `semantic`, `telemetry`.
+  - נושא את ארבע החלטות ההיקף כ-doc comment ברמת ה-crate, כדי שמי שקורא רק את הקוד
+    יראה אותן גם בלי המסמכים.
 * [`src/errors.rs`](../src/errors.rs)
   - `SemanticSearchError` — השגיאה הראשית המאגדת את כל תת-המערכות.
   - `EmbeddingError` — שגיאות טעינת מודל ואינפרנס.
@@ -69,11 +104,19 @@ otzaria-semantic-search/
     המועדפת: הקורא מחליט מה החתימה של ספר, וזו הדרך היחידה שבה PDF יכול להגיע
     ל"מעודכן". `get_semantic_index_diff_from_lexical_hashes()` היא הצורה הידידותית
     ל-FFI (`u64` גולמי), כי enum ש-Dart יכול לבנות הוא enum ש-Dart יכול לבנות שגוי.
+  - `get_telemetry_snapshot()` / `reset_telemetry()` / `clear_query_cache()` —
+    מוני ריצה ופסילת cache. הכול בתוך התהליך; שום דבר לא נשלח לשום מקום.
   - `index_books()` — אינדוקס ספרים (manifest נשמר פעם אחת בסוף, לא פר-ספר).
   - `remove_semantic_books()` — מיישם בקבוצה את `IndexDiff::removed_books`.
   - `reset_semantic_index()` — מסלול ההתאוששות מאינדקס לא תואם; בלעדיו
     `needs_full_reindex` היה מבוי סתום.
-  - *לא כאן עדיין (P7):* progress stream, cancel/resume, ניהול הורדת מודל.
+
+  > **ארבע הפעולות האחרונות הן פיגום אב-טיפוס.** לפי חוזה המוצר האפליקציה מתקינה
+  > ארטיפקט מוכן ואינה מאנדקסת, ולכן ב-S5 המסלול הרשמי הוא
+  > `open`/`install_official_semantic_index` ולא `semantic_index_books(Vec<...>)`.
+  > נכון להיום זהו ה-API שהבדיקות והבנייה משתמשות בו, ולכן הוא מתועד ולא מוסתר.
+  > *מה שלא יהיה כאן לעולם:* progress stream ו-cancel/resume של אינדוקס — אין
+  > אינדוקס באפליקציה.
 
 ---
 
@@ -110,6 +153,25 @@ otzaria-semantic-search/
   - `group_by_section()` — מקבץ תוצאות לפי `section_id` וקובץ. הנציג בעל הציון הגבוה ביותר נבחר כ-Representative.
   - `group_by_identical_text()` — מקבץ תוצאות בעלות `line_hash` זהה (מניעת כפילויות של נוסחים זהים).
   - `group_results()` — Dispatcher לפי `GroupingMode`.
+
+* [`src/hybrid/cache.rs`](../src/hybrid/cache.rs)
+  - `QueryCache` — cache תוצאות עם מפתח SHA-256 של פרמטרי השאילתה, קיבולת, TTL
+    ופסילה לפי `generation`: מוטציה באינדקס מקדמת דור, וכל הרשומות מהדור הקודם
+    מפסיקות להיות תקפות בלי לעבור עליהן אחת-אחת.
+  - `QueryCacheStats` — `hits`/`misses`/`evictions`/`size`/`generation`. ה-telemetry
+    מבדיל בין `cache_lookup` ל-`cache_hit`, כדי ש"לא נבדק" לא ייראה כ"פספוס".
+
+* [`src/hybrid/metadata_ranker.rs`](../src/hybrid/metadata_ranker.rs)
+  - `MetadataRanker` — בונוסים קטנים (מקור ראשוני, התאמת דור, התאמת קטגוריה)
+    שנגזרים מה-facets של התוצאה. ברירות המחדל בסדר גודל של 0.02–0.03 בכוונה: אלה
+    סימני היכר, לא שינוי סדר.
+  - `MetadataSignal` — הפירוק לגורמים ולא רק הסך, כדי שאפשר יהיה לדעת למה תוצאה עלתה.
+
+* [`src/hybrid/hebrew_normalizer.rs`](../src/hybrid/hebrew_normalizer.rs)
+  - `HebrewNormalizer::normalize_for_embedding()` — הסרת ניקוד וטעמים ואיחוד
+    גרש/גרשיים לפני ההטמעה. אותה נורמליזציה חייבת לחול על טקסט האינדוקס ועל
+    השאילתה, אחרת שני הצדדים אינם באותו מרחב.
+  - `QueryLanguage` — עברית / ארמית / מעורב / אחר.
 
 ---
 
@@ -221,7 +283,7 @@ otzaria-semantic-search/
     מקבל `GGML_ASSERT` ב-destructor סטטי של ggml **אחרי** עבודה מוצלחת — crash
     reporter מדווח על זה כקריסה. atexit רץ בסדר הפוך לרישום, ולכן ההקדמה מובטחת.
 
-* [`src/semantic/store.rs`](../src/semantic/store.rs)
+* [`src/semantic/store.rs`](../src/semantic/store.rs) — **ה-store שהמנוע פותח בפועל.**
   - `VectorStore` & `VectorStoreConfig` — מנגנון האחסון והשליפה הוקטורי.
   - **Pre-normalization**: נורמליזציה בוקטורים בעת ההכנסה המאפשרת חישוב דמיון קוסינוס בעזרת Dot Product בלבד ($O(dim)$).
   - **BinaryHeap Top-K**: שליפת $k$ התוצאות המובילות בסיבוכיות $O(N \log k)$ ללא שכפול מטא-דאטה של כל המאגר. שוויון ציונים נשבר לפי `semantic_id` — בלי זה `HashMap` עם סדר איטרציה מקרי היה מחזיר top-k שונה בכל ריצה.
@@ -229,6 +291,36 @@ otzaria-semantic-search/
   - `is_persistent()` / `backend_id()` — ה-backend הנוכחי אינו persistent, ומצהיר על כך; ה-engine מסתמך על זה כדי לא להאמין ל-manifest ישן.
   - `dot_product()` — 8 מצברים במקום סכימה סדרתית אחת: ~1.4× מהיר במדידה
     (101ms מול 145ms על 200k וקטורים בממד 1024).
+
+* [`src/semantic/store_backend.rs`](../src/semantic/store_backend.rs)
+  - `VectorStoreBackend` — החוזה המשותף: `backend_id`, `is_persistent`,
+    `embedding_dim`, `count`, `insert_batch`, `search`, `remove_by_book`, `clear`,
+    `book_keys`. שני ה-stores מקיימים אותו.
+  - **ה-engine עדיין אינו תלוי בו** אלא ב-`VectorStore` הקונקרטי. החלפת התלות היא
+    העבודה הראשונה ב-S2, ובלעדיה ה-trait הוא הכנה ולא נקודת החלפה.
+
+* [`src/semantic/zevc_store.rs`](../src/semantic/zevc_store.rs)
+  - `ZevcStore` & `ZevcStoreConfig` — snapshot מתמיד לדיסק: payload לכל ספר,
+    SHA-256 למטא-דאטה ולווקטורים, אינדקס ספרים, ופתיחה מחדש שמאמתת checksums.
+  - **מה זה לא:** לא הספרייה `zvec`, לא ANN, לא mmap. הפתיחה טוענת את **כל**
+    הווקטורים ל-`HashMap` והחיפוש סורק את כולם, `O(N·D)` — בדיוק כמו ה-store
+    בזיכרון. השם דומה למה שמפת הדרכים המקורית ייעדה, המימוש אינו אותו דבר.
+  - לכן S2 מגדיר אותו כ-baseline נכונות שנמדד ב-1M וב-6M רשומות, ולא כפתרון סקייל
+    מוכח.
+
+* [`src/semantic/versioning.rs`](../src/semantic/versioning.rs)
+  - `IndexVersion` — זהות האינדקס שנשמרת בחבילה: `schema_version`, `model_id`,
+    `embedding_dim`, `pooling`, `max_tokens`, `normalization_version`,
+    `chunking_identity`, `store_backend`, `vector_precision`.
+  - `describe_incompatibilities()` — מחזיר את **כל** ההבדלים, לא רק את הראשון;
+    `is_compatible()` מוגדר כ"אין הבדלים". שגיאת ייבוא מצטטת את הרשימה.
+  - **מה חסר:** `corpus_id`, `tantivy_schema_version` ו-`document_id_scheme_version`.
+    בלעדיהם אפשר לפתוח חבילה שמצביעה ל-`line_id` של קטלוג אחר. זה S3, וזו הסיבה
+    שהוא חוסם את S4–S5.
+
+* [`src/semantic/embedding_cache.rs`](../src/semantic/embedding_cache.rs)
+  - `EmbeddingCache` — cache בגודל חסום לווקטורים של טקסטים שהוטמעו, עם החלפה
+    לפי שעון גישה. חוסך inference על שאילתות חוזרות בלבד; אינו נוגע באינדקס.
 
 * [`src/semantic/manifest.rs`](../src/semantic/manifest.rs)
   - `SemanticManifest` — ניהול גירסאות אינדקס אטומי: כתיבה ל-`.tmp`, `fsync`, ואז
@@ -272,6 +364,50 @@ otzaria-semantic-search/
 
 ---
 
+### 5. תת-מערכות תומכות
+
+* [`src/config/profiles.rs`](../src/config/profiles.rs)
+  - `SearchProfile` — `Fast` / `Balanced` / `Best`.
+  - `RankingProfile` — כל פרמטרי הכיול במקום אחד (thresholds, בונוסים, קיבולות
+    cache, אסטרטגיית fusion). מקור אמת יחיד, כדי שלא יהיו שתי קבוצות ברירות מחדל.
+  - `FusionStrategy` — `Weighted` / `RRF { k }` / `Adaptive`.
+
+* [`src/config/feature_flags.rs`](../src/config/feature_flags.rs)
+  - `FeatureFlags` — כל שדה הוא `Option`, ולכן „לא צוין” נבדל מ„צוין כברירת המחדל”.
+  - `apply()` — דורס פרופיל קיים במקום להחזיק העתק שני שלו. ערכים לא-חוקיים
+    (`NaN`, מחוץ לטווח) נבלמים ולא נכנסים לפרופיל.
+
+* [`src/telemetry/mod.rs`](../src/telemetry/mod.rs)
+  - `SearchTelemetry` — רשומה לשאילתה: סוג שאילתה, מצב שרץ, אסטרטגיה, alpha,
+    ספירות מועמדים, cache, latency (כולל embedding ו-fusion בנפרד) ופרופיל.
+  - `TelemetryCollector` / `TelemetrySnapshot` — אגרגציה thread-safe.
+  - **אין כאן רשת.** אלה מונים בזיכרון התהליך; המאגר אינו שולח דבר לשום שרת.
+
+* [`src/distribution/package.rs`](../src/distribution/package.rs)
+  - `PackageManifest` — `IndexVersion` + `created_at` + ספירות ספרים/וקטורים + גודל.
+  - `IndexPackage::write()` — מסרב לכתוב חבילה שה-payload שלה חסר או לא תואם את
+    ה-checksums. חבילה שנכתבה „בהצלחה” בלי לאמת היא בדיוק החבילה שתיכשל אצל המשתמש.
+  - `validate_payload_name()` — שם payload חייב להיות רכיב נתיב יחיד ולא
+    `manifest.json`/`checksums.json`. זה מה שחוסם `../` ושמות שדורסים את המניפסט.
+  - `verify_checksums()` — symlink או משהו שאינו קובץ רגיל נדחה, לא נעקב.
+
+* [`src/distribution/importer.rs`](../src/distribution/importer.rs)
+  - `IndexImporter::import()` — קריאת חבילה, אימות checksums, בדיקת תאימות
+    `IndexVersion`, העתקה ל-staging, אימות **שוב על ה-staging**, ואז החלפת תיקייה.
+  - `replace_directory()` — היעד עובר לגיבוי, ה-staging נכנס במקומו, וכשל בהחלפה
+    מחזיר את הגיבוי. אין מצב ביניים שבו אין תיקיית יעד.
+  - מסרב שהיעד יהיה תיקיית החבילה או צאצא שלה — ייבוא כזה היה מוחק את המקור.
+  - **מה שאינו כאן:** ה-importer אינו חשוף דרך `OtzariaHybridEngine`, ה-FFI או
+    אוצריא. חשיפתו היא S3–S5.
+
+* [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
+  - `measure()` / `aggregate()` / `QuerySet` / `BenchmarkConfig` — תזמון, אחוזונים
+    והערכת תפוקה סדרתית. הקורא מספק את סגירת החיפוש ואת ה-corpus.
+  - זה **כלי מדידה**, לא dataset של רלוונטיות תורנית ולא הוכחת סקייל. dataset
+    האיכות הוא S1.
+
+---
+
 ## 🧪 בדיקות ותשתית
 
 * [`tests/hybrid_integration_test.rs`](../tests/hybrid_integration_test.rs)
@@ -289,6 +425,10 @@ otzaria-semantic-search/
   - תהליך CI מלא ב-GitHub Actions הרץ על Ubuntu, Windows ו-macOS, **בשתי
     קונפיגורציות features**, כולל `cargo fmt --check`, clippy עם `-D warnings`,
     ואימות קישורי תיעוד (`cargo doc`).
+  - job נפרד ל-`llama-backend` (Linux + macOS), ו-job **Golden Vectors** שמריץ את
+    שער ה-parity מול המודל האמיתי. השער דורש את הסוד `OTZARIA_HF_TOKEN`, וכשהוא
+    חסר הוא נכשל במפורש ולא מדווח דילוג כהצלחה. ראו
+    [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §5.
 
 ## מדידות
 
