@@ -356,7 +356,11 @@ fn difference_summary(from: &BTreeSet<u64>, other: &BTreeSet<u64>) -> (usize, Op
 
 /// The three sources that each know a part of the identity, and the completeness check
 /// that has to come before any of them is compared to anything.
-fn compose_identity(
+///
+/// Reachable from [`builder`](crate::distribution::builder) for the same reason
+/// [`ensure_output_is_free`] is: a blank `model_id` should fail a build in the second it
+/// takes to notice, not after a library has been chunked and embedded.
+pub(crate) fn compose_identity(
     corpus: &dyn CorpusIndex,
     model: &ModelIdentity,
 ) -> Result<IndexVersion, PackError> {
@@ -372,7 +376,11 @@ fn compose_identity(
 }
 
 /// Refuse an output path that is not an empty place to write a whole artifact.
-fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
+///
+/// Reachable from [`builder`](crate::distribution::builder) so a build asks this before it
+/// loads a model and walks a corpus, rather than after: [`pack`] checks it too, but by then
+/// the expensive half of a build has already happened.
+pub(crate) fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
     let unusable = |reason: String| PackError::UnusableOutput {
         path: path.display().to_string(),
         reason,

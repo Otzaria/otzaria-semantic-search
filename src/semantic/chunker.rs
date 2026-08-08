@@ -10,9 +10,19 @@
 //! choice.
 
 use crate::semantic::types::{BookForIndexing, SemanticChunk};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone)]
+/// Serializable because a build declares its recipe in a file: `chunking_identity` in the
+/// artifact is a hash, and a hash cannot be turned back into these five numbers. Whoever
+/// applies the recipe has to be handed the recipe itself, and
+/// [`Self::identity`] is what ties the two together — see
+/// [`BuildPlan`](crate::distribution::builder::BuildPlan).
+///
+/// No `serde(default)`: a field left out of the file would silently become 20 or 512 and
+/// change what every vector was built from, which is precisely the class of drift the
+/// identity check exists to catch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkerConfig {
     /// Below this length a line borrows context from its neighbours.
     pub min_meaningful_chars: usize,
