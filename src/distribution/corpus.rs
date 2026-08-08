@@ -193,6 +193,13 @@ pub struct CorpusLineRecord {
 /// vector in RAM until it commits (see [`zevc_store`](crate::semantic::zevc_store)).
 /// Both are the same S2b measurement, and neither is hidden behind an interface that
 /// implies otherwise.
+/// The one id scheme whose ordering a transcription can reconstruct.
+///
+/// Scheme 1 composes an id as `((catalogue_order + 1) << 32) + (ordinal + 1)`, so within
+/// one book ascending ids *are* corpus order. Nothing about that generalizes, which is why
+/// [`JsonlCorpus::load`] refuses any other value rather than sorting anyway.
+const SORTABLE_ID_SCHEME: u32 = 1;
+
 #[derive(Debug)]
 pub struct JsonlCorpus {
     identity: CorpusIdentity,
@@ -259,6 +266,25 @@ impl JsonlCorpus {
         if lines.is_empty() {
             return Err(PackError::Corpus {
                 reason: format!("{} holds no lines", lines_path.display()),
+            });
+        }
+
+        // The book view below orders a book's lines by ascending `line_id`, which is corpus
+        // order only because scheme 1 puts the line's 1-based position in the low half.
+        // Under any other scheme that ordering is a guess, and a wrong one silently builds
+        // a short line's context out of the wrong neighbours — text nothing in the book
+        // contains, hashed into the artifact as if it did. Refused rather than assumed:
+        // this file cannot carry the order, so a corpus that needs one carried has to be
+        // read through an implementation that knows it.
+        if identity.document_id_scheme_version != SORTABLE_ID_SCHEME {
+            return Err(PackError::Corpus {
+                reason: format!(
+                    "{} declares document_id_scheme_version {}, and a transcription can \
+                     only recover a book's line order under scheme {SORTABLE_ID_SCHEME}, \
+                     where the low half of an id is the line's position",
+                    identity_path.display(),
+                    identity.document_id_scheme_version
+                ),
             });
         }
 
@@ -478,6 +504,43 @@ mod tests {
             corpus.book_line_ids("absent.txt"),
             Err(PackError::Corpus { .. })
         ));
+    }
+
+    /// The book view sorts by `line_id`, and that reconstructs corpus order only under
+    /// scheme 1. Under another scheme the sort is a guess, and a wrong one builds a short
+    /// line's context out of neighbours it never had — text the book does not contain,
+    /// embedded and hashed into the artifact as though it did. Nothing downstream could
+    /// see it: the anchor line's digest still matches, because the anchor is still right.
+    #[test]
+    fn a_transcription_of_an_id_scheme_it_cannot_order_is_refused() {
+        let dir = TempDir::new("id_scheme");
+        let identity_path = dir.path().join("corpus-identity.json");
+        let lines_path = dir.path().join("corpus-lines.jsonl");
+        std::fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&CorpusIdentity {
+                document_id_scheme_version: 2,
+                ..identity()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &lines_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&record(1, "genesis.txt", "בראשית ברא")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        match JsonlCorpus::load(&identity_path, &lines_path) {
+            Err(PackError::Corpus { reason }) => assert!(
+                reason.contains("document_id_scheme_version 2"),
+                "the refusal must name the scheme: {reason}"
+            ),
+            other => panic!("an unorderable id scheme must be refused, got {other:?}"),
+        }
     }
 
     /// Two records for one id would make the artifact depend on file order.

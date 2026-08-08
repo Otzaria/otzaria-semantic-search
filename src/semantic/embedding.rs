@@ -8,6 +8,7 @@ use crate::errors::EmbeddingError;
 use crate::semantic::backend::{
     ensure_pooling_is_implemented, select_backend, EmbeddingBackend, Pooling,
 };
+use crate::semantic::recipe::NormalizationStrategy;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,13 @@ pub struct EmbeddingConfig {
     /// How the backend must collapse token states into one vector. Typed rather
     /// than a free string: it is part of the index's identity in the manifest.
     pub pooling: Pooling,
+    /// What is done to a vector before it is stored or compared.
+    ///
+    /// Typed for the same reason as `pooling`, and for one more: the manifest records
+    /// `normalization_version`, and while that was a bare number the runtime performed L2
+    /// whatever it said. An artifact could declare a normalization nobody had written. The
+    /// choke point below now dispatches on this, so the number selects behaviour.
+    pub normalization: NormalizationStrategy,
 }
 
 impl Default for EmbeddingConfig {
@@ -81,6 +89,7 @@ impl Default for EmbeddingConfig {
             max_tokens: 512,
             batch_size: 32,
             pooling: Pooling::LastToken,
+            normalization: NormalizationStrategy::L2Unit,
         }
     }
 }
@@ -302,7 +311,7 @@ impl EmbeddingRuntime {
             }
 
             for mut vector in raw {
-                normalize_validated(&mut vector, dim)?;
+                normalize(self.config.normalization, &mut vector, dim)?;
                 results.push(vector);
             }
         }
@@ -323,6 +332,11 @@ impl EmbeddingRuntime {
         self.config.pooling
     }
 
+    /// What this runtime does to every vector it produces.
+    pub fn normalization(&self) -> NormalizationStrategy {
+        self.config.normalization
+    }
+
     /// The token cap in force: the loaded backend's effective one, or the requested
     /// one before a model is loaded. The two can differ, since a backend clamps the
     /// request to its model's context length. This layer never truncates — the cap
@@ -336,6 +350,22 @@ impl EmbeddingRuntime {
     /// Maximum number of texts sent to the backend per inference call.
     pub fn batch_size(&self) -> usize {
         self.config.batch_size.max(1)
+    }
+}
+
+/// Apply the declared normalization to a vector, having refused one that cannot be
+/// compared at all.
+///
+/// The `match` is what makes `normalization_version` mean something. A second strategy —
+/// S1 may want one — has to be written here before its number can be declared anywhere,
+/// and every path that produces or accepts a vector goes through this function.
+pub fn normalize(
+    strategy: NormalizationStrategy,
+    vector: &mut [f32],
+    expected_dim: u32,
+) -> Result<(), EmbeddingError> {
+    match strategy {
+        NormalizationStrategy::L2Unit => normalize_validated(vector, expected_dim),
     }
 }
 

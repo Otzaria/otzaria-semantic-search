@@ -535,3 +535,85 @@ mod with_a_backend {
             .all(|hit| hit.metadata.line_id != 4_294_967_300));
     }
 }
+
+/// The whole build, once, against the real model — not the deterministic stand-in.
+///
+/// Every other test here runs on a backend that echoes its own configuration back, so the
+/// half of the model check that only real weights can drive is never exercised: a declared
+/// width, pooling or token cap that the model does not have. This is also the only place
+/// the recipe is applied to text a real tokenizer sees.
+///
+/// `#[ignore]`d and **skips loudly**, matching the rest of the crate's real-model tests:
+/// the ordinary suite stays green without a 396 MB gated download, and CI runs it with
+/// `--ignored` after fetching the file.
+#[cfg(all(feature = "llama-backend", not(feature = "mock-embedding")))]
+#[test]
+#[ignore = "needs the real GGUF; set OTZARIA_TEST_MODEL"]
+fn the_real_model_builds_an_artifact_that_verifies() {
+    use otzaria_semantic_search::distribution::builder::{build, BuildRequest};
+    use otzaria_semantic_search::distribution::corpus::JsonlCorpus;
+    use otzaria_semantic_search::distribution::packer::validate_artifact;
+    use otzaria_semantic_search::semantic::embedding::validate_and_checksum_gguf;
+    use otzaria_semantic_search::semantic::llama_backend::LlamaCppBackend;
+
+    let Ok(model_file) = std::env::var("OTZARIA_TEST_MODEL") else {
+        println!(
+            "SKIPPED: OTZARIA_TEST_MODEL is not set. This test needs the 396 MB gated \
+             model file."
+        );
+        return;
+    };
+    let model_file = PathBuf::from(model_file);
+    if !model_file.exists() {
+        println!("SKIPPED: OTZARIA_TEST_MODEL points at {model_file:?}, which does not exist");
+        return;
+    }
+
+    let dir = TempDir::new("real_model");
+    let chunking = ChunkerConfig::default();
+    // The dimension and the token cap are the model's, not this test's: declaring anything
+    // else is exactly what the build is supposed to refuse, and asserting that here would
+    // be asserting the check rather than the build.
+    let model = ModelIdentity {
+        model_checksum: validate_and_checksum_gguf(&model_file).unwrap(),
+        embedding_backend: LlamaCppBackend::ID.to_string(),
+        embedding_dim: 1024,
+        max_tokens: 512,
+        ..model_identity("unused", &chunking)
+    };
+    let fixture = write_fixture(dir.path(), &model, &chunking);
+
+    let out = dir.path().join("artifact");
+    let report = build(
+        BuildRequest {
+            output_path: out.clone(),
+            model_path: model_file,
+            model: model.clone(),
+            chunking: chunking.clone(),
+            created_at: "2026-08-09T00:00:00Z".to_string(),
+            collection_name: "chunks".to_string(),
+            batch_size: 4,
+            // Real inference: the gate this flag exists for must stay shut.
+            allow_non_semantic_backend: false,
+        },
+        &JsonlCorpus::load(&fixture.corpus_identity, &fixture.corpus_lines).unwrap(),
+    )
+    .expect("the real model builds an artifact");
+
+    assert_eq!(
+        report.vector_count, 4,
+        "one line is below min_embeddable_chars"
+    );
+    assert_eq!(report.identity.model.embedding_dim, 1024);
+
+    // Verified independently, against the same corpus seen through the same recipe.
+    let corpus = JsonlCorpus::load(&fixture.corpus_identity, &fixture.corpus_lines).unwrap();
+    let planned = otzaria_semantic_search::distribution::builder::PlannedCorpus::new(
+        &corpus, &chunking, &model,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_artifact(&out, &model, &planned).unwrap().digest,
+        report.digest
+    );
+}

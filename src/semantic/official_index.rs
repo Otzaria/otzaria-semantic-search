@@ -55,6 +55,7 @@ use crate::distribution::package::{
 use crate::errors::{ArtifactError, SemanticSearchError};
 use crate::semantic::backend::Pooling;
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::recipe::{EmbeddingTextRecipe, NormalizationStrategy};
 use crate::semantic::store_backend::VectorSearchBackend;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, SemanticStatus};
 use crate::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity, StoreIdentity};
@@ -208,11 +209,21 @@ impl OfficialSemanticIndex {
             );
         }
 
+        // Before the model is opened: the two recipe versions this installation declares
+        // are versions of code in this crate, so an unimplemented one is settled here
+        // rather than compared against another copy of the same number and agreed with.
+        // The artifact's own copy is refused by `validate_complete` during verification;
+        // this refuses the *installation's*, which is what stops a configuration and an
+        // artifact from agreeing on a recipe neither can run.
+        EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
+        let normalization = NormalizationStrategy::from_version(model.normalization_version)?;
+
         let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model.model_path.clone(),
             embedding_dim: model.embedding_dim,
             pooling: model.pooling_strategy()?,
             max_tokens: model.max_tokens,
+            normalization,
             // One query at a time is all this path ever embeds; batching belongs to the
             // builder, which has a library to get through.
             batch_size: 1,

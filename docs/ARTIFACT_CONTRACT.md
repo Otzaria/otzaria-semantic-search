@@ -409,9 +409,18 @@ flush(...)` במקום הזה הוא בדיוק מה שהפך „`fsync` אחר�
 - **מסלול הבנייה כן קובע יותר (S4b).**
   [`distribution::builder`](../src/distribution/builder.rs) פותח את המודל בעצמו: הטקסט
   שנחתם הוא אותו `String` שנמסר ל־backend, ו־`model_checksum`, `embedding_backend`,
-  `embedding_dim`, `pooling` ו־`max_tokens` האפקטיבי נקראים מהקובץ שנטען ומושווים למה
-  שהארטיפקט מצהיר. `model_id`, `model_quantization`, `embedding_text_version`
-  ו־`normalization_version` נשארים הצהרות — שום דבר ב־GGUF אינו אומר אותם.
+  `embedding_dim`, `pooling` ו־`max_tokens` האפקטיבי **מדווחים על ידי ה־runtime שנטען**
+  ומושווים למה שהארטיפקט מצהיר. `model_id` ו־`model_quantization` נשארים הצהרות — שום דבר
+  ב־GGUF אינו אומר אותם.
+- **שלוש גרסאות המתכון מוכרעות, לא מוצהרות.** `embedding_text_version`,
+  `normalization_version` ו־`chunking_version` הן גרסאות של הקוד ב־crate הזה, ולכן הן
+  היחידות בזהות שאפשר להכריע במקום להשוות. כל אחת היא קבוצה סגורה
+  ב־[`semantic::recipe`](../src/semantic/recipe.rs), והקוד שמבצע את העבודה עושה `match`
+  עליה. שתיים מהן נבדקות ב־`validate_complete` ולכן נדחות **גם בבנייה וגם בפתיחה**;
+  `chunking_version` נבדק בכל מקום שבו יש `ChunkerConfig`, כלומר בבנייה — לארטיפקט יש רק
+  את ה־hash של התצורה.
+- **חלון TOCTOU מוצהר:** ה־checksum מחושב, ואז ה־backend פותח את אותו נתיב שוב. הסגירה היא
+  staging לעותק content-addressed בצינור ההפצה.
 - **קבוצת הכיסוי נקבעת לפני ה־inference.**
   [`BuildPlan`](../src/distribution/builder.rs) גוזר אותה מהקורפוס ומה־`ChunkerConfig`
   לפני שקיים ולו וקטור אחד, ו־`chunking_identity` — שהוא hash חד־כיווני — מוצמד לתצורה

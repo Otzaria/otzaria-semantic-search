@@ -16,6 +16,7 @@ use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
     describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
+use crate::semantic::recipe::NormalizationStrategy;
 use crate::semantic::store::{VectorStore, VectorStoreConfig};
 use crate::semantic::store_backend::VectorStoreBackend;
 use crate::semantic::types::{
@@ -198,7 +199,10 @@ impl SemanticEngine {
             )));
         }
 
-        let chunker = Chunker::new(config.chunking.clone());
+        // Fallible: the chunking configuration names an algorithm and a text recipe, and
+        // one this build does not implement is refused here rather than folded into a hash
+        // and acted on as if it were version 1.
+        let chunker = Chunker::new(config.chunking.clone())?;
         let backend_id = store.backend_id();
 
         let mut engine = Self {
@@ -313,6 +317,9 @@ impl SemanticEngine {
             pooling: self.config.pooling_strategy()?,
             max_tokens: self.config.embedding_max_tokens,
             batch_size: self.config.embedding_batch_size,
+            // The manifest records `normalization_version`; this is what makes the number
+            // select what is actually done to a vector.
+            normalization: NormalizationStrategy::from_version(self.config.normalization_version)?,
         });
 
         if let Err(e) = runtime.load() {
@@ -829,7 +836,7 @@ fn manifest_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::EmbeddingError;
+    use crate::errors::{ArtifactError, EmbeddingError};
     use crate::semantic::embedding::mock;
     use crate::semantic::types::BookLine;
 
@@ -1858,13 +1865,44 @@ mod tests {
         assert!(engine.status().needs_full_reindex.is_none());
     }
 
-    /// Every knob, not just `chunking_version`: each one changes the text that was
-    /// embedded, so each must invalidate the index.
+    /// A chunking algorithm this build does not implement is not an incompatibility to
+    /// report — it is a configuration that cannot be acted on at all. Opening under it and
+    /// then chunking with version 1's code would record version 2 in the manifest for
+    /// vectors version 1 produced.
+    #[test]
+    fn a_chunking_version_this_build_does_not_implement_is_refused_at_open() {
+        let dir = TempDir::new("unimplemented_chunking");
+        let mut config = config_at(&dir);
+        config.chunking.chunking_version = 2;
+
+        match SemanticEngine::open(config) {
+            Err(SemanticSearchError::Artifact(ArtifactError::UnsupportedRecipeVersion {
+                field,
+                found,
+                ..
+            })) => {
+                assert_eq!(field, "chunking_version");
+                assert_eq!(found, 2);
+            }
+            Err(other) => panic!(
+                "an unimplemented chunking algorithm must be refused as \
+                                  such, got {other:?}"
+            ),
+            Ok(_) => panic!("an unimplemented chunking algorithm must not open"),
+        }
+    }
+
+    /// Every knob changes the text that was embedded, so each must invalidate the index.
+    ///
+    /// `chunking_version` is not among them, and its absence is the point: it no longer
+    /// names "some other configuration of the same algorithm" but a *different algorithm*,
+    /// and one this build does not have is refused outright rather than opened and flagged
+    /// — see `a_chunking_version_this_build_does_not_implement_is_refused_at_open`. When a
+    /// second algorithm exists it will change the identity too, and land back in this list.
     #[test]
     fn a_changed_chunking_config_forces_every_book_to_be_reindexed() {
         type Change = (&'static str, fn(&mut ChunkerConfig));
-        let changes: [Change; 5] = [
-            ("version", |c| c.chunking_version = 2),
+        let changes: [Change; 4] = [
             ("max_chunk_chars", |c| c.max_chunk_chars = 256),
             ("context_window_lines", |c| c.context_window_lines = 5),
             ("min_meaningful_chars", |c| c.min_meaningful_chars = 40),

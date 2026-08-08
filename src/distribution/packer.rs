@@ -82,10 +82,11 @@ use crate::distribution::package::{
 };
 use crate::errors::{EmbeddingError, PackError};
 use crate::semantic::chunker::compute_semantic_id;
-use crate::semantic::embedding::normalize_validated;
+use crate::semantic::embedding::normalize;
 use crate::semantic::official_index::{
     ensure_snapshot_layout, readable_store_identity, verify_counts_against_payload,
 };
+use crate::semantic::recipe::NormalizationStrategy;
 use crate::semantic::store_backend::{VectorSearchBackend, VectorStoreBackend};
 use crate::semantic::types::VectorMetadata;
 use crate::semantic::versioning::{IndexVersion, ModelIdentity};
@@ -189,6 +190,10 @@ pub fn pack(
 
     let embedding_dim = identity.model.embedding_dim;
     let chunking_identity = identity.model.chunking_identity;
+    // `compose_identity` has already refused a version nothing implements, so this cannot
+    // fail here — it is resolved rather than assumed so that the vectors are checked under
+    // the strategy the artifact declares and not under whichever one is written today.
+    let normalization = NormalizationStrategy::from_version(identity.model.normalization_version)?;
     let store = ZevcStore::open_or_create(ZevcStoreConfig {
         db_path: request.output_path.clone(),
         embedding_dim,
@@ -208,7 +213,13 @@ pub fn pack(
                 line_id: input.line_id,
             });
         }
-        let metadata = join_to_corpus(&mut input, corpus, embedding_dim, chunking_identity)?;
+        let metadata = join_to_corpus(
+            &mut input,
+            corpus,
+            embedding_dim,
+            chunking_identity,
+            normalization,
+        )?;
 
         batch.push((metadata, input.vector));
         accepted = accepted.saturating_add(1);
@@ -418,14 +429,17 @@ pub(crate) fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
 /// Check one input against the corpus and turn it into the record that will be stored.
 ///
 /// The vector is normalized here rather than left to the payload writer, because
-/// [`normalize_validated`] is the crate's one choke point for "can this vector be
-/// compared at all" and its rejection is reported against the `line_id` a build log can
-/// act on. The writer normalizes again; doing it twice is idempotent and costs one pass.
+/// [`normalize`](crate::semantic::embedding::normalize) is the crate's one choke point for
+/// "can this vector be compared at all" and its rejection is reported against the `line_id`
+/// a build log can act on. It is given the strategy the artifact declares, so a
+/// `normalization_version` nobody implements cannot reach a payload. The writer normalizes
+/// again; doing it twice is idempotent and costs one pass.
 fn join_to_corpus(
     input: &mut VectorInput,
     corpus: &dyn CorpusIndex,
     embedding_dim: u32,
     chunking_identity: u64,
+    normalization: NormalizationStrategy,
 ) -> Result<VectorMetadata, PackError> {
     if input.vector.len() as u32 != embedding_dim {
         return Err(PackError::VectorDimensionMismatch {
@@ -434,7 +448,7 @@ fn join_to_corpus(
             found: input.vector.len(),
         });
     }
-    normalize_validated(&mut input.vector, embedding_dim).map_err(|error| {
+    normalize(normalization, &mut input.vector, embedding_dim).map_err(|error| {
         PackError::UnusableVector {
             line_id: input.line_id,
             // Unwrapped from the label the runtime puts on these, which does not apply

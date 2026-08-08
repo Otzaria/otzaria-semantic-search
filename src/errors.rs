@@ -228,6 +228,40 @@ pub enum ArtifactError {
         reason: String,
     },
 
+    /// An identity field names a recipe version this build does not implement.
+    ///
+    /// Distinct from [`Self::IncompleteIdentity`], which catches a field nobody filled in.
+    /// This one is filled in, plausible, and describes behaviour that exists nowhere: the
+    /// three recipe versions are versions of *this crate's code*, so a number with no
+    /// implementation behind it means the vectors were built by something else or the
+    /// identity was written by hand. Being lenient would let an artifact declare a recipe
+    /// and an installation agree to it, with neither running it.
+    #[error(
+        "{field} is {found}, and this build implements {supported}: that recipe exists \
+         nowhere in this code"
+    )]
+    UnsupportedRecipeVersion {
+        field: &'static str,
+        found: u32,
+        supported: String,
+    },
+
+    /// The chunker configuration in hand and the identity an artifact declares disagree
+    /// about a value they both carry.
+    ///
+    /// One fact in two places is a fact that drifts. `embedding_text_version` has to be in
+    /// the configuration, because that is what selects the code path, and in the identity,
+    /// because an installation compares identities and never sees a configuration.
+    #[error(
+        "{field} is {configured} in the chunker configuration and {declared} in the model \
+         identity"
+    )]
+    RecipeDisagreesWithIdentity {
+        field: &'static str,
+        configured: u32,
+        declared: u32,
+    },
+
     /// The artifact describes a different corpus, model or store format than this
     /// installation. Lists every disagreement, not the first.
     #[error(

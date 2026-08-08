@@ -29,6 +29,7 @@
 //! each value.
 
 use crate::errors::ArtifactError;
+use crate::semantic::recipe::{EmbeddingTextRecipe, NormalizationStrategy};
 use serde::{Deserialize, Serialize};
 
 /// Full identity of a built artifact, in the three groups that must agree
@@ -371,6 +372,17 @@ impl IndexVersion {
             self.model.normalization_version.into(),
         )?;
         require_positive(F::ChunkingIdentity, self.model.chunking_identity)?;
+
+        // Filled in is not the same as implemented. These two are versions of *this
+        // crate's code*, so unlike every other field here they can be settled outright
+        // rather than compared against another copy of themselves — and a number nobody
+        // wrote code for has to be refused at both ends: a build must not produce it, and
+        // an installation must not open it just because its own configuration repeats it.
+        // `chunking_version` is absent because an artifact carries the hash of the chunker
+        // configuration and not the configuration; see
+        // [`recipe`](crate::semantic::recipe).
+        EmbeddingTextRecipe::from_version(self.model.embedding_text_version)?;
+        NormalizationStrategy::from_version(self.model.normalization_version)?;
 
         require_text(F::StoreBackendId, &self.store.backend_id)?;
         require_positive(

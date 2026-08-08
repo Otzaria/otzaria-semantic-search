@@ -16,13 +16,32 @@
 //! * the text that is hashed is the same `String` that is handed to the backend, in the
 //!   same expression — there is no path by which one can describe the other;
 //! * `model_checksum`, `embedding_backend`, `embedding_dim`, `pooling` and the effective
-//!   `max_tokens` are read off the loaded model and compared against what the artifact
-//!   declares, so the declaration is a checked claim rather than a copied string.
+//!   `max_tokens` are **reported by the loaded runtime** and compared against what the
+//!   artifact declares, so the declaration is a checked claim rather than a copied string.
 //!
-//! What is still declared and unverifiable: `model_id`, `model_quantization`,
-//! `embedding_text_version` and `normalization_version`. Nothing in a GGUF file states
-//! them, and inventing a check that reads them from the same place that wrote them would
-//! prove nothing.
+//! "Reported by the runtime" rather than "read from the file", because they are not all the
+//! same kind of fact: the checksum is of the bytes on disk; the width and the token cap are
+//! what the weights actually carry; the backend id is which implementation was selected;
+//! and pooling is what that implementation performs. All five are settled by the thing that
+//! is about to produce the vectors, which is what makes comparing them worth anything —
+//! but only the first three are properties of the file.
+//!
+//! The three **recipe versions** — `embedding_text_version`, `normalization_version` and
+//! `chunking_version` — are not properties of a model at all. They are versions of code in
+//! this crate, so they are settled outright rather than compared:
+//! [`EmbeddingRecipe::resolve`] refuses any of them that names behaviour nobody has
+//! written, and the code that does the work dispatches on the resolved value. See
+//! [`recipe`](crate::semantic::recipe).
+//!
+//! What is left declared and unverifiable: `model_id` and `model_quantization`. Nothing in
+//! a GGUF file states either, and inventing a check that reads them from the same place
+//! that wrote them would prove nothing.
+//!
+//! **One window stays open, and is not closed here.** The checksum is computed, and then
+//! the backend opens the same path again; a model file swapped between those two reads
+//! would be hashed as one file and executed as another. Closing it means giving the build a
+//! content-addressed copy it owns — a staging step in the pipeline around this, not a check
+//! inside it.
 //!
 //! # The plan comes before the inference
 //!
@@ -59,6 +78,7 @@ use crate::errors::PackError;
 use crate::semantic::backend::Pooling;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::recipe::EmbeddingRecipe;
 use crate::semantic::types::{BookForIndexing, BookLine, SemanticChunk};
 use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
 use sha2::{Digest, Sha256};
@@ -122,7 +142,7 @@ impl BuildPlan {
         model: &ModelIdentity,
     ) -> Result<Self, PackError> {
         let chunking_identity = ensure_recipe_matches(chunking, model)?;
-        let chunker = Chunker::new(chunking.clone());
+        let chunker = Chunker::new(chunking.clone())?;
         let mut line_ids = BTreeSet::new();
         let mut books = 0usize;
         for book_key in corpus.book_keys()? {
@@ -275,8 +295,9 @@ fn ensure_recipe_matches(
 pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackReport, PackError> {
     ensure_output_is_free(&request.output_path)?;
     compose_identity(corpus, &request.model)?;
+    let recipe = EmbeddingRecipe::resolve(&request.chunking, &request.model)?;
     ensure_recipe_matches(&request.chunking, &request.model)?;
-    let runtime = load_model(&request)?;
+    let runtime = load_model(&request, recipe)?;
 
     let planned = PlannedCorpus::new(corpus, &request.chunking, &request.model)?;
     log::info!(
@@ -303,10 +324,16 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackRepo
 ///
 /// The runtime refuses a width or a pooling that disagrees with the loaded backend before
 /// this returns, so two of the five comparisons below can only fail through it. They are
-/// listed anyway: this table is the statement of what a model file can be held to, and
-/// leaving a field out of it because something else happens to cover it today is how such a
-/// check quietly stops covering it.
-fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
+/// listed anyway: this table is the statement of what the loaded runtime can be held to,
+/// and leaving a field out of it because something else happens to cover it today is how
+/// such a check quietly stops covering it.
+///
+/// Not all five are facts about the *file* — see the module header. The checksum is; the
+/// backend id is which implementation was selected for it.
+fn load_model(
+    request: &BuildRequest,
+    recipe: EmbeddingRecipe,
+) -> Result<EmbeddingRuntime, PackError> {
     let declared = &request.model;
     let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
         model_path: request.model_path.clone(),
@@ -314,6 +341,9 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
         max_tokens: declared.max_tokens,
         batch_size: request.batch_size,
         pooling: Pooling::parse(&declared.pooling)?,
+        // Resolved from `normalization_version`, so the runtime performs the strategy the
+        // artifact will declare rather than the only one that happens to be written.
+        normalization: recipe.normalization,
     });
     runtime.load()?;
 
@@ -461,9 +491,14 @@ fn chunks_for_book(
 
 /// The corpus, chunked and embedded, one batch at a time.
 ///
-/// An iterator rather than a `Vec` because the packer consumes one at a time: a build
-/// therefore holds one batch of vectors beyond the payload the writer is accumulating,
-/// instead of a second complete copy of it.
+/// An iterator rather than a `Vec` because the packer consumes one at a time, so a build
+/// never holds a second complete copy of the payload the writer is accumulating.
+///
+/// What it does hold, stated rather than implied: **one book's chunks and one batch of
+/// vectors.** A book is chunked whole because neighbour context needs the lines around a
+/// line, so `pending` is as large as the longest book in the corpus — that is the number to
+/// measure, not the batch size. Both are inside the same S2b measurement as the payload
+/// writer, and neither is on a device.
 ///
 /// The first error ends the stream. Continuing after one would mean the packer sees a
 /// truncated set and reports a coverage mismatch — a second, louder symptom of a fault
@@ -491,7 +526,7 @@ impl<'a> PlannedEmbeddings<'a> {
         Ok(Self {
             corpus,
             runtime,
-            chunker: Chunker::new(chunking.clone()),
+            chunker: Chunker::new(chunking.clone())?,
             // A batch of zero would embed nothing forever.
             batch_size: batch_size.max(1),
             books: corpus.book_keys()?.into_iter(),
@@ -1065,6 +1100,92 @@ mod tests {
             build(wrong_recipe, &corpus),
             Err(PackError::RecipeMismatch { .. })
         ));
+    }
+
+    /// **The three recipe versions are claims about this crate's code, and each is refused
+    /// on its own.**
+    ///
+    /// Without this, all three were free labels: a build could declare
+    /// `embedding_text_version = 27`, run the only text recipe that exists, and produce an
+    /// artifact where every count, checksum and identity field agreed — including with an
+    /// installation whose configuration repeated the same 27. The artifact would describe a
+    /// recipe nobody had written, and nothing anywhere would notice.
+    ///
+    /// Each case below names a model file that does not exist, so a build that got as far
+    /// as inference would fail differently. None does.
+    #[test]
+    fn a_recipe_version_this_build_does_not_implement_is_refused_before_the_model_opens() {
+        let dir = TempDir::new("recipe_versions");
+        let corpus = standard_corpus(&dir);
+        let default = ChunkerConfig::default();
+        let truthful = model_for(&"ab".repeat(32), &default);
+
+        // `embedding_text_version` lives in both the configuration and the identity, so
+        // moving it alone means moving both — the disagreement between them is its own
+        // rejection, tested separately in `recipe`.
+        let text_chunking = ChunkerConfig {
+            embedding_text_version: 2,
+            ..ChunkerConfig::default()
+        };
+        let cases: [(&str, ChunkerConfig, ModelIdentity); 3] = [
+            (
+                "embedding_text_version",
+                text_chunking.clone(),
+                ModelIdentity {
+                    embedding_text_version: 2,
+                    chunking_identity: text_chunking.identity(),
+                    ..truthful.clone()
+                },
+            ),
+            (
+                "normalization_version",
+                default.clone(),
+                ModelIdentity {
+                    normalization_version: 2,
+                    ..truthful.clone()
+                },
+            ),
+            (
+                // Only the configuration carries this one — the artifact carries the hash
+                // of the configuration — so the declared identity moves with it.
+                "chunking_version",
+                ChunkerConfig {
+                    chunking_version: 2,
+                    ..ChunkerConfig::default()
+                },
+                ModelIdentity {
+                    chunking_identity: ChunkerConfig {
+                        chunking_version: 2,
+                        ..ChunkerConfig::default()
+                    }
+                    .identity(),
+                    ..truthful.clone()
+                },
+            ),
+        ];
+
+        for (field, chunking, model) in cases {
+            let mut request = build_request(&dir, model, chunking);
+            request.output_path = dir.path().join(format!("artifact_{field}"));
+            match build(request, &corpus) {
+                Err(PackError::Artifact(
+                    crate::errors::ArtifactError::UnsupportedRecipeVersion {
+                        field: named,
+                        found,
+                        supported,
+                    },
+                )) => {
+                    assert_eq!(named, field);
+                    assert_eq!(found, 2);
+                    assert_eq!(supported, "1");
+                }
+                other => panic!("{field} 2 must be refused, got {other:?}"),
+            }
+            assert!(
+                !dir.path().join(format!("artifact_{field}")).exists(),
+                "a build refused for {field} writes nothing"
+            );
+        }
     }
 
     /// Hash vectors are structurally perfect and mean nothing, and no later check can tell.
