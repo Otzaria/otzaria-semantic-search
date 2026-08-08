@@ -160,7 +160,8 @@ BM25 עדיין עובד
 | מסלול ריצה read-only              | ממומש — `OfficialSemanticIndex` פותח ארטיפקט מאומת מעל store שאין עליו כתיבה; **לא חשוף ב־FFI** (S5) |
 | עוגן אמון לארטיפקט               | המכניזם קיים (digest מפורסם); **אין מי שמפרסם ואין חתימה** (S6) |
 | זהות ארטיפקט (`IndexVersion`)     | מלאה — corpus/Tantivy/ID scheme/מודל+checksum/store; נדחית לפי שדה, ומסלול הריצה קורא לה בפתיחה |
-| builder של הארטיפקט הרשמי        | **לא קיים** (S4)           |
+| packer של הארטיפקט הרשמי         | קיים — `pack`/`validate` מקבלים וקטורים מוכנים ומצרפים אותם לקורפוס דרך פורט (S4a) |
+| builder שמייצר את הווקטורים ומצטרף ל־Tantivy חי | **לא קיים** (S4b) |
 | Production persistence במסלול הפעיל | קיימת — ארטיפקט מותקן נפתח מחדש אחרי restart בלי לאנדקס; **לא נמדדה בקנה מידה** (S2b) |
 | אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד, והפתיחה טוענת הכול ל־RAM); האם נדרש — הכרעת S2b לפי מדידה |
 | UI סמנטי באוצריא                 | **לא קיים** (S7)           |
@@ -172,7 +173,9 @@ BM25 עדיין עובד
 > מה שכן ממומש באמת: inference אמיתי מול המודל, שלושת מצבי החיפוש, fusion עם פרופילים,
 > caches, telemetry, אריזה והתקנה מאומתות, חוזה זהות שקושר את הארטיפקט ל־corpus מסוים,
 > ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`. מה שחסר כדי שיהיה מוצר:
-> מדידה של אותו מסלול בקנה מידה (S2b), builder שמפיק ארטיפקט מ־Tantivy (S4),
+> ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`, וכלי צד־build שמייצר ארטיפקט
+> כזה מווקטורים מוכנים ומאמת אותו מול הקורפוס. מה שחסר כדי שיהיה מוצר: מדידה של אותו
+> מסלול בקנה מידה (S2b), חיבור ה־packer ל־Tantivy חי ויצירת הווקטורים עצמם (S4b),
 > והפעלה באפליקציה (S5–S7).
 
 ## מה השתנה ב־PR הראשון (Correctness baseline)
@@ -763,7 +766,10 @@ status()
 
 > **היכן זה רץ:** במכונת build, או בבדיקות. **לא** באפליקציה. אין באוצריא אינדוקס
 > ברקע, אין progress stream ואין cancel/resume — ראו [`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §4.
-> הזרימה כאן היא מה שה־builder של S4 יפעיל, ספר אחד בכל פעם, מתוך אינדקס Tantivy סופי.
+> הזרימה כאן היא מה שה־builder של S4b יפעיל, ספר אחד בכל פעם, מתוך אינדקס Tantivy סופי.
+> **שימו לב שזה אינו המסלול של ה־packer:** [`packer.rs`](../src/distribution/packer.rs)
+> אינו מחלק לקטעים ואינו מטמיע — הוא מקבל וקטורים מוכנים. הזרימה הזאת היא מה שמייצר
+> אותם לפני שהם מגיעים אליו.
 
 ה־flow הנוכחי:
 
@@ -1466,9 +1472,11 @@ golden vectors. מאחורי `--features llama-backend`.
 | **S2a** — מסלול ריצה read-only | ✅ [`official_index.rs`](../src/semantic/official_index.rs) פותח `VerifiedPackage` מעל [`ReadOnlyZevcStore`](../src/semantic/zevc_store.rs), והחוזה פוצל ל־[read/write](../src/semantic/store_backend.rs) |
 | **S2b** — סקייל ומדידה | למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M: cold-open, p50/p95/p99, peak RSS, דיסק. ANN נכנס רק אם המדידה מחייבת |
 | **S3** — חוזה ארטיפקט | ✅ הזהות והאימות ב־[`versioning.rs`](../src/semantic/versioning.rs) וב־[`package.rs`](../src/distribution/package.rs); מה שנשאר הוא חשיפת [`IndexImporter`](../src/distribution/importer.rs) ב־API |
+| **S4a** — packer לווקטורים מוכנים | ✅ [`packer.rs`](../src/distribution/packer.rs) מעל הפורט ב־[`corpus.rs`](../src/distribution/corpus.rs). הקלט הוא `line_id` + וקטור + digest של טקסט השורה; כל שאר המטא־דאטה מגיע מהקורפוס |
+| **S4b** — Tantivy חי ו־embeddings | לממש `CorpusIndex` מעל האינדקס הסופי ב־`otzaria_search_engine`, ולהזין ל־`pack` וקטורים שנוצרו מאותם מסמכים |
 
 הסדר בפועל: S3 (חוזה) נעשה לפני S1/S2, מפני שהוא קובע אילו שדות מוצהרים ולא אילו ערכים
-נבחרים; אחריו S2a, שנתן לחוזה קורא. הבא בתור הוא S4a — packer לווקטורים מוכנים. S1 לפני
+נבחרים; אחריו S2a, שנתן לחוזה קורא, ואחריו S4a — הכותב. הבא בתור הוא S4b. S1 לפני
 S2b — אך בלי לקפוא על ערכים לפני שהמדידה בידיים.
 
 ---
@@ -1614,7 +1622,8 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [ ] lock לשתי התקנות במקביל לאותו יעד — מתועד כמחוץ להיקף (S6, אם יידרש)
 * [ ] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי (S2b/S8)
 * [ ] חשיפת ה־importer דרך ה־API / FFI (S5)
-* [ ] builder שמפיק את הארטיפקט מ־Tantivy הסופי (S4)
+* [x] packer שמפיק ארטיפקט מווקטורים מוכנים, ומצרף כל אחד לשורה שלו בקורפוס (S4a)
+* [ ] מימוש `CorpusIndex` מעל Tantivy הסופי, ויצירת הווקטורים עצמם (S4b)
 
 ### Indexing (צד ה־build בלבד)
 
@@ -1739,7 +1748,8 @@ Architecture
      └── distribution (package + importer)
               ├── ✅ שער אימות מלא, דחייה לפי שדה                   (S3)
               ├── ✅ קורא שמפעיל אותו: OfficialSemanticIndex        (S2a)
-              └── אין builder, ואין חשיפה ב-FFI                     (S4, S5)
+              ├── ✅ כותב: packer + פורט אל הקורפוס                  (S4a)
+              └── אין Tantivy חי, ואין חשיפה ב-FFI                  (S4b, S5)
 ```
 
 זה דווקא מצב טוב יחסית: החוזים במקום, וכל פער הוא חיבור או הרחבה ולא שכתוב.
@@ -1767,7 +1777,10 @@ Architecture
    ↓
 ✅ 7a. S2a — read-only runtime path: the artifact's reader, and read/write split
    ↓
-   8. S4 — builder from the final Tantivy index   (otzaria_search_engine)
+✅ 7b. S4a — packer for ready-made vectors, joined to the corpus
+   ↓
+   8. S4b — embeddings + a CorpusIndex over the final Tantivy index
+             (otzaria_search_engine)
    ↓
    9. S5 — repin, open/install API, FFI            (otzaria_search_engine)
    ↓
@@ -1783,9 +1796,9 @@ S1 לפני S2b בכוונה: ממד ודיוק קובעים אם סריקה מ�
 **הסדר בפועל שונה מהמספור, במכוון:** S3 (חוזה הזהות) נעשה לפני S1 ו־S2, מפני שאינו
 תלוי בהם — הממד, הדיוק ופורמט ה־store הם **נתונים בתוך** ה־manifest ולא קבועים בקוד,
 ולכן הכרעות S1/S2 ממלאות שדות קיימים ואינן משנות את החוזה. אחריו נעשה S2a: מסלול ריצה
-read-only שפותח את הארטיפקט המאומת, וזה מה שנתן לחוזה צרכן. הבא בתור הוא packer
-לווקטורים מוכנים (S4a). S1 ו־S2b חוזרים לפני יצירת הארטיפקט האמיתי והכרעת backend
-ה־production.
+read-only שפותח את הארטיפקט המאומת, וזה מה שנתן לחוזה צרכן; ואחריו S4a, ה־packer, שהוא
+הצד הכותב שלו. הבא בתור הוא S4b. S1 ו־S2b חוזרים לפני יצירת הארטיפקט האמיתי והכרעת
+backend ה־production.
 
 כיול עדין של fusion נשאר אחרון: הוא כיוון ההגה, לא המנוע.
 
@@ -1899,8 +1912,10 @@ src/
 │
 ├── distribution/
 │   ├── package.rs        → package manifest + payload checksums
-│   └── importer.rs       → staged install + interruption recovery
-│                            (its reader lives in semantic/official_index.rs)
+│   ├── importer.rs       → staged install + interruption recovery
+│   │                        (its reader lives in semantic/official_index.rs)
+│   ├── corpus.rs         → the port onto the lexical index (CorpusIndex)
+│   └── packer.rs         → ready-made vectors → a verified artifact
 │
 ├── telemetry/            → in-process counters (no network)
 └── benchmark/            → timing & percentile helpers
@@ -1910,19 +1925,21 @@ src/
 
 # 47. The Most Important Next Task
 
-### Build the packer (S4a), then decide the representation (S1) and measure the store (S2b).
+### Reach the app (S4b/S5), then decide the representation (S1) and measure the store (S2b).
 
-Two tasks this section used to name are **done**. Real GGUF inference runs behind
-`--features llama-backend`, verified against committed golden vectors. And the
-read-only runtime path exists: the artifact has a reader, the store contract is split
-so the application holds a type with no write on it, and an installed artifact reopens
-after a restart without indexing anything (S2a).
+Three tasks this section used to name are **done**. Real GGUF inference runs behind
+`--features llama-backend`, verified against committed golden vectors. The read-only
+runtime path exists: the artifact has a reader, the store contract is split so the
+application holds a type with no write on it, and an installed artifact reopens after a
+restart without indexing anything (S2a). And the packer exists (S4a): ready-made vectors
+plus a corpus port produce a verified artifact, and every record is joined back to the
+line it claims — so the artifact the reader opens is now one a tool wrote, not one a test
+assembled by hand.
 
 What that leaves, in an order that is not interchangeable:
 
 ```text
-S4a a packer for ready-made vectors: line_id + model/corpus identity → an artifact,
-    with join validation against Tantivy
+S4b a CorpusIndex over the live Tantivy index, and the embeddings themselves
         ↓
 S5  repin, open/install API, FFI — the app reaches the reader that already exists
         ↓
@@ -1995,8 +2012,10 @@ hashing for install, metadata plus presence for open — and the install recover
 both crash windows, flushes what it writes, and is tested with injected rename
 failures. A runtime path now calls it: `OfficialSemanticIndex::open` takes the verified
 token, checks the manifest's counts against the payload's content, and catches a
-same-length edit that the cheap depth cannot see. What is missing: it is not exposed
-through the FFI, no builder produces an official artifact, and no timing budget has been
+same-length edit that the cheap depth cannot see. A packer now produces one, joining every
+vector to the corpus line it names before it writes and re-checking the whole artifact
+afterwards. What is missing: none of it is exposed through the FFI, the corpus it joins
+against is a transcription rather than a live Tantivy index, and no timing budget has been
 measured.
 
 **Hybrid fusion:** 🟢 Implemented — weighted / RRF / adaptive, chosen by profile

@@ -33,6 +33,7 @@ otzaria-semantic-search/
 │   └── vector_search.rs                    # מדידת latency של VectorStore::search
 ├── tests/
 │   ├── artifact_contract.rs                # זהות הארטיפקט ושער ההתקנה, דרך ה-API הציבורי בלבד
+│   ├── artifact_packer.rs                  # שער הקבלה של S4a: pack/validate ב-CLI, ומה שנארז נפתח ועונה
 │   ├── official_runtime.rs                 # התקנה→פתיחה→שאילתה על ארטיפקט (דורש --features mock-embedding)
 │   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
 │   └── production_backend_gate.rs          # מאמת שבנייה רגילה מסרבת לייצר embeddings
@@ -50,7 +51,9 @@ otzaria-semantic-search/
     │   └── feature_flags.rs                # דריסות נקודתיות מעל פרופיל
     ├── distribution/
     │   ├── package.rs                      # manifest של חבילה + SHA-256 לכל payload
-    │   └── importer.rs                     # התקנה בשני renames, עם שחזור מהפרעה
+    │   ├── importer.rs                     # התקנה בשני renames, עם שחזור מהפרעה
+    │   ├── corpus.rs                       # הפורט אל האינדקס הלקסיקלי, ותמלול שלו לשני קבצים
+    │   └── packer.rs                       # צד ה-build: וקטורים מוכנים → ארטיפקט מאומת
     ├── hybrid/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Hybrid
     │   ├── coordinator.rs                  # מתאם החיפוש ההיברידי הראשי
@@ -530,6 +533,42 @@ otzaria-semantic-search/
   - **מה שאינו כאן:** ה-importer אינו חשוף דרך `OtzariaHybridEngine`, ה-FFI או
     אוצריא. ההתקנה עצמה עדיין אינה מופעלת מהאפליקציה — זה S5 ו-S6.
 
+* [`src/distribution/corpus.rs`](../src/distribution/corpus.rs) — **הפורט אל האינדקס
+  הלקסיקלי.**
+  - `CorpusIndex` — `identity()` ו-`line(line_id)`. ה-packer מקבל את זה ולא נתיב, כי
+    Tantivy אינו תלות של ה-crate הזה ואסור שיהיה: האינדקס, הסכמה וסכמת ה-IDs חיים
+    ב-`otzaria_search_engine`.
+  - **שתי תוצאות, ושתיהן העיקר:** זהות ה-corpus נקראת מהאינדקס ולא מוקלדת ליד
+    הווקטורים, וכל שדה ברשומה נגזר מהקורפוס — ולכן אין תיאור שני של ספר שיכול להיפרד
+    מהראשון.
+  - `CorpusLine` — בדיוק השדות שרשומה נושאת, פחות השלושה שהצד הסמנטי גוזר
+    (`semantic_id`, `source_doc_key`, `chunk_hash`), ועוד ה-`text` שממנו הווקטור נבנה.
+    הטקסט **אינו** נשמר בארטיפקט; הוא מה שמוכיח שהווקטור שייך לשורה הזאת.
+  - `JsonlCorpus` — תמלול לשני קבצים (`identity.json` + `lines.jsonl`), שמאפשר להריץ
+    packer בלי Tantivy. **תמלול, לא מקור אמת:** הוא אמין בדיוק כמו מי שכתב אותו, וה-join
+    המחייב הוא זה שמימוש מעל אינדקס חי מבצע. הוא גם מחזיק כל שורה בזיכרון — כמו ה-store
+    שהוא מזין, וזאת אותה מדידה של S2b.
+
+* [`src/distribution/packer.rs`](../src/distribution/packer.rs) — **צד ה-build (S4a).**
+  - `pack()` — וקטורים מוכנים → ארטיפקט. הסדר כפוי: זהות שלמה → יעד פנוי → בדיקת כל
+    וקטור מול הקורפוס → commit → metadata → `validate_artifact`. שום דבר אינו נוגע בדיסק
+    לפני ה-commit, ולכן דחייה משאירה תיקייה ריקה ואפשר פשוט לחזור על הריצה.
+  - **הקלט הוא `line_id`, וקטור ו-SHA-256 של טקסט השורה.** ה-digest הוא מה שהופך את הכלי
+    ממחתמת גומי לשער: קובץ וקטורים שנסע בשורה אחת מול רשימת ה-IDs עובר כל בדיקה אחרת
+    שקיימת — הספירות מסתדרות, ה-checksums עוברים, וכל תוצאה תהיה שורה שכנה. מה שאי אפשר
+    להוכיח: שהיצרן חישב את ה-digest כשהטמיע ולא מהקורפוס בזמן האריזה. זה נאמר, לא מוסתר.
+  - `validate_artifact()` — האימות של הריצה (`verify_for_install`, פריסת payload, פתיחת
+    `ReadOnlyZevcStore`, `verify_counts_against_payload` — **אותן פונקציות**, לא מימוש שני)
+    ועוד ה-join: כל רשומה מושווית שדה־שדה למה שהקורפוס אומר על השורה שלה. חשוף גם לבדו,
+    ולכן הוא עונה על „האם התיקייה הזאת שייכת לקורפוס ולמודל האלה” לארטיפקט שלא נבנה כאן.
+  - `record_fields()` — טבלת שדות אחת ששני הצדדים נמדדים לפיה, ובדיקה שמשווה את השמות
+    שבה ל-JSON של הרשומה: שדה שיתווסף בלי שורה כאן ייכתב לכל ארטיפקט ולא יושווה לדבר.
+  - `read_vector_inputs()` — הזרמה של שני קבצי הקלט: `f32` little-endian בלי כותרת,
+    ולצידו JSONL באותו סדר. ההצמדה מיקומית, ולכן **שתי** צורות אי-ההתאמה נתפסות: רשומות
+    עודפות נגמרות באמצע וקטור, ורשומות חסרות משאירות בייטים — וזה מדווח בסוף ולא נבלע.
+  - `store` הוא `readable_store_identity()` ולא בחירה של הקורא: packer שכותב פריסה
+    שהריצה שלו אינה יודעת לקרוא מייצר ארטיפקטים לאף אחד.
+
 * [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
   - `measure()` / `aggregate()` / `QuerySet` / `BenchmarkConfig` — תזמון, אחוזונים
     והערכת תפוקה סדרתית. הקורא מספק את סגירת החיפוש ואת ה-corpus.
@@ -554,6 +593,16 @@ otzaria-semantic-search/
     ב-`SemanticOnly` וב-`Hybrid`. בנוסף: כל פעולה בונה נדחית בשם והארטיפקט אינו משתנה,
     ופתיחה חוזרת (restart) מחזירה את אותה תשובה בלי לבנות דבר.
   - דורש `--features mock-embedding`.
+* [`tests/artifact_packer.rs`](../tests/artifact_packer.rs)
+  - שער הקבלה של S4a, דרך הבינארי שצינור build באמת מריץ: `pack` הופך קובץ וקטורים
+    לארטיפקט מאומת, `validate` מבסס את אותו הדבר על תיקייה שהוא לא בנה, ושתי הריצות
+    מדווחות את אותו digest. ובצד השני — קלט שבו הווקטורים והמזהים נסעו זה מול זה נדחה
+    בקוד יציאה ובהודעה, ולא נשארת תיקייה.
+  - הבדיקה שמצדיקה את כל השאר: מה שה-packer כתב עובר `IndexImporter`,
+    `OfficialSemanticIndex` ושאילתה — בלי fixture שנבנה ביד באמצע. עד עכשיו „ה-packer
+    כותב את מה שהקורא קורא” לא הייתה טענה שמשהו היה נכשל אם תפסיק להיות נכונה.
+    החלק הזה דורש `--features mock-embedding` (שאילתה צריכה להטמיע); שאר הקובץ רץ
+    בבנייה רגילה, כי אריזה אינה מטמיעה דבר.
 * [`tests/artifact_contract.rs`](../tests/artifact_contract.rs)
   - חוזה הארטיפקט מבחוץ: התקנה ואימות חוזר, digest מפורסם מול חבילה עקבית-עם-עצמה,
     שחזור מקריסה בין שני ה-renames, דחייה לפי שם שדה, והפרדת „פגום” מ„לא תואם”.
@@ -605,3 +654,30 @@ cargo clippy --all-targets --features mock-embedding -- -D warnings
 cargo test --lib --tests                                           # שער ה-production
 cargo test --lib --tests --features mock-embedding                  # החבילה המלאה
 ```
+
+## אריזת ארטיפקט (S4a)
+
+```bash
+cargo run --release -- pack \
+  --vectors vectors.f32 --records vectors.jsonl \
+  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
+  --model model.json --out ./artifact
+
+cargo run --release -- validate \
+  --artifact ./artifact \
+  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
+  --model model.json
+```
+
+* `vectors.f32` — `f32` little-endian, `מספר_וקטורים × embedding_dim`, בלי כותרת.
+* `vectors.jsonl` — שורה לכל וקטור, **באותו סדר**:
+  `{"line_id": N, "line_sha256": "..."}`. ה-`line_sha256` הוא SHA-256 של טקסט השורה
+  בקורפוס, ב-hex קטן; בלעדיו קובץ וקטורים שנסע בשורה אחת היה נארז בלי תלונה.
+* `corpus-lines.jsonl` — `{"line_id": N, "source_book_key": ..., "title": ...,
+  "reference": ..., "section_id": N, "segment": N, "is_pdf": bool, "line_hash": N,
+  "content_hash": N, "facets": [...], "text": "..."}` לכל מסמך.
+* `model.json` — `ModelIdentity` (ראו [`versioning.rs`](../src/semantic/versioning.rs)).
+
+שתי הפקודות עובדות ב**בנייה רגילה**: אריזה אינה הופכת טקסט לווקטור, ולכן היא אינה
+דורשת backend inference. ה-`Digest` שמודפס הוא מה שצריך להתפרסם **מחוץ** לארטיפקט —
+בלעדיו אימות מזהה נזק וארטיפקט לא נכון, ולא ארטיפקט שנבנה מחדש בכוונה.
