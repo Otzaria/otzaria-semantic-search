@@ -355,21 +355,35 @@ pub enum PackError {
     #[error("line_id {line_id} has a vector but no document in the corpus")]
     LineNotInCorpus { line_id: u64 },
 
-    /// Lines the corpus expects a vector for did not get one.
+    /// The vectors and the corpus do not describe the same set of lines.
     ///
-    /// The other half of [`Self::LineNotInCorpus`], and the more dangerous half: a vector
-    /// for a line that does not exist is at least *visible*, while a library missing most
-    /// of itself produces an artifact whose counts, checksums and identity all agree. One
-    /// good vector out of six million would otherwise pack successfully.
+    /// Checked in **both** directions, because they are different faults and neither is
+    /// visible any other way:
+    ///
+    /// * *missing* — lines the recipe embeds that got no vector. A library missing most of
+    ///   itself still produces an artifact whose counts, checksums and identity all agree,
+    ///   so one good vector out of six million would otherwise pack successfully.
+    /// * *unexpected* — vectors for lines the recipe does **not** embed. Distinct from
+    ///   [`Self::LineNotInCorpus`], which is a line the corpus has never heard of: this one
+    ///   exists and is answerable, it simply should not have been embedded. A line too
+    ///   short to carry meaning acquiring a vector means the artifact was built by a recipe
+    ///   other than the one it declares.
     #[error(
-        "The artifact covers {covered} of the corpus's {expected} line(s); {missing} have \
-         no vector, the first being line {first_missing}"
+        "The artifact covers {covered} line(s) and the corpus expects {expected}: \
+         {missing} have no vector{}, and {unexpected} vector(s) name a line the recipe \
+         does not embed{}",
+        describe_first(*first_missing),
+        describe_first(*first_unexpected)
     )]
-    IncompleteCoverage {
+    CoverageMismatch {
         expected: usize,
         covered: usize,
         missing: usize,
-        first_missing: u64,
+        unexpected: usize,
+        /// Smallest missing id, so two runs over the same fault name the same line.
+        first_missing: Option<u64>,
+        /// Smallest unexpected id, for the same reason.
+        first_unexpected: Option<u64>,
     },
 
     /// The vector was produced from text this corpus does not hold for that line.
@@ -422,6 +436,11 @@ pub enum PackError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Name an example line in a coverage rejection, or say nothing when that side is clean.
+fn describe_first(line_id: Option<u64>) -> String {
+    line_id.map_or(String::new(), |line_id| format!(" (first: line {line_id})"))
 }
 
 /// Errors from the chunking subsystem.

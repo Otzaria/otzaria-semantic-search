@@ -17,10 +17,13 @@
 //!   producer can know, which is a digest of the text it embedded. The title, reference,
 //!   section, facets and the rest are whatever the corpus says today, so there is no
 //!   second description of a book to drift from the first.
-//! * **The corpus says how many vectors there should be.** [`CorpusIndex::expected_line_ids`]
+//! * **The corpus says which vectors there should be.** [`CorpusIndex::expected_line_ids`]
 //!   is what makes "complete artifact" a checkable claim rather than a hope: without it a
 //!   packer can only vouch for the vectors it was handed, and one good vector would pack
-//!   into a valid-looking artifact for a six-million-line library.
+//!   into a valid-looking artifact for a six-million-line library. It takes the model
+//!   identity, because the set is a function of the recipe the artifact declares — "which
+//!   lines exist" and "which lines get embedded" are different questions, and only the
+//!   second one is coverage.
 //!
 //! [`JsonlCorpus`] is the implementation this crate can offer: a transcription of the
 //! index into two files. It is what makes the CLI usable without Tantivy, and what the
@@ -29,9 +32,9 @@
 //! behind it.
 
 use crate::errors::PackError;
-use crate::semantic::versioning::CorpusIdentity;
+use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -77,21 +80,30 @@ pub trait CorpusIndex {
     /// declares and what the runtime will compare against; a packer never composes it.
     fn identity(&self) -> Result<CorpusIdentity, PackError>;
 
-    /// Every `line_id` an artifact of this corpus must carry a vector for.
+    /// Every `line_id` an artifact built under `model` must carry a vector for — no more
+    /// and no fewer.
     ///
     /// **This is the completeness contract, and there is no way to opt out of it.**
     /// Without it a packer can only check the vectors it was given, so one good vector
     /// out of six million would produce a perfectly valid "official artifact": the
     /// counts, the checksums and the identity would all agree, and the library would be
-    /// missing from itself. Coverage is compared exactly — a missing id is a rejection,
-    /// and so is a vector for an id that is not here.
+    /// missing from itself. The comparison runs in both directions, because an extra
+    /// vector is its own fault — a line the recipe skips acquiring one means the artifact
+    /// was built by a recipe other than the one it declares.
     ///
-    /// **It is not "every document in the index".** The embedding recipe decides what
-    /// gets a vector: a line too short to carry meaning is skipped, and an artifact is
-    /// not incomplete for skipping it. So the set is the *recipe's* output, which is why
-    /// it is answered by whoever implements the recipe rather than derived here. For
-    /// [`JsonlCorpus`] that means: export exactly the lines that should be embedded.
-    fn expected_line_ids(&self) -> Result<Vec<u64>, PackError>;
+    /// **It is not "every document in the index".** The embedding recipe decides what gets
+    /// a vector: a line too short to carry meaning is skipped, and an artifact is not
+    /// incomplete for skipping it. That is why `model` is a parameter — the set is a
+    /// function of `embedding_text_version`, `chunking_identity` and `max_tokens`, which
+    /// are exactly what the artifact declares about itself, and an implementation that
+    /// answered for some other recipe would be certifying coverage of an artifact nobody
+    /// built.
+    ///
+    /// **Do not derive it from the vectors that were produced.** A batch that died halfway
+    /// or a line the backend silently dropped would vanish from both sides at once, and the
+    /// check would confirm itself. The set has to be decided before inference, from the
+    /// corpus and the recipe.
+    fn expected_line_ids(&self, model: &ModelIdentity) -> Result<BTreeSet<u64>, PackError>;
 
     /// The line `line_id` names, or `None` when the corpus holds no live document with
     /// that id.
@@ -119,6 +131,13 @@ pub struct CorpusLineRecord {
 /// as whatever wrote it; the authoritative join is the one an implementation over the
 /// live index performs. That is why the trait exists and why this type is not the only
 /// way in.
+///
+/// **What it cannot express.** One map answers both "what is line N" and "which lines get
+/// vectors", so here those two questions can never disagree: a line that exists but is not
+/// embedded has no representation. A live index has both — it holds every document while
+/// the recipe embeds some of them — so that half of the coverage check is exercised
+/// against a corpus that can tell them apart, and enforced for the implementation that
+/// will need to.
 ///
 /// **What it costs.** Every line is held in memory, text included. At library scale that
 /// is not affordable — but neither is the payload writer this feeds, which holds every
@@ -215,7 +234,13 @@ impl CorpusIndex for JsonlCorpus {
     /// Every line in the file. The file is therefore the coverage contract as well as the
     /// metadata source: whoever exported it decided which lines get vectors, which is the
     /// same decision the embedding recipe makes.
-    fn expected_line_ids(&self) -> Result<Vec<u64>, PackError> {
+    ///
+    /// `model` is ignored, and that is this type's limit rather than an oversight. A
+    /// transcription records a recipe that was **already applied**; nothing in the file can
+    /// re-derive the set for a different one, so it cannot notice an export made for
+    /// `embedding_text_version` 1 being packed under version 2. An implementation over a
+    /// live index re-runs the recipe and can, which is one more reason the trait exists.
+    fn expected_line_ids(&self, _model: &ModelIdentity) -> Result<BTreeSet<u64>, PackError> {
         Ok(self.lines.keys().copied().collect())
     }
 

@@ -49,8 +49,10 @@
 //! [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex)
 //! checks — plus two only a build machine can make. Every record read back out of the
 //! payload is compared, field by field, against what the corpus says about its line; and
-//! the set of ids is compared against [`CorpusIndex::expected_line_ids`], so an artifact that is internally perfect and covers a tenth of the library is a
-//! rejection. Over every record, not a sample: the corpus is already in memory, and a
+//! the set of ids is compared against [`CorpusIndex::expected_line_ids`] in both
+//! directions, so an artifact that is internally perfect and covers a tenth of the library
+//! is a rejection — and so is one carrying a vector for a line the recipe does not embed.
+//! Over every record, not a sample: the corpus is already in memory, and a
 //! sampled gate makes a failing build depend on which records the sample happened to
 //! include.
 //!
@@ -92,7 +94,7 @@ use crate::semantic::zevc_store::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -169,7 +171,7 @@ pub struct PackReport {
 /// 2. Refuse an output path that already holds something.
 /// 3. Per input: the declared width, a vector a search could return, an id seen once, a
 ///    line the corpus holds, and the text that line actually carries.
-/// 4. Coverage: every id the corpus expects got a vector.
+/// 4. Coverage: the ids are exactly the ones the corpus expects for this recipe.
 /// 5. Commit the payload, describe it, and write the metadata.
 /// 6. [`validate_artifact`], which re-reads everything just written.
 ///
@@ -194,7 +196,7 @@ pub fn pack(
         auto_persist: false,
     })?;
 
-    let mut seen: HashSet<u64> = HashSet::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut batch: Vec<(VectorMetadata, Vec<f32>)> = Vec::with_capacity(INSERT_BATCH);
     let mut accepted: u32 = 0;
 
@@ -221,7 +223,7 @@ pub fn pack(
     if accepted == 0 {
         return Err(PackError::NoVectors);
     }
-    verify_coverage(&seen, corpus)?;
+    verify_coverage(&seen, corpus, &identity.model)?;
 
     // The payload writer replaces on a duplicate `semantic_id` rather than failing, so
     // "everything accepted is in the payload" is counted and not assumed.
@@ -260,7 +262,7 @@ pub fn pack(
 /// 4. the payload opens through the verified token, which checks a SHA-256 per record;
 /// 5. the manifest's counts are what the payload holds;
 /// 6. every record's metadata is what the corpus says about its line;
-/// 7. every line the corpus expects a vector for has one.
+/// 7. the ids are exactly the lines the corpus expects for this recipe.
 ///
 /// Steps 6 and 7 are what make this more than a re-run of the runtime's checks. An
 /// artifact can be internally perfect and still describe books by a title the catalogue no
@@ -287,38 +289,51 @@ pub fn validate_artifact(
             .map(|record| record.line_id)
             .collect(),
         corpus,
+        &identity.model,
     )?;
 
     Ok(report(&verified, identity, book_count))
 }
 
-/// Refuse an artifact that does not cover the corpus.
+/// Refuse an artifact whose vectors are not exactly the lines the recipe embeds.
 ///
-/// The complement of [`PackError::LineNotInCorpus`], and the half that is easy to miss: a
-/// vector whose line does not exist is at least *present* and gets rejected on sight, while
-/// lines with no vector leave nothing behind to notice. Every count in the manifest, every
-/// payload checksum and every identity field agrees with an artifact holding one line out
-/// of six million.
+/// **Both directions, and neither is the other's mirror.**
 ///
-/// The missing id reported is the smallest one, so two runs over the same fault name the
-/// same line.
-fn verify_coverage(covered: &HashSet<u64>, corpus: &dyn CorpusIndex) -> Result<(), PackError> {
-    let expected = corpus.expected_line_ids()?;
-    let Some(first_missing) = expected
-        .iter()
-        .filter(|line_id| !covered.contains(line_id))
-        .min()
-        .copied()
-    else {
-        return Ok(());
-    };
+/// A line with no vector is invisible: every count in the manifest, every payload checksum
+/// and every identity field agrees with an artifact holding one line out of six million.
+/// That is the half [`PackError::LineNotInCorpus`] cannot reach, because nothing is there
+/// to be rejected.
+///
+/// A vector for a line the recipe does **not** embed is a different fault, and it is not
+/// caught by the per-input join either: that check asks the corpus whether the line
+/// exists, and a line skipped for being too short to carry meaning exists perfectly well.
+/// It should simply never have been embedded — so its presence says the vectors came from
+/// a recipe other than the one the artifact declares.
+///
+/// Checked as a whole set rather than per input, so a build log gets both totals at once
+/// instead of stopping on whichever id came first. The example ids are the smallest of
+/// each kind, so two runs over the same fault name the same lines.
+fn verify_coverage(
+    covered: &BTreeSet<u64>,
+    corpus: &dyn CorpusIndex,
+    model: &ModelIdentity,
+) -> Result<(), PackError> {
+    let expected = corpus.expected_line_ids(model)?;
 
-    let unique: HashSet<u64> = expected.into_iter().collect();
-    Err(PackError::IncompleteCoverage {
-        expected: unique.len(),
+    let missing: Vec<u64> = expected.difference(covered).copied().collect();
+    let unexpected: Vec<u64> = covered.difference(&expected).copied().collect();
+    if missing.is_empty() && unexpected.is_empty() {
+        return Ok(());
+    }
+
+    Err(PackError::CoverageMismatch {
+        expected: expected.len(),
         covered: covered.len(),
-        missing: unique.difference(covered).count(),
-        first_missing,
+        missing: missing.len(),
+        unexpected: unexpected.len(),
+        // `BTreeSet::difference` yields in ascending order, so the first is the smallest.
+        first_missing: missing.first().copied(),
+        first_unexpected: unexpected.first().copied(),
     })
 }
 
@@ -854,9 +869,16 @@ mod tests {
 
     /// A corpus that answers from a table, and can be made to disagree with an artifact
     /// after one was built from it.
+    ///
+    /// The two sets are held **separately** on purpose. A real index answers `line()` for
+    /// every document it holds while the recipe embeds only some of them, and a fake that
+    /// derived one from the other could not express the case where a vector exists for a
+    /// line that should never have been embedded — which is exactly the direction of the
+    /// coverage check that is easy to leave out.
     struct FakeCorpus {
         identity: CorpusIdentity,
         lines: HashMap<u64, CorpusLine>,
+        expected: BTreeSet<u64>,
     }
 
     impl FakeCorpus {
@@ -872,7 +894,15 @@ mod tests {
                     .iter()
                     .map(|(line_id, book, text)| (*line_id, corpus_line(book, text)))
                     .collect(),
+                expected: LINES.iter().map(|(line_id, _, _)| *line_id).collect(),
             }
+        }
+
+        /// The same corpus, with `line_id` still answerable but no longer embedded — a
+        /// line the recipe skips for being too short to carry meaning.
+        fn not_embedding(mut self, line_id: u64) -> Self {
+            self.expected.remove(&line_id);
+            self
         }
     }
 
@@ -880,8 +910,8 @@ mod tests {
         fn identity(&self) -> Result<CorpusIdentity, PackError> {
             Ok(self.identity.clone())
         }
-        fn expected_line_ids(&self) -> Result<Vec<u64>, PackError> {
-            Ok(self.lines.keys().copied().collect())
+        fn expected_line_ids(&self, _model: &ModelIdentity) -> Result<BTreeSet<u64>, PackError> {
+            Ok(self.expected.clone())
         }
         fn line(&self, line_id: u64) -> Result<Option<CorpusLine>, PackError> {
             Ok(self.lines.get(&line_id).cloned())
@@ -1345,17 +1375,21 @@ mod tests {
             vec![Ok(input(LINES[0].0, LINES[0].2))],
             &corpus,
         ) {
-            Err(PackError::IncompleteCoverage {
+            Err(PackError::CoverageMismatch {
                 expected,
                 covered,
                 missing,
+                unexpected,
                 first_missing,
+                first_unexpected,
             }) => {
                 assert_eq!(expected, LINES.len());
                 assert_eq!(covered, 1);
                 assert_eq!(missing, LINES.len() - 1);
+                assert_eq!(unexpected, 0);
                 // The smallest missing id, so two runs over the same fault agree.
-                assert_eq!(first_missing, LINES[1].0);
+                assert_eq!(first_missing, Some(LINES[1].0));
+                assert_eq!(first_unexpected, None);
             }
             other => panic!("a partial artifact must be refused, got {other:?}"),
         }
@@ -1369,11 +1403,71 @@ mod tests {
         grown
             .lines
             .insert(12_884_901_889, corpus_line("otzaria/new.txt", "שורה חדשה"));
+        grown.expected.insert(12_884_901_889);
         match validate_artifact(&output, &model(), &grown) {
-            Err(PackError::IncompleteCoverage { first_missing, .. }) => {
-                assert_eq!(first_missing, 12_884_901_889)
+            Err(PackError::CoverageMismatch { first_missing, .. }) => {
+                assert_eq!(first_missing, Some(12_884_901_889))
             }
             other => panic!("a corpus that grew must fail validation, got {other:?}"),
+        }
+    }
+
+    /// The other direction, and the one that is easy to leave out: a vector for a line the
+    /// recipe does **not** embed.
+    ///
+    /// Nothing else here can see it. The per-input join asks whether the corpus holds the
+    /// line and it does — a line skipped for being too short to carry meaning exists
+    /// perfectly well — so only "is this one of the lines that should have been embedded"
+    /// catches it. And it matters: a vector that should not exist means the artifact was
+    /// built by a recipe other than the one it declares.
+    #[test]
+    fn a_vector_for_a_line_the_recipe_does_not_embed_is_refused() {
+        let dir = TempDir::new("unexpected_coverage");
+        let skipped = LINES[1].0;
+        let corpus = FakeCorpus::new().not_embedding(skipped);
+
+        // Every remaining line is covered, so the missing side is clean.
+        match pack(
+            request(&dir.path().join("artifact")),
+            good_inputs(),
+            &corpus,
+        ) {
+            Err(PackError::CoverageMismatch {
+                expected,
+                covered,
+                missing,
+                unexpected,
+                first_missing,
+                first_unexpected,
+            }) => {
+                assert_eq!(expected, LINES.len() - 1);
+                assert_eq!(covered, LINES.len());
+                assert_eq!(missing, 0);
+                assert_eq!(unexpected, 1);
+                assert_eq!(first_missing, None);
+                assert_eq!(first_unexpected, Some(skipped));
+            }
+            other => panic!("an extra vector must be refused, got {other:?}"),
+        }
+
+        // The corpus still answers for that line, which is why nothing before the coverage
+        // check could have refused it.
+        assert!(corpus.line(skipped).unwrap().is_some());
+
+        // And an artifact already holding it fails validation on its own, which is what a
+        // recipe change after a build looks like.
+        let output = dir.path().join("built-under-the-old-recipe");
+        pack(request(&output), good_inputs(), &FakeCorpus::new()).unwrap();
+        match validate_artifact(&output, &model(), &corpus) {
+            Err(PackError::CoverageMismatch {
+                unexpected,
+                first_unexpected,
+                ..
+            }) => {
+                assert_eq!(unexpected, 1);
+                assert_eq!(first_unexpected, Some(skipped));
+            }
+            other => panic!("an extra vector must fail validation, got {other:?}"),
         }
     }
 
@@ -1655,7 +1749,10 @@ mod tests {
                     reason: "the index could not be opened".to_string(),
                 })
             }
-            fn expected_line_ids(&self) -> Result<Vec<u64>, PackError> {
+            fn expected_line_ids(
+                &self,
+                _model: &ModelIdentity,
+            ) -> Result<BTreeSet<u64>, PackError> {
                 unreachable!("the identity is read first")
             }
             fn line(&self, _line_id: u64) -> Result<Option<CorpusLine>, PackError> {
