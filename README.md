@@ -139,12 +139,13 @@ otzaria-semantic-search/
 │   └── vector_search.rs                ➜ Vector-search latency benchmark (harness = false)
 ├── tests/
 │   ├── artifact_contract.rs            ➜ Artifact identity & install gate, through the public API
+│   ├── artifact_packer.rs              ➜ S4a's gate: pack/validate through the CLI, and what it packs opens
 │   ├── official_runtime.rs             ➜ Install → open → query an artifact, through the public API
 │   ├── hybrid_integration_test.rs      ➜ End-to-end integration test suite
 │   └── production_backend_gate.rs      ➜ Proves a default build refuses to embed
 └── src/
     ├── lib.rs                          ➜ Library root, module exports & product contract
-    ├── main.rs                         ➜ Development CLI (audit / smoke runs)
+    ├── main.rs                         ➜ Development CLI (audit / smoke) + the build commands: pack / validate
     ├── errors.rs                       ➜ Strongly-typed error hierarchy (thiserror)
     ├── api/
     │   ├── mod.rs                      ➜ API module declaration
@@ -156,7 +157,9 @@ otzaria-semantic-search/
     │   └── feature_flags.rs            ➜ Per-run overrides onto a RankingProfile
     ├── distribution/
     │   ├── package.rs                  ➜ Index package manifest & SHA-256 payload checksums
-    │   └── importer.rs                 ➜ Staged install, with recovery from an interrupted swap
+    │   ├── importer.rs                 ➜ Staged install, with recovery from an interrupted swap
+    │   ├── corpus.rs                   ➜ The port onto the lexical index, and a two-file transcription of one
+    │   └── packer.rs                   ➜ The build side: ready-made vectors → a verified artifact
     ├── hybrid/
     │   ├── mod.rs                      ➜ Hybrid search module declaration
     │   ├── coordinator.rs              ➜ Hybrid search coordinator & fallback logic
@@ -216,9 +219,12 @@ otzaria-semantic-search/
 | **Telemetry** | [`src/telemetry/mod.rs`](src/telemetry/mod.rs) | `TelemetryCollector`, `SearchTelemetry` | In-process counters only — nothing is transmitted anywhere |
 | **Index Package** | [`src/distribution/package.rs`](src/distribution/package.rs) | `IndexPackage`, `ArtifactExpectation`, `VerifiedPackage`, `VerificationDepth` | Metadata plus a SHA-256 per payload, and the artifact digest that a published value can be compared against. `verify_for_install` hashes everything; `verify_for_open` does not, and the token records which ran |
 | **Package Install** | [`src/distribution/importer.rs`](src/distribution/importer.rs) | `IndexImporter`, `recover_interrupted_install` | Verify the source, copy to staging, verify the copy, swap. The swap is two renames with a window in between, so the intermediate names are deterministic and recovery is a documented step |
+| **Corpus Port** | [`src/distribution/corpus.rs`](src/distribution/corpus.rs) | `CorpusIndex`, `CorpusLine`, `JsonlCorpus` | The lexical index a packer joins against, as a trait — Tantivy is not a dependency of this crate and must not be. The corpus supplies the identity, every stored field, **and the exact set of lines the declared recipe embeds**, so there is no second description of a book to drift from the first, no silently partial artifact, and no vector for a line that should never have been embedded |
+| **Artifact Packer** | [`src/distribution/packer.rs`](src/distribution/packer.rs) | `pack`, `validate_artifact`, `VectorInput` | Ready-made vectors in, a verified artifact out. An input is a `line_id`, a vector and two digests: of the corpus line, which is checked and catches a vector file shifted by one row, and of the text that was actually embedded, which becomes the record's `chunk_hash` |
 | **Benchmark Harness** | [`src/benchmark/mod.rs`](src/benchmark/mod.rs) | `measure`, `aggregate`, `QuerySet` | Timing and percentile helpers. A measurement tool, **not** a relevance dataset |
 | **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | feature-gated integration tests | End-to-end public-API suite using the explicit mock backend |
-| **Official Runtime Test** | [`tests/official_runtime.rs`](tests/official_runtime.rs) | feature-gated integration tests | Builds an artifact the way the packer will, installs it, opens it, and asserts a query returns the `line_id` it was built from — plus that every build-side call is refused and the artifact is never written to |
+| **Official Runtime Test** | [`tests/official_runtime.rs`](tests/official_runtime.rs) | feature-gated integration tests | Builds an artifact the way the packer does, installs it, opens it, and asserts a query returns the `line_id` it was built from — plus that every build-side call is refused and the artifact is never written to |
+| **Packer Test** | [`tests/artifact_packer.rs`](tests/artifact_packer.rs) | integration tests, one feature-gated | S4a end to end through the binary a pipeline runs: pack, re-validate, two independent packs producing byte-identical payloads, and misaligned or partial input refused. Then what the packer wrote is installed, opened and queried — with no fixture assembled by hand in between. (The "extra vector" half of coverage needs a corpus that can tell "exists" from "is embedded" apart, which the JSONL transcription cannot, so it is exercised in the packer's own tests.) |
 | **CI Workflow** | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | `check-and-test` | Multi-platform GitHub Actions CI workflow (Linux, Windows, macOS) |
 
 ---
@@ -226,8 +232,8 @@ otzaria-semantic-search/
 ## 🚀 Roadmap & Implementation Status
 
 The stages below are the plan of record from
-[שלבי ויעדי התקדמות.md](שלבי%20ויעדי%20התקדמות.md). S4–S8 land in
-`otzaria_search_engine` and `otzaria`, not here.
+[שלבי ויעדי התקדמות.md](שלבי%20ויעדי%20התקדמות.md). S4a is the packer in this repo;
+S4b and S5–S8 land in `otzaria_search_engine` and `otzaria`.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────────┐
@@ -245,7 +251,8 @@ The stages below are the plan of record from
 │ [✔] S2a Read-only runtime path: the artifact's reader, read/write store split    │
 │ [ ] S2b Scale: cold-open, latency, RSS and disk at 1M/6M — then the ANN decision │
 │ [✔] S3  Artifact contract: identity, two depths, recoverable install, reader     │
-│ [ ] S4  Builder that reads the final Tantivy index (otzaria_search_engine)       │
+│ [✔] S4a Packer: ready-made vectors + a corpus join → a verified artifact         │
+│ [ ] S4b Embeddings, and a CorpusIndex over a live Tantivy (search_engine)        │
 │ [ ] S5  Repin, open/install API, explicit statuses, FFI (otzaria_search_engine)  │
 │ [ ] S6  Artifact & model management in the app (otzaria)                         │
 │ [ ] S7  RetrievalMode in BLoC and UI (otzaria)                                   │
@@ -266,10 +273,23 @@ The stages below are the plan of record from
    depths, the published-digest anchor, a recoverable install, and a runtime path that
    opens the verified token landed; see
    [docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md). What is left:
-   - Publish the artifact digest (and sign it): the check exists, the anchor does not (S6).
-   - Decide whether the distributed artifact is a single archive rather than a directory (packer-side, S4).
+   - Publish the artifact digest (and sign it): the check exists, and `pack` now prints the value, but nobody publishes it (S6).
+   - Decide whether the distributed artifact is a single archive rather than a directory. The packer writes a directory, so this is entirely a distribution decision (S6).
    - Measure open and install against a budget on a representative artifact (S2b/S8).
-4. **Quality evaluation suite**:
+4. **From the packer to a real artifact (S4b)** — `pack` takes ready-made vectors and a
+   [`CorpusIndex`](src/distribution/corpus.rs); what is missing is the two things Tantivy
+   owns:
+   - implement that port over a live Tantivy index in `otzaria_search_engine`, which also
+     decides how `corpus_id` is derived — the JSONL transcription here is a transcription,
+     not a source of truth. `expected_line_ids` must apply the declared recipe, and must
+     **not** be derived from the vectors that came out: a batch that died halfway would
+     then vanish from both sides at once and the coverage check would confirm itself.
+     `chunking_identity` is an opaque hash, so that implementation has to hold the real
+     `ChunkerConfig` and assert `config.identity() == model.chunking_identity` — it cannot
+     recover the recipe from the identity it is handed.
+   - produce the embeddings themselves from the same documents, in batches, and feed them
+     to `pack`.
+5. **Quality evaluation suite**:
    - Build the rabbinic relevance dataset behind S1 and report against BM25-only and semantic-only baselines.
 
 ---
@@ -319,6 +339,47 @@ cargo fmt --check
 # Run strict Clippy lints (run for each feature combination above)
 cargo clippy --all-targets -- -D warnings
 ```
+
+### Packing an artifact (S4a)
+
+Both commands work in a **default build** — packing never turns text into a vector, so it
+needs no inference backend.
+
+```bash
+cargo run --release -- pack \
+  --vectors vectors.f32 --records vectors.jsonl \
+  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
+  --model model.json --out ./artifact
+
+cargo run --release -- validate \
+  --artifact ./artifact \
+  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
+  --model model.json
+```
+
+| File | Shape |
+|------|-------|
+| `vectors.f32` | little-endian `f32`, `vector_count × embedding_dim`, no header |
+| `vectors.jsonl` | one `{"line_id": N, "source_line_sha256": "...", "embedding_text_sha256": "..."}` per vector, **in the same order** |
+| `corpus-identity.json` | the `CorpusIdentity` the lexical index reports |
+| `corpus-lines.jsonl` | one document per line: `line_id`, book key, title, reference, section, segment, `is_pdf`, hashes, facets and `text`. **Also the coverage contract** — the vectors must cover it exactly, with nothing missing and nothing extra, so export exactly the lines that should be embedded |
+| `model.json` | a `ModelIdentity` — see [`versioning.rs`](src/semantic/versioning.rs) |
+
+`source_line_sha256` is the SHA-256 of the corpus line's text and is checked against the
+corpus: a vector file shifted by one row passes every other check there is.
+`embedding_text_sha256` is of the text that was actually embedded — after any title prefix,
+neighbour context or truncation — and is recorded as the record's `chunk_hash`, because
+that field is defined as a digest of the embedded text and the corpus holds the line.
+
+Both are alignment and provenance *records*, not proof: nothing available to a tool that
+receives finished floats can establish that a vector came from that text, by that model.
+Closing that means producing the vector, its digest and the model identity in one pipeline
+(S4b).
+
+The `Digest:` line the tool prints is what has to be published **outside** the artifact —
+without it, a later verification detects damage and the wrong artifact, but not one
+deliberately rebuilt to match. Two independent packs of the same vectors produce the same
+digest, which is what makes publishing one meaningful.
 
 ### Testing against the real model
 

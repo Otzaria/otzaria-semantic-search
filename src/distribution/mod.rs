@@ -12,5 +12,12 @@
 //!
 //! The module was named `cloud` before S0; the name implied a runtime dependency
 //! on a server that does not exist. See `docs/PRODUCT_CONTRACT.md` §5.
+//!
+//! The build side lives here too, because producing a package and installing one are two
+//! ends of the same contract: [`packer`] turns ready-made vectors into a directory
+//! [`package`] verifies and [`importer`] installs, and it joins every vector to the
+//! [`corpus`] whose ids it claims before it writes anything.
+pub mod corpus;
 pub mod importer;
 pub mod package;
+pub mod packer;

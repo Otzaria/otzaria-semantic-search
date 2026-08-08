@@ -365,7 +365,11 @@ impl OfficialSemanticIndex {
 ///
 /// The names are compared as a set: [`SNAPSHOT_FILENAMES`] is in read order, and the token's
 /// table is sorted.
-fn ensure_snapshot_layout(verified: &VerifiedPackage) -> Result<(), ArtifactError> {
+///
+/// `pub(crate)` so the packer's own acceptance check
+/// ([`validate_artifact`](crate::distribution::packer::validate_artifact)) is this check
+/// and not a second implementation of it.
+pub(crate) fn ensure_snapshot_layout(verified: &VerifiedPackage) -> Result<(), ArtifactError> {
     let declared: BTreeSet<&str> = verified.payload_names().into_iter().collect();
     let required: BTreeSet<&str> = SNAPSHOT_FILENAMES.into_iter().collect();
     if declared != required {
@@ -390,7 +394,12 @@ fn ensure_snapshot_layout(verified: &VerifiedPackage) -> Result<(), ArtifactErro
 /// across `book_count` books needs a reader of the store format. The definition the packer
 /// has to match: `vector_count` is the number of records, and `book_count` is the number of
 /// **distinct `source_book_key`s** among them.
-fn verify_counts_against_payload(
+///
+/// `pub(crate)` so the packer matches that definition by *calling* it — see
+/// [`validate_artifact`](crate::distribution::packer::validate_artifact). A count the
+/// build side computes one way and the runtime checks another way is a build that ships
+/// artifacts refusing to open.
+pub(crate) fn verify_counts_against_payload(
     verified: &VerifiedPackage,
     store: &dyn VectorSearchBackend,
 ) -> Result<u32, ArtifactError> {
