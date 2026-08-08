@@ -370,7 +370,7 @@ fn reopening_the_index_never_claims_books_whose_vectors_are_gone() {
     assert!(!status.vectors_persisted);
 
     let fingerprints = library_fingerprints();
-    let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
+    let diff = api.get_semantic_index_diff(&fingerprints).unwrap().unwrap();
     assert!(!diff.is_up_to_date());
     assert_eq!(diff.books_to_index(), 2);
     assert!(!diff.needs_full_rebuild(), "the configuration is unchanged");
@@ -384,6 +384,7 @@ fn reopening_the_index_never_claims_books_whose_vectors_are_gone() {
     assert!(api.get_semantic_status().available);
     assert!(api
         .get_semantic_index_diff(&fingerprints)
+        .unwrap()
         .unwrap()
         .is_up_to_date());
 }
@@ -468,6 +469,7 @@ fn reindexing_a_book_removes_the_vectors_of_lines_that_no_longer_exist() {
     assert!(api
         .get_semantic_index_diff(&fingerprints)
         .unwrap()
+        .unwrap()
         .is_up_to_date());
 }
 
@@ -514,7 +516,7 @@ fn correcting_a_pdfs_author_is_visible_at_diff_time() {
         ),
     ]);
 
-    let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
+    let diff = api.get_semantic_index_diff(&fingerprints).unwrap().unwrap();
     assert_eq!(
         diff.changed_books,
         vec![BERACHOT.to_string()],
@@ -567,7 +569,7 @@ fn a_file_only_signature_cannot_declare_a_pdf_current() {
         ),
     ]);
 
-    let diff = api.get_semantic_index_diff(&fingerprints).unwrap();
+    let diff = api.get_semantic_index_diff(&fingerprints).unwrap().unwrap();
     assert_eq!(
         diff.unverifiable_books,
         vec![BERACHOT.to_string()],
@@ -594,6 +596,7 @@ fn a_pdf_without_a_caller_supplied_signature_is_always_offered() {
 
     let diff = api
         .get_semantic_index_diff_from_lexical_hashes(&tantivy)
+        .unwrap()
         .unwrap();
 
     assert_eq!(
@@ -626,7 +629,7 @@ fn a_book_deleted_from_the_library_is_reported_as_removed() {
         ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
     )]);
 
-    let diff = api.get_semantic_index_diff(&only_genesis).unwrap();
+    let diff = api.get_semantic_index_diff(&only_genesis).unwrap().unwrap();
     assert_eq!(diff.removed_books, vec![BERACHOT.to_string()]);
     assert!(diff.new_books.is_empty());
     assert!(diff.changed_books.is_empty());
@@ -641,7 +644,7 @@ fn removed_books_can_be_applied_through_the_public_api() {
         GENESIS.to_string(),
         ContentFingerprint::from_lexical_hash(genesis_book().content_fingerprint),
     )]);
-    let diff = api.get_semantic_index_diff(&only_genesis).unwrap();
+    let diff = api.get_semantic_index_diff(&only_genesis).unwrap().unwrap();
 
     assert_eq!(
         api.remove_semantic_books(&diff.removed_books).unwrap(),
@@ -652,6 +655,7 @@ fn removed_books_can_be_applied_through_the_public_api() {
     assert_eq!(status.vector_count, 3);
     assert!(
         api.get_semantic_index_diff(&only_genesis)
+            .unwrap()
             .unwrap()
             .is_up_to_date(),
         "applying removed_books must make the diff converge"

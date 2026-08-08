@@ -5,11 +5,18 @@
 //! is **not persistent**, which [`VectorStore::is_persistent`] reports so callers
 //! never treat a stale manifest as a populated index.
 //!
-//! The official path needs a persistent read-only backend, which is stage S2.
-//! Whether that backend also needs to be approximate is a question the S2
-//! measurement answers — a full scan may or may not fit the latency and memory
-//! budget once the dimension and precision are chosen in S1. This API is the seam
-//! either answer slots into.
+//! The official path does not use this backend: it opens an installed artifact through
+//! [`ReadOnlyZevcStore`](crate::semantic::zevc_store::ReadOnlyZevcStore), which persists
+//! and cannot be written to. This one is what
+//! [`SemanticEngine::open`](crate::semantic::engine::SemanticEngine::open) starts from —
+//! the prototype and test default — and any backend can take its place through
+//! [`SemanticEngine::with_store`](crate::semantic::engine::SemanticEngine::with_store).
+//!
+//! Whether the official backend also needs to be *approximate* is a question the S2b
+//! measurement answers — a full scan may or may not fit the latency and memory budget
+//! once the dimension and precision are chosen in S1.
+//! [`VectorSearchBackend`](crate::semantic::store_backend::VectorSearchBackend) is the
+//! seam either answer slots into.
 
 use crate::errors::VectorStoreError;
 // One threshold for the whole crate, so no two layers can disagree about it.
@@ -62,26 +69,30 @@ struct StoreState {
 }
 
 /// Bounded-heap entry for top-k selection.
-struct ScoredEntry {
+///
+/// The id is borrowed from the record: the scan visits every vector, so an owned `String`
+/// here would be one allocation per stored vector per query — cost the full scan does not
+/// require. The records are behind the read lock for the whole scan, so they outlive it.
+struct ScoredEntry<'a> {
     score: f32,
-    semantic_id: String,
+    semantic_id: &'a str,
 }
 
-impl PartialEq for ScoredEntry {
+impl PartialEq for ScoredEntry<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for ScoredEntry {}
+impl Eq for ScoredEntry<'_> {}
 
-impl PartialOrd for ScoredEntry {
+impl PartialOrd for ScoredEntry<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for ScoredEntry {
+impl Ord for ScoredEntry<'_> {
     /// Orders candidates **worst first**, making a max-heap a bounded min-heap: `peek`
     /// yields the candidate to evict. Among equal scores a larger `semantic_id` is
     /// "greater" — randomized `HashMap` order would otherwise return a different top-k
@@ -90,7 +101,7 @@ impl Ord for ScoredEntry {
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| self.semantic_id.cmp(&other.semantic_id))
+            .then_with(|| self.semantic_id.cmp(other.semantic_id))
     }
 }
 
@@ -286,7 +297,7 @@ impl VectorStore {
 
             let entry = ScoredEntry {
                 score,
-                semantic_id: record.metadata.semantic_id.clone(),
+                semantic_id: &record.metadata.semantic_id,
             };
             if heap.len() < top_k {
                 heap.push(entry);
@@ -304,7 +315,7 @@ impl VectorStore {
             .filter_map(|entry| {
                 state
                     .records
-                    .get(&entry.semantic_id)
+                    .get(entry.semantic_id)
                     .map(|record| SemanticCandidate {
                         metadata: record.metadata.clone(),
                         similarity_score: entry.score,
@@ -399,7 +410,7 @@ impl VectorStore {
     }
 }
 
-impl crate::semantic::store_backend::VectorStoreBackend for VectorStore {
+impl crate::semantic::store_backend::VectorSearchBackend for VectorStore {
     fn backend_id(&self) -> &'static str {
         VectorStore::backend_id(self)
     }
@@ -416,14 +427,6 @@ impl crate::semantic::store_backend::VectorStoreBackend for VectorStore {
         VectorStore::vector_count(self).min(u32::MAX as usize) as u32
     }
 
-    fn insert_batch(
-        &self,
-        records: Vec<(VectorMetadata, Vec<f32>)>,
-    ) -> Result<u32, VectorStoreError> {
-        VectorStore::insert_batch(self, &records)?;
-        Ok(records.len().min(u32::MAX as usize) as u32)
-    }
-
     fn search(
         &self,
         query_vector: &[f32],
@@ -431,6 +434,24 @@ impl crate::semantic::store_backend::VectorStoreBackend for VectorStore {
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
         VectorStore::search(self, query_vector, top_k, filters)
+    }
+
+    fn book_keys(&self) -> Vec<String> {
+        VectorStore::book_keys(self)
+    }
+
+    fn book_vector_count(&self, source_book_key: &str) -> usize {
+        VectorStore::book_vector_count(self, source_book_key)
+    }
+}
+
+impl crate::semantic::store_backend::VectorStoreBackend for VectorStore {
+    fn insert_batch(
+        &self,
+        records: Vec<(VectorMetadata, Vec<f32>)>,
+    ) -> Result<u32, VectorStoreError> {
+        VectorStore::insert_batch(self, &records)?;
+        Ok(records.len().min(u32::MAX as usize) as u32)
     }
 
     fn remove_by_book(&self, source_book_key: &str) -> Result<u32, VectorStoreError> {
@@ -441,8 +462,8 @@ impl crate::semantic::store_backend::VectorStoreBackend for VectorStore {
         VectorStore::clear(self)
     }
 
-    fn book_keys(&self) -> Vec<String> {
-        VectorStore::book_keys(self)
+    fn commit(&self) -> Result<(), VectorStoreError> {
+        VectorStore::commit(self)
     }
 }
 

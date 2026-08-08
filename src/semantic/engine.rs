@@ -17,6 +17,7 @@ use crate::semantic::manifest::{
     describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
 use crate::semantic::store::{VectorStore, VectorStoreConfig};
+use crate::semantic::store_backend::VectorStoreBackend;
 use crate::semantic::types::{
     BookForIndexing, ContentFingerprint, IndexDiff, IndexOutcome, IndexingSummary, SearchFilters,
     SemanticCandidate, SemanticChunk, SemanticStatus, VectorMetadata,
@@ -137,11 +138,17 @@ impl SemanticConfig {
 }
 
 /// The main semantic search engine sidecar.
+///
+/// This is the **builder-side** engine: it chunks, embeds and writes. The application
+/// path is [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex),
+/// which opens a verified artifact read-only and has no indexing to expose.
 pub struct SemanticEngine {
     config: SemanticConfig,
     manifest: SemanticManifest,
     chunker: Chunker,
-    store: VectorStore,
+    /// Held as the write-side trait, not a concrete store, so the backend is a choice
+    /// [`SemanticEngine::with_store`] makes rather than something compiled in here.
+    store: Box<dyn VectorStoreBackend>,
     runtime: Option<EmbeddingRuntime>,
     /// Non-empty when the persisted index was built with a configuration this one
     /// cannot use; while non-empty the semantic path is refused.
@@ -150,18 +157,52 @@ pub struct SemanticEngine {
 }
 
 impl SemanticEngine {
-    /// Initialize or open an existing semantic search index.
+    /// Initialize or open an existing semantic search index over the in-memory backend.
     ///
     /// A corrupt or foreign-version manifest is moved aside and a fresh index
     /// started, with the reason in [`SemanticStatus::last_error`].
+    ///
+    /// The vectors do **not** survive a restart — see
+    /// [`VectorSearchBackend::is_persistent`](crate::semantic::store_backend::VectorSearchBackend::is_persistent).
+    /// For an index that does, hand
+    /// [`SemanticEngine::with_store`] a persistent backend.
     pub fn open(config: SemanticConfig) -> Result<Self, SemanticSearchError> {
-        config.validate()?;
-
         let store = VectorStore::open_or_create(config.store.clone())?;
+        Self::with_store(config, Box::new(store))
+    }
+
+    /// Open over a caller-provided backend.
+    ///
+    /// The seam the artifact builder uses: a persistent store is what makes an indexing
+    /// run something an artifact can be packed from, and the choice belongs to the caller
+    /// rather than to this module. Whichever backend is passed is the one recorded in the
+    /// manifest, so reopening the same index with a different backend is reported as an
+    /// incompatibility instead of quietly answering from an empty store.
+    ///
+    /// `config.store` is not used to open anything here — the store is already open — but
+    /// its `embedding_dim` is still validated, because [`SemanticConfig::validate`] is one
+    /// gate for the whole configuration. The backend's own dimension is checked against
+    /// the model's on top of that.
+    pub fn with_store(
+        config: SemanticConfig,
+        store: Box<dyn VectorStoreBackend>,
+    ) -> Result<Self, SemanticSearchError> {
+        config.validate()?;
+        if store.embedding_dim() != config.embedding_dim {
+            return Err(SemanticSearchError::Config(format!(
+                "backend '{}' stores {}-dimensional vectors, and the model produces {}; \
+                 every stored vector must have the model's dimensionality",
+                store.backend_id(),
+                store.embedding_dim(),
+                config.embedding_dim
+            )));
+        }
+
         let chunker = Chunker::new(config.chunking.clone());
+        let backend_id = store.backend_id();
 
         let mut engine = Self {
-            manifest: SemanticManifest::new(&manifest_config(&config, None, None)),
+            manifest: SemanticManifest::new(&manifest_config(&config, None, None, backend_id)),
             config,
             chunker,
             store,
@@ -176,7 +217,7 @@ impl SemanticEngine {
 
     /// Load the manifest, deciding between reuse, pruning and starting fresh.
     fn open_manifest(&mut self) -> Result<(), SemanticSearchError> {
-        let expected = manifest_config(&self.config, None, None);
+        let expected = manifest_config(&self.config, None, None, self.store.backend_id());
 
         match SemanticManifest::load(&self.config.root_dir) {
             Ok(manifest) => {
@@ -283,7 +324,12 @@ impl SemanticEngine {
         let backend = runtime.backend_id().map(str::to_string);
         self.runtime = Some(runtime);
 
-        let expected = manifest_config(&self.config, checksum.clone(), backend.clone());
+        let expected = manifest_config(
+            &self.config,
+            checksum.clone(),
+            backend.clone(),
+            self.store.backend_id(),
+        );
         let mismatches = self.manifest.validate(&expected);
         if !mismatches.is_empty() {
             log::warn!(
@@ -414,7 +460,7 @@ impl SemanticEngine {
         // vectors but an unchanged manifest entry if inference failed halfway.
         let vectors = self.embed_chunks(&chunks)?;
 
-        let removed = self.store.delete_book(&book.source_book_key)?;
+        let removed = self.store.remove_by_book(&book.source_book_key)?;
         if removed > 0 {
             log::debug!(
                 "Replaced {removed} existing vector(s) for {}",
@@ -443,7 +489,7 @@ impl SemanticEngine {
             .zip(vectors)
             .collect();
 
-        if let Err(e) = self.store.insert_batch(&batch) {
+        if let Err(e) = self.store.insert_batch(batch) {
             // Do not leave a manifest entry describing vectors that are not there.
             self.manifest.remove_book(&book.source_book_key);
             self.last_error = Some(e.to_string());
@@ -530,7 +576,7 @@ impl SemanticEngine {
         let mut dirty = false;
 
         for source_book_key in source_book_keys {
-            let count = self.store.delete_book(source_book_key)?;
+            let count = self.store.remove_by_book(source_book_key)?;
             removed_vectors = removed_vectors.saturating_add(count);
             let removed_record = self.manifest.remove_book(source_book_key).is_some();
             dirty |= count > 0 || removed_record;
@@ -561,7 +607,12 @@ impl SemanticEngine {
             .and_then(|r| r.backend_id())
             .map(str::to_string);
 
-        self.manifest = SemanticManifest::new(&manifest_config(&self.config, checksum, backend));
+        self.manifest = SemanticManifest::new(&manifest_config(
+            &self.config,
+            checksum,
+            backend,
+            self.store.backend_id(),
+        ));
         self.manifest.save(&self.config.root_dir)?;
         self.incompatibilities.clear();
         self.last_error = None;
@@ -704,7 +755,7 @@ impl SemanticEngine {
 
     /// Retrieve current operational status.
     pub fn status(&self) -> SemanticStatus {
-        let vector_count = self.store.vector_count() as u32;
+        let vector_count = self.store.count();
         let needs_full_reindex = (!self.incompatibilities.is_empty())
             .then(|| describe_mismatches(&self.incompatibilities));
 
@@ -750,10 +801,15 @@ impl SemanticEngine {
 
 /// Build the manifest-comparison config; `model_checksum` and `embedding_backend`
 /// are `None` until a model is loaded.
+///
+/// `vector_backend` is the store that is actually open, not a constant: an index written
+/// by one backend cannot be read by another, and recording what was compiled in rather
+/// than what was opened would let that swap pass unnoticed.
 fn manifest_config(
     config: &SemanticConfig,
     model_checksum: Option<String>,
     embedding_backend: Option<String>,
+    vector_backend: &str,
 ) -> ManifestConfig {
     ManifestConfig {
         embedding_model_id: config.embedding_model_id.clone(),
@@ -764,7 +820,7 @@ fn manifest_config(
         embedding_max_tokens: config.embedding_max_tokens,
         model_quantization: config.model_quantization.clone(),
         vector_precision: config.vector_precision.clone(),
-        vector_backend: crate::semantic::store::BACKEND_ID.to_string(),
+        vector_backend: vector_backend.to_string(),
         chunking_identity: config.chunking.identity(),
         normalization_version: config.normalization_version,
     }
@@ -2055,5 +2111,101 @@ mod tests {
         engine.load_model().unwrap();
         assert!(engine.status().available);
         assert!(engine.search("בריאה", 5, None).is_ok());
+    }
+
+    // ── the backend is a choice, not a constant ──
+
+    fn zevc_config_for(config: &SemanticConfig) -> crate::semantic::zevc_store::ZevcStoreConfig {
+        crate::semantic::zevc_store::ZevcStoreConfig {
+            db_path: config.store.db_path.clone(),
+            embedding_dim: config.embedding_dim,
+            collection_name: config.store.collection_name.clone(),
+            auto_persist: false,
+        }
+    }
+
+    fn zevc_store(config: &SemanticConfig) -> Box<dyn VectorStoreBackend> {
+        Box::new(
+            crate::semantic::zevc_store::ZevcStore::open_or_create(zevc_config_for(config))
+                .unwrap(),
+        )
+    }
+
+    /// The builder half of what S2a splits: handed a persistent backend, an indexing run
+    /// produces something a restart can still read — which is the precondition for an
+    /// artifact being packable from it at all.
+    #[test]
+    fn an_engine_over_a_persistent_backend_keeps_its_vectors_across_a_reopen() {
+        let dir = TempDir::new("persistent_backend");
+        let config = config_at(&dir);
+
+        {
+            let mut engine =
+                SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
+            assert_eq!(
+                engine.index_book(&three_line_book()).unwrap(),
+                IndexOutcome::Indexed { chunks: 3 }
+            );
+            let status = engine.status();
+            assert!(status.vectors_persisted);
+            assert_eq!(status.vector_count, 3);
+        }
+
+        let engine = SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
+        let status = engine.status();
+        assert_eq!(status.vector_count, 3, "the vectors survived the restart");
+        assert_eq!(
+            status.indexed_book_count, 1,
+            "so the manifest's record of them is not stale and must be kept"
+        );
+        assert!(status.needs_full_reindex.is_none());
+        assert!(engine
+            .diff_against_tantivy(&HashMap::from([(
+                "otzaria/tanach/genesis.txt".to_string(),
+                111u64
+            )]))
+            .is_up_to_date());
+    }
+
+    /// The manifest records the backend that is actually open. Without that, reopening a
+    /// persisted index with the volatile backend would answer every query from an empty
+    /// store while the manifest still called the books indexed.
+    #[test]
+    fn reopening_a_persisted_index_with_another_backend_is_an_incompatibility() {
+        let dir = TempDir::new("backend_swap");
+        let config = config_at(&dir);
+
+        {
+            let mut engine =
+                SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
+            engine.index_book(&three_line_book()).unwrap();
+        }
+
+        let engine = SemanticEngine::open(config).unwrap();
+        let reason = engine
+            .status()
+            .needs_full_reindex
+            .expect("a backend swap must be reported");
+        assert!(reason.contains("Vector backend"), "{reason}");
+        assert!(engine.search("בריאה", 5, None).is_err());
+    }
+
+    #[test]
+    fn a_backend_whose_dimension_disagrees_with_the_model_is_refused() {
+        let dir = TempDir::new("backend_dim");
+        let config = config_at(&dir);
+
+        let mut narrower = zevc_config_for(&config);
+        narrower.embedding_dim = config.embedding_dim / 2;
+        let store = crate::semantic::zevc_store::ZevcStore::open_or_create(narrower).unwrap();
+
+        // Mapped to a describable value: an engine is not `Debug`, and a panic message
+        // reading "got true" says nothing about what went wrong.
+        match SemanticEngine::with_store(config, Box::new(store)).map(|engine| engine.status()) {
+            Err(SemanticSearchError::Config(message)) => {
+                assert!(message.contains("dimensional"), "{message}")
+            }
+            other => panic!("a narrower store must be refused, got {other:?}"),
+        }
     }
 }

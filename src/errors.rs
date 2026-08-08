@@ -37,6 +37,18 @@ pub enum SemanticSearchError {
     #[error("Semantic index is incompatible with the current configuration: {details}")]
     IncompatibleIndex { details: String },
 
+    /// A build-side operation was asked of an installed official artifact.
+    ///
+    /// Not "no semantic index": there is one, it is open, and it is read-only. The two
+    /// have to stay distinguishable — a caller that reads a refusal as "nothing
+    /// configured" would go on to offer indexing as the fix, and indexing the library on
+    /// the device is exactly what the product contract rules out.
+    #[error(
+        "'{operation}' is not available: the semantic index is an installed official \
+         artifact, opened read-only. Producing one is a build-machine operation"
+    )]
+    ReadOnlyIndex { operation: &'static str },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

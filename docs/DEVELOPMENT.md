@@ -157,11 +157,12 @@ BM25 עדיין עובד
 | כתיבת manifest באינדוקס מלא      | פעם אחת בסוף (לא פר-ספר) |
 | Rust API seam ל-Flutter/FFI      | קיים; bindings אמיתיים נבנים ב־`otzaria_search_engine` |
 | חבילת אינדקס + התקנה              | ממומשים ומאמתים במלואם (`distribution`), עם שחזור התקנה שנקטעה ו־`fsync`; **לא חשופים ב־API** |
+| מסלול ריצה read-only              | ממומש — `OfficialSemanticIndex` פותח ארטיפקט מאומת מעל store שאין עליו כתיבה; **לא חשוף ב־FFI** (S5) |
 | עוגן אמון לארטיפקט               | המכניזם קיים (digest מפורסם); **אין מי שמפרסם ואין חתימה** (S6) |
-| זהות ארטיפקט (`IndexVersion`)     | מלאה — corpus/Tantivy/ID scheme/מודל+checksum/store; נדחית לפי שדה. **אף מסלול ריצה עוד אינו קורא לה** (S2a) |
+| זהות ארטיפקט (`IndexVersion`)     | מלאה — corpus/Tantivy/ID scheme/מודל+checksum/store; נדחית לפי שדה, ומסלול הריצה קורא לה בפתיחה |
 | builder של הארטיפקט הרשמי        | **לא קיים** (S4)           |
-| Production persistence במסלול הפעיל | **עדיין חסרה** (S2)     |
-| אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד); האם נדרש — הכרעת S2 לפי מדידה |
+| Production persistence במסלול הפעיל | קיימת — ארטיפקט מותקן נפתח מחדש אחרי restart בלי לאנדקס; **לא נמדדה בקנה מידה** (S2b) |
+| אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד, והפתיחה טוענת הכול ל־RAM); האם נדרש — הכרעת S2b לפי מדידה |
 | UI סמנטי באוצריא                 | **לא קיים** (S7)           |
 
 הנקודה החשובה ביותר למפתח חדש:
@@ -169,9 +170,10 @@ BM25 עדיין עובד
 > **זהו כרגע skeleton ארכיטקטוני עובד חלקית, לא מנוע semantic production-complete.**
 >
 > מה שכן ממומש באמת: inference אמיתי מול המודל, שלושת מצבי החיפוש, fusion עם פרופילים,
-> caches, telemetry, ואב־טיפוס של persistence ואריזה. מה שחסר כדי שיהיה מוצר: backend
-> read-only שמחובר למנוע ונמדד בקנה מידה, חוזה זהות שקושר את הארטיפקט ל־corpus מסוים,
-> builder שמפיק אותו, והפעלה באפליקציה.
+> caches, telemetry, אריזה והתקנה מאומתות, חוזה זהות שקושר את הארטיפקט ל־corpus מסוים,
+> ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`. מה שחסר כדי שיהיה מוצר:
+> מדידה של אותו מסלול בקנה מידה (S2b), builder שמפיק ארטיפקט מ־Tantivy (S4),
+> והפעלה באפליקציה (S5–S7).
 
 ## מה השתנה ב־PR הראשון (Correctness baseline)
 
@@ -278,8 +280,9 @@ BM25 עדיין עובד
 
 ## מה הוסיף PR #3 (Hybrid, פרופילים, אב־טיפוס persistence)
 
-1. **`VectorStoreBackend`** — חוזה משותף לשני ה־stores. ה־engine עדיין תלוי
-   ב־`VectorStore` הקונקרטי, ולכן ה־trait הוא הכנה ולא נקודת החלפה בפועל. S2.
+1. **`VectorStoreBackend`** — חוזה משותף לשני ה־stores. במצב של PR #3 ה־engine היה
+   תלוי ב־`VectorStore` הקונקרטי, ולכן ה־trait היה הכנה ולא נקודת החלפה בפועל.
+   **נסגר ב־S2a:** החוזה פוצל לצד קורא וצד כותב, וה־engine תלוי בכותב כ־trait object.
 2. **`ZevcStore`** — snapshots לדיסק עם checksum לכל payload, ופתיחה מחדש שמאמתת
    אותם. **הוא אינו הספרייה `zvec`, אינו ANN ואינו mmap:** הפתיחה טוענת את כל
    הווקטורים ל־`HashMap` והחיפוש סורק את כולם. השם מטעה, המימוש לא.
@@ -638,26 +641,30 @@ ZevcStore (zevc_store.rs)       ← קיים, נבדק, לא מחובר
 **כל** הווקטורים ל־`HashMap` והחיפוש סורק את כולם ב־`O(N·D)` — אותה סיבוכיות בדיוק כמו
 ה־store בזיכרון. מה שהוא כן פותר: הווקטורים שורדים restart, והשלמות שלהם נבדקת.
 
-### לכן המשימה (S2) היא:
+### מה שנעשה ב־S2a
 
 ```text
-עכשיו:
-SemanticEngine ──תלוי ישירות──▶ VectorStore (בזיכרון)
+צד ה-build:            SemanticEngine ──▶ dyn VectorStoreBackend  (insert/remove/clear/commit)
+                                            ├── in-memory   (ברירת מחדל, בדיקות)
+                                            └── ZevcStore   (כדי שיהיה ממה לארוז)
 
-היעד:
-SemanticEngine ──תלוי ב──▶ VectorStoreBackend
-                             ├── in-memory   (בדיקות)
-                             └── official read-only (מסלול המוצר)
-                                  ללא delete/upsert בזמן ריצת האפליקציה
+מסלול האפליקציה:  OfficialSemanticIndex ──▶ dyn VectorSearchBackend (search/count בלבד)
+                                            └── ReadOnlyZevcStore
 ```
 
-ולאחר מכן **למדוד** לפני שבוחרים: `ZevcStore` כ־baseline נכונות ב־1M וב־6M רשומות,
-cold-open, p50/p95/p99, peak RSS וגודל דיסק. ANN אמיתי על הדיסק נכנס רק אם המדידה
-מוכיחה שסריקה מלאה אינה עומדת בתקציב — ולא מפני ש"ANN" נשמע מהיר יותר. פתיחה שטוענת
-את כל הווקטורים ל־RAM אינה קבילה אלא אם מדידה מראה שהיא עומדת בתקציב בכל היעדים.
+הפיצול הוא מה שהופך „ללא delete/upsert בזמן ריצה” מכלל למאפיין של הטיפוס: לטיפוס
+שהאפליקציה מחזיקה **אין** פעולת כתיבה לקרוא. `open` מקבל `VerifiedPackage` ולא נתיב,
+ולכן גם „לאמת לפני שנוגעים בווקטורים” אינו סדר קריאות שמישהו זוכר.
 
-ה־API של ה־store צריך להישאר abstraction, כדי שהחלפת backend לא תדרוש לשכתב את
-ה־semantic engine.
+### מה שנשאר ל־S2b — המדידה
+
+`ZevcStore` הוא baseline נכונות, לא פתרון סקייל: הפתיחה קוראת כל בייט, מגבבת כל רשומה
+וטוענת את כל הווקטורים ל־RAM. צריך למדוד ב־1M וב־6M רשומות: cold-open, p50/p95/p99,
+peak RSS וגודל דיסק. ANN אמיתי על הדיסק נכנס רק אם המדידה מוכיחה שסריקה מלאה אינה
+עומדת בתקציב — ולא מפני ש"ANN" נשמע מהיר יותר. פתיחה שטוענת את כל הווקטורים ל־RAM
+אינה קבילה אלא אם מדידה מראה שהיא עומדת בתקציב בכל היעדים.
+
+`VectorSearchBackend` הוא ה־seam שכל תשובה כזאת נכנסת אליו, בלי לשכתב את מסלול הריצה.
 
 ---
 
@@ -691,7 +698,7 @@ D = 1024
 זה נכון לשני ה־stores: גם `ZevcStore` סורק את כולם. הוא מוסיף persistence, לא אחזור
 תת־ליניארי.
 
-**האם זו הארכיטקטורה הסופית — לא ידוע, ומכוון שלא ידוע.** ההכרעה תלויה במדידה של S2
+**האם זו הארכיטקטורה הסופית — לא ידוע, ומכוון שלא ידוע.** ההכרעה תלויה במדידה של S2b
 ובממד/דיוק שייבחרו ב־S1: 6.1 מיליון וקטורים ב־128 ממדים int8 הם ~0.72 GiB, וב־1024
 ממדים f32 הם ~23.1 GiB. אלה שני עולמות שונים לחלוטין לשאלה "האם סריקה מלאה קבילה".
 
@@ -741,12 +748,14 @@ status()
 
 שתי הערות שנוגעות לחוזה המוצר:
 
-1. **`store: VectorStore` הוא תלות קונקרטית.** `open()` פותח את ה־store בזיכרון. זה
-   הפער המרכזי של S2, ולא פרט מימוש שאפשר לדחות: כל עוד התלות קונקרטית, `ZevcStore`
-   אינו יכול להיכנס למסלול הפעיל בלי שינוי חתימות.
+1. **ה־store הוא `Box<dyn VectorStoreBackend>`.** `open()` פותח את זה שבזיכרון,
+   ו־`with_store()` מקבל כל backend אחר; ה־manifest רושם את מי שנפתח בפועל, ולכן
+   פתיחה מחדש עם backend אחר מדווחת כאי־תאימות. זה מה שמאפשר לארוז ארטיפקט מריצת
+   אינדוקס.
 2. **`index_book`/`index_books`/`reset_index` הן פעולות אב־טיפוס.** הן משמשות את
    הבדיקות ואת ה־builder העתידי, לא את האפליקציה. במסלול המוצר האפליקציה מתקינה
-   ארטיפקט מוכן ופותחת אותו read-only.
+   ארטיפקט מוכן ופותחת אותו read-only — דרך `OfficialSemanticIndex`, שאין עליו אף אחת
+   מהפעולות האלה.
 
 ---
 
@@ -1387,24 +1396,28 @@ bad input
 brute-force scan, O(N·D)
 ```
 
-נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה ריצה, אותה מכונה). בהערכה
-**ליניארית** — לא במדידה — זה ~2.5–3.2s על 6.1 מיליון שורות באותו ממד ודיוק. זה מספר
-שמחייב או ממד/דיוק קטנים יותר (S1), או backend אחזור אחר (S2) — ולא אופטימיזציה נקודתית.
+נמדד: 79–132ms לשאילתה על 200k×1024 (min/max באותה ריצה, אותה מכונה; לפני S2a נמדדו
+84–208ms על אותו קוד פחות הקצאת ה־`String` לכל רשומה שהוסרה שם — הפער בין שתי המדידות
+בתוך רעש המכונה, ואין לייחס אותו כולו לשינוי). בהערכה **ליניארית** — לא במדידה — זה
+~2.4s על 6.1 מיליון שורות באותו ממד ודיוק. זה מספר
+שמחייב או ממד/דיוק קטנים יותר (S1), או backend אחזור אחר (S2b) — ולא אופטימיזציה נקודתית.
 
 ---
 
 ## Persistence במסלול הפעיל
 
-הווקטורים במסלול שה־engine פותח חיים ב־RAM ואינם שורדים restart. `ZevcStore` פותר את
-זה אך אינו מחובר, ופתיחה שלו טוענת בכל מקרה את הכול ל־RAM. S2.
+ארטיפקט מותקן נפתח מחדש אחרי restart ואינו מאונדקס שוב — זה נסגר ב־S2a. מה שנשאר:
+הפתיחה טוענת את **כל** הווקטורים ל־RAM ומגבבת כל רשומה, ולזה אין תקציב נמדד. S2b.
+במסלול צד ה־build ברירת המחדל היא ה־store שבזיכרון, ושם הווקטורים אכן אינם שורדים
+restart — אלא אם הקורא נותן backend מתמיד ל־`with_store`.
 
 ---
 
 ## Cold-open ותקציב זיכרון
 
 לא נמדדו בכלל בקנה מידה של הספרייה. `cargo bench` מודד חיפוש, לא פתיחה. אלה מספרים
-שחייבים להיות בשער הקבלה של S2, כי הם מה שקובע אם ארטיפקט של מיליוני שורות בכלל
-נפתח על מכשיר של משתמש.
+שחייבים להיות בשער הקבלה של S2b, כי הם מה שקובע אם ארטיפקט של מיליוני שורות בכלל
+נפתח על מכשיר של משתמש — והפתיחה הנוכחית קוראת כל בייט ומגבבת כל רשומה.
 
 ---
 
@@ -1450,12 +1463,13 @@ golden vectors. מאחורי `--features llama-backend`.
 | שלב | מאיפה מתחילים בקוד |
 |---|---|
 | **S1** — ייצוג, ממד ודיוק | [`chunker.rs`](../src/semantic/chunker.rs) (טקסט ההטמעה) ו־[`benchmark/`](../src/benchmark/) (המדידה). התוצר מקפיא שדות בזהות האינדקס |
-| **S2** — backend מתמיד read-only | להחליף את `store: VectorStore` ב־[`engine.rs`](../src/semantic/engine.rs) בתלות ב־[`VectorStoreBackend`](../src/semantic/store_backend.rs), ואז למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M |
-| **S2a** — מסלול ריצה read-only | אותה החלפה כמו S2, ובנוסף: לתת ל־[`VerifiedPackage`](../src/distribution/package.rs) קורא. `open` יקבל טוקן מאומת ולא נתיב, ולא יחשוף insert/delete |
-| **S3** — חוזה ארטיפקט | ✅ הזהות והאימות ב־[`versioning.rs`](../src/semantic/versioning.rs) וב־[`package.rs`](../src/distribution/package.rs); מה שנשאר הוא ספירה מול תוכן ה־payload וחשיפת [`IndexImporter`](../src/distribution/importer.rs) ב־API |
+| **S2a** — מסלול ריצה read-only | ✅ [`official_index.rs`](../src/semantic/official_index.rs) פותח `VerifiedPackage` מעל [`ReadOnlyZevcStore`](../src/semantic/zevc_store.rs), והחוזה פוצל ל־[read/write](../src/semantic/store_backend.rs) |
+| **S2b** — סקייל ומדידה | למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M: cold-open, p50/p95/p99, peak RSS, דיסק. ANN נכנס רק אם המדידה מחייבת |
+| **S3** — חוזה ארטיפקט | ✅ הזהות והאימות ב־[`versioning.rs`](../src/semantic/versioning.rs) וב־[`package.rs`](../src/distribution/package.rs); מה שנשאר הוא חשיפת [`IndexImporter`](../src/distribution/importer.rs) ב־API |
 
 הסדר בפועל: S3 (חוזה) נעשה לפני S1/S2, מפני שהוא קובע אילו שדות מוצהרים ולא אילו ערכים
-נבחרים. הבא בתור הוא S2a. S1 לפני S2b — אך בלי לקפוא על ערכים לפני שהמדידה בידיים.
+נבחרים; אחריו S2a, שנתן לחוזה קורא. הבא בתור הוא S4a — packer לווקטורים מוכנים. S1 לפני
+S2b — אך בלי לקפוא על ערכים לפני שהמדידה בידיים.
 
 ---
 
@@ -1565,12 +1579,14 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 ### Vector Store
 
 * [x] persistence — קיים ב־`ZevcStore`
-* [ ] persistence **במסלול שה־engine פותח** (S2)
-* [ ] מצב official-read-only ללא delete/upsert בזמן ריצה (S2)
-* [ ] ANN או הוכחה שאין בו צורך — נמדד: 84–208ms לשאילתה על 200k×1024 (min/max באותה
-  ריצה), כלומר ~2.5–3.2s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה
+* [x] persistence **במסלול שהאפליקציה פותחת** — ארטיפקט מותקן, `vectors_persisted=true` (S2a)
+* [x] מצב official-read-only ללא delete/upsert בזמן ריצה — טיפוס שאין עליו כתיבה (S2a)
+* [x] ה־engine תלוי ב־trait ולא ב־store קונקרטי, וה־manifest רושם את ה־backend שנפתח (S2a)
+* [ ] ANN או הוכחה שאין בו צורך (S2b) — נמדד: 79–132ms לשאילתה על 200k×1024 (min/max
+  באותה ריצה), כלומר ~2.4s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה
   (`cargo bench`)
-* [ ] cold-open, peak RSS וגודל דיסק ב־1M וב־6M רשומות (S2)
+* [ ] cold-open, peak RSS וגודל דיסק ב־1M וב־6M רשומות (S2b) — הפתיחה קוראת כל בייט,
+  מגבבת כל רשומה וטוענת הכול ל־RAM
 * [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
 * [x] insert/update/delete
 * [x] filtering
@@ -1590,9 +1606,10 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [x] digest מפורסם כעוגן אמון, ו־`without_published_digest` כוויתור מוצהר (S3)
 * [x] שמות payload פורטביליים, נבדקים על המחרוזת ולא דרך `Path` (S3)
 * [x] שחזור התקנה שנקטעה, `fsync` לקבצים ולתיקיית האב, ובדיקות הזרקת־כשל (S3)
-* [ ] התאמת ספירות ספרים/וקטורים מול **תוכן** ה־payload — דורש קורא של פורמט ה־store (S2a/S4a)
-* [ ] קורא שמפעיל את האימות: `VerifiedPackage` עדיין ללא צרכן (S2a)
-* [ ] זיהוי עריכה באותו אורך בזמן פתיחה — בדיקה של קורא ה־store (S2a)
+* [x] התאמת ספירות ספרים/וקטורים מול **תוכן** ה־payload, בפתיחה (S2a)
+* [x] קורא שמפעיל את האימות: `OfficialSemanticIndex` מקבל את הטוקן ולא נתיב (S2a)
+* [x] זיהוי עריכה באותו אורך בזמן פתיחה — SHA-256 לכל רשומה בקורא ה־store (S2a)
+* [ ] זיהוי payload שנערך **יחד עם** ה־checksums שלו — רק digest מפורסם מבדיל (S6)
 * [ ] צינור שמפרסם digest, וחתימה (S6)
 * [ ] lock לשתי התקנות במקביל לאותו יעד — מתועד כמחוץ להיקף (S6, אם יידרש)
 * [ ] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי (S2b/S8)
@@ -1712,16 +1729,17 @@ Architecture
      ├── EmbeddingRuntime + backend contract
      │        └── ✅ inference אמיתי קיים (feature)
      │
-     ├── VectorStoreBackend contract
-     │        ├── ZevcStore קיים ונבדק — אך ה-engine לא תלוי בו   (S2)
-     │        └── אין ANN/mmap, וסקייל 6M לא נמדד                  (S2)
+     ├── store contract (read / write)
+     │        ├── ✅ הריצה מקבלת צד קורא בלבד, וה-engine תלוי ב-trait (S2a)
+     │        └── אין ANN/mmap, וסקייל 6M לא נמדד                  (S2b)
      │
      ├── IndexVersion
      │        └── ✅ זהות corpus / Tantivy / ID / מודל / store מלאה  (S3)
      │
      └── distribution (package + importer)
               ├── ✅ שער אימות מלא, דחייה לפי שדה                   (S3)
-              └── אין קורא שמפעיל אותו, ואין builder               (S2a, S4)
+              ├── ✅ קורא שמפעיל אותו: OfficialSemanticIndex        (S2a)
+              └── אין builder, ואין חשיפה ב-FFI                     (S4, S5)
 ```
 
 זה דווקא מצב טוב יחסית: החוזים במקום, וכל פער הוא חיבור או הרחבה ולא שכתוב.
@@ -1742,10 +1760,12 @@ Architecture
    ↓
    5. S1 — quality dataset → dimension & precision decision
    ↓
-   6. S2 — persistent read-only backend, measured at 1M and 6M
+   6. S2b — scale measurement at 1M and 6M, then the ANN decision
    ↓
 ✅ 7. S3 — artifact identity contract & recoverable install (זהות, אימות בשני עומקים,
-      עוגן digest; ספירה מול תוכן ה-payload נשארה ל-S2a/S4)
+      עוגן digest)
+   ↓
+✅ 7a. S2a — read-only runtime path: the artifact's reader, and read/write split
    ↓
    8. S4 — builder from the final Tantivy index   (otzaria_search_engine)
    ↓
@@ -1756,15 +1776,16 @@ Architecture
   11. S8 — release gates on the full platform matrix
 ```
 
-S1 לפני S2 בכוונה: ממד ודיוק קובעים אם סריקה מלאה בכלל קבילה, ולכן בחירת backend לפני
+S1 לפני S2b בכוונה: ממד ודיוק קובעים אם סריקה מלאה בכלל קבילה, ולכן בחירת backend לפני
 בחירת ממד היא בחירה בעיניים עצומות. שני השלבים יכולים לרוץ במקביל, אבל אין לקפוא על
-פורמט ארטיפקט לפני שה־מדידה של S1 בידיים.
+פורמט ארטיפקט לפני שהמדידה של S1 בידיים.
 
 **הסדר בפועל שונה מהמספור, במכוון:** S3 (חוזה הזהות) נעשה לפני S1 ו־S2, מפני שאינו
 תלוי בהם — הממד, הדיוק ופורמט ה־store הם **נתונים בתוך** ה־manifest ולא קבועים בקוד,
-ולכן הכרעות S1/S2 ממלאות שדות קיימים ואינן משנות את החוזה. הבא בתור הוא מסלול ריצה
-read-only שפותח ארטיפקט מאומת (S2a), ואחריו packer לווקטורים מוכנים (S4a). S1 חוזר
-לפני יצירת הארטיפקט האמיתי והכרעת backend ה־production.
+ולכן הכרעות S1/S2 ממלאות שדות קיימים ואינן משנות את החוזה. אחריו נעשה S2a: מסלול ריצה
+read-only שפותח את הארטיפקט המאומת, וזה מה שנתן לחוזה צרכן. הבא בתור הוא packer
+לווקטורים מוכנים (S4a). S1 ו־S2b חוזרים לפני יצירת הארטיפקט האמיתי והכרעת backend
+ה־production.
 
 כיול עדין של fusion נשאר אחרון: הוא כיוון ההגה, לא המנוע.
 
@@ -1879,6 +1900,7 @@ src/
 ├── distribution/
 │   ├── package.rs        → package manifest + payload checksums
 │   └── importer.rs       → staged install + interruption recovery
+│                            (its reader lives in semantic/official_index.rs)
 │
 ├── telemetry/            → in-process counters (no network)
 └── benchmark/            → timing & percentile helpers
@@ -1888,36 +1910,37 @@ src/
 
 # 47. The Most Important Next Task
 
-### Decide the representation (S1), then wire a persistent read-only backend (S2).
+### Build the packer (S4a), then decide the representation (S1) and measure the store (S2b).
 
-Replacing the fake embedding — the task this section used to name — is **done**:
-`--features llama-backend` runs real GGUF inference, verified against committed
-golden vectors. Semantic quality can now actually be measured, which is exactly why
-measuring it is the next task rather than an optional one.
+Two tasks this section used to name are **done**. Real GGUF inference runs behind
+`--features llama-backend`, verified against committed golden vectors. And the
+read-only runtime path exists: the artifact has a reader, the store contract is split
+so the application holds a type with no write on it, and an installed artifact reopens
+after a restart without indexing anything (S2a).
 
-The order matters and is not interchangeable:
+What that leaves, in an order that is not interchangeable:
 
 ```text
+S4a a packer for ready-made vectors: line_id + model/corpus identity → an artifact,
+    with join validation against Tantivy
+        ↓
+S5  repin, open/install API, FFI — the app reaches the reader that already exists
+        ↓
 S1  labelled rabbinic query set
         ↓
     Recall@K / MRR / nDCG per representation and per dimension
         ↓
     frozen: embedding_text_version, dim, precision, max_tokens, pooling, norm
         ↓
-S2  SemanticEngine depends on VectorStoreBackend, not VectorStore
-        ↓
-    official-read-only mode (no delete/upsert at app runtime)
-        ↓
-    measured at 1M and 6M: cold-open, p50/p95/p99, peak RSS, disk
+S2b measured at 1M and 6M: cold-open, p50/p95/p99, peak RSS, disk
         ↓
     ANN on disk only if the measurement demands it
 ```
 
-Doing S2 first means choosing a storage strategy without knowing whether the
-vectors are 0.72 GiB or 23.1 GiB — a 32× spread that decides the answer for you.
-
-Only after both does it make sense to freeze an artifact format (S3), build it from
-Tantivy (S4), and tune hybrid ranking against real relevance numbers.
+Measuring the store before S1 means choosing a storage strategy without knowing
+whether the vectors are 0.72 GiB or 23.1 GiB — a 32× spread that decides the answer
+for you. Neither decision changes the artifact contract: the dimension, the precision
+and the store format are **fields in the manifest**, not constants in this crate.
 
 ---
 
@@ -1939,17 +1962,21 @@ Tantivy (S4), and tune hybrid ranking against real relevance numbers.
 verified against golden vectors. A default build still has no backend at all, by
 design — it fails loudly rather than serving fake vectors.
 
-**Vector abstraction:** 🟢 `VectorStoreBackend` exists
+**Vector abstraction:** 🟢 Split in two: `VectorSearchBackend` is what the runtime
+gets, `VectorStoreBackend` adds the mutations a builder needs. The engine depends on
+the second as a trait object; the application holds the first.
 
-**Persistent vector database:** 🟡 `ZevcStore` persists and reopens with verified
-checksums — but the engine still opens the in-memory store, so **the active path has
-no persistence**.
+**Persistent vector database:** 🟢 The application path opens an installed artifact
+through `ReadOnlyZevcStore`: it persists, it reopens after a restart without indexing,
+and it reports `vectors_persisted = true` because that is now true. 🟡 What is not
+proven is the cost — opening reads every byte, hashes every record and holds every
+vector in RAM.
 
 **ANN retrieval:** 🔴 Missing — and both stores scan everything. Brute force measures
-84–208ms per query over 200k×1024 on one machine (`cargo bench` prints
+79–132ms per query over 200k×1024 on one machine (`cargo bench` prints
 min/median/max; the spread is the machine, not the code). Extrapolated linearly, that
-is ~2.5–3.2s over the 6,058,210-line library — an extrapolation, not a measurement.
-Whether ANN is needed at all is an S2 decision that depends on the S1 dimension
+is ~2.4s over the 6,058,210-line library — an extrapolation, not a measurement.
+Whether ANN is needed at all is an S2b decision that depends on the S1 dimension
 choice.
 
 **Artifact identity:** 🟢 `IndexVersion` carries corpus digest, library version,
@@ -1966,8 +1993,10 @@ not against forgery.
 **Packaging & install:** 🟡 Verification is complete and tested at two depths — full
 hashing for install, metadata plus presence for open — and the install recovers from
 both crash windows, flushes what it writes, and is tested with injected rename
-failures. What is missing: nothing in a runtime path calls any of it, it is not exposed
-through the API, no builder produces an official artifact, and no timing budget has been
+failures. A runtime path now calls it: `OfficialSemanticIndex::open` takes the verified
+token, checks the manifest's counts against the payload's content, and catches a
+same-length edit that the cheap depth cannot see. What is missing: it is not exposed
+through the FFI, no builder produces an official artifact, and no timing budget has been
 measured.
 
 **Hybrid fusion:** 🟢 Implemented — weighted / RRF / adaptive, chosen by profile
@@ -2015,13 +2044,15 @@ The main work now is to connect and measure what already exists:
 ```text
 ✅ Fake embedding              →  Real GGUF inference
 ✅ Per-chunk inference         →  Batch inference
+✅ Model-only index identity   →  Corpus + Tantivy + ID-scheme identity
+✅ Engine bound to VectorStore  →  Read/write split; the application opens a
+                                   verified artifact through the read side
 
-Engine bound to VectorStore    →  Engine bound to VectorStoreBackend,
-                                  official-read-only, measured at 6M
-
-Model-only index identity      →  Corpus + Tantivy + ID-scheme identity
+Verified artifact, unmeasured  →  cold-open, p50/p95/p99, RSS and disk at 6M
 
 Package written by tests       →  Artifact built from the final Tantivy index
+
+Reader inside the crate        →  Reader reached from Otzaria, through the FFI
 
 Heuristic weights              →  Benchmark-driven ranking
 ```
