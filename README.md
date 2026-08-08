@@ -284,6 +284,9 @@ S4b and S5–S8 land in `otzaria_search_engine` and `otzaria`.
      not a source of truth. `expected_line_ids` must apply the declared recipe, and must
      **not** be derived from the vectors that came out: a batch that died halfway would
      then vanish from both sides at once and the coverage check would confirm itself.
+     `chunking_identity` is an opaque hash, so that implementation has to hold the real
+     `ChunkerConfig` and assert `config.identity() == model.chunking_identity` — it cannot
+     recover the recipe from the identity it is handed.
    - produce the embeddings themselves from the same documents, in batches, and feed them
      to `pack`.
 5. **Quality evaluation suite**:

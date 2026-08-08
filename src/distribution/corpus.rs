@@ -103,6 +103,12 @@ pub trait CorpusIndex {
     /// or a line the backend silently dropped would vanish from both sides at once, and the
     /// check would confirm itself. The set has to be decided before inference, from the
     /// corpus and the recipe.
+    ///
+    /// **`model.chunking_identity` is an opaque hash**, so an implementation cannot recover
+    /// the recipe from it. It has to hold the real
+    /// [`ChunkerConfig`](crate::semantic::chunker::ChunkerConfig) and check
+    /// `config.identity() == model.chunking_identity` before answering; otherwise the
+    /// parameter is in the signature and binds nothing.
     fn expected_line_ids(&self, model: &ModelIdentity) -> Result<BTreeSet<u64>, PackError>;
 
     /// The line `line_id` names, or `None` when the corpus holds no live document with

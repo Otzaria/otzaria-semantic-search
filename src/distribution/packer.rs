@@ -313,28 +313,45 @@ pub fn validate_artifact(
 /// Checked as a whole set rather than per input, so a build log gets both totals at once
 /// instead of stopping on whichever id came first. The example ids are the smallest of
 /// each kind, so two runs over the same fault name the same lines.
+///
+/// The agreeing case is one comparison and no allocation, and the disagreeing case counts
+/// rather than collects. At library scale either side is millions of ids, so materializing
+/// the differences would allocate tens of MiB on the path where something has already gone
+/// wrong — which is the worst moment to ask a build machine for memory.
 fn verify_coverage(
     covered: &BTreeSet<u64>,
     corpus: &dyn CorpusIndex,
     model: &ModelIdentity,
 ) -> Result<(), PackError> {
     let expected = corpus.expected_line_ids(model)?;
-
-    let missing: Vec<u64> = expected.difference(covered).copied().collect();
-    let unexpected: Vec<u64> = covered.difference(&expected).copied().collect();
-    if missing.is_empty() && unexpected.is_empty() {
+    if &expected == covered {
         return Ok(());
     }
+
+    // Two sets are equal exactly when both differences are empty, so past that check at
+    // least one of these is non-zero and there is a real disagreement to report.
+    let (missing, first_missing) = difference_summary(&expected, covered);
+    let (unexpected, first_unexpected) = difference_summary(covered, &expected);
 
     Err(PackError::CoverageMismatch {
         expected: expected.len(),
         covered: covered.len(),
-        missing: missing.len(),
-        unexpected: unexpected.len(),
-        // `BTreeSet::difference` yields in ascending order, so the first is the smallest.
-        first_missing: missing.first().copied(),
-        first_unexpected: unexpected.first().copied(),
+        missing,
+        unexpected,
+        first_missing,
+        first_unexpected,
     })
+}
+
+/// How many ids are in `from` and not in `other`, and the smallest of them.
+///
+/// One pass and constant extra memory. `BTreeSet::difference` yields in ascending order,
+/// so the first id it produces is the smallest.
+fn difference_summary(from: &BTreeSet<u64>, other: &BTreeSet<u64>) -> (usize, Option<u64>) {
+    from.difference(other)
+        .fold((0, None), |(count, first), line_id| {
+            (count + 1, first.or(Some(*line_id)))
+        })
 }
 
 /// The three sources that each know a part of the identity, and the completeness check
@@ -1410,6 +1427,19 @@ mod tests {
             }
             other => panic!("a corpus that grew must fail validation, got {other:?}"),
         }
+    }
+
+    /// The example id in a coverage rejection is the smallest, not the first one a walk
+    /// happens to reach. Pinned directly, because the counts are summarized in one pass
+    /// with no list to sort afterwards, and "two runs name the same line" rests on it.
+    #[test]
+    fn a_difference_is_summarized_by_its_size_and_its_smallest_member() {
+        let expected: BTreeSet<u64> = [90, 10, 50, 30].into_iter().collect();
+        let covered: BTreeSet<u64> = [50, 7].into_iter().collect();
+
+        assert_eq!(difference_summary(&expected, &covered), (3, Some(10)));
+        assert_eq!(difference_summary(&covered, &expected), (1, Some(7)));
+        assert_eq!(difference_summary(&expected, &expected), (0, None));
     }
 
     /// The other direction, and the one that is easy to leave out: a vector for a line the
