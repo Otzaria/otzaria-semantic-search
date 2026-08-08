@@ -16,7 +16,6 @@ use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
     describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
-use crate::semantic::recipe::NormalizationStrategy;
 use crate::semantic::store::{VectorStore, VectorStoreConfig};
 use crate::semantic::store_backend::VectorStoreBackend;
 use crate::semantic::types::{
@@ -318,8 +317,6 @@ impl SemanticEngine {
             max_tokens: self.config.embedding_max_tokens,
             batch_size: self.config.embedding_batch_size,
             // The manifest records `normalization_version`; this is what makes the number
-            // select what is actually done to a vector.
-            normalization: NormalizationStrategy::from_version(self.config.normalization_version)?,
         });
 
         if let Err(e) = runtime.load() {
@@ -649,7 +646,10 @@ impl SemanticEngine {
             ));
         };
 
-        Ok(runtime.embed_one(query)?)
+        // Through the same text recipe the chunker applied to everything it stored: both
+        // sides of a comparison have to reach the model the same way.
+        let (_, _, normalization) = self.chunker.recipe();
+        Ok(runtime.embed_one(&normalization.apply(query))?)
     }
 
     /// Search with a vector already produced by this engine's embedding runtime.

@@ -26,12 +26,13 @@
 //! is about to produce the vectors, which is what makes comparing them worth anything —
 //! but only the first three are properties of the file.
 //!
-//! The three **recipe versions** — `embedding_text_version`, `normalization_version` and
-//! `chunking_version` — are not properties of a model at all. They are versions of code in
-//! this crate, so they are settled outright rather than compared:
-//! [`EmbeddingRecipe::resolve`] refuses any of them that names behaviour nobody has
-//! written, and the code that does the work dispatches on the resolved value. See
-//! [`recipe`](crate::semantic::recipe).
+//! The three **recipe versions** — `chunking_version`, `embedding_text_version` and
+//! `normalization_version` — are not properties of a model at all. They are versions of
+//! code in this crate, so they are settled outright rather than compared:
+//! [`EmbeddingRecipe::resolve`] refuses any that names behaviour nobody has written, and
+//! the [`Chunker`] dispatches on the resolved values. All three describe what happens to
+//! the **text**; L2 normalization of the finished vector is an unconditional invariant of
+//! cosine and is deliberately not versioned. See [`recipe`](crate::semantic::recipe).
 //!
 //! What is left declared and unverifiable: `model_id` and `model_quantization`. Nothing in
 //! a GGUF file states either, and inventing a check that reads them from the same place
@@ -295,9 +296,12 @@ fn ensure_recipe_matches(
 pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackReport, PackError> {
     ensure_output_is_free(&request.output_path)?;
     compose_identity(corpus, &request.model)?;
-    let recipe = EmbeddingRecipe::resolve(&request.chunking, &request.model)?;
+    // Every version the build is about to act under, settled before anything is opened:
+    // the chunker will resolve them again from the same configuration, and the text
+    // normalization is applied there, where the digest of the embedded string is computed.
+    EmbeddingRecipe::resolve(&request.chunking, &request.model)?;
     ensure_recipe_matches(&request.chunking, &request.model)?;
-    let runtime = load_model(&request, recipe)?;
+    let runtime = load_model(&request)?;
 
     let planned = PlannedCorpus::new(corpus, &request.chunking, &request.model)?;
     log::info!(
@@ -330,10 +334,7 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackRepo
 ///
 /// Not all five are facts about the *file* — see the module header. The checksum is; the
 /// backend id is which implementation was selected for it.
-fn load_model(
-    request: &BuildRequest,
-    recipe: EmbeddingRecipe,
-) -> Result<EmbeddingRuntime, PackError> {
+fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
     let declared = &request.model;
     let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
         model_path: request.model_path.clone(),
@@ -341,9 +342,6 @@ fn load_model(
         max_tokens: declared.max_tokens,
         batch_size: request.batch_size,
         pooling: Pooling::parse(&declared.pooling)?,
-        // Resolved from `normalization_version`, so the runtime performs the strategy the
-        // artifact will declare rather than the only one that happens to be written.
-        normalization: recipe.normalization,
     });
     runtime.load()?;
 
@@ -1138,10 +1136,19 @@ mod tests {
                 },
             ),
             (
+                // Carried in both places, like the text version above, so both move.
                 "normalization_version",
-                default.clone(),
+                ChunkerConfig {
+                    normalization_version: 2,
+                    ..ChunkerConfig::default()
+                },
                 ModelIdentity {
                     normalization_version: 2,
+                    chunking_identity: ChunkerConfig {
+                        normalization_version: 2,
+                        ..ChunkerConfig::default()
+                    }
+                    .identity(),
                     ..truthful.clone()
                 },
             ),
@@ -1185,6 +1192,56 @@ mod tests {
                 !dir.path().join(format!("artifact_{field}")).exists(),
                 "a build refused for {field} writes nothing"
             );
+        }
+    }
+
+    /// A version carried in two places is a fact that can drift, so the two are compared.
+    ///
+    /// The chunker needs `embedding_text_version` and `normalization_version` to choose a
+    /// code path; an installation compares identities and never holds a configuration. Left
+    /// unchecked, a build would apply one recipe and declare another — the same fault
+    /// `chunking_identity` guards against, on the two fields that guard is not made of.
+    ///
+    /// The configuration is the side that moves here, because that is the only reachable
+    /// shape: a *declared* version nothing implements is refused earlier, by the identity's
+    /// own completeness check.
+    #[test]
+    fn a_configuration_that_contradicts_the_declared_versions_is_refused() {
+        let dir = TempDir::new("recipe_disagreement");
+        let corpus = standard_corpus(&dir);
+
+        type Move = (&'static str, fn(&mut ChunkerConfig));
+        let moves: [Move; 2] = [
+            ("embedding_text_version", |c| c.embedding_text_version = 2),
+            ("normalization_version", |c| c.normalization_version = 2),
+        ];
+
+        for (field, apply) in moves {
+            let mut chunking = ChunkerConfig::default();
+            apply(&mut chunking);
+            // The declared identity still says 1 for both — and its `chunking_identity` is
+            // the moved configuration's, so this is not a hash mismatch either.
+            let model = ModelIdentity {
+                chunking_identity: chunking.identity(),
+                ..model_for(&"ab".repeat(32), &ChunkerConfig::default())
+            };
+
+            let mut request = build_request(&dir, model, chunking);
+            request.output_path = dir.path().join(format!("artifact_{field}"));
+            match build(request, &corpus) {
+                Err(PackError::Artifact(
+                    crate::errors::ArtifactError::RecipeDisagreesWithIdentity {
+                        field: named,
+                        configured,
+                        declared,
+                    },
+                )) => {
+                    assert_eq!(named, field);
+                    assert_eq!((configured, declared), (2, 1));
+                }
+                other => panic!("a contradicted {field} must be refused, got {other:?}"),
+            }
+            assert!(!dir.path().join(format!("artifact_{field}")).exists());
         }
     }
 

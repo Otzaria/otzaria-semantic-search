@@ -29,7 +29,7 @@
 //! each value.
 
 use crate::errors::ArtifactError;
-use crate::semantic::recipe::{EmbeddingTextRecipe, NormalizationStrategy};
+use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use serde::{Deserialize, Serialize};
 
 /// Full identity of a built artifact, in the three groups that must agree
@@ -382,7 +382,7 @@ impl IndexVersion {
         // configuration and not the configuration; see
         // [`recipe`](crate::semantic::recipe).
         EmbeddingTextRecipe::from_version(self.model.embedding_text_version)?;
-        NormalizationStrategy::from_version(self.model.normalization_version)?;
+        TextNormalizationRecipe::from_version(self.model.normalization_version)?;
 
         require_text(F::StoreBackendId, &self.store.backend_id)?;
         require_positive(

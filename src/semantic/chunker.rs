@@ -10,7 +10,7 @@
 //! choice.
 
 use crate::errors::ArtifactError;
-use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingTextRecipe};
+use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::types::{BookForIndexing, SemanticChunk};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,6 +49,14 @@ pub struct ChunkerConfig {
     /// [`EmbeddingRecipe::resolve`](crate::semantic::recipe::EmbeddingRecipe::resolve)
     /// compares the copies at the one point both are in hand.
     pub embedding_text_version: u32,
+    /// What is done to the text before the model sees it — see
+    /// [`TextNormalizationRecipe`]. **Text**, not the finished vector: L2 is an
+    /// unconditional invariant of cosine and is deliberately not versioned.
+    ///
+    /// Here because the digest a record carries has to describe the string that was
+    /// actually embedded, and that string is normalized before it is hashed. Also in
+    /// `ModelIdentity`, for the same reason as `embedding_text_version`.
+    pub normalization_version: u32,
 }
 
 impl ChunkerConfig {
@@ -69,6 +77,7 @@ impl ChunkerConfig {
             self.min_embeddable_chars as u64,
             u64::from(self.chunking_version),
             u64::from(self.embedding_text_version),
+            u64::from(self.normalization_version),
         ] {
             hasher.update(field.to_le_bytes());
         }
@@ -86,6 +95,7 @@ impl Default for ChunkerConfig {
             min_embeddable_chars: 5,
             chunking_version: ChunkingAlgorithm::AnchoredLine.version(),
             embedding_text_version: EmbeddingTextRecipe::LineOrNeighbourContext.version(),
+            normalization_version: TextNormalizationRecipe::AsSuppliedByCorpus.version(),
         }
     }
 }
@@ -96,6 +106,7 @@ pub struct Chunker {
     /// from, so [`Self::chunk_book`] cannot run under a version nothing implements.
     algorithm: ChunkingAlgorithm,
     text_recipe: EmbeddingTextRecipe,
+    normalization: TextNormalizationRecipe,
 }
 
 impl Chunker {
@@ -110,14 +121,21 @@ impl Chunker {
         Ok(Self {
             algorithm: ChunkingAlgorithm::from_version(config.chunking_version)?,
             text_recipe: EmbeddingTextRecipe::from_version(config.embedding_text_version)?,
+            normalization: TextNormalizationRecipe::from_version(config.normalization_version)?,
             config,
         })
     }
 
-    /// Which algorithm and text recipe this chunker resolved to. Reported so a builder can
-    /// record what it is about to run rather than what it was asked for.
-    pub fn algorithm(&self) -> (ChunkingAlgorithm, EmbeddingTextRecipe) {
-        (self.algorithm, self.text_recipe)
+    /// What this chunker resolved to. Reported so a builder can record what it is about to
+    /// run rather than what it was asked for.
+    pub fn recipe(
+        &self,
+    ) -> (
+        ChunkingAlgorithm,
+        EmbeddingTextRecipe,
+        TextNormalizationRecipe,
+    ) {
+        (self.algorithm, self.text_recipe, self.normalization)
     }
 
     pub fn chunk_book(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
@@ -150,10 +168,15 @@ impl Chunker {
 
             let truncated_text =
                 truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars);
-            if truncated_text.trim().is_empty() {
+            // Normalized *before* the digest, because the digest has to describe the string
+            // the model is given. Hashing the pre-normalization text would put a digest of
+            // something nothing was built from into every record — the same fault
+            // `chunk_hash` describing the corpus line instead of the embedded text would be.
+            let embedded_text = self.normalization.apply(&truncated_text).into_owned();
+            if embedded_text.trim().is_empty() {
                 continue;
             }
-            let chunk_hash = compute_chunk_hash(&truncated_text);
+            let chunk_hash = compute_chunk_hash(&embedded_text);
             let semantic_id =
                 compute_semantic_id(&book.source_book_key, line.line_id, chunking_identity);
 
@@ -165,7 +188,7 @@ impl Chunker {
                 section_id: line.section_id,
                 line_hash: line.line_hash,
                 anchor_text: line.text.clone(),
-                embedding_text: truncated_text,
+                embedding_text: embedded_text,
                 chunk_hash,
                 content_hash: book.content_fingerprint,
                 reference: line.reference.clone(),

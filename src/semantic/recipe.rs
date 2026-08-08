@@ -19,9 +19,16 @@
 //!   [`Chunker::chunk_book`](crate::semantic::chunker::Chunker::chunk_book).
 //! * [`EmbeddingTextRecipe`] selects what text a chunk carries to the model, in the same
 //!   place.
-//! * [`NormalizationStrategy`] selects what happens to a vector before it is stored or
-//!   compared, in [`EmbeddingRuntime`](crate::semantic::embedding::EmbeddingRuntime) and in
-//!   the packer.
+//! * [`TextNormalizationRecipe`] selects what is done to a text before it reaches the
+//!   model — on the build side inside the chunker, and on the query side before the one
+//!   string a search embeds.
+//!
+//! **It is text normalization, not vector normalization.** `normalization_version` has
+//! meant "text preprocessing before embedding" since the manifest first carried it, and
+//! that is what it still means. L2 normalization of a finished vector is not versioned and
+//! must not be: it is the invariant that makes a dot product a cosine, every store applies
+//! it unconditionally, and a "version" that some code paths ignored would be a label
+//! again — which is the whole failure this module exists to prevent.
 //!
 //! Each dispatch is a `match` over the enum rather than a default with a comment, so adding
 //! a variant does not compile until every path that behaves differently under it has been
@@ -33,7 +40,7 @@
 //! | version | carried by | refused by |
 //! |---|---|---|
 //! | `embedding_text_version` | `ModelIdentity`, and the chunker configuration | [`IndexVersion::validate_complete`](crate::semantic::versioning::IndexVersion::validate_complete), so both a build and an install refuse it |
-//! | `normalization_version` | `ModelIdentity` | the same |
+//! | `normalization_version` | `ModelIdentity`, and the chunker configuration | the same |
 //! | `chunking_version` | the chunker configuration only — the artifact carries the *hash* of that configuration | [`EmbeddingRecipe::resolve`] and [`Chunker::new`](crate::semantic::chunker::Chunker::new), i.e. wherever a configuration exists |
 //!
 //! The asymmetry in the last row is not an oversight. An installation never chunks
@@ -66,13 +73,33 @@ pub enum EmbeddingTextRecipe {
     LineOrNeighbourContext,
 }
 
-/// What happens to a vector before it is stored or compared.
+/// What is done to a text before the model sees it.
+///
+/// Applied to **both** sides of a search, and that is why it is versioned: a stored vector
+/// built from normalized text and a query embedded from raw text land in different places,
+/// and nothing about either vector says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NormalizationStrategy {
-    /// L2 to unit length, after refusing a vector that cannot be compared at all — a
-    /// non-finite component, an overflowing norm, or no direction. This is what makes a
-    /// dot product a cosine everywhere downstream.
-    L2Unit,
+pub enum TextNormalizationRecipe {
+    /// Nothing. The text is embedded exactly as the corpus stores it.
+    ///
+    /// A choice rather than a placeholder: the lexical index already holds text that went
+    /// through the engine's own normalization at indexing time, so a second pass here would
+    /// embed something neither side holds. Whether stripping vowels, folding finals or
+    /// removing punctuation helps retrieval is S1's measurement, and the answer becomes a
+    /// second variant here.
+    AsSuppliedByCorpus,
+}
+
+impl TextNormalizationRecipe {
+    /// The text the model is given.
+    ///
+    /// Borrowed when the recipe changes nothing, so the identity case costs no allocation
+    /// over six million lines.
+    pub fn apply<'a>(self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        match self {
+            Self::AsSuppliedByCorpus => std::borrow::Cow::Borrowed(text),
+        }
+    }
 }
 
 /// Generate the version mapping, the supported list and the rejection for one recipe axis.
@@ -125,8 +152,8 @@ recipe_versions!(ChunkingAlgorithm, "chunking_version", {
 recipe_versions!(EmbeddingTextRecipe, "embedding_text_version", {
     LineOrNeighbourContext => 1,
 });
-recipe_versions!(NormalizationStrategy, "normalization_version", {
-    L2Unit => 1,
+recipe_versions!(TextNormalizationRecipe, "normalization_version", {
+    AsSuppliedByCorpus => 1,
 });
 
 /// The three versions resolved together, once, before any of them is acted on.
@@ -138,29 +165,42 @@ recipe_versions!(NormalizationStrategy, "normalization_version", {
 pub struct EmbeddingRecipe {
     pub chunking: ChunkingAlgorithm,
     pub text: EmbeddingTextRecipe,
-    pub normalization: NormalizationStrategy,
+    pub normalization: TextNormalizationRecipe,
 }
 
 impl EmbeddingRecipe {
     /// Resolve every version a build is about to act under, and refuse the recipe if the
     /// configuration and the identity disagree about the text.
     ///
-    /// `embedding_text_version` is the one value both sides carry — the configuration
-    /// because the chunker needs it to choose a path, the identity because an installation
-    /// has to compare it without ever seeing a configuration. Two copies of one fact drift,
-    /// so they are compared here, at the only point where both are in hand.
+    /// Two of the three are carried in both places — the configuration because the chunker
+    /// needs them to choose a path, the identity because an installation compares identities
+    /// and never sees a configuration. Two copies of one fact drift, so they are compared
+    /// here, at the only point where both are in hand.
     pub fn resolve(chunking: &ChunkerConfig, model: &ModelIdentity) -> Result<Self, ArtifactError> {
-        if chunking.embedding_text_version != model.embedding_text_version {
-            return Err(ArtifactError::RecipeDisagreesWithIdentity {
-                field: "embedding_text_version",
-                configured: chunking.embedding_text_version,
-                declared: model.embedding_text_version,
-            });
+        for (field, configured, declared) in [
+            (
+                "embedding_text_version",
+                chunking.embedding_text_version,
+                model.embedding_text_version,
+            ),
+            (
+                "normalization_version",
+                chunking.normalization_version,
+                model.normalization_version,
+            ),
+        ] {
+            if configured != declared {
+                return Err(ArtifactError::RecipeDisagreesWithIdentity {
+                    field,
+                    configured,
+                    declared,
+                });
+            }
         }
         Ok(Self {
             chunking: ChunkingAlgorithm::from_version(chunking.chunking_version)?,
             text: EmbeddingTextRecipe::from_version(chunking.embedding_text_version)?,
-            normalization: NormalizationStrategy::from_version(model.normalization_version)?,
+            normalization: TextNormalizationRecipe::from_version(chunking.normalization_version)?,
         })
     }
 }
@@ -185,10 +225,10 @@ mod tests {
                 *recipe
             );
         }
-        for strategy in NormalizationStrategy::ALL {
+        for recipe in TextNormalizationRecipe::ALL {
             assert_eq!(
-                NormalizationStrategy::from_version(strategy.version()).unwrap(),
-                *strategy
+                TextNormalizationRecipe::from_version(recipe.version()).unwrap(),
+                *recipe
             );
         }
     }
@@ -208,7 +248,7 @@ mod tests {
             ),
             (
                 "normalization_version",
-                NormalizationStrategy::from_version(2).unwrap_err(),
+                TextNormalizationRecipe::from_version(2).unwrap_err(),
             ),
         ] {
             match error {
@@ -263,7 +303,7 @@ mod tests {
             EmbeddingRecipe {
                 chunking: ChunkingAlgorithm::AnchoredLine,
                 text: EmbeddingTextRecipe::LineOrNeighbourContext,
-                normalization: NormalizationStrategy::L2Unit,
+                normalization: TextNormalizationRecipe::AsSuppliedByCorpus,
             }
         );
     }

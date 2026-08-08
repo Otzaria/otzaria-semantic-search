@@ -357,7 +357,8 @@ cargo run --release --features llama-backend -- build \
 
 ```json
 {"min_meaningful_chars": 20, "context_window_lines": 2, "max_chunk_chars": 512,
- "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 1}
+ "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 1,
+ "normalization_version": 1}
 ```
 
 It must hash to the `chunking_identity` the model declares, and the build refuses it
@@ -372,12 +373,15 @@ by the loaded runtime and compared against what the artifact declares — the ch
 the width are facts about the file, the backend id is which implementation was selected,
 and pooling is what that implementation performs.
 
-The three recipe versions — `embedding_text_version`, `normalization_version` and
-`chunking_version` — are not facts about a model at all; they are versions of code in this
-crate. Each is a closed set in [`recipe.rs`](src/semantic/recipe.rs), and the code that does
-the work dispatches on it, so a version nobody has implemented is refused rather than
-declared. `model_id` and `model_quantization` remain declarations — nothing in a GGUF
-states either.
+The three recipe versions — `chunking_version`, `embedding_text_version` and
+`normalization_version` — are not facts about a model at all; they are versions of code in
+this crate. Each is a closed set in [`recipe.rs`](src/semantic/recipe.rs), and the chunker
+dispatches on it, so a version nobody has implemented is refused rather than declared. All
+three are about the **text**: `normalization_version` is the text preprocessing applied
+before the model sees a string — on both sides, so a query reaches the model the same way
+the stored vectors did. L2 normalization of the finished vector is an invariant of cosine,
+applied by every store unconditionally, and is deliberately not versioned. `model_id` and
+`model_quantization` remain declarations — nothing in a GGUF states either.
 
 Which lines get a vector is **derived** by running the chunker over the corpus, before any
 inference. A line too short to carry meaning is skipped, and an artifact that skips it is
@@ -406,7 +410,7 @@ cargo run --release -- validate \
 | `vectors.jsonl` | one `{"line_id": N, "source_line_sha256": "...", "embedding_text_sha256": "..."}` per vector, **in the same order** |
 | `corpus-identity.json` | the `CorpusIdentity` the lexical index reports |
 | `corpus-lines.jsonl` | one document per line: `line_id`, book key, title, reference, section, segment, `is_pdf`, hashes, facets and `text` |
-| `chunking.json` | optional here, required by `build`. Its `chunking_version` and `embedding_text_version` must name algorithms this build implements. With it, the lines that must get a vector are the ones the recipe embeds, and the recipe is pinned to the declared `chunking_identity`. Without it the corpus file **is** the coverage contract — the vectors must cover it exactly, with nothing missing and nothing extra, so export exactly the lines that should be embedded |
+| `chunking.json` | optional here, required by `build`. Its three recipe versions must name behaviour this build implements, and must equal the ones the model identity declares. With it, the lines that must get a vector are the ones the recipe embeds, and the recipe is pinned to the declared `chunking_identity`. Without it the corpus file **is** the coverage contract — the vectors must cover it exactly, with nothing missing and nothing extra, so export exactly the lines that should be embedded |
 | `model.json` | a `ModelIdentity` — see [`versioning.rs`](src/semantic/versioning.rs) |
 
 `source_line_sha256` is the SHA-256 of the corpus line's text and is checked against the
