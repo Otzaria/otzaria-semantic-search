@@ -219,12 +219,12 @@ otzaria-semantic-search/
 | **Telemetry** | [`src/telemetry/mod.rs`](src/telemetry/mod.rs) | `TelemetryCollector`, `SearchTelemetry` | In-process counters only — nothing is transmitted anywhere |
 | **Index Package** | [`src/distribution/package.rs`](src/distribution/package.rs) | `IndexPackage`, `ArtifactExpectation`, `VerifiedPackage`, `VerificationDepth` | Metadata plus a SHA-256 per payload, and the artifact digest that a published value can be compared against. `verify_for_install` hashes everything; `verify_for_open` does not, and the token records which ran |
 | **Package Install** | [`src/distribution/importer.rs`](src/distribution/importer.rs) | `IndexImporter`, `recover_interrupted_install` | Verify the source, copy to staging, verify the copy, swap. The swap is two renames with a window in between, so the intermediate names are deterministic and recovery is a documented step |
-| **Corpus Port** | [`src/distribution/corpus.rs`](src/distribution/corpus.rs) | `CorpusIndex`, `CorpusLine`, `JsonlCorpus` | The lexical index a packer joins against, as a trait — Tantivy is not a dependency of this crate and must not be. The corpus identity and every stored field come from it, so there is no second description of a book to drift from the first |
-| **Artifact Packer** | [`src/distribution/packer.rs`](src/distribution/packer.rs) | `pack`, `validate_artifact`, `VectorInput` | Ready-made vectors in, a verified artifact out. Each input is a `line_id`, a vector and a digest of the line's text — and that digest is what stops a vector file shifted by one from packing without complaint |
+| **Corpus Port** | [`src/distribution/corpus.rs`](src/distribution/corpus.rs) | `CorpusIndex`, `CorpusLine`, `JsonlCorpus` | The lexical index a packer joins against, as a trait — Tantivy is not a dependency of this crate and must not be. The corpus supplies the identity, every stored field, **and the set of lines an artifact must cover**, so there is no second description of a book to drift from the first and no such thing as a silently partial artifact |
+| **Artifact Packer** | [`src/distribution/packer.rs`](src/distribution/packer.rs) | `pack`, `validate_artifact`, `VectorInput` | Ready-made vectors in, a verified artifact out. An input is a `line_id`, a vector and two digests: of the corpus line, which is checked and catches a vector file shifted by one row, and of the text that was actually embedded, which becomes the record's `chunk_hash` |
 | **Benchmark Harness** | [`src/benchmark/mod.rs`](src/benchmark/mod.rs) | `measure`, `aggregate`, `QuerySet` | Timing and percentile helpers. A measurement tool, **not** a relevance dataset |
 | **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | feature-gated integration tests | End-to-end public-API suite using the explicit mock backend |
 | **Official Runtime Test** | [`tests/official_runtime.rs`](tests/official_runtime.rs) | feature-gated integration tests | Builds an artifact the way the packer does, installs it, opens it, and asserts a query returns the `line_id` it was built from — plus that every build-side call is refused and the artifact is never written to |
-| **Packer Test** | [`tests/artifact_packer.rs`](tests/artifact_packer.rs) | integration tests, one feature-gated | S4a end to end through the binary a pipeline runs: pack, re-validate, the same digest twice, and a misaligned input refused. Then what the packer wrote is installed, opened and queried — with no fixture assembled by hand in between |
+| **Packer Test** | [`tests/artifact_packer.rs`](tests/artifact_packer.rs) | integration tests, one feature-gated | S4a end to end through the binary a pipeline runs: pack, re-validate, two independent packs producing byte-identical payloads, and misaligned or partial input refused. Then what the packer wrote is installed, opened and queried — with no fixture assembled by hand in between |
 | **CI Workflow** | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | `check-and-test` | Multi-platform GitHub Actions CI workflow (Linux, Windows, macOS) |
 
 ---
@@ -355,16 +355,26 @@ cargo run --release -- validate \
 | File | Shape |
 |------|-------|
 | `vectors.f32` | little-endian `f32`, `vector_count × embedding_dim`, no header |
-| `vectors.jsonl` | one `{"line_id": N, "line_sha256": "..."}` per vector, **in the same order** |
+| `vectors.jsonl` | one `{"line_id": N, "source_line_sha256": "...", "embedding_text_sha256": "..."}` per vector, **in the same order** |
 | `corpus-identity.json` | the `CorpusIdentity` the lexical index reports |
-| `corpus-lines.jsonl` | one document per line: `line_id`, book key, title, reference, section, segment, `is_pdf`, hashes, facets and `text` |
+| `corpus-lines.jsonl` | one document per line: `line_id`, book key, title, reference, section, segment, `is_pdf`, hashes, facets and `text`. **Also the coverage contract** — every line in it must get a vector, so export exactly the lines that should be embedded |
 | `model.json` | a `ModelIdentity` — see [`versioning.rs`](src/semantic/versioning.rs) |
 
-`line_sha256` is the SHA-256 of the corpus line's text, lowercase hex. It is what proves
-each vector was built from the line its id names; a vector file shifted by one row passes
-every other check there is. The `Digest:` line the tool prints is what has to be published
-**outside** the artifact — without it, a later verification detects damage and the wrong
-artifact, but not one deliberately rebuilt to match.
+`source_line_sha256` is the SHA-256 of the corpus line's text and is checked against the
+corpus: a vector file shifted by one row passes every other check there is.
+`embedding_text_sha256` is of the text that was actually embedded — after any title prefix,
+neighbour context or truncation — and is recorded as the record's `chunk_hash`, because
+that field is defined as a digest of the embedded text and the corpus holds the line.
+
+Both are alignment and provenance *records*, not proof: nothing available to a tool that
+receives finished floats can establish that a vector came from that text, by that model.
+Closing that means producing the vector, its digest and the model identity in one pipeline
+(S4b).
+
+The `Digest:` line the tool prints is what has to be published **outside** the artifact —
+without it, a later verification detects damage and the wrong artifact, but not one
+deliberately rebuilt to match. Two independent packs of the same vectors produce the same
+digest, which is what makes publishing one meaningful.
 
 ### Testing against the real model
 

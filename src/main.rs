@@ -46,7 +46,7 @@ Options for 'status':
 
 Options for 'pack':
   --vectors <path>           Raw little-endian f32 vectors, count x embedding_dim, no header
-  --records <path>           JSONL, one {{"line_id":N,"line_sha256":"..."}} per vector, same order
+  --records <path>           JSONL, one record per vector, in the same order (see below)
   --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
   --corpus-lines <path>      JSONL, one corpus line per document
   --model <path>             JSON ModelIdentity describing how the vectors were produced
@@ -60,9 +60,19 @@ Options for 'validate':
   --corpus-lines <path>      As above
   --model <path>             As above
 
-`line_sha256` is the SHA-256 of the corpus line's text, in lowercase hex. It is what
-proves each vector was built from the line its id names; without it a shifted vector
-file would pack without complaint.
+A record is {{"line_id":N,"source_line_sha256":"...","embedding_text_sha256":"..."}}.
+Both digests are lowercase hex SHA-256.
+
+  source_line_sha256     of the corpus line's text. Checked against the corpus: this is
+                         what catches a vector file that drifted out of step with its id
+                         list, which nothing else here would notice.
+  embedding_text_sha256  of the text that was actually embedded, after any title prefix,
+                         neighbour context or truncation. Recorded as the record's
+                         chunk_hash; not checked against anything, because the corpus
+                         holds the line and not the recipe's output.
+
+The corpus lines file is also the coverage contract: every line in it must get a vector,
+so export exactly the lines that should be embedded.
 
 Examples:
   otzaria-semantic-search version

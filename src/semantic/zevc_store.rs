@@ -97,7 +97,10 @@ struct PersistedBookIndex {
     format_version: u32,
     embedding_dim: u32,
     collection_name: String,
-    books: HashMap<String, Vec<String>>,
+    /// A `BTreeMap` because this is written to disk: its serialization is key-ordered,
+    /// and a `HashMap`'s is whatever the run's hasher decided. Reading is unaffected —
+    /// the map is compared as a map — so this is not a format change.
+    books: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Default)]
@@ -216,7 +219,18 @@ impl ZevcStore {
                 })?,
             );
 
-        for record in state.records.values() {
+        // Sorted, so the same records produce the same bytes.
+        //
+        // Not a tidiness preference: an artifact's payload checksums feed
+        // [`IndexPackage::digest`](crate::distribution::package::IndexPackage::digest), the
+        // value a publisher announces. Written in `HashMap` order, two independent builds
+        // of identical vectors produced different files and therefore different digests —
+        // which made "the same build produces the same digest twice" false for every
+        // reason except the one that was documented (`created_at`).
+        let mut ordered: Vec<&StoredVectorRecord> = state.records.values().collect();
+        ordered.sort_by(|a, b| a.metadata.semantic_id.cmp(&b.metadata.semantic_id));
+
+        for record in ordered {
             let mut vector_bytes = Vec::with_capacity(record.vector.len() * 4);
             for value in &record.vector {
                 vector_bytes.extend_from_slice(&value.to_le_bytes());
@@ -251,11 +265,21 @@ impl ZevcStore {
         let b_file = File::create(&b_tmp).map_err(|e| VectorStoreError::CommitFailed {
             reason: e.to_string(),
         })?;
+        // Sorted for the same reason, on both levels: a `BTreeMap` serializes its keys in
+        // order, and the id list under each key is ordered here.
         let persisted_book_index = PersistedBookIndex {
             format_version: STORE_FORMAT_VERSION,
             embedding_dim: self.config.embedding_dim,
             collection_name: self.config.collection_name.clone(),
-            books: state.book_index.clone(),
+            books: state
+                .book_index
+                .iter()
+                .map(|(book, ids)| {
+                    let mut ids = ids.clone();
+                    ids.sort();
+                    (book.clone(), ids)
+                })
+                .collect(),
         };
         serde_json::to_writer(&b_file, &persisted_book_index).map_err(|e| {
             VectorStoreError::CommitFailed {
@@ -780,7 +804,11 @@ fn read_snapshot(
     expected.verify_file(METADATA_FILENAME, &m_reader.into_inner().finalize())?;
     expected.verify_file(VECTORS_FILENAME, &v_file.finalize())?;
 
-    let mut rebuilt_book_index: HashMap<String, Vec<String>> = HashMap::new();
+    // Compared as ordered maps, so a stored index that lists the same ids in another
+    // order still agrees: order is a property of how the file was written, not of what it
+    // claims. `read_snapshot` therefore keeps reading artifacts written before the writer
+    // began ordering them.
+    let mut rebuilt_book_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for record in records.values() {
         rebuilt_book_index
             .entry(record.metadata.source_book_key.clone())
@@ -802,7 +830,7 @@ fn read_snapshot(
 
     Ok(Some(Snapshot {
         records,
-        book_index: rebuilt_book_index,
+        book_index: rebuilt_book_index.into_iter().collect(),
         collection_name: persisted_book_index.collection_name,
     }))
 }
@@ -1330,6 +1358,53 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(store.count(), 0);
+    }
+
+    /// Two stores holding the same records write byte-identical snapshots, whatever order
+    /// they were inserted in.
+    ///
+    /// This is what a published artifact digest rests on: the digest is taken over the
+    /// payload checksums, so a writer that emitted `HashMap` order would give two builds
+    /// of identical vectors two different digests — and there would be no such thing as
+    /// rebuilding an artifact and checking it against what was announced.
+    #[test]
+    fn the_same_records_write_the_same_bytes_whatever_order_they_arrived_in() {
+        let records = [
+            (sample_metadata("c3", "book_b"), vec![0.0, 0.0, 1.0, 0.0]),
+            (sample_metadata("a1", "book_a"), vec![1.0, 0.0, 0.0, 0.0]),
+            (sample_metadata("b2", "book_a"), vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+
+        let snapshot_of = |name: &str, order: Vec<usize>| {
+            let dir = TempDir::new(name);
+            let store = ZevcStore::open_or_create(ZevcStoreConfig {
+                db_path: dir.path().to_path_buf(),
+                embedding_dim: 4,
+                collection_name: "chunks".to_string(),
+                auto_persist: false,
+            })
+            .unwrap();
+            for index in order {
+                store.insert_batch(vec![records[index].clone()]).unwrap();
+            }
+            store.commit().unwrap();
+            let bytes: Vec<(String, Vec<u8>)> = SNAPSHOT_FILENAMES
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_string(),
+                        fs::read(dir.path().join(name)).unwrap(),
+                    )
+                })
+                .collect();
+            bytes
+        };
+
+        assert_eq!(
+            snapshot_of("determinism_a", vec![0, 1, 2]),
+            snapshot_of("determinism_b", vec![2, 0, 1]),
+            "the payload must not depend on insertion order"
+        );
     }
 
     #[test]

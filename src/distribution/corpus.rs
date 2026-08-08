@@ -13,10 +13,14 @@
 //!   the two scheme versions are read off the index that is actually open, never typed
 //!   into a configuration file beside the vectors. An artifact cannot be labelled for a
 //!   catalogue it was not built from.
-//! * **Every field of a record comes from the corpus too.** The packer's input carries a
-//!   `line_id` and a vector; the title, reference, section, facets and the rest are
-//!   whatever the corpus says today. There is no second description of a book to drift
-//!   from the first.
+//! * **Every field of a record comes from the corpus too** — except the one only the
+//!   producer can know, which is a digest of the text it embedded. The title, reference,
+//!   section, facets and the rest are whatever the corpus says today, so there is no
+//!   second description of a book to drift from the first.
+//! * **The corpus says how many vectors there should be.** [`CorpusIndex::expected_line_ids`]
+//!   is what makes "complete artifact" a checkable claim rather than a hope: without it a
+//!   packer can only vouch for the vectors it was handed, and one good vector would pack
+//!   into a valid-looking artifact for a six-million-line library.
 //!
 //! [`JsonlCorpus`] is the implementation this crate can offer: a transcription of the
 //! index into two files. It is what makes the CLI usable without Tantivy, and what the
@@ -65,13 +69,29 @@ pub struct CorpusLine {
 
 /// The corpus a set of vectors claims to describe.
 ///
-/// Implemented by whoever has the lexical index open. Both methods may fail, because a
+/// Implemented by whoever has the lexical index open. Every method may fail, because a
 /// real index can: a read error and "there is no such line" are different answers and
 /// stay different — the first is a broken build input, the second is a broken pairing.
 pub trait CorpusIndex {
     /// Identity of the corpus, as the index reports it. This is what the artifact
     /// declares and what the runtime will compare against; a packer never composes it.
     fn identity(&self) -> Result<CorpusIdentity, PackError>;
+
+    /// Every `line_id` an artifact of this corpus must carry a vector for.
+    ///
+    /// **This is the completeness contract, and there is no way to opt out of it.**
+    /// Without it a packer can only check the vectors it was given, so one good vector
+    /// out of six million would produce a perfectly valid "official artifact": the
+    /// counts, the checksums and the identity would all agree, and the library would be
+    /// missing from itself. Coverage is compared exactly — a missing id is a rejection,
+    /// and so is a vector for an id that is not here.
+    ///
+    /// **It is not "every document in the index".** The embedding recipe decides what
+    /// gets a vector: a line too short to carry meaning is skipped, and an artifact is
+    /// not incomplete for skipping it. So the set is the *recipe's* output, which is why
+    /// it is answered by whoever implements the recipe rather than derived here. For
+    /// [`JsonlCorpus`] that means: export exactly the lines that should be embedded.
+    fn expected_line_ids(&self) -> Result<Vec<u64>, PackError>;
 
     /// The line `line_id` names, or `None` when the corpus holds no live document with
     /// that id.
@@ -190,6 +210,13 @@ impl JsonlCorpus {
 impl CorpusIndex for JsonlCorpus {
     fn identity(&self) -> Result<CorpusIdentity, PackError> {
         Ok(self.identity.clone())
+    }
+
+    /// Every line in the file. The file is therefore the coverage contract as well as the
+    /// metadata source: whoever exported it decided which lines get vectors, which is the
+    /// same decision the embedding recipe makes.
+    fn expected_line_ids(&self) -> Result<Vec<u64>, PackError> {
+        Ok(self.lines.keys().copied().collect())
     }
 
     fn line(&self, line_id: u64) -> Result<Option<CorpusLine>, PackError> {

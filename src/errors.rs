@@ -355,6 +355,23 @@ pub enum PackError {
     #[error("line_id {line_id} has a vector but no document in the corpus")]
     LineNotInCorpus { line_id: u64 },
 
+    /// Lines the corpus expects a vector for did not get one.
+    ///
+    /// The other half of [`Self::LineNotInCorpus`], and the more dangerous half: a vector
+    /// for a line that does not exist is at least *visible*, while a library missing most
+    /// of itself produces an artifact whose counts, checksums and identity all agree. One
+    /// good vector out of six million would otherwise pack successfully.
+    #[error(
+        "The artifact covers {covered} of the corpus's {expected} line(s); {missing} have \
+         no vector, the first being line {first_missing}"
+    )]
+    IncompleteCoverage {
+        expected: usize,
+        covered: usize,
+        missing: usize,
+        first_missing: u64,
+    },
+
     /// The vector was produced from text this corpus does not hold for that line.
     ///
     /// This is the check that catches the failure the whole join exists for: a vector

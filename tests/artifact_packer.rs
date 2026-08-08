@@ -143,7 +143,7 @@ fn write_corpus(dir: &Path) -> (PathBuf, PathBuf) {
 fn write_vectors(
     dir: &Path,
     name: &str,
-    vector_for: impl Fn(usize) -> (u64, Vec<f32>, String),
+    vector_for: impl Fn(usize) -> (u64, Vec<f32>, String, String),
 ) -> (PathBuf, PathBuf) {
     let vectors_path = dir.join(format!("{name}.f32"));
     let records_path = dir.join(format!("{name}.jsonl"));
@@ -151,7 +151,7 @@ fn write_vectors(
     let mut bytes = Vec::new();
     let mut records = String::new();
     for index in 0..LINES.len() {
-        let (line_id, vector, line_sha256) = vector_for(index);
+        let (line_id, vector, source_line_sha256, embedding_text_sha256) = vector_for(index);
         for value in &vector {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -159,7 +159,8 @@ fn write_vectors(
             "{}\n",
             serde_json::to_string(&VectorInputRecord {
                 line_id,
-                line_sha256,
+                source_line_sha256,
+                embedding_text_sha256,
             })
             .unwrap()
         ));
@@ -183,6 +184,16 @@ fn stand_in_vector(text: &str) -> Vec<f32> {
     (0..DIM)
         .map(|i| f32::from(digest[i as usize % 32]) + 1.0)
         .collect()
+}
+
+/// A line whose recipe embedded it unchanged: both digests are of the same text.
+fn embedded_unchanged(line_id: u64, text: &str) -> (u64, Vec<f32>, String, String) {
+    (
+        line_id,
+        stand_in_vector(text),
+        sha256_hex(text.as_bytes()),
+        sha256_hex(text.as_bytes()),
+    )
 }
 
 fn stand_in_model() -> ModelIdentity {
@@ -210,7 +221,7 @@ fn the_cli_packs_ready_made_vectors_into_a_verified_artifact() {
     let model_path = write_model(dir.path(), &stand_in_model());
     let (vectors_path, records_path) = write_vectors(dir.path(), "good", |index| {
         let (line_id, _, text) = LINES[index];
-        (line_id, stand_in_vector(text), sha256_hex(text.as_bytes()))
+        embedded_unchanged(line_id, text)
     });
     let out = dir.path().join("artifact");
 
@@ -306,11 +317,10 @@ fn the_cli_refuses_vectors_that_do_not_belong_to_the_lines_they_name() {
     let (vectors_path, records_path) = write_vectors(dir.path(), "shifted", |index| {
         let (line_id, _, _) = LINES[index];
         let (_, _, neighbour) = LINES[(index + 1) % LINES.len()];
-        (
-            line_id,
-            stand_in_vector(neighbour),
-            sha256_hex(neighbour.as_bytes()),
-        )
+        // Every id is still present exactly once, so coverage and the counts are
+        // untouched: only the source digest can see this.
+        let (_, vector, source, embedded) = embedded_unchanged(line_id, neighbour);
+        (line_id, vector, source, embedded)
     });
     let out = dir.path().join("artifact");
 
@@ -359,7 +369,7 @@ fn the_library_entry_point_packs_the_same_artifact_the_cli_does() {
     let (corpus_identity_path, corpus_lines_path) = write_corpus(dir.path());
     let (vectors_path, records_path) = write_vectors(dir.path(), "good", |index| {
         let (line_id, _, text) = LINES[index];
-        (line_id, stand_in_vector(text), sha256_hex(text.as_bytes()))
+        embedded_unchanged(line_id, text)
     });
     let corpus = JsonlCorpus::load(&corpus_identity_path, &corpus_lines_path).unwrap();
     let out = dir.path().join("artifact");
@@ -385,6 +395,111 @@ fn the_library_entry_point_packs_the_same_artifact_the_cli_does() {
             .unwrap()
             .digest,
         report.digest
+    );
+}
+
+/// Two independent packs of the same vectors produce the same artifact, byte for byte.
+///
+/// This is what a published digest rests on. The digest covers the payload checksums, so
+/// unless the payload is written deterministically, "the same build produces the same
+/// digest twice" is false and a rebuilt artifact can never be checked against what was
+/// announced. Two separate directories, because comparing a pack against a `validate` of
+/// the same directory would pass no matter what the writer did.
+#[test]
+fn packing_the_same_vectors_twice_produces_the_same_artifact() {
+    let dir = TempDir::new("reproducible");
+    let (corpus_identity_path, corpus_lines_path) = write_corpus(dir.path());
+    let (vectors_path, records_path) = write_vectors(dir.path(), "good", |index| {
+        let (line_id, _, text) = LINES[index];
+        embedded_unchanged(line_id, text)
+    });
+    let corpus = JsonlCorpus::load(&corpus_identity_path, &corpus_lines_path).unwrap();
+
+    let pack_into = |name: &str| {
+        pack(
+            PackRequest {
+                output_path: dir.path().join(name),
+                model: stand_in_model(),
+                // Deliberately different, because `created_at` is excluded from the digest
+                // and this is the test that would notice if it stopped being.
+                created_at: format!("2026-08-0{}T00:00:00Z", name.len()),
+                collection_name: "chunks".to_string(),
+            },
+            read_vector_inputs(&vectors_path, &records_path, DIM).unwrap(),
+            &corpus,
+        )
+        .unwrap()
+    };
+
+    let first = pack_into("one");
+    let second = pack_into("two2");
+    assert_eq!(first.digest, second.digest);
+
+    for payload in ["vectors.bin", "metadata.jsonl", "book_index.json"] {
+        assert_eq!(
+            std::fs::read(dir.path().join("one").join(payload)).unwrap(),
+            std::fs::read(dir.path().join("two2").join(payload)).unwrap(),
+            "{payload} must not depend on anything but the vectors and the corpus"
+        );
+    }
+}
+
+/// An artifact that holds part of the library passes every count, checksum and identity
+/// field there is. Only the corpus knows how many vectors there should have been.
+#[test]
+fn the_cli_refuses_an_artifact_that_covers_part_of_the_corpus() {
+    let dir = TempDir::new("cli_coverage");
+    let (corpus_identity_path, corpus_lines_path) = write_corpus(dir.path());
+    let model_path = write_model(dir.path(), &stand_in_model());
+    let (vectors_path, records_path) = write_vectors(dir.path(), "good", |index| {
+        let (line_id, _, text) = LINES[index];
+        embedded_unchanged(line_id, text)
+    });
+
+    // Keep the first record and its vector; drop the rest, as a truncated export would.
+    let partial_records = dir.path().join("partial.jsonl");
+    let partial_vectors = dir.path().join("partial.f32");
+    let records = std::fs::read_to_string(&records_path).unwrap();
+    std::fs::write(
+        &partial_records,
+        format!("{}\n", records.lines().next().unwrap()),
+    )
+    .unwrap();
+    let vectors = std::fs::read(&vectors_path).unwrap();
+    std::fs::write(&partial_vectors, &vectors[..DIM as usize * 4]).unwrap();
+
+    let out = dir.path().join("artifact");
+    let packed = Command::new(env!("CARGO_BIN_EXE_otzaria-semantic-search"))
+        .args([
+            "pack",
+            "--vectors",
+            partial_vectors.to_str().unwrap(),
+            "--records",
+            partial_records.to_str().unwrap(),
+            "--corpus-identity",
+            corpus_identity_path.to_str().unwrap(),
+            "--corpus-lines",
+            corpus_lines_path.to_str().unwrap(),
+            "--model",
+            model_path.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("the CLI binary runs");
+
+    assert!(
+        !packed.status.success(),
+        "a partial artifact must not pack successfully"
+    );
+    let stderr = String::from_utf8_lossy(&packed.stderr);
+    assert!(
+        stderr.contains("no vector") && stderr.contains(&format!("{}", LINES.len())),
+        "the refusal must say how much is missing: {stderr}"
+    );
+    assert!(
+        !out.exists() || std::fs::read_dir(&out).unwrap().count() == 0,
+        "a refused pack must not leave an artifact behind"
     );
 }
 
@@ -443,6 +558,7 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
         (
             line_id,
             mock::hash_embedding(text, DIM),
+            sha256_hex(text.as_bytes()),
             sha256_hex(text.as_bytes()),
         )
     });

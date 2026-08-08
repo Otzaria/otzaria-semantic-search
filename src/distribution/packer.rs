@@ -7,23 +7,34 @@
 //!
 //! # What the input is, and what it deliberately is not
 //!
-//! An input record is a `line_id`, a vector, and a digest of the line's text. That is
-//! all. Every other field a stored record carries — book key, title, reference, section,
-//! segment, facets — is read out of the [`CorpusIndex`] at pack time, so there is never a
-//! second description of a book that can drift from the lexical index the application
-//! hydrates from.
+//! An input record is a `line_id`, a vector, and **two** digests: of the corpus line, and
+//! of the text that was actually embedded. That is all. Every other field a stored record
+//! carries — book key, title, reference, section, segment, facets — is read out of the
+//! [`CorpusIndex`] at pack time, so there is never a second description of a book that can
+//! drift from the lexical index the application hydrates from.
 //!
-//! The text digest is the part that looks redundant and is not. Ids and vectors arrive
-//! from two places, and the failure that matters is that they drifted apart — an
-//! off-by-one, a different sort order, a subset. Nothing about a vector reveals which
-//! text produced it, so the producer has to say, and the packer checks it against the
-//! corpus. Without that, packing is a rubber stamp: it would happily label a shifted
-//! vector file as an artifact of this catalogue, and every search result would be
-//! confident and wrong.
+//! **`source_line_sha256`** is checked against the corpus. It catches one specific and
+//! very likely failure: the vector file and the id list drifted apart — an off-by-one, a
+//! different sort order, a subset. That failure is otherwise invisible, because the counts
+//! still add up, the checksums still pass and the identity still matches, so every result
+//! is a neighbouring line returned with full confidence.
 //!
-//! What it cannot prove: that the producer computed the digest when it embedded the line
-//! rather than from the corpus at pack time. Nothing can. It is stated rather than
-//! implied.
+//! **`embedding_text_sha256`** is not checked against anything; it is *recorded*, as the
+//! record's `chunk_hash`. The embedded text is not the corpus line whenever the recipe
+//! prefixes a title, borrows context from neighbours or truncates — so a `chunk_hash`
+//! computed from the corpus line would describe a text nothing was ever built from, and
+//! [`Chunker`](crate::semantic::chunker::Chunker) defines that field as a digest of the
+//! embedded text. The producer is the only party that has it.
+//!
+//! ## What the digests do not prove
+//!
+//! They are an alignment check, not provenance. Neither one establishes that the vector
+//! was produced from that text, by the declared model, under the declared normalization —
+//! a producer that hashed the corpus at pack time rather than at embedding time satisfies
+//! both. Nothing available to a tool that receives finished floats can establish more than
+//! that, and no wording here should suggest otherwise. Closing it means producing the
+//! vector, its digest and the model identity in one pipeline, from the model and the index
+//! that are actually open; that is S4b's, and it reaches this code through the same input.
 //!
 //! # Two entry points over one set of checks
 //!
@@ -36,10 +47,12 @@
 //! The post-write checks are the runtime's own — [`IndexPackage::verify_for_install`],
 //! the payload layout, the reader, and the counts
 //! [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex)
-//! checks — plus one only a build machine can make: every record read back out of the
-//! payload is compared, field by field, against what the corpus says about its line. Over
-//! every record, not a sample: the corpus is already in memory, and a sampled gate makes a
-//! failing build depend on which records the sample happened to include.
+//! checks — plus two only a build machine can make. Every record read back out of the
+//! payload is compared, field by field, against what the corpus says about its line; and
+//! the set of ids is compared against [`CorpusIndex::expected_line_ids`], so an artifact that is internally perfect and covers a tenth of the library is a
+//! rejection. Over every record, not a sample: the corpus is already in memory, and a
+//! sampled gate makes a failing build depend on which records the sample happened to
+//! include.
 //!
 //! # What it costs, stated rather than hidden
 //!
@@ -66,7 +79,7 @@ use crate::distribution::package::{
     ArtifactExpectation, IndexPackage, PackageManifest, PayloadDescriptor, VerifiedPackage,
 };
 use crate::errors::{EmbeddingError, PackError};
-use crate::semantic::chunker::{compute_chunk_hash, compute_semantic_id};
+use crate::semantic::chunker::compute_semantic_id;
 use crate::semantic::embedding::normalize_validated;
 use crate::semantic::official_index::{
     ensure_snapshot_layout, readable_store_identity, verify_counts_against_payload,
@@ -94,9 +107,14 @@ const INSERT_BATCH: usize = 1024;
 pub struct VectorInput {
     /// The global document id the vector describes, in the corpus's own id scheme.
     pub line_id: u64,
-    /// SHA-256 of the corpus line's text as the producer read it, in 64 lowercase hex
-    /// digits. See the module documentation for why this is required and not optional.
-    pub line_sha256: String,
+    /// SHA-256 of the **corpus line's** text as the producer read it, in 64 lowercase hex
+    /// digits. Checked against the corpus; see the module documentation.
+    pub source_line_sha256: String,
+    /// SHA-256 of the text that was actually **embedded** — after whatever prefixing,
+    /// neighbour context and truncation the recipe applies. Recorded as the record's
+    /// `chunk_hash`, and equal to the corpus line's digest only when the recipe embedded
+    /// the line unchanged.
+    pub embedding_text_sha256: String,
     pub vector: Vec<f32>,
 }
 
@@ -104,7 +122,8 @@ pub struct VectorInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorInputRecord {
     pub line_id: u64,
-    pub line_sha256: String,
+    pub source_line_sha256: String,
+    pub embedding_text_sha256: String,
 }
 
 /// What to build, beyond the vectors and the corpus.
@@ -150,11 +169,12 @@ pub struct PackReport {
 /// 2. Refuse an output path that already holds something.
 /// 3. Per input: the declared width, a vector a search could return, an id seen once, a
 ///    line the corpus holds, and the text that line actually carries.
-/// 4. Commit the payload, describe it, and write the metadata.
-/// 5. [`validate_artifact`], which re-reads everything just written.
+/// 4. Coverage: every id the corpus expects got a vector.
+/// 5. Commit the payload, describe it, and write the metadata.
+/// 6. [`validate_artifact`], which re-reads everything just written.
 ///
-/// Nothing reaches the disk before step 4: the payload writer buffers until it commits,
-/// so a rejection in step 3 leaves the output directory empty and the run can simply be
+/// Nothing reaches the disk before step 5: the payload writer buffers until it commits,
+/// so a rejection in steps 3–4 leaves the output directory empty and the run can simply be
 /// repeated. A failure *after* the commit leaves a partial artifact in place, and the
 /// next attempt refuses it rather than writing over it — that directory is evidence.
 pub fn pack(
@@ -201,6 +221,7 @@ pub fn pack(
     if accepted == 0 {
         return Err(PackError::NoVectors);
     }
+    verify_coverage(&seen, corpus)?;
 
     // The payload writer replaces on a duplicate `semantic_id` rather than failing, so
     // "everything accepted is in the payload" is counted and not assumed.
@@ -238,11 +259,13 @@ pub fn pack(
 /// 3. the payload set is exactly this backend's;
 /// 4. the payload opens through the verified token, which checks a SHA-256 per record;
 /// 5. the manifest's counts are what the payload holds;
-/// 6. every record's metadata is what the corpus says about its line.
+/// 6. every record's metadata is what the corpus says about its line;
+/// 7. every line the corpus expects a vector for has one.
 ///
-/// Step 6 is the one that makes this more than a re-run of the runtime's checks: an
-/// artifact can be internally perfect and still describe books by a title the catalogue
-/// no longer uses.
+/// Steps 6 and 7 are what make this more than a re-run of the runtime's checks. An
+/// artifact can be internally perfect and still describe books by a title the catalogue no
+/// longer uses — and it can be internally perfect while holding a hundredth of the
+/// library, which every count, checksum and identity field would agree with.
 pub fn validate_artifact(
     artifact_path: &Path,
     model: &ModelIdentity,
@@ -258,8 +281,45 @@ pub fn validate_artifact(
     let store = ReadOnlyZevcStore::open(&verified)?;
     let book_count = verify_counts_against_payload(&verified, &store)?;
     verify_records_against_corpus(&store, corpus, identity.model.chunking_identity)?;
+    verify_coverage(
+        &store
+            .stored_metadata()
+            .map(|record| record.line_id)
+            .collect(),
+        corpus,
+    )?;
 
     Ok(report(&verified, identity, book_count))
+}
+
+/// Refuse an artifact that does not cover the corpus.
+///
+/// The complement of [`PackError::LineNotInCorpus`], and the half that is easy to miss: a
+/// vector whose line does not exist is at least *present* and gets rejected on sight, while
+/// lines with no vector leave nothing behind to notice. Every count in the manifest, every
+/// payload checksum and every identity field agrees with an artifact holding one line out
+/// of six million.
+///
+/// The missing id reported is the smallest one, so two runs over the same fault name the
+/// same line.
+fn verify_coverage(covered: &HashSet<u64>, corpus: &dyn CorpusIndex) -> Result<(), PackError> {
+    let expected = corpus.expected_line_ids()?;
+    let Some(first_missing) = expected
+        .iter()
+        .filter(|line_id| !covered.contains(line_id))
+        .min()
+        .copied()
+    else {
+        return Ok(());
+    };
+
+    let unique: HashSet<u64> = expected.into_iter().collect();
+    Err(PackError::IncompleteCoverage {
+        expected: unique.len(),
+        covered: covered.len(),
+        missing: unique.difference(covered).count(),
+        first_missing,
+    })
 }
 
 /// The three sources that each know a part of the identity, and the completeness check
@@ -346,15 +406,19 @@ fn join_to_corpus(
         }
     })?;
 
-    let declared = &input.line_sha256;
-    if !is_lowercase_sha256(declared) {
-        return Err(PackError::MalformedInput {
-            reason: format!(
-                "line {} declares {declared:?} as its text digest, which is not 64 \
-                 lowercase hex digits",
-                input.line_id
-            ),
-        });
+    for (field, declared) in [
+        ("source_line_sha256", &input.source_line_sha256),
+        ("embedding_text_sha256", &input.embedding_text_sha256),
+    ] {
+        if !is_lowercase_sha256(declared) {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "line {} declares {declared:?} as its {field}, which is not 64 \
+                     lowercase hex digits",
+                    input.line_id
+                ),
+            });
+        }
     }
 
     let line = corpus
@@ -363,26 +427,45 @@ fn join_to_corpus(
             line_id: input.line_id,
         })?;
     let actual = sha256_hex(line.text.as_bytes());
-    if &actual != declared {
+    if actual != input.source_line_sha256 {
         return Err(PackError::LineTextMismatch {
             line_id: input.line_id,
-            declared: declared.clone(),
+            declared: input.source_line_sha256.clone(),
             actual,
         });
     }
 
-    Ok(record_for(input.line_id, &line, chunking_identity))
+    Ok(record_for(
+        input.line_id,
+        &line,
+        chunking_identity,
+        // Safe to slice: the digest was checked to be 64 ASCII hex digits above.
+        &input.embedding_text_sha256[..CHUNK_HASH_HEX_LEN],
+    ))
 }
 
-/// The record a line gets, derived entirely from the corpus.
+/// The record a line gets: the corpus for everything it knows, and the producer for the
+/// one thing it cannot.
 ///
-/// The three fields that are not read straight off the corpus are computed the way the
-/// chunker computes them, so an artifact built here and one built by the prototype
-/// indexing path key their vectors identically. `chunk_hash` is over the line's own text:
-/// this packer's granularity is one vector per line, and *which* text was embedded — the
-/// line alone, or the line with context — is declared by `model.embedding_text_version`
-/// rather than reconstructed from a hash.
-fn record_for(line_id: u64, line: &CorpusLine, chunking_identity: u64) -> VectorMetadata {
+/// `semantic_id` and `source_doc_key` are composed the way the chunker composes them, so
+/// an artifact built here and one built by the prototype indexing path key their vectors
+/// identically.
+///
+/// `chunk_hash` is [`compute_chunk_hash`](crate::semantic::chunker::compute_chunk_hash) of
+/// the **embedded** text, which is the
+/// definition the chunker set and the reason the producer has to declare a second digest.
+/// Whenever the recipe prefixes a title, borrows context from a neighbour or truncates, the
+/// embedded text is not the corpus line — so deriving this field from the corpus would
+/// have made every record describe a text nothing was ever built from. The caller passes
+/// the first 128 bits of the declared SHA-256, which is exactly what that function
+/// produces; `a_chunk_hash_is_the_documented_prefix_of_a_sha256` pins that so the two
+/// cannot drift apart.
+fn record_for(
+    line_id: u64,
+    line: &CorpusLine,
+    chunking_identity: u64,
+    chunk_hash: &str,
+) -> VectorMetadata {
     VectorMetadata {
         semantic_id: compute_semantic_id(&line.source_book_key, line_id, chunking_identity),
         source_book_key: line.source_book_key.clone(),
@@ -390,7 +473,7 @@ fn record_for(line_id: u64, line: &CorpusLine, chunking_identity: u64) -> Vector
         line_id,
         section_id: line.section_id,
         line_hash: line.line_hash,
-        chunk_hash: compute_chunk_hash(&line.text),
+        chunk_hash: chunk_hash.to_string(),
         content_hash: line.content_hash,
         reference: line.reference.clone(),
         segment: line.segment,
@@ -400,13 +483,17 @@ fn record_for(line_id: u64, line: &CorpusLine, chunking_identity: u64) -> Vector
     }
 }
 
-/// Every stored field, paired with the name a rejection reports it under.
+/// Length of a `chunk_hash` — the chunker emits the first 16 bytes of a SHA-256 as hex.
+const CHUNK_HASH_HEX_LEN: usize = 32;
+
+/// Every stored field the corpus decides, paired with the name a rejection reports it
+/// under.
 ///
 /// A table rather than a hand-written comparison, so the two sides cannot be walked
-/// differently — and so `every_stored_field_is_compared_against_the_corpus` can check the
-/// names against the record's *serialized* shape and fail when a new field is added
-/// without one.
-fn record_fields(record: &VectorMetadata) -> [(&'static str, String); 13] {
+/// differently. Values are rendered for the message *and* compared, so anything with
+/// internal structure is rendered unambiguously: `facets` goes through JSON, because
+/// joining it on `", "` made `["/a, /b"]` and `["/a", "/b"]` compare equal.
+fn corpus_fields(record: &VectorMetadata) -> [(&'static str, String); 12] {
     [
         ("semantic_id", record.semantic_id.clone()),
         ("source_book_key", record.source_book_key.clone()),
@@ -414,15 +501,28 @@ fn record_fields(record: &VectorMetadata) -> [(&'static str, String); 13] {
         ("line_id", record.line_id.to_string()),
         ("section_id", record.section_id.to_string()),
         ("line_hash", record.line_hash.to_string()),
-        ("chunk_hash", record.chunk_hash.clone()),
         ("content_hash", record.content_hash.to_string()),
         ("reference", record.reference.clone()),
         ("segment", record.segment.to_string()),
         ("is_pdf", record.is_pdf.to_string()),
         ("title", record.title.clone()),
-        ("facets", record.facets.join(", ")),
+        (
+            "facets",
+            serde_json::to_string(&record.facets)
+                .unwrap_or_else(|_| format!("{:?}", record.facets)),
+        ),
     ]
 }
+
+/// The one stored field the corpus cannot answer.
+///
+/// `chunk_hash` describes the text the *producer* embedded, and the corpus holds the line
+/// rather than the recipe's output. Named as a constant so
+/// `every_stored_field_is_compared_or_deliberately_not` can require every serialized field
+/// to be either in [`corpus_fields`] or here — a field in neither would be written into
+/// every artifact and checked by nothing.
+#[cfg(test)]
+const UNCOMPARABLE_FIELD: &str = "chunk_hash";
 
 /// Compare every record in an opened payload against the corpus it names.
 ///
@@ -430,6 +530,10 @@ fn record_fields(record: &VectorMetadata) -> [(&'static str, String); 13] {
 /// would report a different one of several disagreements on every run — which is the
 /// difference between a build failure someone can fix and one they re-run until it names
 /// something else.
+///
+/// The producer's own field is not compared, because there is nothing to compare it to:
+/// what is checked instead is that it has the shape the chunker produces, so a record
+/// carrying a full SHA-256, an empty string or a sentence is still a rejection.
 fn verify_records_against_corpus(
     store: &ReadOnlyZevcStore,
     corpus: &dyn CorpusIndex,
@@ -444,11 +548,24 @@ fn verify_records_against_corpus(
             .ok_or(PackError::LineNotInCorpus {
                 line_id: stored.line_id,
             })?;
-        let expected = record_for(stored.line_id, &line, chunking_identity);
+        // Before the record is rebuilt around it: this reads an artifact nobody here
+        // necessarily wrote, and a `chunk_hash` that is not one has to be a rejection
+        // rather than something every later step has to be careful with.
+        if !is_chunk_hash(&stored.chunk_hash) {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "the record for line {} carries {:?} as its chunk_hash, which is not \
+                     {CHUNK_HASH_HEX_LEN} lowercase hex digits",
+                    stored.line_id, stored.chunk_hash
+                ),
+            });
+        }
 
-        for ((field, artifact), (_, corpus_value)) in record_fields(stored)
+        let expected = record_for(stored.line_id, &line, chunking_identity, &stored.chunk_hash);
+
+        for ((field, artifact), (_, corpus_value)) in corpus_fields(stored)
             .into_iter()
-            .zip(record_fields(&expected))
+            .zip(corpus_fields(&expected))
         {
             if artifact != corpus_value {
                 return Err(PackError::RecordDisagreesWithCorpus {
@@ -513,7 +630,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// requires it of a model checksum: the comparison is a string equality, and accepting
 /// both cases would let the same digest fail to match itself.
 fn is_lowercase_sha256(value: &str) -> bool {
-    value.len() == 64
+    is_lowercase_hex(value, 64)
+}
+
+/// The shape of a stored `chunk_hash`. Checked rather than assumed, because
+/// [`validate_artifact`] runs over artifacts this process did not write.
+fn is_chunk_hash(value: &str) -> bool {
+    is_lowercase_hex(value, CHUNK_HASH_HEX_LEN)
+}
+
+fn is_lowercase_hex(value: &str, digits: usize) -> bool {
+    value.len() == digits
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
@@ -540,6 +667,18 @@ pub fn read_vector_inputs(
             source,
         })
     };
+
+    // Before the arithmetic below, which divides by it. A model identity that declares no
+    // dimension is refused by `validate_complete` — but a caller reads the dimension out
+    // of that identity to call this, and reaching a division by zero on the way to a good
+    // error message is not a way to report anything.
+    if embedding_dim == 0 {
+        return Err(PackError::MalformedInput {
+            reason: "the model identity declares an embedding_dim of 0, so there is no \
+                     record width to read the vectors at"
+                .to_string(),
+        });
+    }
 
     let vectors = open(vectors_path)?;
     let record_bytes = embedding_dim as u64 * 4;
@@ -611,7 +750,8 @@ impl VectorInputReader {
 
         Ok(VectorInput {
             line_id: record.line_id,
-            line_sha256: record.line_sha256,
+            source_line_sha256: record.source_line_sha256,
+            embedding_text_sha256: record.embedding_text_sha256,
             vector,
         })
     }
@@ -672,6 +812,7 @@ impl Iterator for VectorInputReader {
 mod tests {
     use super::*;
     use crate::errors::ArtifactError;
+    use crate::semantic::chunker::compute_chunk_hash;
     use crate::semantic::versioning::{CorpusIdentity, IdentityField};
     use crate::semantic::zevc_store::{METADATA_FILENAME, VECTORS_FILENAME};
     use std::collections::HashMap;
@@ -739,6 +880,9 @@ mod tests {
         fn identity(&self) -> Result<CorpusIdentity, PackError> {
             Ok(self.identity.clone())
         }
+        fn expected_line_ids(&self) -> Result<Vec<u64>, PackError> {
+            Ok(self.lines.keys().copied().collect())
+        }
         fn line(&self, line_id: u64) -> Result<Option<CorpusLine>, PackError> {
             Ok(self.lines.get(&line_id).cloned())
         }
@@ -796,11 +940,20 @@ mod tests {
             .collect()
     }
 
+    /// What a correct producer emits for a line whose recipe embedded it unchanged.
     fn input(line_id: u64, text: &str) -> VectorInput {
+        embedded_as(line_id, text, text)
+    }
+
+    /// A line whose recipe embedded something else — a title prefix, neighbour context, a
+    /// truncation. The source digest still names the corpus line; the embedding digest
+    /// does not.
+    fn embedded_as(line_id: u64, source: &str, embedded: &str) -> VectorInput {
         VectorInput {
             line_id,
-            line_sha256: sha256_hex(text.as_bytes()),
-            vector: vector_for(text),
+            source_line_sha256: sha256_hex(source.as_bytes()),
+            embedding_text_sha256: sha256_hex(embedded.as_bytes()),
+            vector: vector_for(embedded),
         }
     }
 
@@ -861,7 +1014,10 @@ mod tests {
         let dir = TempDir::new("shifted");
         let corpus = FakeCorpus::new();
 
-        // Each record keeps its id and takes the *next* line's vector and digest.
+        // Each record keeps its id and takes the *next* line's vector and digests, which
+        // is what a vector file sorted differently from its id list looks like. Coverage
+        // is untouched — every id is still present exactly once — so only the text digest
+        // can see it.
         let shifted: Vec<Result<VectorInput, PackError>> = LINES
             .iter()
             .enumerate()
@@ -1129,13 +1285,18 @@ mod tests {
         ));
     }
 
-    /// A field added to a stored record without a line in [`record_fields`] would be
-    /// written into every artifact and compared against nothing. Driven off the
-    /// serialized record, so it sees exactly what the payload carries.
+    /// A field added to a stored record that is in neither list would be written into
+    /// every artifact and checked by nothing. Driven off the serialized record, so it sees
+    /// exactly what the payload carries.
     #[test]
-    fn every_stored_field_is_compared_against_the_corpus() {
-        let record = record_for(LINES[0].0, &corpus_line(GENESIS, LINES[0].2), 7);
-        let serialized: Vec<String> = serde_json::to_value(&record)
+    fn every_stored_field_is_compared_or_deliberately_not() {
+        let record = record_for(
+            LINES[0].0,
+            &corpus_line(GENESIS, LINES[0].2),
+            7,
+            &sha256_hex(b"embedded"),
+        );
+        let mut carried: Vec<String> = serde_json::to_value(&record)
             .unwrap()
             .as_object()
             .expect("a record is a JSON object")
@@ -1143,17 +1304,168 @@ mod tests {
             .cloned()
             .collect();
 
-        let mut compared: Vec<String> = record_fields(&record)
+        let mut accounted: Vec<String> = corpus_fields(&record)
             .iter()
             .map(|(name, _)| (*name).to_string())
+            .chain([UNCOMPARABLE_FIELD.to_string()])
             .collect();
-        let mut carried = serialized;
-        compared.sort();
+        accounted.sort();
         carried.sort();
         assert_eq!(
-            compared, carried,
-            "a stored field is compared that the record does not carry, or vice versa"
+            accounted, carried,
+            "a stored field is in neither list, or a list names a field the record does \
+             not carry"
         );
+    }
+
+    /// `chunk_hash` is stored as the first 128 bits of the producer's SHA-256, and the
+    /// chunker computes it as the first 128 bits of its own SHA-256. If those ever stop
+    /// being the same operation, an artifact from this packer and one from the prototype
+    /// indexing path would describe the same text differently.
+    #[test]
+    fn a_chunk_hash_is_the_documented_prefix_of_a_sha256() {
+        for text in ["בראשית ברא", "", "a longer line with some words in it"] {
+            assert_eq!(
+                compute_chunk_hash(text),
+                sha256_hex(text.as_bytes())[..CHUNK_HASH_HEX_LEN],
+                "for {text:?}"
+            );
+        }
+    }
+
+    /// The gap that made "official artifact" mean nothing: one good vector out of a whole
+    /// library passes every count, every checksum and every identity field.
+    #[test]
+    fn an_artifact_that_covers_part_of_the_corpus_is_refused() {
+        let dir = TempDir::new("coverage");
+        let corpus = FakeCorpus::new();
+
+        match pack(
+            request(&dir.path().join("artifact")),
+            vec![Ok(input(LINES[0].0, LINES[0].2))],
+            &corpus,
+        ) {
+            Err(PackError::IncompleteCoverage {
+                expected,
+                covered,
+                missing,
+                first_missing,
+            }) => {
+                assert_eq!(expected, LINES.len());
+                assert_eq!(covered, 1);
+                assert_eq!(missing, LINES.len() - 1);
+                // The smallest missing id, so two runs over the same fault agree.
+                assert_eq!(first_missing, LINES[1].0);
+            }
+            other => panic!("a partial artifact must be refused, got {other:?}"),
+        }
+
+        // And a corpus that grows after an artifact was built leaves that artifact
+        // incomplete, which validation on its own has to see.
+        let output = dir.path().join("complete");
+        pack(request(&output), good_inputs(), &corpus).unwrap();
+
+        let mut grown = FakeCorpus::new();
+        grown
+            .lines
+            .insert(12_884_901_889, corpus_line("otzaria/new.txt", "שורה חדשה"));
+        match validate_artifact(&output, &model(), &grown) {
+            Err(PackError::IncompleteCoverage { first_missing, .. }) => {
+                assert_eq!(first_missing, 12_884_901_889)
+            }
+            other => panic!("a corpus that grew must fail validation, got {other:?}"),
+        }
+    }
+
+    /// The recipe's text is not the corpus line whenever it prefixes, borrows context or
+    /// truncates. The record then has to describe what was embedded — deriving it from the
+    /// corpus would put a digest of a text nothing was built from into every record.
+    #[test]
+    fn a_chunk_hash_describes_the_embedded_text_and_not_the_corpus_line() {
+        let dir = TempDir::new("embedded_text");
+        let output = dir.path().join("artifact");
+        let corpus = FakeCorpus::new();
+
+        // The first line is embedded with its title prefixed; the rest are embedded raw.
+        let contextualized = format!("בראשית — {}", LINES[0].2);
+        let mut inputs = vec![Ok(embedded_as(LINES[0].0, LINES[0].2, &contextualized))];
+        inputs.extend(
+            LINES[1..]
+                .iter()
+                .map(|(line_id, _, text)| Ok(input(*line_id, text))),
+        );
+
+        pack(request(&output), inputs, &corpus).unwrap();
+
+        let stored = std::fs::read_to_string(output.join(METADATA_FILENAME)).unwrap();
+        assert!(
+            stored.contains(&compute_chunk_hash(&contextualized)),
+            "the record must carry a digest of the text that was embedded"
+        );
+        assert!(
+            !stored.contains(&compute_chunk_hash(LINES[0].2)),
+            "and not one of the corpus line, which nothing was built from"
+        );
+
+        // It survives validation, because the corpus is not asked about it.
+        assert!(validate_artifact(&output, &model(), &corpus).is_ok());
+    }
+
+    /// The field the corpus cannot answer still has a shape, and an artifact carrying
+    /// something else in it is not one this packer would have written.
+    #[test]
+    fn a_chunk_hash_that_is_not_one_is_refused_by_validation() {
+        let dir = TempDir::new("bad_chunk_hash");
+        let output = dir.path().join("artifact");
+        let corpus = FakeCorpus::new();
+        pack(request(&output), good_inputs(), &corpus).unwrap();
+
+        // Rewrite one record's chunk_hash, and the per-record checksum that covers it, so
+        // the payload stays internally consistent and only the shape check is left.
+        let metadata_path = output.join(METADATA_FILENAME);
+        let text = std::fs::read_to_string(&metadata_path).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        // Through the struct, because that is what the reader hashes: it deserializes the
+        // record and re-serializes it, so the checksum covers the canonical field order
+        // and not the order the bytes happen to be in.
+        let mut metadata: VectorMetadata =
+            serde_json::from_value(first["metadata"].take()).unwrap();
+        metadata.chunk_hash = "not a hash".to_string();
+        let canonical = serde_json::to_vec(&metadata).unwrap();
+        first["metadata"] = serde_json::from_slice(&canonical).unwrap();
+        first["metadata_sha256"] = serde_json::Value::String(sha256_hex(&canonical));
+        lines[0] = serde_json::to_string(&first).unwrap();
+        std::fs::write(&metadata_path, format!("{}\n", lines.join("\n"))).unwrap();
+        // The payload declarations have to follow, or this is caught as damage instead.
+        redeclare(&output);
+
+        match validate_artifact(&output, &model(), &corpus) {
+            Err(PackError::MalformedInput { reason }) => {
+                assert!(reason.contains("chunk_hash"), "{reason}")
+            }
+            other => panic!("a malformed chunk_hash must be refused, got {other:?}"),
+        }
+    }
+
+    /// Re-describe a directory's payload after a test edited it, so what is under test is
+    /// the check being aimed at rather than the checksum that would fire first.
+    fn redeclare(root: &Path) {
+        let existing = IndexPackage::read(root).unwrap();
+        let payloads: BTreeMap<String, PayloadDescriptor> = SNAPSHOT_FILENAMES
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    PayloadDescriptor::of_file(&root.join(name)).unwrap(),
+                )
+            })
+            .collect();
+        let manifest = PackageManifest {
+            total_size_bytes: payloads.values().map(|payload| payload.size_bytes).sum(),
+            ..existing.manifest
+        };
+        IndexPackage::write(root, &IndexPackage { manifest, payloads }).unwrap();
     }
 
     // ── the input files ──
@@ -1173,7 +1485,8 @@ mod tests {
                 "{}\n",
                 serde_json::to_string(&VectorInputRecord {
                     line_id: input.line_id,
-                    line_sha256: input.line_sha256.clone(),
+                    source_line_sha256: input.source_line_sha256.clone(),
+                    embedding_text_sha256: input.embedding_text_sha256.clone(),
                 })
                 .unwrap()
             ));
@@ -1200,7 +1513,8 @@ mod tests {
         assert_eq!(read.len(), written.len());
         for (read, written) in read.iter().zip(&written) {
             assert_eq!(read.line_id, written.line_id);
-            assert_eq!(read.line_sha256, written.line_sha256);
+            assert_eq!(read.source_line_sha256, written.source_line_sha256);
+            assert_eq!(read.embedding_text_sha256, written.embedding_text_sha256);
             assert_eq!(read.vector, written.vector);
         }
     }
@@ -1302,18 +1616,31 @@ mod tests {
     #[test]
     fn a_text_digest_that_is_not_a_lowercase_sha256_is_named_as_malformed_input() {
         let dir = TempDir::new("bad_digest");
-        let mut wrong_case = input(LINES[0].0, LINES[0].2);
-        wrong_case.line_sha256 = wrong_case.line_sha256.to_uppercase();
-
-        match pack(
-            request(&dir.path().join("artifact")),
-            vec![Ok(wrong_case)],
-            &FakeCorpus::new(),
-        ) {
-            Err(PackError::MalformedInput { reason }) => {
-                assert!(reason.contains("lowercase hex"), "{reason}")
+        for field in ["source_line_sha256", "embedding_text_sha256"] {
+            let mut wrong_case = input(LINES[0].0, LINES[0].2);
+            match field {
+                "source_line_sha256" => {
+                    wrong_case.source_line_sha256 = wrong_case.source_line_sha256.to_uppercase()
+                }
+                _ => {
+                    wrong_case.embedding_text_sha256 =
+                        wrong_case.embedding_text_sha256.to_uppercase()
+                }
             }
-            other => panic!("an uppercase digest must be refused, got {other:?}"),
+
+            match pack(
+                request(&dir.path().join(field)),
+                vec![Ok(wrong_case)],
+                &FakeCorpus::new(),
+            ) {
+                Err(PackError::MalformedInput { reason }) => {
+                    assert!(
+                        reason.contains("lowercase hex") && reason.contains(field),
+                        "{reason}"
+                    )
+                }
+                other => panic!("an uppercase {field} must be refused, got {other:?}"),
+            }
         }
     }
 
@@ -1327,6 +1654,9 @@ mod tests {
                 Err(PackError::Corpus {
                     reason: "the index could not be opened".to_string(),
                 })
+            }
+            fn expected_line_ids(&self) -> Result<Vec<u64>, PackError> {
+                unreachable!("the identity is read first")
             }
             fn line(&self, _line_id: u64) -> Result<Option<CorpusLine>, PackError> {
                 unreachable!("the identity is read first")
