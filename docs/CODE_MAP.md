@@ -334,7 +334,10 @@ otzaria-semantic-search/
     ו-`book_index.json` (כותרת + ספר→ids). השמות חשופים כ-`SNAPSHOT_FILENAMES`, כי
     הם שמות ה-payload שה-packer חייב לכתוב.
   - `ZevcStore` — הפותח הכותב, לצד ה-build. `commit()` הוא נקודת השמירה.
-  - `ReadOnlyZevcStore` — התצוגה של מסלול הריצה. מקיים `VectorSearchBackend` בלבד,
+  - `ReadOnlyZevcStore` — התצוגה של מסלול הריצה. ה־constructor שלו מקבל **`VerifiedPackage`
+    ולא נתיב**, וגוזר ממנו את התיקייה, את רוחב הרשומה ואת ה־SHA-256 של כל קובץ: חתימה
+    שמקבלת נתיב ומפת hashes הייתה מאפשרת גם לקוד פנימי עתידי לפתוח תיקייה שאיש לא אימת, או
+    לצרף hashes של חבילה אחרת. מקיים `VectorSearchBackend` בלבד,
     והרשומות אינן משתנות אחרי הפתיחה — ולכן אין גם lock במסלול השאילתה. שם ה-collection
     **מאומץ** מה-payload ולא נדרש: הוא אינו חלק מזהות הארטיפקט, ואין לקורא מול מה
     להשוות אותו.

@@ -27,6 +27,7 @@
 //! replaces it — see `docs/DEVELOPMENT.md`. Nothing here is an ANN index, and this
 //! module is not the `zvec` library.
 
+use crate::distribution::package::VerifiedPackage;
 use crate::errors::VectorStoreError;
 // One threshold for the whole crate, so no two layers can disagree about which vector
 // has "no direction".
@@ -328,42 +329,53 @@ pub struct ReadOnlyZevcStore {
 }
 
 impl ReadOnlyZevcStore {
-    /// Open the snapshot in `dir`.
+    /// Open the payload of a verified artifact.
     ///
-    /// **Deliberately not public.** A public opener over a bare path would be a way to read
-    /// an artifact nobody verified, which is exactly the property S2a exists to make
-    /// impossible;
-    /// [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex) is
-    /// the only way in, and it derives every argument here from a
-    /// [`VerifiedPackage`](crate::distribution::package::VerifiedPackage).
+    /// **The token is the only argument, and that is the point.** Everything this reader
+    /// needs is derived from it here rather than by the caller: the directory, the record
+    /// width, and the SHA-256 each payload file must have. A signature taking a path and a
+    /// hash table would let in-crate code hand over a directory nobody verified, or a
+    /// dimension and a set of hashes belonging to some other package — so "no reading
+    /// without a verified token" is enforced by the type rather than by whoever calls it.
     ///
-    /// `embedding_dim` is the artifact's declared dimension — the record width this
-    /// reader will decode, so a payload that holds a different one is caught as a
-    /// truncated or trailing read rather than misparsed. `declared_sha256` is what the
-    /// artifact says each of its payload files hashes to; see
-    /// [`SnapshotExpectation::declared_sha256`] for why a reader that skips it leaves a
-    /// published digest unable to protect the payload.
+    /// It is also `pub(crate)`: outside this crate the way in is
+    /// [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex),
+    /// which is what obtains the token in the first place.
+    ///
+    /// What the derived values do:
+    ///
+    /// * the record width decides how the payload is decoded, so a payload holding a
+    ///   different one is caught as a truncated or trailing read rather than misparsed;
+    /// * the declared hashes are checked against the bytes while they are read — see
+    ///   [`SnapshotExpectation::declared_sha256`] for why a reader that skips them leaves a
+    ///   published digest unable to protect the payload.
     ///
     /// The collection name is **adopted from the payload**, not required: it is not part
     /// of an artifact's identity, so a reader has nothing to compare it against and must
     /// not invent a value to demand. What is compared is everything that *is* identity —
     /// by [`IndexPackage::verify_for_open`](crate::distribution::package::IndexPackage::verify_for_open),
-    /// before this is called.
+    /// which is what produced this token.
     ///
     /// An empty directory is a rejection here, unlike for [`ZevcStore`]: a builder may
-    /// legitimately start from nothing, an artifact may not be nothing.
-    pub(crate) fn open(
-        dir: &Path,
-        embedding_dim: u32,
-        declared_sha256: BTreeMap<String, String>,
-    ) -> Result<Self, VectorStoreError> {
+    /// legitimately start from nothing, an artifact may not be nothing. Reaching that branch
+    /// means the files disappeared between verification and this read — the token proves they
+    /// were there, not that they still are.
+    pub(crate) fn open(verified: &VerifiedPackage) -> Result<Self, VectorStoreError> {
+        let dir = verified.root();
+        let embedding_dim = verified.identity().model.embedding_dim;
         let snapshot = read_snapshot(
             dir,
             &SnapshotExpectation {
                 embedding_dim,
                 format_version: STORE_FORMAT_VERSION,
                 collection_name: None,
-                declared_sha256: Some(declared_sha256),
+                declared_sha256: Some(
+                    verified
+                        .payloads()
+                        .iter()
+                        .map(|(name, descriptor)| (name.clone(), descriptor.sha256.clone()))
+                        .collect(),
+                ),
             },
         )?
         .ok_or_else(|| VectorStoreError::Corrupted {
@@ -1382,6 +1394,31 @@ mod tests {
         4
     }
 
+    /// Read a snapshot the way [`ReadOnlyZevcStore::open`] does, without a
+    /// [`VerifiedPackage`].
+    ///
+    /// The reader's own constructor takes nothing but the token, on purpose, and a token can
+    /// only come from verifying a whole artifact — model identity included. These tests are
+    /// about the *format*, so they drive the function both openers share and pass the
+    /// declaration directly; the artifact-level path is covered in
+    /// [`official_index`](crate::semantic::official_index).
+    fn read_as_artifact(
+        dir: &TempDir,
+        embedding_dim: u32,
+        declared_sha256: BTreeMap<String, String>,
+    ) -> Result<usize, VectorStoreError> {
+        let snapshot = read_snapshot(
+            dir.path(),
+            &SnapshotExpectation {
+                embedding_dim,
+                format_version: STORE_FORMAT_VERSION,
+                collection_name: None,
+                declared_sha256: Some(declared_sha256),
+            },
+        )?;
+        Ok(snapshot.map_or(0, |snapshot| snapshot.records.len()))
+    }
+
     /// What an artifact declares about its payload files, as they are on disk *right now*.
     ///
     /// Which moment a test calls this at is the whole point: captured before a tamper, it
@@ -1408,7 +1445,24 @@ mod tests {
         let dir = TempDir::new("read_only_open");
         let dim = write_snapshot(&dir);
 
-        let reader = ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).unwrap();
+        let snapshot = read_snapshot(
+            dir.path(),
+            &SnapshotExpectation {
+                embedding_dim: dim,
+                format_version: STORE_FORMAT_VERSION,
+                collection_name: None,
+                declared_sha256: Some(declared(&dir)),
+            },
+        )
+        .unwrap()
+        .expect("the snapshot is there");
+        let reader = ReadOnlyZevcStore {
+            records: snapshot.records,
+            book_index: snapshot.book_index,
+            embedding_dim: dim,
+            collection_name: snapshot.collection_name,
+        };
+
         assert_eq!(reader.count(), 3);
         assert_eq!(reader.book_keys(), ["book_a", "book_b"]);
         assert_eq!(reader.book_vector_count("book_a"), 2);
@@ -1466,7 +1520,7 @@ mod tests {
         // Named for `metadata.jsonl`, and that is not incidental: a record's checksum lives
         // in a *different file* from the bytes it covers, so forging a vector always
         // disturbs two files, and the metadata file is the one read to its end first.
-        match ReadOnlyZevcStore::open(dir.path(), dim, as_published).map(|store| store.count()) {
+        match read_as_artifact(&dir, dim, as_published) {
             Err(VectorStoreError::Corrupted { reason }) => assert!(
                 reason.contains(METADATA_FILENAME) && reason.contains("SHA-256"),
                 "{reason}"
@@ -1485,9 +1539,9 @@ mod tests {
 
         forge_first_record(&dir, dim);
 
-        let store = ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir))
+        let records = read_as_artifact(&dir, dim, declared(&dir))
             .expect("a self-consistent forgery is indistinguishable from here");
-        assert_eq!(store.count(), 3);
+        assert_eq!(records, 3);
     }
 
     /// And the inner layer still earns its place: an edit that does *not* fix the record's
@@ -1507,7 +1561,7 @@ mod tests {
             length_before
         );
 
-        match ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).map(|store| store.count()) {
+        match read_as_artifact(&dir, dim, declared(&dir)) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains("checksum mismatch"), "{reason}")
             }
@@ -1522,9 +1576,7 @@ mod tests {
 
         // A width this build does not read: the header says otherwise, so nothing is
         // decoded at the wrong offset.
-        match ReadOnlyZevcStore::open(dir.path(), dim + 1, declared(&dir))
-            .map(|store| store.count())
-        {
+        match read_as_artifact(&dir, dim + 1, declared(&dir)) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains("dimensional"), "{reason}")
             }
@@ -1534,7 +1586,7 @@ mod tests {
         // Two of three files: the snapshot is written as one commit, so this is an
         // interrupted write and not an empty index.
         fs::remove_file(dir.path().join(BOOK_INDEX_FILENAME)).unwrap();
-        match ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).map(|store| store.count()) {
+        match read_as_artifact(&dir, dim, declared(&dir)) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains(BOOK_INDEX_FILENAME), "{reason}")
             }
@@ -1542,9 +1594,10 @@ mod tests {
         }
     }
 
-    /// A builder may start from nothing; an artifact may not *be* nothing.
+    /// A builder may start from nothing, so "no snapshot" is not a fault at this level. It
+    /// is one for an artifact, and [`ReadOnlyZevcStore::open`] is where that is decided.
     #[test]
-    fn an_empty_directory_opens_writable_and_is_refused_read_only() {
+    fn a_directory_with_no_snapshot_is_reported_as_absent_rather_than_corrupt() {
         let dir = TempDir::new("read_only_empty");
 
         assert_eq!(
@@ -1559,10 +1612,12 @@ mod tests {
             0
         );
 
-        assert!(matches!(
-            ReadOnlyZevcStore::open(dir.path(), 4, BTreeMap::new()),
-            Err(VectorStoreError::Corrupted { .. })
-        ));
+        assert_eq!(
+            read_as_artifact(&dir, 4, BTreeMap::new()).unwrap(),
+            0,
+            "no snapshot at all is not corruption at this level; refusing it is the \
+             artifact reader's job"
+        );
     }
 
     /// A vector no search could ever return is a record that exists and is unreachable,
@@ -1600,7 +1655,7 @@ mod tests {
         )
         .unwrap();
 
-        match ReadOnlyZevcStore::open(dir.path(), dim, declared(&dir)).map(|store| store.count()) {
+        match read_as_artifact(&dir, dim, declared(&dir)) {
             Err(VectorStoreError::Corrupted { reason }) => {
                 assert!(reason.contains("no search could return it"), "{reason}")
             }
