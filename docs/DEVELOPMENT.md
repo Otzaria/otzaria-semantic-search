@@ -161,7 +161,8 @@ BM25 עדיין עובד
 | עוגן אמון לארטיפקט               | המכניזם קיים (digest מפורסם); **אין מי שמפרסם ואין חתימה** (S6) |
 | זהות ארטיפקט (`IndexVersion`)     | מלאה — corpus/Tantivy/ID scheme/מודל+checksum/store; נדחית לפי שדה, ומסלול הריצה קורא לה בפתיחה |
 | packer של הארטיפקט הרשמי         | קיים — `pack`/`validate` מקבלים וקטורים מוכנים ומצרפים אותם לקורפוס דרך פורט (S4a) |
-| builder שמייצר את הווקטורים ומצטרף ל־Tantivy חי | **לא קיים** (S4b) |
+| builder שמייצר את הווקטורים עצמם | קיים — `build` מחיל את המתכון על הקורפוס, מטמיע ואורז במעבר אחד על מודל אחד (S4b) |
+| חיבור ל־Tantivy חי | **לא קיים** — `CorpusIndex`/`CorpusBooks` מעל אינדקס חי הם יתרת S4b, ב־`otzaria_search_engine` |
 | Production persistence במסלול הפעיל | קיימת — ארטיפקט מותקן נפתח מחדש אחרי restart בלי לאנדקס; **לא נמדדה בקנה מידה** (S2b) |
 | אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד, והפתיחה טוענת הכול ל־RAM); האם נדרש — הכרעת S2b לפי מדידה |
 | UI סמנטי באוצריא                 | **לא קיים** (S7)           |
@@ -174,8 +175,8 @@ BM25 עדיין עובד
 > caches, telemetry, אריזה והתקנה מאומתות, חוזה זהות שקושר את הארטיפקט ל־corpus מסוים,
 > ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`. מה שחסר כדי שיהיה מוצר:
 > ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`, וכלי צד־build שמייצר ארטיפקט
-> כזה מווקטורים מוכנים ומאמת אותו מול הקורפוס. מה שחסר כדי שיהיה מוצר: מדידה של אותו
-> מסלול בקנה מידה (S2b), חיבור ה־packer ל־Tantivy חי ויצירת הווקטורים עצמם (S4b),
+> כזה — מווקטורים מוכנים, או מקורפוס ומודל — ומאמת אותו מול הקורפוס. מה שחסר כדי שיהיה
+> מוצר: מדידה של אותו מסלול בקנה מידה (S2b), חיבור הפורט ל־Tantivy חי (יתרת S4b),
 > והפעלה באפליקציה (S5–S7).
 
 ## מה השתנה ב־PR הראשון (Correctness baseline)
@@ -766,7 +767,8 @@ status()
 
 > **היכן זה רץ:** במכונת build, או בבדיקות. **לא** באפליקציה. אין באוצריא אינדוקס
 > ברקע, אין progress stream ואין cancel/resume — ראו [`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §4.
-> הזרימה כאן היא מה שה־builder של S4b יפעיל, ספר אחד בכל פעם, מתוך אינדקס Tantivy סופי.
+> הזרימה כאן היא מה ש־[`builder.rs`](../src/distribution/builder.rs) מפעיל, ספר אחד בכל
+> פעם, דרך אותו `Chunker` עצמו — ומעל אינדקס Tantivy סופי, כשהפורט ימומש מעליו.
 > **שימו לב שזה אינו המסלול של ה־packer:** [`packer.rs`](../src/distribution/packer.rs)
 > אינו מחלק לקטעים ואינו מטמיע — הוא מקבל וקטורים מוכנים. הזרימה הזאת היא מה שמייצר
 > אותם לפני שהם מגיעים אליו.
@@ -1473,11 +1475,13 @@ golden vectors. מאחורי `--features llama-backend`.
 | **S2b** — סקייל ומדידה | למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M: cold-open, p50/p95/p99, peak RSS, דיסק. ANN נכנס רק אם המדידה מחייבת |
 | **S3** — חוזה ארטיפקט | ✅ הזהות והאימות ב־[`versioning.rs`](../src/semantic/versioning.rs) וב־[`package.rs`](../src/distribution/package.rs); מה שנשאר הוא חשיפת [`IndexImporter`](../src/distribution/importer.rs) ב־API |
 | **S4a** — packer לווקטורים מוכנים | ✅ [`packer.rs`](../src/distribution/packer.rs) מעל הפורט ב־[`corpus.rs`](../src/distribution/corpus.rs). הקלט הוא `line_id` + וקטור + digest של טקסט השורה; כל שאר המטא־דאטה מגיע מהקורפוס |
-| **S4b** — Tantivy חי ו־embeddings | לממש `CorpusIndex` מעל האינדקס הסופי ב־`otzaria_search_engine`, ולהזין ל־`pack` וקטורים שנוצרו מאותם מסמכים |
+| **S4b** — embeddings | ✅ [`builder.rs`](../src/distribution/builder.rs): המתכון מוחל על הקורפוס, קבוצת הכיסוי נקבעת לפני ה־inference, וזהות המודל נבדקת מול הקובץ שנטען |
+| **S4b** — Tantivy חי | לממש `CorpusIndex` ו־`CorpusBooks` מעל האינדקס הסופי ב־`otzaria_search_engine`, ולהעביר אותם ל־`build` |
 
 הסדר בפועל: S3 (חוזה) נעשה לפני S1/S2, מפני שהוא קובע אילו שדות מוצהרים ולא אילו ערכים
-נבחרים; אחריו S2a, שנתן לחוזה קורא, ואחריו S4a — הכותב. הבא בתור הוא S4b. S1 לפני
-S2b — אך בלי לקפוא על ערכים לפני שהמדידה בידיים.
+נבחרים; אחריו S2a, שנתן לחוזה קורא, ואחריו S4a — הכותב — ו־S4b, שמייצר את מה שהכותב
+אורז. הבא בתור היא יתרת S4b: הפורט מעל Tantivy חי. S1 לפני S2b — אך בלי לקפוא על ערכים
+לפני שהמדידה בידיים.
 
 ---
 
@@ -1623,7 +1627,8 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [ ] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי (S2b/S8)
 * [ ] חשיפת ה־importer דרך ה־API / FFI (S5)
 * [x] packer שמפיק ארטיפקט מווקטורים מוכנים, ומצרף כל אחד לשורה שלו בקורפוס (S4a)
-* [ ] מימוש `CorpusIndex` מעל Tantivy הסופי, ויצירת הווקטורים עצמם (S4b)
+* [x] builder שמייצר את הווקטורים מקורפוס וממודל, ומחיל את המתכון בעצמו (S4b)
+* [ ] מימוש `CorpusIndex`/`CorpusBooks` מעל Tantivy הסופי (יתרת S4b)
 
 ### Indexing (צד ה־build בלבד)
 
@@ -1749,6 +1754,7 @@ Architecture
               ├── ✅ שער אימות מלא, דחייה לפי שדה                   (S3)
               ├── ✅ קורא שמפעיל אותו: OfficialSemanticIndex        (S2a)
               ├── ✅ כותב: packer + פורט אל הקורפוס                  (S4a)
+              ├── ✅ builder: מתכון → embeddings → ארטיפקט           (S4b)
               └── אין Tantivy חי, ואין חשיפה ב-FFI                  (S4b, S5)
 ```
 
@@ -1779,7 +1785,9 @@ Architecture
    ↓
 ✅ 7b. S4a — packer for ready-made vectors, joined to the corpus
    ↓
-   8. S4b — embeddings + a CorpusIndex over the final Tantivy index
+✅ 7c. S4b — the builder: corpus + model → embeddings → a verified artifact
+   ↓
+   8. S4b — a CorpusIndex/CorpusBooks over the final Tantivy index
              (otzaria_search_engine)
    ↓
    9. S5 — repin, open/install API, FFI            (otzaria_search_engine)
@@ -1797,8 +1805,8 @@ S1 לפני S2b בכוונה: ממד ודיוק קובעים אם סריקה מ�
 תלוי בהם — הממד, הדיוק ופורמט ה־store הם **נתונים בתוך** ה־manifest ולא קבועים בקוד,
 ולכן הכרעות S1/S2 ממלאות שדות קיימים ואינן משנות את החוזה. אחריו נעשה S2a: מסלול ריצה
 read-only שפותח את הארטיפקט המאומת, וזה מה שנתן לחוזה צרכן; ואחריו S4a, ה־packer, שהוא
-הצד הכותב שלו. הבא בתור הוא S4b. S1 ו־S2b חוזרים לפני יצירת הארטיפקט האמיתי והכרעת
-backend ה־production.
+הצד הכותב שלו, ו־S4b, ה־builder שמייצר את מה שנארז. הבא בתור היא יתרת S4b: הפורט מעל
+Tantivy חי. S1 ו־S2b חוזרים לפני יצירת הארטיפקט האמיתי והכרעת backend ה־production.
 
 כיול עדין של fusion נשאר אחרון: הוא כיוון ההגה, לא המנוע.
 
@@ -1925,7 +1933,7 @@ src/
 
 # 47. The Most Important Next Task
 
-### Reach the app (S4b/S5), then decide the representation (S1) and measure the store (S2b).
+### Reach the app (the rest of S4b, then S5), then decide the representation (S1) and measure the store (S2b).
 
 Three tasks this section used to name are **done**. Real GGUF inference runs behind
 `--features llama-backend`, verified against committed golden vectors. The read-only
@@ -1939,7 +1947,8 @@ assembled by hand.
 What that leaves, in an order that is not interchangeable:
 
 ```text
-S4b a CorpusIndex over the live Tantivy index, and the embeddings themselves
+S4b a CorpusIndex/CorpusBooks over the live Tantivy index — the embeddings
+        themselves now come out of `distribution::builder`
         ↓
 S5  repin, open/install API, FFI — the app reaches the reader that already exists
         ↓

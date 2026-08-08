@@ -33,6 +33,7 @@ otzaria-semantic-search/
 │   └── vector_search.rs                    # מדידת latency של VectorStore::search
 ├── tests/
 │   ├── artifact_contract.rs                # זהות הארטיפקט ושער ההתקנה, דרך ה-API הציבורי בלבד
+│   ├── artifact_builder.rs                 # שער הקבלה של S4b: build ב-CLI, בנייה משוחזרת, ומה שנבנה נפתח ועונה
 │   ├── artifact_packer.rs                  # שער הקבלה של S4a: pack/validate ב-CLI, ומה שנארז נפתח ועונה
 │   ├── official_runtime.rs                 # התקנה→פתיחה→שאילתה על ארטיפקט (דורש --features mock-embedding)
 │   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
@@ -52,6 +53,7 @@ otzaria-semantic-search/
     ├── distribution/
     │   ├── package.rs                      # manifest של חבילה + SHA-256 לכל payload
     │   ├── importer.rs                     # התקנה בשני renames, עם שחזור מהפרעה
+    │   ├── builder.rs                      # צד ה-build: קורפוס + מודל → מתכון מוחל, מוטמע ונארז
     │   ├── corpus.rs                       # הפורט אל האינדקס הלקסיקלי, ותמלול שלו לשני קבצים
     │   └── packer.rs                       # צד ה-build: וקטורים מוכנים → ארטיפקט מאומת
     ├── hybrid/
@@ -540,9 +542,14 @@ otzaria-semantic-search/
 
 * [`src/distribution/corpus.rs`](../src/distribution/corpus.rs) — **הפורט אל האינדקס
   הלקסיקלי.**
-  - `CorpusIndex` — `identity()` ו-`line(line_id)`. ה-packer מקבל את זה ולא נתיב, כי
-    Tantivy אינו תלות של ה-crate הזה ואסור שיהיה: האינדקס, הסכמה וסכמת ה-IDs חיים
-    ב-`otzaria_search_engine`.
+  - `CorpusIndex` — `identity()`, `expected_line_ids(model)` ו-`line(line_id)`. ה-packer
+    מקבל את זה ולא נתיב, כי Tantivy אינו תלות של ה-crate הזה ואסור שיהיה: האינדקס, הסכמה
+    וסכמת ה-IDs חיים ב-`otzaria_search_engine`.
+  - `CorpusBooks` — **צורת** הקורפוס: אילו ספרים יש, ומהו סדר השורות בספר. שורה קצרה
+    שואלת הקשר משכנותיה, ולכן החלת מתכון מחייבת את זה, וגישה לשורה בודדת אינה יכולה
+    להביע זאת. הוא אינו עונה דבר על **תוכן** של שורה — כל שדה שנשמר מגיע מ-`line()`
+    ומשם בלבד, ולכן לשני חצאי הפורט אין דרך לתאר ספר אחרת. המחיר: בנייה קוראת כל שורה
+    פעמיים, והקריאה השנייה היא מה שמוכיח שהקורפוס עדיין אומר את מה שהראשונה הניחה.
   - **שלוש תוצאות, וכולן העיקר:** זהות ה-corpus נקראת מהאינדקס ולא מוקלדת ליד
     הווקטורים; כל שדה ברשומה נגזר מהקורפוס — ולכן אין תיאור שני של ספר שיכול להיפרד
     מהראשון; ו-`expected_line_ids(model)` הופך „ארטיפקט מלא” לטענה שאפשר לבדוק. בלי
@@ -554,15 +561,19 @@ otzaria-semantic-search/
   - **זו אינה „כל השורות באינדקס”:** מתכון ההטמעה מדלג על שורות קצרות מדי, וארטיפקט
     שדילג עליהן אינו חסר. לכן הקבוצה נענית בידי מי שמממש את המתכון, ולכן היא מקבלת
     `ModelIdentity` — בלעדיו אפשר היה לחשב את הקבוצה למתכון אחד ולהצהיר בארטיפקט על אחר.
-    ל-`JsonlCorpus`: ייצאו בדיוק את השורות שאמורות לקבל וקטור. שתי מגבלות מוצהרות שם —
-    הוא מתעלם מה-`model` (תמלול מתעד מתכון שכבר הופעל), ואינו יכול לייצג שורה שקיימת
-    ואינה מוטמעת, מפני שמפה אחת עונה על שתי השאלות.
+    ל-`JsonlCorpus` לבדו: ייצאו בדיוק את השורות שאמורות לקבל וקטור. שתי מגבלות מוצהרות
+    שם — הוא מתעלם מה-`model` (תמלול מתעד מתכון שכבר הופעל), ואינו יכול לייצג שורה
+    שקיימת ואינה מוטמעת, מפני שמפה אחת עונה על שתי השאלות. **שתיהן נעקפות ב-S4b** על ידי
+    עטיפה ב-[`PlannedCorpus`](../src/distribution/builder.rs), שגוזר את הקבוצה מהמתכון
+    ומצמיד אותו ל-`chunking_identity` המוצהר.
   - `CorpusLine` — בדיוק השדות שרשומה נושאת, פחות השלושה שהצד הסמנטי גוזר
     (`semantic_id`, `source_doc_key`, `chunk_hash`), ועוד ה-`text` שממנו הווקטור נבנה.
     הטקסט **אינו** נשמר בארטיפקט; הוא מה שמוכיח שהווקטור שייך לשורה הזאת.
   - `JsonlCorpus` — תמלול לשני קבצים (`identity.json` + `lines.jsonl`), שמאפשר להריץ
-    packer בלי Tantivy. **תמלול, לא מקור אמת:** הוא אמין בדיוק כמו מי שכתב אותו, וה-join
-    המחייב הוא זה שמימוש מעל אינדקס חי מבצע. הוא גם מחזיק כל שורה בזיכרון — כמו ה-store
+    packer ו-builder בלי Tantivy. **תמלול, לא מקור אמת:** הוא אמין בדיוק כמו מי שכתב
+    אותו, וה-join המחייב הוא זה שמימוש מעל אינדקס חי מבצע. הוא גם **מסיק** את סדר השורות
+    בספר מ-`line_id` עולה — נכון תחת `document_id_scheme_version` 1, שבו החצי התחתון הוא
+    מיקום השורה, ולא ניתן לשחזור תחת סכמה אחרת. הוא גם מחזיק כל שורה בזיכרון — כמו ה-store
     שהוא מזין, וזאת אותה מדידה של S2b.
 
 * [`src/distribution/packer.rs`](../src/distribution/packer.rs) — **צד ה-build (S4a).**
@@ -580,7 +591,7 @@ otzaria-semantic-search/
   - **מה ששני ה-digests אינם מוכיחים:** שהווקטור אכן הופק מהטקסט הזה, מהמודל המוצהר או
     תחת הנרמול המוצהר. הם בדיקת יישור, לא provenance — יצרן שגיבב את הקורפוס בזמן האריזה
     מספק את שניהם. כלי שמקבל floats מוגמרים אינו יכול לקבוע יותר מזה, וזה נאמר במפורש.
-    הסגירה היא S4b: ייצור הווקטור, ה-digest וזהות המודל באותו pipeline.
+    ✅ נסגר ב-S4b במסלול הבנייה — ראו [`builder.rs`](../src/distribution/builder.rs) למטה.
   - `validate_artifact()` — האימות של הריצה (`verify_for_install`, פריסת payload, פתיחת
     `ReadOnlyZevcStore`, `verify_counts_against_payload` — **אותן פונקציות**, לא מימוש שני)
     ועוד שתי בדיקות שרק מכונת build יכולה לעשות: כל רשומה מושווית שדה־שדה למה שהקורפוס
@@ -597,6 +608,39 @@ otzaria-semantic-search/
     עודפות נגמרות באמצע וקטור, ורשומות חסרות משאירות בייטים — וזה מדווח בסוף ולא נבלע.
   - `store` הוא `readable_store_identity()` ולא בחירה של הקורא: packer שכותב פריסה
     שהריצה שלו אינה יודעת לקרוא מייצר ארטיפקטים לאף אחד.
+
+* [`src/distribution/builder.rs`](../src/distribution/builder.rs) — **צד ה-build (S4b).**
+  - `build()` — קורפוס ומודל → ארטיפקט מאומת. הסדר הוא **עלות ולא טעם**, וכל שלב הוא
+    הדרך הזולה ביותר להיכשל שעדיין זמינה: יעד פנוי → זהות שלמה → מתכון תואם (hash של
+    חמישה מספרים) → טעינת המודל והשוואתו להצהרה → שער backend לא-סמנטי → תכנית → הטמעה
+    ואריזה. שום דבר אינו מגיע לדיסק לפני ה-commit של ה-payload.
+  - **פער ה-provenance של S4a נסגר כאן.** הטקסט שנחתם הוא אותו `String` שנמסר ל-backend,
+    באותו ביטוי — אין מסלול שבו אחד מתאר את השני. `model_checksum`, `embedding_backend`,
+    `embedding_dim`, `pooling` ו-`max_tokens` האפקטיבי נקראים מהקובץ שנטען ומושווים
+    להצהרה, ולכן ההצהרה היא טענה נבדקת. מה שנשאר הצהרה: `model_id`,
+    `model_quantization`, `embedding_text_version` ו-`normalization_version` — שום דבר
+    ב-GGUF אינו אומר אותם, והמצאת בדיקה שקוראת אותם מאותו מקום שכתב אותם לא הייתה מוכיחה
+    דבר.
+  - `BuildPlan` — קבוצת השורות שהמתכון מטמיע, **לפני שקיים ולו וקטור אחד**. גזירה
+    מהווקטורים שהופקו הייתה הופכת את בדיקת הכיסוי לאישור עצמי: batch שנקטע היה נעלם משני
+    הצדדים בבת אחת. מחזיק מזהים בלבד — הטקסט נגזר שוב במעבר ההטמעה, וזה זול יותר מעותק
+    שני של הקורפוס בזיכרון.
+  - **המתכון מוצמד ואינו מנוחש.** `chunking_identity` הוא hash חד-כיווני, ולכן אי אפשר
+    לשחזר ממנו `ChunkerConfig`. הבנייה מקבלת את התצורה הממשית ודוחה אחת שאינה מה
+    שהארטיפקט יצהיר עליו; בלי זה השדה מתייג מתכון שאיש לא הפעיל.
+  - `PlannedCorpus` — עוטף קורפוס במתכון, ומשנה **רק** את התשובה ל-`expected_line_ids`:
+    „אילו שורות הקורפוס מחזיק” מול „אילו שורות המתכון מטמיע”. הוא גם מסרב לענות למודל
+    שאינו זה שלפיו נבנתה התכנית, אחרת היה מאשר כיסוי למתכון שלא הופעל.
+  - `chunks_for_book()` — מרכיב `BookForIndexing` וקורא ל-`Chunker` **המשותף**. למתכון יש
+    מימוש אחד, ובנייה מפעילה אותו ולא קריאה שנייה שלו. שדות ברמת הספר שנקראים כאן אינם
+    מגיעים לשום מקום שנשמר: ה-packer קורא כל שדה מ-`CorpusIndex::line`.
+  - `PlannedEmbeddings` — iterator ולא `Vec`: ה-packer צורך אחד בכל פעם, ולכן בנייה
+    מחזיקה batch אחד של וקטורים מעבר ל-payload שהכותב צובר. שגיאה ראשונה מסיימת את
+    הזרם — המשך היה מייצר אי-התאמת כיסוי, כלומר תסמין שני ורועש יותר לתקלה שכבר נוקבה
+    בשמה.
+  - **שער ה-backend הלא-סמנטי.** וקטורי hash מושלמים מבנית וריקים ממשמעות, ואף בדיקה
+    מאוחרת אינה יכולה לדעת — לכן הסירוב חייב להיות כאן, במקום שבו ה-backend עוד מזוהה.
+    `allow_non_semantic_backend` הוא `false` בכל דבר שנשלח.
 
 * [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
   - `measure()` / `aggregate()` / `QuerySet` / `BenchmarkConfig` — תזמון, אחוזונים
@@ -622,6 +666,15 @@ otzaria-semantic-search/
     ב-`SemanticOnly` וב-`Hybrid`. בנוסף: כל פעולה בונה נדחית בשם והארטיפקט אינו משתנה,
     ופתיחה חוזרת (restart) מחזירה את אותה תשובה בלי לבנות דבר.
   - דורש `--features mock-embedding`.
+* [`tests/artifact_builder.rs`](../tests/artifact_builder.rs)
+  - שער הקבלה של S4b, דרך הבינארי: `build` מקבל קורפוס, מודל ומתכון ומפיק ארטיפקט;
+    `validate` מבסס אותו שוב ומגיע לאותו digest; שתי בניות עם `created_at` שונה מפיקות
+    את אותם בייטים בדיוק. השורה שהמתכון מדלג עליה נעדרת גם מהארטיפקט וגם מכל תוצאה —
+    ובלי `--chunking` אותו ארטיפקט מדווח כ**חסר**, כי התמלול לבדו מדווח על כל שורה
+    שהוא מחזיק.
+  - שתי בדיקות רצות ב**בנייה רגילה**: מתכון שאינו המוצהר נדחה לפני שנפתח מודל, ובנייה
+    בלי backend מסרבת במקום להמציא וקטורים. השאר דורש `--features mock-embedding`,
+    כי בנייה **היא** inference.
 * [`tests/artifact_packer.rs`](../tests/artifact_packer.rs)
   - שער הקבלה של S4a, דרך הבינארי שצינור build באמת מריץ: `pack` הופך קובץ וקטורים
     לארטיפקט מאומת, `validate` מבסס את אותו הדבר על תיקייה שהוא לא בנה, ושתי הריצות
@@ -684,6 +737,26 @@ cargo test --lib --tests                                           # שער ה-p
 cargo test --lib --tests --features mock-embedding                  # החבילה המלאה
 ```
 
+## בניית ארטיפקט (S4b)
+
+```bash
+cargo run --release --features llama-backend -- build \
+  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
+  --model model.json --model-file model.gguf --chunking chunking.json \
+  --out ./artifact
+```
+
+* `chunking.json` — `ChunkerConfig`, כלומר המתכון עצמו ולא תיאור שלו:
+  `{"min_meaningful_chars": 20, "context_window_lines": 2, "max_chunk_chars": 512,
+  "min_embeddable_chars": 5, "chunking_version": 1}`. הוא חייב לגבב ל-`chunking_identity`
+  שהמודל מצהיר, אחרת הבנייה נדחית — ארטיפקט רושם את ה-hash, ו-hash אינו הפיך לחמישה
+  מספרים.
+* `--model-file` הוא ה-GGUF שממנו נוצרים הווקטורים בפועל. ה-checksum שלו חייב להיות זה
+  שב-`model.json`, וכך גם ה-backend, הרוחב, ה-pooling ותקרת ה-tokens האפקטיבית.
+* מי מקבל וקטור **נגזר**: ה-`Chunker` מוחל על הקורפוס לפני כל inference. שורה קצרה מדי
+  מכדי לשאת משמעות מדולגת, וארטיפקט שדילג עליה שלם ולא חסר.
+* דורש backend inference, כי בנייה היא inference. `pack` ו-`validate` אינם.
+
 ## אריזת ארטיפקט (S4a)
 
 ```bash
@@ -695,7 +768,7 @@ cargo run --release -- pack \
 cargo run --release -- validate \
   --artifact ./artifact \
   --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
-  --model model.json
+  --model model.json --chunking chunking.json
 ```
 
 * `vectors.f32` — `f32` little-endian, `מספר_וקטורים × embedding_dim`, בלי כותרת.
@@ -706,8 +779,10 @@ cargo run --release -- validate \
   כ-`chunk_hash` של הרשומה.
 * `corpus-lines.jsonl` — `{"line_id": N, "source_book_key": ..., "title": ...,
   "reference": ..., "section_id": N, "segment": N, "is_pdf": bool, "line_hash": N,
-  "content_hash": N, "facets": [...], "text": "..."}` לכל מסמך. **הקובץ הזה הוא גם חוזה
-  הכיסוי:** כל שורה בו חייבת לקבל וקטור, ולכן יש לייצא בדיוק את השורות שאמורות להיות
+  "content_hash": N, "facets": [...], "text": "..."}` לכל מסמך.
+* `--chunking` — רשות כאן, חובה ב-`build`. איתו, חוזה הכיסוי הוא **המתכון מוחל על
+  הקורפוס**, והמתכון מוצמד ל-`chunking_identity` המוצהר. בלעדיו הקובץ עצמו הוא חוזה
+  הכיסוי: כל שורה בו חייבת לקבל וקטור, ולכן יש לייצא בדיוק את השורות שאמורות להיות
   מוטמעות.
 * `model.json` — `ModelIdentity` (ראו [`versioning.rs`](../src/semantic/versioning.rs)).
 
