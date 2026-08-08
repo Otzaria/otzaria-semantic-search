@@ -870,7 +870,7 @@ impl HybridCoordinator {
     ///
     /// It is no longer a blocker for the application, though. The app installs a
     /// prebuilt read-only index and never indexes, so the only caller that can be
-    /// blocked here is the artifact builder (S4) — a batch tool with no UI thread.
+    /// blocked here is the artifact builder (S4b) — a batch tool with no UI thread.
     ///
     /// # The manifest is written once, not per book
     ///

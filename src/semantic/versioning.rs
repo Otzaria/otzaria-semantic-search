@@ -67,7 +67,7 @@ pub struct CorpusIdentity {
     /// Version 1 is what `otzaria_search_engine` builds today, matching the app's
     /// `buildCatalogueDocumentId`: `((catalogue_order + 1) << 32) + (ordinal + 1)`. Both
     /// halves are 1-based, so no live document has id 0. The exact arithmetic matters
-    /// because the builder in S4 has to reproduce it from Tantivy, not approximate it.
+    /// because the builder in S4b has to reproduce it from Tantivy, not approximate it.
     pub document_id_scheme_version: u32,
 }
 

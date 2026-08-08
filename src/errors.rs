@@ -301,6 +301,112 @@ pub enum ArtifactError {
     },
 }
 
+/// Why a build machine could not produce — or could not vouch for — an artifact.
+///
+/// Deliberately **not** a variant of [`SemanticSearchError`]: packing never runs on a
+/// user's device, and an error the application cannot encounter has no business in the
+/// enum the application matches on.
+///
+/// The distinctions here are the ones a build log has to make. "The corpus could not be
+/// read" is a broken build input; "this line has a vector and no document" is a broken
+/// pairing between the vectors and the catalogue they claim to describe — and the second
+/// one is the fault that produces confident, wrong search results if it ships.
+#[derive(Error, Debug)]
+pub enum PackError {
+    /// The corpus source itself failed. Distinct from [`Self::LineNotInCorpus`]: that is
+    /// a fault in the vectors, this is a fault in what they are being checked against.
+    #[error("The corpus could not be read: {reason}")]
+    Corpus { reason: String },
+
+    /// The output path is not somewhere a whole artifact can be written: it is not a
+    /// directory, or it is one that already holds files.
+    ///
+    /// A non-empty directory is refused rather than merged into: the payload writer would
+    /// otherwise *load* an artifact already sitting there and append to it, and the result
+    /// would carry vectors this run never saw and never joined to the corpus.
+    #[error("Cannot pack into {path}: {reason}")]
+    UnusableOutput { path: String, reason: String },
+
+    #[error("The vector input is malformed: {reason}")]
+    MalformedInput { reason: String },
+
+    /// One input vector is not the width the model identity declares. The uniform
+    /// dimension the artifact promises is checked per vector, not sampled.
+    #[error(
+        "The vector for line {line_id} holds {found} value(s), and the model declares {expected}"
+    )]
+    VectorDimensionMismatch {
+        line_id: u64,
+        expected: u32,
+        found: usize,
+    },
+
+    /// A vector no search could ever return — a non-finite component, an overflowing
+    /// norm, or no direction at all. Refused at pack time because the alternative is a
+    /// record that exists, counts, and is unreachable.
+    #[error("The vector for line {line_id} cannot be searched: {reason}")]
+    UnusableVector { line_id: u64, reason: String },
+
+    /// Two vectors claim the same line. One of them would silently replace the other in
+    /// the payload, and the artifact would ship with a count nobody can explain.
+    #[error("line_id {line_id} appears more than once in the input")]
+    DuplicateLineId { line_id: u64 },
+
+    #[error("line_id {line_id} has a vector but no document in the corpus")]
+    LineNotInCorpus { line_id: u64 },
+
+    /// The vector was produced from text this corpus does not hold for that line.
+    ///
+    /// This is the check that catches the failure the whole join exists for: a vector
+    /// file and an id list that drifted apart by one, or were sorted differently. Nothing
+    /// about the vectors themselves would ever reveal it.
+    #[error(
+        "The vector for line {line_id} was built from text the corpus does not hold for \
+         it: it declares {declared}, and the corpus line hashes to {actual}"
+    )]
+    LineTextMismatch {
+        line_id: u64,
+        declared: String,
+        actual: String,
+    },
+
+    /// A record inside a written artifact disagrees with the corpus it claims to
+    /// describe. This is what "the builder must not restate Tantivy's metadata" is
+    /// enforced by.
+    #[error(
+        "The artifact's record for line {line_id} declares {field}={artifact:?}, and the \
+         corpus says {corpus:?}"
+    )]
+    RecordDisagreesWithCorpus {
+        line_id: u64,
+        field: &'static str,
+        artifact: String,
+        corpus: String,
+    },
+
+    /// Vectors were accepted and did not reach the payload — a `semantic_id` collision
+    /// is the way this happens. Counted rather than assumed, because the payload writer
+    /// replaces on collision instead of failing.
+    #[error("{accepted} vector(s) were accepted and the payload holds {stored}")]
+    VectorCountChanged { accepted: u32, stored: u32 },
+
+    #[error("There is nothing to pack: the input holds no vectors")]
+    NoVectors,
+
+    #[error("Artifact error: {0}")]
+    Artifact(#[from] ArtifactError),
+
+    #[error("Vector store error: {0}")]
+    VectorStore(#[from] VectorStoreError),
+
+    #[error("Pack IO error ({context}): {source}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Errors from the chunking subsystem.
 #[derive(Error, Debug)]
 pub enum ChunkingError {

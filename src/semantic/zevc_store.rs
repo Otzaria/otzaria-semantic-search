@@ -406,6 +406,17 @@ impl ReadOnlyZevcStore {
     pub fn collection_name(&self) -> &str {
         &self.collection_name
     }
+
+    /// Every record's metadata, in no particular order.
+    ///
+    /// `pub(crate)`, and deliberately not on [`VectorSearchBackend`]: enumerating an
+    /// artifact is not a query, and the runtime has no reason to walk one. The build side
+    /// does — [`validate_artifact`](crate::distribution::packer::validate_artifact) joins
+    /// each record back to the corpus it names — and that runs on a machine that already
+    /// holds the whole payload.
+    pub(crate) fn stored_metadata(&self) -> impl Iterator<Item = &VectorMetadata> {
+        self.records.values().map(|record| &record.metadata)
+    }
 }
 
 impl VectorSearchBackend for ReadOnlyZevcStore {
