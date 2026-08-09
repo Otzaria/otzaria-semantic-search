@@ -1,0 +1,289 @@
+# Produce the semantic vectors for a library release, reusing every vector whose text
+# did not change.
+#
+# The reuse key is `embedding_text_sha256`, not a line id. A vector is a function of the
+# text that was embedded and nothing else, so a digest that appears in the previous
+# release's ledger names a vector that is already correct — whatever id it now carries,
+# and whether or not the library's own identifiers moved underneath it. See
+# docs/VECTOR_CI_PLAN_HE.md §2.
+#
+# What this workflow deliberately does NOT do:
+#
+# * Build the Tantivy index. `corpus_id` is computed over the whole index, and the
+#   artifact has to match the index the application ships — so the index is an input,
+#   downloaded from the release that ships it, never rebuilt here.
+# * Embed anything on a GitHub runner. The `embed` job targets a Kaggle GPU session that
+#   has registered itself as a just-in-time self-hosted runner, the pattern
+#   LinkerToOtzaria already runs in production.
+name: vector-release
+
+on:
+  repository_dispatch:
+    # Sent by SeforimLibrary once a release is published, with a PAT.
+    # client_payload: { library_tag: "v20-…", index_release: "…" }
+    types: [library-released]
+  workflow_dispatch:
+    inputs:
+      library_tag:
+        description: SeforimLibrary release tag to build vectors for
+        required: true
+      base_artifact:
+        description: >-
+          Tag of the vector release to reuse from. Empty means a full baseline —
+          every line goes to the GPU.
+        required: false
+        default: ''
+
+concurrency:
+  # One vector build at a time. Not shared with the linker's `linker-relink` group: this
+  # runs after the library build has finished and on separate Kaggle accounts, so the two
+  # cannot want the same GPU. The preflight step below checks that assumption rather than
+  # trusting it.
+  group: vector-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  LIBRARY_REPO: Otzaria/SeforimLibrary
+  LINKER_REPO: Otzaria/LinkerToOtzaria
+  # A shard boundary must land on a multiple of the batch size: llama.cpp's output
+  # depends on batch composition, so a boundary that splits a batch does not reproduce.
+  # 500_000 = 15_625 batches of 32.
+  SHARD_RECORDS: 500000
+  EMBED_BATCH: 32
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      library_tag: ${{ steps.resolve.outputs.library_tag }}
+      base_artifact: ${{ steps.resolve.outputs.base_artifact }}
+      total_records: ${{ steps.split.outputs.total_records }}
+      embed_records: ${{ steps.split.outputs.embed_records }}
+      shards: ${{ steps.split.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start while the linker holds a GPU
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # One API call, and it turns a collision into an immediate failure. The
+          # schedule already separates the two; this is what proves it each time.
+          active=$(gh run list -R "$LINKER_REPO" --workflow relink.yml \
+            --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [ "$active" != "0" ]; then
+            echo "::error::$active relink run(s) still active in $LINKER_REPO"
+            exit 1
+          fi
+
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag='${{ github.event.inputs.library_tag || github.event.client_payload.library_tag }}'
+          [ -n "$tag" ] || { echo "::error::no library tag"; exit 1; }
+          echo "library_tag=$tag" >> "$GITHUB_OUTPUT"
+
+          base='${{ github.event.inputs.base_artifact }}'
+          if [ -z "$base" ]; then
+            # The newest vector release, or nothing at all on the first run. Resolved
+            # here rather than assumed, so a full baseline is a state and not a failure.
+            base=$(gh release list -R "$GITHUB_REPOSITORY" --limit 20 \
+              --json tagName --jq '[.[] | select(.tagName | startswith("vectors-"))][0].tagName // ""')
+          fi
+          echo "base_artifact=$base" >> "$GITHUB_OUTPUT"
+          echo "library=$tag base=${base:-<none, full baseline>}"
+
+      - name: Pin the library release
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download '${{ steps.resolve.outputs.library_tag }}' \
+            -R "$LIBRARY_REPO" -p 'build_provenance.json' -D provenance
+          # Frozen into the run manifest: an artifact must name the release it describes,
+          # and `latest` moving mid-build is exactly how it would stop doing so.
+          jq -r '.correlation_id // empty, .source_commit // empty' provenance/build_provenance.json
+
+      - name: Fetch the shipped Tantivy index
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The index the application ships, not one built here: `corpus_id` is computed
+          # over its whole content, and an artifact whose corpus_id no device can
+          # reproduce is rejected at install rather than merely wrong.
+          bash .github/scripts/fetch_release_index.sh \
+            '${{ steps.resolve.outputs.library_tag }}' index
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Export the plan
+        run: |
+          set -euo pipefail
+          # No embedding backend: applying the recipe is arithmetic on strings, and this
+          # job has no GPU. `--locked` because the recipe is identity.
+          cargo build --release --locked --bin otzaria-semantic-search
+          ./target/release/otzaria-semantic-search export-plan \
+            --corpus-identity corpus/corpus-identity.json \
+            --corpus-lines corpus/corpus-lines.jsonl \
+            --model model/model.json \
+            --chunking model/chunking.json \
+            --out plan
+
+      - id: split
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          base='${{ steps.resolve.outputs.base_artifact }}'
+          if [ -n "$base" ]; then
+            gh release download "$base" -R "$GITHUB_REPOSITORY" -p 'ledger.jsonl.zst' -D base
+            unzstd base/ledger.jsonl.zst -o base/ledger.jsonl
+          else
+            : > base/ledger.jsonl
+          fi
+          ./target/release/otzaria-semantic-search plan-split \
+            --plan plan/plan.jsonl --ledger base/ledger.jsonl --out split
+          total=$(jq -r '.records' plan/export-manifest.json)
+          embed=$(wc -l < split/embed.jsonl)
+          echo "total_records=$total" >> "$GITHUB_OUTPUT"
+          echo "embed_records=$embed" >> "$GITHUB_OUTPUT"
+          # One shard per window of SHARD_RECORDS, as a JSON list of skip offsets.
+          jq -nc --argjson n "$embed" --argjson s "$SHARD_RECORDS" \
+            '[range(0; $n; $s)]' >> shards.json
+          echo "shards=$(cat shards.json)" >> "$GITHUB_OUTPUT"
+          echo "reuse $((total - embed)) of $total; $embed go to the GPU"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: |
+            plan/
+            split/
+          retention-days: 7
+
+  embed:
+    needs: plan
+    if: needs.plan.outputs.embed_records != '0'
+    # A Kaggle session that has registered itself as a one-job JIT runner. The job is
+    # queued first and waits; the session boots, registers, and picks it up.
+    runs-on: [self-hosted, kaggle, gpu]
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      # Each shard is independent, and a failed one is re-run alone: the merge compares
+      # the ids it was handed against the recipe's expected set, so a lost shard is a
+      # refusal rather than a smaller artifact.
+      matrix:
+        skip: ${{ fromJson(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: plan }
+
+      - name: Embed this window
+        env:
+          OTZARIA_LLAMA_GPU_LAYERS: '99'
+          OTZARIA_LLAMA_CONTEXTS: '1'
+          # Measured: n_ctx 512 / batch 32 is the fastest configuration on both T4 and
+          # P100, and a larger context is monotonically worse — llama.cpp sizes the
+          # compute buffer from n_ctx and reserves a logits tensor this backend never
+          # reads. docs/VECTOR_BUILD_MEASUREMENTS_HE.md §2.
+          OTZARIA_LLAMA_N_CTX: '512'
+        run: |
+          set -euo pipefail
+          ./otzaria-semantic-search embed-shard \
+            --plan split/embed.jsonl \
+            --model model/model.json --model-file "$OTZARIA_MODEL_FILE" \
+            --skip '${{ matrix.skip }}' --take "$SHARD_RECORDS" \
+            --batch "$EMBED_BATCH" \
+            --out "shard-${{ matrix.skip }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.skip }}
+          path: shard-${{ matrix.skip }}/
+          retention-days: 7
+
+  assemble:
+    needs: [plan, embed]
+    if: always() && needs.plan.result == 'success' && (needs.embed.result == 'success' || needs.plan.outputs.embed_records == '0')
+    # Not ubuntu-latest: 5.9M x 1024 x f32 is 24 GB, and a hosted runner has about 14 GB
+    # free. This is an infrastructure requirement, not a tuning knob.
+    runs-on: [self-hosted, linux, large-disk]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'shard-*', path: shards }
+      - uses: actions/download-artifact@v4
+        with: { name: plan }
+
+      - name: Reassemble, pack and verify
+        env:
+          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+        run: |
+          set -euo pipefail
+          base='${{ needs.plan.outputs.base_artifact }}'
+          if [ -n "$base" ]; then
+            gh release download "$base" -R "$GITHUB_REPOSITORY" -p 'vectors.f32.zst' -D base
+            unzstd base/vectors.f32.zst -o base/vectors.f32
+          fi
+          # Vectors in the plan's order, from two sources: copied from the base artifact
+          # where the digest matched, and from this run's shards where it did not.
+          ./target/release/otzaria-semantic-search assemble \
+            --plan plan/plan.jsonl --reuse split/reuse.jsonl \
+            --base-vectors base/vectors.f32 --shards shards \
+            --out merged
+          # Every check S4a performs, against the corpus itself: coverage, the two
+          # digests per record, and the identity the artifact declares.
+          ./target/release/otzaria-semantic-search pack \
+            --vectors merged/vectors.f32 --records merged/records.jsonl \
+            --corpus-identity corpus/corpus-identity.json \
+            --corpus-lines corpus/corpus-lines.jsonl \
+            --model model/model.json --chunking model/chunking.json \
+            --out artifact | tee artifact-report.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact
+          path: |
+            artifact/
+            artifact-report.txt
+            merged/ledger.jsonl
+          retention-days: 7
+
+  publish:
+    needs: [plan, assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: artifact }
+
+      - name: Publish, draft first and never clobbering
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The digest belongs outside the package: verified without it, an install
+          # detects damage and the wrong artifact, but not one deliberately rebuilt to
+          # match.
+          digest=$(grep '^Digest:' artifact-report.txt | awk '{print $2}')
+          tag="vectors-${{ needs.plan.outputs.library_tag }}"
+          zstd -T0 -19 merged/ledger.jsonl -o ledger.jsonl.zst
+          gh release create "$tag" --draft --notes-file artifact-report.txt \
+            artifact/* ledger.jsonl.zst
+          gh release edit "$tag" --draft=false --latest
+          echo "published $tag with digest $digest"
