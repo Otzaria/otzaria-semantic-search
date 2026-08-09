@@ -32,6 +32,17 @@ mock-embedding = []
 # on with no backend behind it; `semantic::backend` gates on the same condition.
 llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 
+# CUDA offload, for the build machine that produces the library's vectors — never
+# for the application, which ships no CUDA runtime.
+#
+# It does not change what the artifact declares: `LlamaCppBackend::ID` names the
+# implementation and the wiring, deliberately not the ggml backend, exactly as
+# `n_gpu_layers` on Metal does not change it today. What it does change is the
+# arithmetic, at the same order as the CPU-vs-Metal divergence
+# `docs/P2_REFERENCE_VECTORS.md` §5 already measures, so a build that uses it owes
+# the same parity evidence against the goldens.
+cuda = ["llama-backend", "llama-cpp-2/cuda"]
+
 [[bench]]
 name = "vector_search"
 harness = false
