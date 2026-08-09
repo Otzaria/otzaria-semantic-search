@@ -26,6 +26,22 @@
 //! the plan be written in ascending id order, which would demand it be sorted, which would
 //! demand the whole thing in memory — 5.9 million passages of text — to buy nothing.
 //!
+//! **A shard boundary should fall on a multiple of the batch size**, and the reason is
+//! arithmetic rather than tidiness. llama.cpp's output depends on how a batch is composed,
+//! so two runs that group the same texts differently produce vectors that differ in the
+//! last bits. Measured on 2 396 real lines with the real GGUF: three shards of 800/800/796
+//! at batch 32 gave a `vectors.f32` **byte-identical** to embedding the whole plan in one
+//! window (`6530649db051…`), because 800 is a multiple of 32 and every batch was therefore
+//! the same batch.
+//!
+//! The same measurement is why an artifact merged from shards is *not* byte-identical to
+//! one [`build`](super::builder::build) produced from the same corpus: `PlannedEmbeddings`
+//! refills from one book at a time, so its batches never span books and every book ends in
+//! a short one. Neither grouping is more correct — the divergence is the same order as the
+//! CPU-versus-Metal disagreement `docs/P2_REFERENCE_VECTORS.md` §5 measures and the
+//! manifest already governs — but only one of them can be the artifact, and for the library
+//! it is this one. It is also the faster one: 7 285 books is 7 285 partial batches.
+//!
 //! **What each side can check, it checks.** The worker cannot recompute
 //! `source_line_sha256`; it has no corpus, and that digest is the packer's business at
 //! merge time. It *can* recompute `embedding_text_sha256`, so it does, on every record —
