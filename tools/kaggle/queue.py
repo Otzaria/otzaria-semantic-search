@@ -35,6 +35,13 @@ STATE = Path.home() / ".otzaria-kaggle"
 JOBS = STATE / "jobs.json"
 MAX_CONCURRENT = 2  # per account; raise once Kaggle's real ceiling is known
 
+# GPU hours this campaign will not touch, per account. An account someone else works
+# from is not a pool of 30 hours; it is a pool of 30 minus whatever they need that
+# week, and taking the last hour of it is a way to break their day rather than a way
+# to finish sooner. Checked against the quota the API reports, before each push.
+RESERVE_HOURS = {"otzaria": 2.0}
+DEFAULT_RESERVE = 0.0
+
 DONE = {"COMPLETE", "ERROR", "CANCEL_REQUESTED", "CANCEL_ACKNOWLEDGED"}
 
 
@@ -101,12 +108,33 @@ def cmd_add(name, account, accelerator, directory):
     print(f"added {name} -> {meta['id']} on {account} ({accelerator})")
 
 
+def remaining_hours(account):
+    """GPU hours the API says are left, or None if it will not say.
+
+    None is not zero: a quota that cannot be read is a reason to ask rather than a
+    reason to spend, so `push` holds the job instead of guessing either way.
+    """
+    for line in kaggle(account, "quota").stdout.splitlines():
+        if line.startswith("GPU"):
+            for field in line.split():
+                if field.endswith("h"):
+                    try:
+                        float(field[:-1])
+                    except ValueError:
+                        continue
+                    # used, remaining, total — the second is the one to act on.
+                    parts = [f for f in line.split() if f.endswith("h")]
+                    return float(parts[1][:-1]) if len(parts) > 1 else None
+    return None
+
+
 def cmd_push(names):
     jobs = load()
     running = {}
     for job in jobs:
         if job["state"] == "pushed":
             running[job["account"]] = running.get(job["account"], 0) + 1
+    budget = {}
 
     for job in jobs:
         if names and job["name"] not in names:
@@ -116,6 +144,17 @@ def cmd_push(names):
         if running.get(job["account"], 0) >= MAX_CONCURRENT:
             print(f"hold  {job['name']}: {job['account']} already has "
                   f"{MAX_CONCURRENT} in flight")
+            continue
+        account = job["account"]
+        if account not in budget:
+            budget[account] = remaining_hours(account)
+        left, reserve = budget[account], RESERVE_HOURS.get(account, DEFAULT_RESERVE)
+        if left is None:
+            print(f"hold  {job['name']}: {account}'s quota could not be read")
+            continue
+        if left <= reserve:
+            print(f"hold  {job['name']}: {account} has {left:.2f}h left and "
+                  f"{reserve:.2f}h is reserved")
             continue
         args = ["kernels", "push", "-p", job["dir"]]
         if job["accelerator"]:
