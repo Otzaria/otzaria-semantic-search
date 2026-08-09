@@ -14,8 +14,11 @@ use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
+use otzaria_semantic_search::distribution::shard::{embed_shard, export_plan, read_plan};
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
+use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
+use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
 use otzaria_semantic_search::semantic::versioning::ModelIdentity;
@@ -37,6 +40,9 @@ Commands:
   search <query> [options]            Execute a search query against the engine.
   index-text <key> <title> <text>     Index a plain-text book into the database.
   build [options]                     Embed a corpus and write an official artifact.
+  export-plan [options]               Apply the recipe and write the work out, for a
+                                      machine that will embed it elsewhere.
+  embed-shard [options]               Embed one window of an exported plan.
   pack [options]                      Build an official artifact from ready-made vectors.
   validate [options]                  Verify an artifact against a corpus and a model.
 
@@ -61,6 +67,28 @@ Options for 'build':
   --allow-non-semantic       Write an artifact from a backend whose vectors mean nothing.
                              For tests only: such an artifact passes every check here and
                              answers nonsense.
+
+Options for 'export-plan':
+  --corpus-identity <path>   As for 'build'
+  --corpus-lines <path>      As for 'build'
+  --model <path>             As for 'build'; no model file is opened, and none is needed
+  --chunking <path>          The recipe to apply
+  --out <dir>                Receives plan.jsonl and export-manifest.json
+
+Options for 'embed-shard':
+  --plan <path>              plan.jsonl, as 'export-plan' wrote it
+  --model <path>             The identity the plan was exported under
+  --model-file <path>        The GGUF; held to every field the identity declares
+  --skip <N>                 Records to skip (default: 0)
+  --take <N>                 Records to embed (default: all that remain)
+  --batch <N>                Texts per inference call (default: 32)
+  --out <dir>                Receives vectors.f32, records.jsonl, shard-manifest.json
+  --allow-non-semantic       As for 'build'
+
+A shard is a window of *records*, not of line_ids. Merge by concatenating every shard's
+vectors.f32 and records.jsonl in any order, then 'pack' the pair: it compares the ids it
+was given against the recipe's expected set, so a lost shard is a refusal and not a
+smaller artifact.
 
 Options for 'pack':
   --vectors <path>           Raw little-endian f32 vectors, count x embedding_dim, no header
@@ -291,6 +319,8 @@ fn main() {
             }
         }
         "build" => run_build(&args),
+        "export-plan" => run_export_plan(&args),
+        "embed-shard" => run_embed_shard(&args),
         "pack" => run_pack(&args),
         "validate" => run_validate(&args),
         "help" | "-h" | "--help" => {
@@ -378,6 +408,170 @@ fn plan_corpus<'a>(
         .unwrap_or_else(|error| exit_with("Could not apply the recipe to the corpus", error));
     println!("Recipe: {} line(s) get a vector", planned.plan().len());
     Some(planned)
+}
+
+/// Apply the recipe on the machine that holds the corpus, and write the work out.
+///
+/// No model is opened and none is needed: this is the half of a build that is arithmetic
+/// on strings. What it writes is what a worker with a GPU and no corpus can act on.
+fn run_export_plan(args: &[String]) {
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let model = read_model(&require_arg(args, "--model"));
+    let chunking = read_chunking(&require_arg(args, "--chunking"));
+    let corpus = load_corpus(args);
+
+    std::fs::create_dir_all(&out)
+        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
+    let plan_path = out.join("plan.jsonl");
+    let file = std::fs::File::create(&plan_path)
+        .unwrap_or_else(|error| exit_with("Could not write the plan", error));
+    let mut sink = std::io::BufWriter::new(file);
+
+    let report = export_plan(&corpus, &chunking, &model, &mut sink)
+        .unwrap_or_else(|error| exit_with("Export failed", error));
+    let manifest = out.join("export-manifest.json");
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&report).unwrap())
+        .unwrap_or_else(|error| exit_with("Could not write the export manifest", error));
+
+    println!("\n=== Exported a build plan ===");
+    println!("Plan:            {}", plan_path.display());
+    println!("Records:         {}", report.records);
+    println!(
+        "line_id range:   {}..={}",
+        report.min_line_id, report.max_line_id
+    );
+    println!("Plan SHA-256:    {}", report.plan_sha256);
+    println!("Chunking:        {}", report.chunking_identity);
+    println!(
+        "\nSplit it by record: --skip and --take name a window, and every record must fall in\n\
+         exactly one. The merge refuses a hole rather than packing around it."
+    );
+}
+
+/// Embed one window of a plan. The half of a build that needs a model and no corpus.
+fn run_embed_shard(args: &[String]) {
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let plan_path = require_arg(args, "--plan");
+    let model = read_model(&require_arg(args, "--model"));
+    let model_file = require_arg(args, "--model-file");
+    let skip: usize = parse_arg(args, "--skip").map_or(0, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|_| exit_with("--skip", "not a number"))
+    });
+    let take: usize = parse_arg(args, "--take").map_or(usize::MAX, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|_| exit_with("--take", "not a number"))
+    });
+
+    let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
+        model_path: PathBuf::from(&model_file),
+        embedding_dim: model.embedding_dim,
+        max_tokens: model.max_tokens,
+        batch_size: parse_arg(args, "--batch")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32),
+        pooling: Pooling::parse(&model.pooling).unwrap_or_else(|error| {
+            exit_with("The model declares a pooling nothing performs", error)
+        }),
+    });
+    runtime
+        .load()
+        .unwrap_or_else(|error| exit_with("Could not load the model", error));
+
+    // The same five comparisons `build` makes, for the same reason: a worker that embeds
+    // with a different file or a different width produces vectors the merge cannot use,
+    // and it should learn that in the second it takes rather than at the end of the shard.
+    for (field, declared, loaded) in [
+        (
+            "model_checksum",
+            model.model_checksum.clone(),
+            runtime.model_checksum().unwrap_or_default().to_string(),
+        ),
+        (
+            "embedding_backend",
+            model.embedding_backend.clone(),
+            runtime.backend_id().unwrap_or_default().to_string(),
+        ),
+        (
+            "embedding_dim",
+            model.embedding_dim.to_string(),
+            runtime.dim().to_string(),
+        ),
+        (
+            "pooling",
+            model.pooling.clone(),
+            runtime.pooling().to_string(),
+        ),
+        (
+            "max_tokens",
+            model.max_tokens.to_string(),
+            runtime.max_tokens().to_string(),
+        ),
+    ] {
+        if declared != loaded {
+            exit_with(
+                "The model file is not the one the plan was made for",
+                format!("{field}: declared {declared}, loaded {loaded}"),
+            );
+        }
+    }
+    if !runtime.backend_is_semantic() && !args.iter().any(|arg| arg == "--allow-non-semantic") {
+        exit_with(
+            "This backend's vectors mean nothing",
+            runtime.backend_id().unwrap_or("none").to_string(),
+        );
+    }
+
+    std::fs::create_dir_all(&out)
+        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
+    let plan = std::io::BufReader::new(
+        std::fs::File::open(&plan_path)
+            .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
+    );
+    // `.partial` until the counts and digests are known: a shard killed by a session
+    // timeout must not leave a file the merge could mistake for a finished one.
+    let vectors_partial = out.join("vectors.f32.partial");
+    let records_partial = out.join("records.jsonl.partial");
+    let mut vectors = std::io::BufWriter::new(
+        std::fs::File::create(&vectors_partial)
+            .unwrap_or_else(|error| exit_with("Could not write the vectors", error)),
+    );
+    let mut records = std::io::BufWriter::new(
+        std::fs::File::create(&records_partial)
+            .unwrap_or_else(|error| exit_with("Could not write the records", error)),
+    );
+
+    let report = embed_shard(
+        read_plan(plan, skip, take),
+        &runtime,
+        runtime.batch_size(),
+        &mut vectors,
+        &mut records,
+    )
+    .unwrap_or_else(|error| exit_with("The shard failed", error));
+    drop((vectors, records));
+
+    for (partial, final_name) in [
+        (&vectors_partial, "vectors.f32"),
+        (&records_partial, "records.jsonl"),
+    ] {
+        std::fs::rename(partial, out.join(final_name))
+            .unwrap_or_else(|error| exit_with("Could not publish the shard", error));
+    }
+    std::fs::write(
+        out.join("shard-manifest.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap_or_else(|error| exit_with("Could not write the shard manifest", error));
+
+    println!("\n=== Embedded a shard ===");
+    println!("Path:            {}", out.display());
+    println!("Records:         {} (skip {skip})", report.records);
+    println!("Dimension:       {}", report.embedding_dim);
+    println!("vectors SHA-256: {}", report.vectors_sha256);
+    println!("records SHA-256: {}", report.records_sha256);
 }
 
 fn run_build(args: &[String]) {

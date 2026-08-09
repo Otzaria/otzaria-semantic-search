@@ -25,3 +25,4 @@ pub mod corpus;
 pub mod importer;
 pub mod package;
 pub mod packer;
+pub mod shard;
