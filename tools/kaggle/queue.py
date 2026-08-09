@@ -49,10 +49,15 @@ def save(jobs):
 
 def kaggle(account, *args, capture=True):
     env = dict(os.environ)
-    # The account that holds the local token keeps using it; anything else is a
+    # The account whose token is installed globally keeps using it; anything else is a
     # directory that was dropped in later.
+    #
+    # A *credential* has to be there, not just the directory. An empty folder — one
+    # created in advance of a teammate's token — would otherwise redirect `kaggle` at
+    # nothing and fail as "not authenticated" rather than as "that account has no key
+    # yet", which is a much longer way round to the same fix.
     config = ACCOUNTS / account
-    if config.exists():
+    if any((config / name).exists() for name in ("kaggle.json", "credentials.json")):
         env["KAGGLE_CONFIG_DIR"] = str(config)
     return subprocess.run(
         ["kaggle", *args], env=env, capture_output=capture, text=True
