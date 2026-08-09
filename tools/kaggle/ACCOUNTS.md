@@ -1,32 +1,31 @@
-# Adding an account to the pool
+# הוספת חשבון למאגר
 
-Each account is one directory under `~/.kaggle-accounts/`, named however you like —
-the name is what `queue.py` takes as its `account` argument:
+כל חשבון הוא תיקייה אחת תחת `~/.kaggle-accounts/`, בשם כרצונך — השם הוא מה
+ש־`queue.py` מקבל כארגומנט `account`:
 
 ```text
 ~/.kaggle-accounts/
-  otzaria/                 <- the account whose token is already installed
+  otzaria/                 <- החשבון שהטוקן שלו כבר מותקן
   yossi/
     kaggle.json
   miriam/
     kaggle.json
 ```
 
-`kaggle.json` is exactly the file Kaggle's **Settings -> API -> Create New Token**
-downloads. Two fields:
+`kaggle.json` הוא בדיוק הקובץ ש־**Settings ← API ← Create New Token** של Kaggle מוריד.
+שני שדות:
 
 ```json
-{ "username": "their-kaggle-username", "key": "..." }
+{ "username": "שם-המשתמש-שלהם-בקאגל", "key": "..." }
 ```
 
-Drop it in and `chmod 600` it. Nothing else changes: `queue.py` points
-`KAGGLE_CONFIG_DIR` at the directory per command, so accounts never overwrite each
-other and there is no login step to repeat.
+מניחים אותו שם ומריצים עליו `chmod 600`. שום דבר אחר לא משתנה: `queue.py` מכוון את
+`KAGGLE_CONFIG_DIR` לתיקייה הנכונה בכל פקודה, ולכן חשבונות אינם דורסים זה את זה ואין
+שלב התחברות שחוזר על עצמו.
 
-The directory is outside the repository on purpose. A key is a credential — anyone
-holding it can act as that account — so it must not be one `git add -A` away from
-being published, and each teammate can revoke theirs from the same settings page,
-which is the clean way to end their participation.
+התיקייה נמצאת מחוץ למאגר בכוונה. מפתח הוא אמצעי הזדהות — מי שמחזיק בו יכול לפעול
+כאותו חשבון — ולכן אסור לו להיות במרחק `git add -A` מפרסום. כל אחד מחברי הצוות יכול
+לבטל את המפתח שלו מאותו מסך הגדרות, וזו הדרך הנקייה לסיים השתתפות.
 
-Quota is per account and does not pool. `queue.py quota` reads what is actually left
-on each rather than assuming.
+המכסה היא לכל חשבון בנפרד ואינה מתאחדת. `queue.py quota` קורא כמה באמת נשאר בכל אחד,
+במקום להניח.
