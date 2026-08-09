@@ -56,8 +56,18 @@ def kaggle(account, *args, capture=True):
     # created in advance of a teammate's token — would otherwise redirect `kaggle` at
     # nothing and fail as "not authenticated" rather than as "that account has no key
     # yet", which is a much longer way round to the same fix.
+    #
+    # Two shapes, and the order matters. `KAGGLE_API_TOKEN` accepts a *path*, which is
+    # the only per-process way to point CLI 2.2 at a specific token: it reads
+    # `~/.kaggle/access_token` from an absolute path that `KAGGLE_CONFIG_DIR` does not
+    # move. `KAGGLE_CONFIG_DIR` still serves an OAuth `credentials.json`, which is what
+    # `kaggle auth login` leaves behind for a teammate who would rather not hand over a
+    # token at all.
     config = ACCOUNTS / account
-    if any((config / name).exists() for name in ("kaggle.json", "credentials.json")):
+    token = config / "access_token"
+    if token.exists():
+        env["KAGGLE_API_TOKEN"] = str(token)
+    elif (config / "credentials.json").exists():
         env["KAGGLE_CONFIG_DIR"] = str(config)
     return subprocess.run(
         ["kaggle", *args], env=env, capture_output=capture, text=True
@@ -150,7 +160,12 @@ def cmd_fetch(names):
 
 
 def cmd_quota():
-    accounts = {job["account"] for job in load()} or {"otzaria"}
+    # Every account that has a credential, not only the ones already carrying work:
+    # the number this prints is the pool, and the pool is what the schedule is built
+    # from. `otzaria` is included by name because its token is the globally installed
+    # one and it therefore has no directory here.
+    accounts = {directory.name for directory in ACCOUNTS.glob("*") if directory.is_dir()}
+    accounts |= {job["account"] for job in load()} | {"otzaria"}
     for account in sorted(accounts):
         result = kaggle(account, "quota")
         gpu = [l for l in result.stdout.splitlines() if l.startswith("GPU")]
