@@ -228,6 +228,40 @@ pub enum ArtifactError {
         reason: String,
     },
 
+    /// An identity field names a recipe version this build does not implement.
+    ///
+    /// Distinct from [`Self::IncompleteIdentity`], which catches a field nobody filled in.
+    /// This one is filled in, plausible, and describes behaviour that exists nowhere: the
+    /// three recipe versions are versions of *this crate's code*, so a number with no
+    /// implementation behind it means the vectors were built by something else or the
+    /// identity was written by hand. Being lenient would let an artifact declare a recipe
+    /// and an installation agree to it, with neither running it.
+    #[error(
+        "{field} is {found}, and this build implements {supported}: that recipe exists \
+         nowhere in this code"
+    )]
+    UnsupportedRecipeVersion {
+        field: &'static str,
+        found: u32,
+        supported: String,
+    },
+
+    /// The chunker configuration in hand and the identity an artifact declares disagree
+    /// about a value they both carry.
+    ///
+    /// One fact in two places is a fact that drifts. `embedding_text_version` has to be in
+    /// the configuration, because that is what selects the code path, and in the identity,
+    /// because an installation compares identities and never sees a configuration.
+    #[error(
+        "{field} is {configured} in the chunker configuration and {declared} in the model \
+         identity"
+    )]
+    RecipeDisagreesWithIdentity {
+        field: &'static str,
+        configured: u32,
+        declared: u32,
+    },
+
     /// The artifact describes a different corpus, model or store format than this
     /// installation. Lists every disagreement, not the first.
     #[error(
@@ -423,6 +457,57 @@ pub enum PackError {
 
     #[error("There is nothing to pack: the input holds no vectors")]
     NoVectors,
+
+    /// The chunker configuration a build was handed is not the one the artifact declares.
+    ///
+    /// `chunking_identity` is a one-way hash of the whole configuration, so nothing can
+    /// recover the recipe from an artifact — a builder has to be *given* the recipe, and
+    /// this is the only thing that can establish it was given the right one. Without the
+    /// check, `expected_line_ids` would apply one recipe while the artifact declared
+    /// another, and coverage would certify a set nobody built.
+    #[error(
+        "The chunker configuration hashes to {actual} and the model declares \
+         chunking_identity {declared}: the vectors would be built by a recipe other than \
+         the one the artifact announces"
+    )]
+    RecipeMismatch { declared: u64, actual: u64 },
+
+    /// The model identity a build declares disagrees with the model file it loaded.
+    ///
+    /// This is what turns the declaration into a checked claim. A file of finished floats
+    /// can be labelled with any model; a build that loads the model itself cannot, because
+    /// the checksum, the backend, the width, the pooling and the effective token cap are
+    /// all readable from the thing that is about to produce the vectors.
+    #[error(
+        "The declared model identity does not match the model file: {field} is declared \
+         as {declared:?}, and the loaded model reports {loaded:?}"
+    )]
+    ModelDisagreesWithFile {
+        field: &'static str,
+        declared: String,
+        loaded: String,
+    },
+
+    /// The loaded backend does not produce semantic vectors.
+    ///
+    /// Nothing downstream can tell: hash vectors have a plausible norm, a plausible
+    /// dimension and plausible neighbours, and an artifact built from them passes every
+    /// structural check in this crate. The identity records which backend it was, so a
+    /// mismatched runtime would refuse it — but a runtime built with the same stand-in
+    /// would open it and answer nonsense with full confidence.
+    #[error(
+        "Backend '{backend}' reports that its vectors are not semantic; an artifact built \
+         from them would look entirely normal and answer nothing"
+    )]
+    NonSemanticBackend { backend: String },
+
+    /// The recipe embeds no line of this corpus. Refused before the model is asked for a
+    /// single vector, because the alternative is an empty artifact that verifies.
+    #[error("The recipe embeds no line of the {books} book(s) in this corpus")]
+    NothingToEmbed { books: usize },
+
+    #[error("Embedding error: {0}")]
+    Embedding(#[from] EmbeddingError),
 
     #[error("Artifact error: {0}")]
     Artifact(#[from] ArtifactError),

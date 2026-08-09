@@ -25,6 +25,13 @@
 //!   lines exist" and "which lines get embedded" are different questions, and only the
 //!   second one is coverage.
 //!
+//! [`CorpusBooks`] adds the one thing per-line access cannot express: the corpus's
+//! *shape*. A recipe decides what to embed by looking at a line together with its
+//! neighbours in the same section, so applying it needs to know which lines share a book
+//! and in what order they run. It deliberately adds no new metadata —
+//! [`CorpusIndex::line`] stays the only description of a line — so the two halves of the
+//! port cannot disagree about a book.
+//!
 //! [`JsonlCorpus`] is the implementation this crate can offer: a transcription of the
 //! index into two files. It is what makes the CLI usable without Tantivy, and what the
 //! tests drive. The implementation that reads a live Tantivy index belongs to
@@ -34,7 +41,7 @@
 use crate::errors::PackError;
 use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -116,6 +123,42 @@ pub trait CorpusIndex {
     fn line(&self, line_id: u64) -> Result<Option<CorpusLine>, PackError>;
 }
 
+/// The corpus's shape: which books it holds, and the order one book's lines run in.
+///
+/// [`CorpusIndex`] answers about a line in isolation, which is all the *join* needs. A
+/// *recipe* needs more: a line too short to stand alone borrows text from its neighbours
+/// in the same section, so what gets embedded for one line depends on the lines around
+/// it. That is the only thing this trait adds — and it is why it is a separate trait
+/// rather than three more methods everything must implement.
+///
+/// **It answers no question about a line's contents**, on purpose. Every field an
+/// artifact stores comes from [`CorpusIndex::line`] and from nowhere else, so a book has
+/// exactly one description and there is no second one for it to drift from. What comes
+/// through here is structure: a list of keys, and a list of ids.
+///
+/// The cost is that a build reads each line twice — once to derive the text to embed, and
+/// once when the packer joins the finished vector back to the corpus. That is deliberate:
+/// the second read is what proves the corpus still says what the first read assumed, and
+/// this runs on a build machine.
+pub trait CorpusBooks: CorpusIndex {
+    /// Every book in the corpus, in an order that does not change between runs.
+    ///
+    /// Determinism is not cosmetic here: it is what makes a rejection name the same book
+    /// twice, and a long build resumable by a human reading a log.
+    fn book_keys(&self) -> Result<Vec<String>, PackError>;
+
+    /// The ids of one book's lines, **in the order the corpus holds them**.
+    ///
+    /// Not sorted for tidiness — the order *is* the answer. Neighbour context is taken
+    /// from adjacent entries in this list, so a list in the wrong order embeds a line
+    /// against text that never surrounded it, and the artifact records a `chunk_hash` for
+    /// a passage the book does not contain.
+    ///
+    /// An id here that [`CorpusIndex::line`] does not answer for is a corpus that
+    /// contradicts itself, and is refused rather than skipped.
+    fn book_line_ids(&self, book_key: &str) -> Result<Vec<u64>, PackError>;
+}
+
 /// One line of the corpus lines file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorpusLineRecord {
@@ -150,10 +193,21 @@ pub struct CorpusLineRecord {
 /// vector in RAM until it commits (see [`zevc_store`](crate::semantic::zevc_store)).
 /// Both are the same S2b measurement, and neither is hidden behind an interface that
 /// implies otherwise.
+/// The one id scheme whose ordering a transcription can reconstruct.
+///
+/// Scheme 1 composes an id as `((catalogue_order + 1) << 32) + (ordinal + 1)`, so within
+/// one book ascending ids *are* corpus order. Nothing about that generalizes, which is why
+/// [`JsonlCorpus::load`] refuses any other value rather than sorting anyway.
+const SORTABLE_ID_SCHEME: u32 = 1;
+
 #[derive(Debug)]
 pub struct JsonlCorpus {
     identity: CorpusIdentity,
     lines: HashMap<u64, CorpusLine>,
+    /// Each book's line ids in ascending order — see [`CorpusBooks`] on `JsonlCorpus`
+    /// for why ascending is the corpus order here. `BTreeMap`, so the book list is the
+    /// same on every run.
+    books: BTreeMap<String, Vec<u64>>,
 }
 
 impl JsonlCorpus {
@@ -215,7 +269,41 @@ impl JsonlCorpus {
             });
         }
 
-        Ok(Self { identity, lines })
+        // The book view below orders a book's lines by ascending `line_id`, which is corpus
+        // order only because scheme 1 puts the line's 1-based position in the low half.
+        // Under any other scheme that ordering is a guess, and a wrong one silently builds
+        // a short line's context out of the wrong neighbours — text nothing in the book
+        // contains, hashed into the artifact as if it did. Refused rather than assumed:
+        // this file cannot carry the order, so a corpus that needs one carried has to be
+        // read through an implementation that knows it.
+        if identity.document_id_scheme_version != SORTABLE_ID_SCHEME {
+            return Err(PackError::Corpus {
+                reason: format!(
+                    "{} declares document_id_scheme_version {}, and a transcription can \
+                     only recover a book's line order under scheme {SORTABLE_ID_SCHEME}, \
+                     where the low half of an id is the line's position",
+                    identity_path.display(),
+                    identity.document_id_scheme_version
+                ),
+            });
+        }
+
+        let mut books: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (line_id, line) in &lines {
+            books
+                .entry(line.source_book_key.clone())
+                .or_default()
+                .push(*line_id);
+        }
+        for ids in books.values_mut() {
+            ids.sort_unstable();
+        }
+
+        Ok(Self {
+            identity,
+            lines,
+            books,
+        })
     }
 
     /// How many lines were transcribed. Reported by the CLI so a corpus file that is
@@ -252,6 +340,31 @@ impl CorpusIndex for JsonlCorpus {
 
     fn line(&self, line_id: u64) -> Result<Option<CorpusLine>, PackError> {
         Ok(self.lines.get(&line_id).cloned())
+    }
+}
+
+/// Books are grouped by `source_book_key`, and each book's lines are ordered by ascending
+/// `line_id`.
+///
+/// That ordering is a property of the id scheme rather than a convenience.
+/// `document_id_scheme_version` 1 composes an id as
+/// `((catalogue_order + 1) << 32) + (ordinal + 1)`, so within one book the low half is the
+/// line's 1-based position and ascending ids *are* corpus order. Under a scheme where that
+/// stops holding, this transcription cannot recover the order and the file would have to
+/// carry it — which is one more reason the authoritative implementation is the one over the
+/// live index, where the order is not inferred at all.
+impl CorpusBooks for JsonlCorpus {
+    fn book_keys(&self) -> Result<Vec<String>, PackError> {
+        Ok(self.books.keys().cloned().collect())
+    }
+
+    fn book_line_ids(&self, book_key: &str) -> Result<Vec<u64>, PackError> {
+        self.books
+            .get(book_key)
+            .cloned()
+            .ok_or_else(|| PackError::Corpus {
+                reason: format!("no book keyed {book_key:?}"),
+            })
     }
 }
 
@@ -353,6 +466,81 @@ mod tests {
             line("genesis.txt", "בראשית ברא")
         );
         assert!(corpus.line(1).unwrap().is_none());
+    }
+
+    /// The recipe reads the corpus as books, and neighbour context comes from adjacent
+    /// entries — so the grouping and the order are both answers, not presentation. The file
+    /// is written in no particular order here on purpose: what comes back must not depend
+    /// on that.
+    #[test]
+    fn a_transcribed_corpus_reports_its_books_and_their_line_order() {
+        let dir = TempDir::new("books");
+        let (identity_path, lines_path) = write_corpus(
+            &dir,
+            &[
+                record(4_294_967_299, "genesis.txt", "ויאמר אלהים"),
+                record(8_589_934_593, "berachot.txt", "מאימתי קורין"),
+                record(4_294_967_297, "genesis.txt", "בראשית ברא"),
+                record(4_294_967_298, "genesis.txt", "והארץ היתה"),
+            ],
+        );
+
+        let corpus = JsonlCorpus::load(&identity_path, &lines_path).unwrap();
+        assert_eq!(
+            corpus.book_keys().unwrap(),
+            vec!["berachot.txt".to_string(), "genesis.txt".to_string()],
+            "the book list is sorted, so two runs walk the corpus the same way"
+        );
+        assert_eq!(
+            corpus.book_line_ids("genesis.txt").unwrap(),
+            vec![4_294_967_297, 4_294_967_298, 4_294_967_299],
+            "ascending line_id is corpus order under document_id_scheme_version 1"
+        );
+        assert_eq!(
+            corpus.book_line_ids("berachot.txt").unwrap(),
+            vec![8_589_934_593]
+        );
+        assert!(matches!(
+            corpus.book_line_ids("absent.txt"),
+            Err(PackError::Corpus { .. })
+        ));
+    }
+
+    /// The book view sorts by `line_id`, and that reconstructs corpus order only under
+    /// scheme 1. Under another scheme the sort is a guess, and a wrong one builds a short
+    /// line's context out of neighbours it never had — text the book does not contain,
+    /// embedded and hashed into the artifact as though it did. Nothing downstream could
+    /// see it: the anchor line's digest still matches, because the anchor is still right.
+    #[test]
+    fn a_transcription_of_an_id_scheme_it_cannot_order_is_refused() {
+        let dir = TempDir::new("id_scheme");
+        let identity_path = dir.path().join("corpus-identity.json");
+        let lines_path = dir.path().join("corpus-lines.jsonl");
+        std::fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&CorpusIdentity {
+                document_id_scheme_version: 2,
+                ..identity()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &lines_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&record(1, "genesis.txt", "בראשית ברא")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        match JsonlCorpus::load(&identity_path, &lines_path) {
+            Err(PackError::Corpus { reason }) => assert!(
+                reason.contains("document_id_scheme_version 2"),
+                "the refusal must name the scheme: {reason}"
+            ),
+            other => panic!("an unorderable id scheme must be refused, got {other:?}"),
+        }
     }
 
     /// Two records for one id would make the artifact depend on file order.

@@ -1,18 +1,21 @@
 //! Binary CLI interface for `otzaria-semantic-search`.
 //!
 //! Provides a standalone command-line application for querying, indexing, and
-//! inspecting the Otzaria semantic search engine, and the build-side `pack` and
-//! `validate` commands that produce an official artifact from ready-made vectors.
+//! inspecting the Otzaria semantic search engine, and the build-side `build`, `pack` and
+//! `validate` commands that produce an official artifact.
 //!
 //! `pack` and `validate` need no embedding backend — they never turn text into a vector —
-//! so they work in a default build, which is the one a release pipeline has.
+//! so they work in a default build, which is the one a release pipeline has. `build` does
+//! turn text into vectors, and so needs one compiled in.
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
-use otzaria_semantic_search::distribution::corpus::JsonlCorpus;
+use otzaria_semantic_search::distribution::builder::{build, BuildRequest, PlannedCorpus};
+use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
+use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
 use otzaria_semantic_search::semantic::versioning::ModelIdentity;
@@ -33,6 +36,7 @@ Commands:
   status [--dir <path>]               Display search engine index and model status.
   search <query> [options]            Execute a search query against the engine.
   index-text <key> <title> <text>     Index a plain-text book into the database.
+  build [options]                     Embed a corpus and write an official artifact.
   pack [options]                      Build an official artifact from ready-made vectors.
   validate [options]                  Verify an artifact against a corpus and a model.
 
@@ -44,12 +48,27 @@ Options for 'search':
 Options for 'status':
   --dir <path>       Directory holding semantic database (default: "./semantic_db")
 
+Options for 'build':
+  --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
+  --corpus-lines <path>      JSONL, one corpus line per document
+  --model <path>             JSON ModelIdentity describing how the vectors are produced
+  --model-file <path>        The GGUF the vectors are produced with
+  --chunking <path>          JSON ChunkerConfig — the recipe itself (see below)
+  --out <dir>                Output directory; must not exist, or be empty
+  --batch <N>                Texts per inference call (default: 32)
+  --collection <name>        Collection name in the payload header (default: "chunks")
+  --created-at <timestamp>   Manifest timestamp (default: now, UTC)
+  --allow-non-semantic       Write an artifact from a backend whose vectors mean nothing.
+                             For tests only: such an artifact passes every check here and
+                             answers nonsense.
+
 Options for 'pack':
   --vectors <path>           Raw little-endian f32 vectors, count x embedding_dim, no header
   --records <path>           JSONL, one record per vector, in the same order (see below)
-  --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
-  --corpus-lines <path>      JSONL, one corpus line per document
-  --model <path>             JSON ModelIdentity describing how the vectors were produced
+  --corpus-identity <path>   As above
+  --corpus-lines <path>      As above
+  --model <path>             As above
+  --chunking <path>          Optional; see 'The coverage contract' below
   --out <dir>                Output directory; must not exist, or be empty
   --collection <name>        Collection name in the payload header (default: "chunks")
   --created-at <timestamp>   Manifest timestamp (default: now, UTC)
@@ -59,6 +78,7 @@ Options for 'validate':
   --corpus-identity <path>   As above
   --corpus-lines <path>      As above
   --model <path>             As above
+  --chunking <path>          Optional; as for 'pack'
 
 A record is {{"line_id":N,"source_line_sha256":"...","embedding_text_sha256":"..."}}.
 Both digests are lowercase hex SHA-256.
@@ -71,14 +91,24 @@ Both digests are lowercase hex SHA-256.
                          chunk_hash; not checked against anything, because the corpus
                          holds the line and not the recipe's output.
 
-The corpus lines file is also the coverage contract: every line in it must get a vector,
-so export exactly the lines that should be embedded.
+A chunker configuration is
+{{"min_meaningful_chars":20,"context_window_lines":2,"max_chunk_chars":512,
+  "min_embeddable_chars":5,"chunking_version":1}}, and its hash must be the
+chunking_identity the model declares — an artifact records the hash, and a hash cannot
+be turned back into the recipe.
+
+The coverage contract: with --chunking, the lines that must get a vector are the ones the
+recipe embeds, derived from the corpus. Without it, they are every line in the corpus
+file, so it has to hold exactly the lines that should be embedded. 'build' always derives
+them; there is nothing to declare that it does not apply.
 
 Examples:
   otzaria-semantic-search version
   otzaria-semantic-search status --dir ./semantic_db
   otzaria-semantic-search search "מצות תפילין" --mode semantic --limit 5
   otzaria-semantic-search index-text "otzaria/demo.txt" "ספר הדגמה" "כל העוסק בתורה בלילה שכינה כנגדו"
+  otzaria-semantic-search build --corpus-identity corpus.json --corpus-lines corpus.jsonl \
+      --model model.json --model-file model.gguf --chunking chunking.json --out ./artifact
   otzaria-semantic-search pack --vectors v.f32 --records v.jsonl \
       --corpus-identity corpus.json --corpus-lines corpus.jsonl \
       --model model.json --out ./artifact
@@ -260,6 +290,7 @@ fn main() {
                 }
             }
         }
+        "build" => run_build(&args),
         "pack" => run_pack(&args),
         "validate" => run_validate(&args),
         "help" | "-h" | "--help" => {
@@ -318,12 +349,75 @@ fn load_corpus(args: &[String]) -> JsonlCorpus {
     corpus
 }
 
+/// Read the recipe a build applies.
+///
+/// A separate file from the model identity because it is a different kind of fact: the
+/// identity says what the artifact *declares*, and this says what will actually be done to
+/// the text. The build refuses to proceed unless one hashes to the other.
+fn read_chunking(path: &str) -> ChunkerConfig {
+    let json = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| exit_with(&format!("Could not read {path}"), error));
+    serde_json::from_str(&json)
+        .unwrap_or_else(|error| exit_with(&format!("{path} is not a chunker configuration"), error))
+}
+
+/// Wrap the corpus in the recipe, when one was given.
+///
+/// Without `--chunking` the corpus file is the coverage contract, which is what it has
+/// always been and is exactly as trustworthy as whoever exported it. With one, the lines
+/// that must get a vector are derived by applying the recipe — and the recipe is pinned to
+/// the `chunking_identity` the artifact declares, so an export made under one recipe cannot
+/// be packed under another.
+fn plan_corpus<'a>(
+    args: &[String],
+    corpus: &'a JsonlCorpus,
+    model: &ModelIdentity,
+) -> Option<PlannedCorpus<'a>> {
+    let chunking = read_chunking(&parse_arg(args, "--chunking")?);
+    let planned = PlannedCorpus::new(corpus, &chunking, model)
+        .unwrap_or_else(|error| exit_with("Could not apply the recipe to the corpus", error));
+    println!("Recipe: {} line(s) get a vector", planned.plan().len());
+    Some(planned)
+}
+
+fn run_build(args: &[String]) {
+    let out = require_arg(args, "--out");
+    let model = read_model(&require_arg(args, "--model"));
+    let model_file = require_arg(args, "--model-file");
+    let chunking = read_chunking(&require_arg(args, "--chunking"));
+    let corpus = load_corpus(args);
+
+    let report = build(
+        BuildRequest {
+            output_path: PathBuf::from(&out),
+            model_path: PathBuf::from(&model_file),
+            model,
+            chunking,
+            created_at: parse_arg(args, "--created-at")
+                .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
+            collection_name: parse_arg(args, "--collection")
+                .unwrap_or_else(|| "chunks".to_string()),
+            batch_size: parse_arg(args, "--batch")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32),
+            allow_non_semantic_backend: args.iter().any(|arg| arg == "--allow-non-semantic"),
+        },
+        &corpus,
+    )
+    .unwrap_or_else(|error| exit_with("Build failed", error));
+
+    println!("\n=== Built an official artifact ===");
+    print_report(&report);
+}
+
 fn run_pack(args: &[String]) {
     let vectors = require_arg(args, "--vectors");
     let records = require_arg(args, "--records");
     let out = require_arg(args, "--out");
     let model = read_model(&require_arg(args, "--model"));
     let corpus = load_corpus(args);
+    let planned = plan_corpus(args, &corpus, &model);
+    let target: &dyn CorpusIndex = planned.as_ref().map_or(&corpus, |planned| planned);
 
     let inputs = read_vector_inputs(
         Path::new(&vectors),
@@ -342,7 +436,7 @@ fn run_pack(args: &[String]) {
                 .unwrap_or_else(|| "chunks".to_string()),
         },
         inputs,
-        &corpus,
+        target,
     )
     .unwrap_or_else(|error| exit_with("Packing failed", error));
 
@@ -354,8 +448,10 @@ fn run_validate(args: &[String]) {
     let artifact = require_arg(args, "--artifact");
     let model = read_model(&require_arg(args, "--model"));
     let corpus = load_corpus(args);
+    let planned = plan_corpus(args, &corpus, &model);
+    let target: &dyn CorpusIndex = planned.as_ref().map_or(&corpus, |planned| planned);
 
-    let report = validate_artifact(Path::new(&artifact), &model, &corpus)
+    let report = validate_artifact(Path::new(&artifact), &model, target)
         .unwrap_or_else(|error| exit_with("Validation failed", error));
 
     println!("\n=== Artifact verified ===");

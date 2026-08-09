@@ -4,6 +4,8 @@
 //! - Types and data models
 //! - Manifest / versioning
 //! - Chunking (text → semantic chunks)
+//! - The recipe versions an artifact declares, as closed sets this build either
+//!   implements or refuses
 //! - Embedding backend contract (what an inference implementation must provide)
 //! - Embedding runtime (model validation, batching, normalization)
 //! - Real GGUF inference through llama.cpp (behind the `llama-backend` feature)
@@ -35,6 +37,7 @@ pub mod engine;
 pub mod llama_backend;
 pub mod manifest;
 pub mod official_index;
+pub mod recipe;
 pub mod store;
 pub mod store_backend;
 pub mod types;

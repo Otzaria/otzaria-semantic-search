@@ -356,7 +356,11 @@ fn difference_summary(from: &BTreeSet<u64>, other: &BTreeSet<u64>) -> (usize, Op
 
 /// The three sources that each know a part of the identity, and the completeness check
 /// that has to come before any of them is compared to anything.
-fn compose_identity(
+///
+/// Reachable from [`builder`](crate::distribution::builder) for the same reason
+/// [`ensure_output_is_free`] is: a blank `model_id` should fail a build in the second it
+/// takes to notice, not after a library has been chunked and embedded.
+pub(crate) fn compose_identity(
     corpus: &dyn CorpusIndex,
     model: &ModelIdentity,
 ) -> Result<IndexVersion, PackError> {
@@ -372,7 +376,11 @@ fn compose_identity(
 }
 
 /// Refuse an output path that is not an empty place to write a whole artifact.
-fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
+///
+/// Reachable from [`builder`](crate::distribution::builder) so a build asks this before it
+/// loads a model and walks a corpus, rather than after: [`pack`] checks it too, but by then
+/// the expensive half of a build has already happened.
+pub(crate) fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
     let unusable = |reason: String| PackError::UnusableOutput {
         path: path.display().to_string(),
         reason,
@@ -410,9 +418,13 @@ fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
 /// Check one input against the corpus and turn it into the record that will be stored.
 ///
 /// The vector is normalized here rather than left to the payload writer, because
-/// [`normalize_validated`] is the crate's one choke point for "can this vector be
-/// compared at all" and its rejection is reported against the `line_id` a build log can
-/// act on. The writer normalizes again; doing it twice is idempotent and costs one pass.
+/// [`normalize_validated`] is the crate's one choke point for "can this vector be compared
+/// at all" and its rejection is reported against the `line_id` a build log can act on. The
+/// writer normalizes again; doing it twice is idempotent and costs one pass.
+///
+/// This is not `normalization_version`: that field is about the *text* a vector was built
+/// from, which a packer receiving finished floats can neither perform nor verify. All it
+/// does with it is refuse a version nothing implements, in `compose_identity`.
 fn join_to_corpus(
     input: &mut VectorInput,
     corpus: &dyn CorpusIndex,

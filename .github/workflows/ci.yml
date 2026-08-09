@@ -187,3 +187,13 @@ jobs:
         env:
           OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
         run: cargo test --lib --features llama-backend -- --ignored --nocapture
+
+      # The build path, against the same weights. Every other builder test runs on the
+      # deterministic stand-in, which is constructed from the configuration and echoes its
+      # width, pooling and token cap straight back — so the half of the model check that
+      # only real weights can drive is exercised nowhere else, and neither is the recipe
+      # applied to text a real tokenizer sees.
+      - name: A real artifact, built and verified end to end
+        env:
+          OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
+        run: cargo test --test artifact_builder --features llama-backend -- --ignored --nocapture

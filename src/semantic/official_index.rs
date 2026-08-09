@@ -55,6 +55,7 @@ use crate::distribution::package::{
 use crate::errors::{ArtifactError, SemanticSearchError};
 use crate::semantic::backend::Pooling;
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::store_backend::VectorSearchBackend;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, SemanticStatus};
 use crate::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity, StoreIdentity};
@@ -172,6 +173,9 @@ pub struct OfficialSemanticIndex {
     verified: VerifiedPackage,
     store: Box<dyn VectorSearchBackend>,
     runtime: EmbeddingRuntime,
+    /// The text recipe the artifact's vectors were built under, applied to every query.
+    /// Both sides of a comparison have to go through the same one.
+    normalization: TextNormalizationRecipe,
     recovery: InstallRecovery,
     /// Counted once, at open, because the payload cannot change under a read-only store —
     /// and because counting means listing every book key, which is not something
@@ -208,6 +212,18 @@ impl OfficialSemanticIndex {
             );
         }
 
+        // Before the model is opened: the two recipe versions this installation declares
+        // are versions of code in this crate, so an unimplemented one is settled here
+        // rather than compared against another copy of the same number and agreed with.
+        // The artifact's own copy is refused by `validate_complete` during verification;
+        // this refuses the *installation's*, which is what stops a configuration and an
+        // artifact from agreeing on a recipe neither can run.
+        EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
+        // Held, not just checked: the query has to reach the model through the same text
+        // recipe the stored vectors were built under, or the two live in different places
+        // and nothing about either vector says so.
+        let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
+
         let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model.model_path.clone(),
             embedding_dim: model.embedding_dim,
@@ -241,6 +257,7 @@ impl OfficialSemanticIndex {
             verified,
             store: Box::new(store),
             runtime,
+            normalization,
             recovery,
             book_count,
         };
@@ -273,7 +290,10 @@ impl OfficialSemanticIndex {
 
     /// Embed a query separately, so the coordinator can cache the vector.
     pub(crate) fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
-        Ok(self.runtime.embed_one(query)?)
+        // The same recipe the stored vectors were built under. A query embedded from raw
+        // text against vectors built from normalized text scores nonsense with full
+        // confidence, and no check downstream can see it.
+        Ok(self.runtime.embed_one(&self.normalization.apply(query))?)
     }
 
     /// Search with a vector this index's runtime already produced.

@@ -341,6 +341,12 @@ impl EmbeddingRuntime {
 
 /// L2-normalize a vector in place after checking it can be compared at all.
 ///
+/// **Unconditional, and deliberately not versioned.** Unit length is what makes a dot
+/// product a cosine, and every store applies it on insertion and on query regardless of
+/// what any manifest says. `normalization_version` is about the *text* that reaches the
+/// model — see [`TextNormalizationRecipe`](crate::semantic::recipe::TextNormalizationRecipe)
+/// — and giving that name to this would produce a "version" three code paths ignore.
+///
 /// Two of the four guards are not redundant with a norm test: `NaN <
 /// MIN_VECTOR_NORM` is `false`, so a poisoned component passes one; and a
 /// *finite* vector whose squares overflow `f32` (components around `1e30`) gets an

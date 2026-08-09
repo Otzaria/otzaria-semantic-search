@@ -16,7 +16,11 @@
 //! The build side lives here too, because producing a package and installing one are two
 //! ends of the same contract: [`packer`] turns ready-made vectors into a directory
 //! [`package`] verifies and [`importer`] installs, and it joins every vector to the
-//! [`corpus`] whose ids it claims before it writes anything.
+//! [`corpus`] whose ids it claims before it writes anything. [`builder`] is the step
+//! before that one — it applies the embedding recipe to the corpus and produces the
+//! vectors themselves, so the floats and the identity that describes them come from a
+//! single pass over a single model.
+pub mod builder;
 pub mod corpus;
 pub mod importer;
 pub mod package;

@@ -16,6 +16,7 @@ use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
     describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
+use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::store::{VectorStore, VectorStoreConfig};
 use crate::semantic::store_backend::VectorStoreBackend;
 use crate::semantic::types::{
@@ -48,10 +49,14 @@ pub struct SemanticConfig {
     pub model_quantization: String,
     /// Precision vectors are stored at (e.g. `"f32"`).
     pub vector_precision: String,
-    /// Text preprocessing version; bump it to mark existing vectors stale.
-    pub normalization_version: u32,
     /// Texts handed to the embedding backend per inference call.
     pub embedding_batch_size: usize,
+    /// The whole text recipe, and the **only** place its versions live.
+    ///
+    /// `normalization_version` used to sit beside this as well, and the two drifted by
+    /// construction: the manifest was signed from the outer copy while the chunker
+    /// normalized by the inner one, so a configuration could record version 2 and perform
+    /// version 1. Every manifest field is now derived from here.
     pub chunking: ChunkerConfig,
     pub store: VectorStoreConfig,
 }
@@ -68,7 +73,6 @@ impl Default for SemanticConfig {
             embedding_max_tokens: 512,
             model_quantization: "Q4".to_string(),
             vector_precision: "f32".to_string(),
-            normalization_version: 1,
             embedding_batch_size: 32,
             chunking: ChunkerConfig::default(),
             store: VectorStoreConfig {
@@ -111,6 +115,12 @@ impl SemanticConfig {
         // of the index's identity, so correcting it later would report the *index*
         // as incompatible rather than the configuration that caused it.
         self.pooling_strategy()?;
+        // The same argument, for the three recipe versions. `Chunker::new` resolves them
+        // too, but that happens after this and only on the path that builds one — and a
+        // manifest signed with a version nothing implements is exactly what this refuses.
+        ChunkingAlgorithm::from_version(self.chunking.chunking_version)?;
+        EmbeddingTextRecipe::from_version(self.chunking.embedding_text_version)?;
+        TextNormalizationRecipe::from_version(self.chunking.normalization_version)?;
         // 2, not 1: the cap counts the EOS the backend appends, so 1 leaves no room for
         // content and every text embeds as a bare `[eos]`.
         if self.embedding_max_tokens < 2 {
@@ -198,7 +208,10 @@ impl SemanticEngine {
             )));
         }
 
-        let chunker = Chunker::new(config.chunking.clone());
+        // Fallible: the chunking configuration names an algorithm and a text recipe, and
+        // one this build does not implement is refused here rather than folded into a hash
+        // and acted on as if it were version 1.
+        let chunker = Chunker::new(config.chunking.clone())?;
         let backend_id = store.backend_id();
 
         let mut engine = Self {
@@ -478,7 +491,7 @@ impl SemanticEngine {
                 line_fingerprint,
                 0,
                 self.config.chunking.identity(),
-                self.config.normalization_version,
+                self.config.chunking.normalization_version,
             );
             return Ok(IndexOutcome::Empty);
         }
@@ -503,7 +516,7 @@ impl SemanticEngine {
             line_fingerprint,
             chunks.len() as u32,
             self.config.chunking.identity(),
-            self.config.normalization_version,
+            self.config.chunking.normalization_version,
         );
 
         Ok(IndexOutcome::Indexed {
@@ -531,7 +544,7 @@ impl SemanticEngine {
             && entry.content_hash == book.content_fingerprint
             && entry.chunk_count as usize == chunk_count
             && entry.chunking_identity == self.config.chunking.identity()
-            && entry.normalization_version == self.config.normalization_version
+            && entry.normalization_version == self.config.chunking.normalization_version
             && self.store.book_vector_count(&book.source_book_key) == chunk_count
     }
 
@@ -642,7 +655,10 @@ impl SemanticEngine {
             ));
         };
 
-        Ok(runtime.embed_one(query)?)
+        // Through the same text recipe the chunker applied to everything it stored: both
+        // sides of a comparison have to reach the model the same way.
+        let (_, _, normalization) = self.chunker.recipe();
+        Ok(runtime.embed_one(&normalization.apply(query))?)
     }
 
     /// Search with a vector already produced by this engine's embedding runtime.
@@ -693,7 +709,7 @@ impl SemanticEngine {
                 book_key,
                 fingerprint,
                 self.config.chunking.identity(),
-                self.config.normalization_version,
+                self.config.chunking.normalization_version,
             );
 
             match need {
@@ -822,14 +838,14 @@ fn manifest_config(
         vector_precision: config.vector_precision.clone(),
         vector_backend: vector_backend.to_string(),
         chunking_identity: config.chunking.identity(),
-        normalization_version: config.normalization_version,
+        normalization_version: config.chunking.normalization_version,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::EmbeddingError;
+    use crate::errors::{ArtifactError, EmbeddingError};
     use crate::semantic::embedding::mock;
     use crate::semantic::types::BookLine;
 
@@ -1088,7 +1104,7 @@ mod tests {
             "vector_precision": "f32",
             "vector_backend": crate::semantic::store::BACKEND_ID,
             "chunking_version": config.chunking.chunking_version,
-            "normalization_version": config.normalization_version,
+            "normalization_version": config.chunking.normalization_version,
             "created_at": 1_700_000_000u64,
             "updated_at": 1_700_000_000u64,
             "books": {
@@ -1099,7 +1115,7 @@ mod tests {
                     "chunk_count": 3,
                     "indexed_at": 1_700_000_000u64,
                     "chunking_version": config.chunking.chunking_version,
-                    "normalization_version": config.normalization_version
+                    "normalization_version": config.chunking.normalization_version
                 }
             }
         });
@@ -1858,13 +1874,70 @@ mod tests {
         assert!(engine.status().needs_full_reindex.is_none());
     }
 
-    /// Every knob, not just `chunking_version`: each one changes the text that was
-    /// embedded, so each must invalidate the index.
+    /// The manifest records the recipe the chunker actually ran.
+    ///
+    /// `normalization_version` used to exist twice: once on the configuration and once
+    /// inside its `chunking`. The manifest was signed from the outer copy and the text was
+    /// normalized by the inner one, so a configuration could declare version 2, perform
+    /// version 1, and leave an index labelled with a recipe nothing had applied — the free
+    /// label the recipe module exists to abolish, reintroduced one struct away from it.
+    /// There is one field now, and this is what would fail if a second appeared.
+    #[test]
+    fn the_manifest_records_the_recipe_the_chunker_ran() {
+        let dir = TempDir::new("recipe_source_of_truth");
+        let mut config = config_at(&dir);
+        config.chunking.normalization_version =
+            TextNormalizationRecipe::AsSuppliedByCorpus.version();
+
+        let engine = SemanticEngine::open(config.clone()).unwrap();
+        assert_eq!(
+            engine.manifest.normalization_version, config.chunking.normalization_version,
+            "the manifest is signed from the configuration the chunker was built with"
+        );
+        assert_eq!(
+            engine.chunker.recipe().2,
+            TextNormalizationRecipe::AsSuppliedByCorpus
+        );
+    }
+
+    /// A chunking algorithm this build does not implement is not an incompatibility to
+    /// report — it is a configuration that cannot be acted on at all. Opening under it and
+    /// then chunking with version 1's code would record version 2 in the manifest for
+    /// vectors version 1 produced.
+    #[test]
+    fn a_chunking_version_this_build_does_not_implement_is_refused_at_open() {
+        let dir = TempDir::new("unimplemented_chunking");
+        let mut config = config_at(&dir);
+        config.chunking.chunking_version = 2;
+
+        match SemanticEngine::open(config) {
+            Err(SemanticSearchError::Artifact(ArtifactError::UnsupportedRecipeVersion {
+                field,
+                found,
+                ..
+            })) => {
+                assert_eq!(field, "chunking_version");
+                assert_eq!(found, 2);
+            }
+            Err(other) => panic!(
+                "an unimplemented chunking algorithm must be refused as \
+                                  such, got {other:?}"
+            ),
+            Ok(_) => panic!("an unimplemented chunking algorithm must not open"),
+        }
+    }
+
+    /// Every knob changes the text that was embedded, so each must invalidate the index.
+    ///
+    /// `chunking_version` is not among them, and its absence is the point: it no longer
+    /// names "some other configuration of the same algorithm" but a *different algorithm*,
+    /// and one this build does not have is refused outright rather than opened and flagged
+    /// — see `a_chunking_version_this_build_does_not_implement_is_refused_at_open`. When a
+    /// second algorithm exists it will change the identity too, and land back in this list.
     #[test]
     fn a_changed_chunking_config_forces_every_book_to_be_reindexed() {
         type Change = (&'static str, fn(&mut ChunkerConfig));
-        let changes: [Change; 5] = [
-            ("version", |c| c.chunking_version = 2),
+        let changes: [Change; 4] = [
             ("max_chunk_chars", |c| c.max_chunk_chars = 256),
             ("context_window_lines", |c| c.context_window_lines = 5),
             ("min_meaningful_chars", |c| c.min_meaningful_chars = 40),

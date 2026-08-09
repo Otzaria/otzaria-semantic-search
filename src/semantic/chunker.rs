@@ -9,10 +9,22 @@
 //! labelled query set — the current behaviour is the starting point, not a validated
 //! choice.
 
+use crate::errors::ArtifactError;
+use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::types::{BookForIndexing, SemanticChunk};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone)]
+/// Serializable because a build declares its recipe in a file: `chunking_identity` in the
+/// artifact is a hash, and a hash cannot be turned back into these five numbers. Whoever
+/// applies the recipe has to be handed the recipe itself, and
+/// [`Self::identity`] is what ties the two together — see
+/// [`BuildPlan`](crate::distribution::builder::BuildPlan).
+///
+/// No `serde(default)`: a field left out of the file would silently become 20 or 512 and
+/// change what every vector was built from, which is precisely the class of drift the
+/// identity check exists to catch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkerConfig {
     /// Below this length a line borrows context from its neighbours.
     pub min_meaningful_chars: usize,
@@ -22,7 +34,29 @@ pub struct ChunkerConfig {
     /// Below this length a line is skipped entirely. Measured after trimming, so
     /// a line of blanks is never embedded.
     pub min_embeddable_chars: usize,
+    /// Which algorithm turns a book into chunks — see
+    /// [`ChunkingAlgorithm`]. Refused by
+    /// [`Chunker::new`] when it names one this build does not implement, rather than
+    /// travelling into a hash as an opaque number.
     pub chunking_version: u32,
+    /// Which text a chunk carries to the model — see
+    /// [`EmbeddingTextRecipe`].
+    ///
+    /// Here as well as in
+    /// [`ModelIdentity`](crate::semantic::versioning::ModelIdentity) because the two need
+    /// it for different reasons: the chunker to select a code path, and an installation to
+    /// compare an artifact against itself without ever holding a configuration.
+    /// [`EmbeddingRecipe::resolve`](crate::semantic::recipe::EmbeddingRecipe::resolve)
+    /// compares the copies at the one point both are in hand.
+    pub embedding_text_version: u32,
+    /// What is done to the text before the model sees it — see
+    /// [`TextNormalizationRecipe`]. **Text**, not the finished vector: L2 is an
+    /// unconditional invariant of cosine and is deliberately not versioned.
+    ///
+    /// Here because the digest a record carries has to describe the string that was
+    /// actually embedded, and that string is normalized before it is hashed. Also in
+    /// `ModelIdentity`, for the same reason as `embedding_text_version`.
+    pub normalization_version: u32,
 }
 
 impl ChunkerConfig {
@@ -42,6 +76,8 @@ impl ChunkerConfig {
             self.max_chunk_chars as u64,
             self.min_embeddable_chars as u64,
             u64::from(self.chunking_version),
+            u64::from(self.embedding_text_version),
+            u64::from(self.normalization_version),
         ] {
             hasher.update(field.to_le_bytes());
         }
@@ -57,21 +93,61 @@ impl Default for ChunkerConfig {
             context_window_lines: 2,
             max_chunk_chars: 512,
             min_embeddable_chars: 5,
-            chunking_version: 1,
+            chunking_version: ChunkingAlgorithm::AnchoredLine.version(),
+            embedding_text_version: EmbeddingTextRecipe::LineOrNeighbourContext.version(),
+            normalization_version: TextNormalizationRecipe::AsSuppliedByCorpus.version(),
         }
     }
 }
 
 pub struct Chunker {
     config: ChunkerConfig,
+    /// Resolved once, in [`Self::new`]. Held as the enum rather than as the number it came
+    /// from, so [`Self::chunk_book`] cannot run under a version nothing implements.
+    algorithm: ChunkingAlgorithm,
+    text_recipe: EmbeddingTextRecipe,
+    normalization: TextNormalizationRecipe,
 }
 
 impl Chunker {
-    pub fn new(config: ChunkerConfig) -> Self {
-        Self { config }
+    /// Refuses a configuration naming an algorithm or a text recipe this build does not
+    /// have.
+    ///
+    /// Fallible for one reason: `chunking_version` used to be folded into
+    /// [`ChunkerConfig::identity`] and read by nothing else, so a build could declare
+    /// version 99 and run version 1's code. The identity would be self-consistent and the
+    /// artifact would describe a recipe that exists nowhere.
+    pub fn new(config: ChunkerConfig) -> Result<Self, ArtifactError> {
+        Ok(Self {
+            algorithm: ChunkingAlgorithm::from_version(config.chunking_version)?,
+            text_recipe: EmbeddingTextRecipe::from_version(config.embedding_text_version)?,
+            normalization: TextNormalizationRecipe::from_version(config.normalization_version)?,
+            config,
+        })
+    }
+
+    /// What this chunker resolved to. Reported so a builder can record what it is about to
+    /// run rather than what it was asked for.
+    pub fn recipe(
+        &self,
+    ) -> (
+        ChunkingAlgorithm,
+        EmbeddingTextRecipe,
+        TextNormalizationRecipe,
+    ) {
+        (self.algorithm, self.text_recipe, self.normalization)
     }
 
     pub fn chunk_book(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
+        // Exhaustive on purpose: a second algorithm has to be written here before its
+        // version number can be accepted anywhere.
+        match self.algorithm {
+            ChunkingAlgorithm::AnchoredLine => self.chunk_book_anchored(book),
+        }
+    }
+
+    /// One chunk per line, anchored on the line and borrowing context when it is short.
+    fn chunk_book_anchored(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
         let mut chunks = Vec::with_capacity(book.lines.len());
         // Built once per book, not per line: every chunk carries the same set.
         let facets = book.all_facets();
@@ -88,18 +164,19 @@ impl Chunker {
                 continue;
             }
 
-            let embedding_text = if char_count < self.config.min_meaningful_chars {
-                self.build_context_text(book, i)
-            } else {
-                line.text.clone()
-            };
+            let embedding_text = self.embedding_text_for(book, i, char_count);
 
             let truncated_text =
                 truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars);
-            if truncated_text.trim().is_empty() {
+            // Normalized *before* the digest, because the digest has to describe the string
+            // the model is given. Hashing the pre-normalization text would put a digest of
+            // something nothing was built from into every record — the same fault
+            // `chunk_hash` describing the corpus line instead of the embedded text would be.
+            let embedded_text = self.normalization.apply(&truncated_text).into_owned();
+            if embedded_text.trim().is_empty() {
                 continue;
             }
-            let chunk_hash = compute_chunk_hash(&truncated_text);
+            let chunk_hash = compute_chunk_hash(&embedded_text);
             let semantic_id =
                 compute_semantic_id(&book.source_book_key, line.line_id, chunking_identity);
 
@@ -111,7 +188,7 @@ impl Chunker {
                 section_id: line.section_id,
                 line_hash: line.line_hash,
                 anchor_text: line.text.clone(),
-                embedding_text: truncated_text,
+                embedding_text: embedded_text,
                 chunk_hash,
                 content_hash: book.content_fingerprint,
                 reference: line.reference.clone(),
@@ -123,6 +200,29 @@ impl Chunker {
         }
 
         chunks
+    }
+
+    /// What the model is given for one line.
+    ///
+    /// The `match` is the point: whether a title prefix or a reference prefix helps is
+    /// S1's measurement, and the answer becomes a second
+    /// [`EmbeddingTextRecipe`] with an arm here. Until one exists, `embedding_text_version`
+    /// can only be 1 — which is what stops an artifact declaring a recipe nobody wrote.
+    fn embedding_text_for(
+        &self,
+        book: &BookForIndexing,
+        index: usize,
+        char_count: usize,
+    ) -> String {
+        match self.text_recipe {
+            EmbeddingTextRecipe::LineOrNeighbourContext => {
+                if char_count < self.config.min_meaningful_chars {
+                    self.build_context_text(book, index)
+                } else {
+                    book.lines[index].text.clone()
+                }
+            }
+        }
     }
 
     fn build_context_text(&self, book: &BookForIndexing, index: usize) -> String {
@@ -202,6 +302,12 @@ mod tests {
     use super::*;
     use crate::semantic::types::BookLine;
 
+    /// Every test here drives a configuration this build implements, so the resolution
+    /// [`Chunker::new`] performs is not what any of them is about.
+    fn chunker(config: ChunkerConfig) -> Chunker {
+        Chunker::new(config).expect("the default recipe is implemented")
+    }
+
     fn dummy_book(lines: Vec<(u64, &str)>) -> BookForIndexing {
         BookForIndexing {
             source_book_key: "book1.txt".to_string(),
@@ -227,7 +333,7 @@ mod tests {
 
     #[test]
     fn skips_very_short_lines() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let book = dummy_book(vec![(1, "a"), (1, "ab"), (1, "abcde")]);
         let chunks = chunker.chunk_book(&book);
         assert_eq!(chunks.len(), 1);
@@ -236,7 +342,7 @@ mod tests {
 
     #[test]
     fn long_lines_stand_alone() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let book = dummy_book(vec![(
             1,
             "This is a very long line that exceeds twenty characters.",
@@ -254,7 +360,7 @@ mod tests {
     /// nothing. It must never reach the model.
     #[test]
     fn skips_lines_that_are_only_whitespace() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let book = dummy_book(vec![
             (1, "          "),
             (1, "\t\t\n  "),
@@ -272,7 +378,7 @@ mod tests {
     /// chunk through the context path either.
     #[test]
     fn a_short_line_whose_only_context_is_blank_still_embeds_its_own_text() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let book = dummy_book(vec![(1, "     "), (1, "אמת ויציב"), (1, "     ")]);
 
         let chunks = chunker.chunk_book(&book);
@@ -284,7 +390,7 @@ mod tests {
 
     #[test]
     fn short_lines_borrow_context_from_the_same_section_only() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let book = dummy_book(vec![
             (1, "סוף הסעיף הקודם עם מספיק תווים"),
             (2, "פתיחת הסעיף החדש עם מספיק תווים"),
@@ -313,7 +419,7 @@ mod tests {
 
     #[test]
     fn embedding_text_is_truncated_on_character_boundaries() {
-        let chunker = Chunker::new(ChunkerConfig {
+        let chunker = chunker(ChunkerConfig {
             max_chunk_chars: 10,
             ..Default::default()
         });
@@ -357,7 +463,7 @@ mod tests {
 
     #[test]
     fn chunk_hash_tracks_the_embedded_text_not_the_source_line() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let book = dummy_book(vec![(1, "שורה ראשונה עם מספיק תווים כדי לעמוד לבד")]);
         let chunks = chunker.chunk_book(&book);
 
@@ -374,7 +480,7 @@ mod tests {
 
     #[test]
     fn every_chunk_carries_its_books_metadata() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         let mut book = dummy_book(vec![(7, "שורה ארוכה דיה כדי לעמוד בפני עצמה")]);
         book.title = "ספר הבדיקה".to_string();
         book.topics = "/מקרא/תורה".to_string();
@@ -408,7 +514,7 @@ mod tests {
 
     #[test]
     fn an_empty_book_yields_no_chunks() {
-        let chunker = Chunker::new(ChunkerConfig::default());
+        let chunker = chunker(ChunkerConfig::default());
         assert!(chunker.chunk_book(&dummy_book(vec![])).is_empty());
     }
 
