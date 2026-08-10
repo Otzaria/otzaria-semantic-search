@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -173,11 +174,89 @@ def test_smoke_accepts_only_a_gpu_and_a_network(tmp_path):
     )
 
 
-def test_the_tools_that_report_a_failure_also_exit_non_zero():
-    """A benchmark that prints three failures and exits zero gets read by eye."""
-    for name in ("smoke", "run_bench", "build_cuda_binary"):
-        body = (HERE / f"{name}.py").read_text()
-        assert "SystemExit" in body, f"{name}.py can still finish successfully after failing"
+def done(returncode, stdout):
+    """What `subprocess.run` hands back from a `build`."""
+    return subprocess.CompletedProcess("build", returncode, stdout, "stderr text")
+
+
+# Both benchmark scripts carry the same rule, and cannot share a module: each is uploaded
+# to Kaggle as a standalone notebook. So both are tested, and a divergence between the two
+# copies fails here rather than on a GPU.
+@pytest.fixture(params=["run_bench", "build_cuda_binary"])
+def bench(request, tmp_path):
+    return load(request.param, tmp_path)
+
+
+def test_a_run_that_printed_no_vector_count_measured_nothing(bench):
+    """The one that cost an hour: `ok` was true whenever the exit code was zero, so a
+    session that embedded nothing was recorded as a successful run with a null rate."""
+    result = bench.verdict(done(0, "Path: /kaggle/working/artifact\nBooks: 3\n"), 10.0)
+
+    assert result["ok"] is False
+    assert "no vector count" in result["reason"]
+
+
+def test_a_nonzero_exit_measured_nothing_whatever_it_printed(bench):
+    result = bench.verdict(done(101, "Vectors:         24000\n"), 10.0)
+
+    assert result["ok"] is False
+    assert "exit 101" in result["reason"]
+
+
+def test_a_measurement_is_a_count_and_a_rate(bench):
+    result = bench.verdict(done(0, "Vectors:         24000\n"), 10.0)
+
+    assert result["ok"] is True
+    assert (result["vectors"], result["vectors_per_second"]) == (24000, 2400.0)
+
+
+def test_a_failed_configuration_is_run_through_the_real_loop(tmp_path, monkeypatch):
+    """`verdict` is right, and `run_configuration` is what calls it."""
+    module = load("run_bench", tmp_path)
+    monkeypatch.setattr(module, "OUT", tmp_path)
+    monkeypatch.setattr(module, "run", lambda *args, **kw: None)
+
+    result = module.run_configuration(
+        "binary",
+        "model",
+        "corpus",
+        module.CONFIGS[0],
+        runner=lambda *args, **kw: done(0, "no count here\n"),
+    )
+
+    assert result["ok"] is False and result["name"] == module.CONFIGS[0]["name"]
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [("run_bench", "configuration(s) failed"), ("build_cuda_binary", "the measurement failed")],
+)
+def test_a_tool_that_reports_a_failure_also_exits_non_zero(tmp_path, monkeypatch, name, expected):
+    """Exercised, not grepped for. The first version of this test looked for the string
+    `SystemExit` in the file, which proves the word is present and nothing else."""
+    module = load(name, tmp_path)
+    binary = tmp_path / "otzaria-semantic-search"
+    binary.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(module, "OUT", tmp_path)
+    monkeypatch.setattr(module, "run", lambda *args, **kw: None)
+    monkeypatch.setattr(module, "subprocess", SimpleNamespace(run=lambda *a, **k: done(0, "T4")))
+    monkeypatch.setattr(
+        module,
+        "run_configuration",
+        lambda *args, **kw: {"name": "n_ctx512-batch32", "ok": False, "reason": "exit 101"},
+    )
+    if name == "run_bench":
+        monkeypatch.setattr(module, "locate", lambda: (binary, "model", "corpus"))
+    else:
+        monkeypatch.setattr(module, "compile_binary", lambda: binary)
+
+    with pytest.raises(SystemExit) as refusal:
+        module.main()
+
+    assert expected in str(refusal.value)
+    # And the results are on disk before the refusal: Kaggle keeps a failed kernel's
+    # output, so the run that failed is still the run that can be read.
+    assert json.loads((tmp_path / "bench-results.json").read_text())["runs"][0]["ok"] is False
 
 
 if __name__ == "__main__":

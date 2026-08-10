@@ -56,55 +56,82 @@ def run(cmd, check=True, **kw):
     return result
 
 
-run("nvidia-smi")
-run("nvcc --version", check=False)
+def verdict(completed, elapsed):
+    """What one configuration measured, and whether it measured anything at all.
 
-# bindgen needs libclang, which the image does not carry.
-run("apt-get -qq update && apt-get -qq install -y libclang-dev", check=False)
-run("ls /usr/lib/llvm-*/lib/libclang.so* /usr/lib/x86_64-linux-gnu/libclang*", check=False)
+    The same rule `run_bench.py` applies, deliberately identical: `returncode == 0` is not
+    the bar, because `build` prints `Vectors: N` from its own report only after it has
+    packed and verified the artifact. A run without that line measured nothing, and used
+    to be recorded as `ok` with a null rate.
+    """
+    vectors = next(
+        (
+            int(line.split()[-1])
+            for line in completed.stdout.splitlines()
+            if line.startswith("Vectors:")
+        ),
+        None,
+    )
+    seconds = round(elapsed, 2)
+    if completed.returncode != 0:
+        return {"ok": False, "seconds": seconds, "reason": f"exit {completed.returncode}"}
+    if not vectors:
+        return {"ok": False, "seconds": seconds, "reason": "no vector count was printed"}
+    return {
+        "ok": True,
+        "seconds": seconds,
+        "vectors": vectors,
+        "vectors_per_second": round(vectors / elapsed, 2) if elapsed > 0 else None,
+    }
 
-run(
-    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
-    "| sh -s -- -y --default-toolchain stable --profile minimal"
-)
-os.environ["PATH"] = f"{os.path.expanduser('~/.cargo/bin')}:{os.environ['PATH']}"
 
-run(f"rm -rf {SRC} && git clone {REPO} {SRC}")
-run(f"cd {SRC} && git checkout {REV} && git rev-parse HEAD")
+def compile_binary():
+    """Toolchain, sources, nvcc — and the binary published where a later session can
+    attach it."""
+    run("nvidia-smi")
+    run("nvcc --version", check=False)
 
-env = dict(os.environ)
-# 75 == Turing (T4): int8 tensor cores and __dp4a, which is what llama.cpp's
-# quantized matmul needs. 60 == P100, which has neither. Both, so the sibling run
-# on a P100 uses the same binary and the comparison is of hardware only.
-# `cuda-no-vmm`, not `cuda`: llama.cpp links `CUDA::cuda_driver` for its virtual-memory
-# allocator, and that CMake target only exists when the driver *stub* `libcuda.so` is
-# installed. Kaggle's image ships `libcuda.so.1` — the runtime library — and no stub, so
-# `cuda` fails configure at ggml-cuda/CMakeLists.txt:182 with "the target was not found".
-# `GGML_CUDA_NO_VMM=ON` drops that link. It costs a pooled-allocator optimization and
-# changes no arithmetic.
-env["CUDAARCHS"] = "60-real;75-real"
-env["CMAKE_BUILD_PARALLEL_LEVEL"] = str(os.cpu_count() or 4)
-run(
-    f"cd {SRC} && cargo build --release --locked "
-    '--features "llama-backend,llama-cpp-2/cuda-no-vmm" '
-    "--bin otzaria-semantic-search",
-    env=env,
-)
+    # bindgen needs libclang, which the image does not carry.
+    run("apt-get -qq update && apt-get -qq install -y libclang-dev", check=False)
+    run("ls /usr/lib/llvm-*/lib/libclang.so* /usr/lib/x86_64-linux-gnu/libclang*", check=False)
 
-binary = OUT / "otzaria-semantic-search"
-run(f"cp {SRC}/target/release/otzaria-semantic-search {binary}")
-run(f"cd {SRC} && git rev-parse HEAD > {OUT}/BUILT_FROM.txt")
-run(f"sha256sum {binary} | tee -a {OUT}/BUILT_FROM.txt")
+    run(
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
+        "| sh -s -- -y --default-toolchain stable --profile minimal"
+    )
+    os.environ["PATH"] = f"{os.path.expanduser('~/.cargo/bin')}:{os.environ['PATH']}"
 
-gpu = subprocess.run(
-    "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
-    shell=True,
-    capture_output=True,
-    text=True,
-).stdout.strip()
+    run(f"rm -rf {SRC} && git clone {REPO} {SRC}")
+    run(f"cd {SRC} && git checkout {REV} && git rev-parse HEAD")
 
-results = []
-for config in CONFIGS:
+    env = dict(os.environ)
+    # 75 == Turing (T4): int8 tensor cores and __dp4a, which is what llama.cpp's
+    # quantized matmul needs. 60 == P100, which has neither. Both, so the sibling run
+    # on a P100 uses the same binary and the comparison is of hardware only.
+    # `cuda-no-vmm`, not `cuda`: llama.cpp links `CUDA::cuda_driver` for its virtual-memory
+    # allocator, and that CMake target only exists when the driver *stub* `libcuda.so` is
+    # installed. Kaggle's image ships `libcuda.so.1` — the runtime library — and no stub, so
+    # `cuda` fails configure at ggml-cuda/CMakeLists.txt:182 with "the target was not found".
+    # `GGML_CUDA_NO_VMM=ON` drops that link. It costs a pooled-allocator optimization and
+    # changes no arithmetic.
+    env["CUDAARCHS"] = "60-real;75-real"
+    env["CMAKE_BUILD_PARALLEL_LEVEL"] = str(os.cpu_count() or 4)
+    run(
+        f"cd {SRC} && cargo build --release --locked "
+        '--features "llama-backend,llama-cpp-2/cuda-no-vmm" '
+        "--bin otzaria-semantic-search",
+        env=env,
+    )
+
+    binary = OUT / "otzaria-semantic-search"
+    run(f"cp {SRC}/target/release/otzaria-semantic-search {binary}")
+    run(f"cd {SRC} && git rev-parse HEAD > {OUT}/BUILT_FROM.txt")
+    run(f"sha256sum {binary} | tee -a {OUT}/BUILT_FROM.txt")
+    return binary
+
+
+def run_configuration(binary, config, runner=subprocess.run):
+    """Build the whole bench corpus once, under one pair of knob settings."""
     artifact = OUT / f"artifact-{config['name']}"
     run(f"rm -rf {artifact}", check=False)
 
@@ -123,7 +150,7 @@ for config in CONFIGS:
     )
 
     started = time.time()
-    completed = subprocess.run(
+    completed = runner(
         f"{binary} build"
         f" --corpus-identity {CORPUS}/corpus-identity.json"
         f" --corpus-lines {CORPUS}/corpus-lines.jsonl"
@@ -141,38 +168,48 @@ for config in CONFIGS:
 
     print(f"\n=== {config['name']} ===", flush=True)
     print(completed.stdout[-2000:], flush=True)
-    if completed.returncode != 0:
+    result = {**config, **verdict(completed, elapsed)}
+    if not result["ok"]:
         print(completed.stderr[-4000:], flush=True)
-        results.append({**config, "ok": False, "seconds": round(elapsed, 2)})
-        continue
-
-    vectors = next(
-        (
-            int(line.split()[-1])
-            for line in completed.stdout.splitlines()
-            if line.startswith("Vectors:")
-        ),
-        None,
-    )
-    results.append(
-        {
-            **config,
-            "ok": True,
-            "seconds": round(elapsed, 2),
-            "vectors": vectors,
-            "vectors_per_second": round(vectors / elapsed, 2) if vectors else None,
-        }
-    )
-    print(f"--> {results[-1]['vectors_per_second']} vectors/s", flush=True)
+        print(f"--> FAILED: {result['reason']}", flush=True)
+    else:
+        print(f"--> {result['vectors_per_second']} vectors/s", flush=True)
     # The rate is the deliverable, not this artifact; /kaggle/working is capped.
     run(f"rm -rf {artifact}", check=False)
+    return result
 
-(OUT / "bench-results.json").write_text(
-    json.dumps({"gpu": gpu, "revision": REV, "runs": results}, indent=2)
-)
-print(json.dumps({"gpu": gpu, "runs": results}, indent=2), flush=True)
-run(f"ls -la {OUT}")
 
-# The binary is the deliverable, and a kernel that finishes without one has not built it.
-if not (OUT / "otzaria-semantic-search").exists():
-    raise SystemExit("the build produced no binary")
+def main():
+    binary = compile_binary()
+    gpu = subprocess.run(
+        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
+        shell=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    results = [run_configuration(binary, config) for config in CONFIGS]
+    (OUT / "bench-results.json").write_text(
+        json.dumps({"gpu": gpu, "revision": REV, "runs": results}, indent=2)
+    )
+    print(json.dumps({"gpu": gpu, "runs": results}, indent=2), flush=True)
+    run(f"ls -la {OUT}")
+
+    # The binary is the deliverable, and a kernel that finishes without one has not built
+    # it.
+    if not binary.exists():
+        raise SystemExit("the build produced no binary")
+
+    # The compile is worth keeping even when the measurement failed — it is an hour of
+    # quota and every later session attaches it — so the binary is published above and only
+    # then is this session called what it was. Kaggle keeps the output of a failed kernel,
+    # so refusing here loses nothing and is the difference between "no number" and "a
+    # number nobody checked": all three configurations could fail and this script still
+    # exited zero.
+    failed = [f"{run['name']} ({run['reason']})" for run in results if not run["ok"]]
+    if failed:
+        raise SystemExit(f"the binary was built; the measurement failed: {', '.join(failed)}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
