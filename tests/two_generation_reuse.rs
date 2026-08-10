@@ -17,6 +17,12 @@
 //! *neighbour* changed is the case an id-keyed diff gets silently wrong, and it is the
 //! reason the ledger is keyed on the embedding text instead — see
 //! `distribution::reuse`. A corpus of independent lines would pass either design.
+//!
+//! Two generations have to be embedded here, so a backend is required, and the stub GGUF
+//! this uses is one real inference rightly refuses — hence `mock-embedding` without
+//! `llama-backend`, the same gate the other end-to-end tests carry.
+
+#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
 
 use otzaria_semantic_search::distribution::builder::PlannedCorpus;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};

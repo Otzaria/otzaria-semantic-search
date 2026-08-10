@@ -61,7 +61,12 @@ jobs:
       # `py_compile` proves the operational tools parse; these prove they fail. A tool
       # that reports a failure and exits zero is one somebody reads by eye, and that is
       # how four accounts with no GPU were scheduled work during the v1 campaign.
+      #
+      # Linux only. These are operator scripts run from one machine against Kaggle, not
+      # anything the crate ships, so a second platform adds no signal — and `python3` is
+      # not reliably on PATH on the Windows runner without `setup-python`.
       - name: Test the operational tools
+        if: runner.os == 'Linux'
         run: |
           python3 -m pip install --quiet pytest
           python3 -m pytest tools/kaggle/test_queue.py -q
