@@ -556,8 +556,96 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
             "{name} was touched by a merge that refused to run"
         );
     }
-    assert!(
-        !merged.join("vectors.f32.partial").exists(),
-        "and no partial was opened before the refusal"
+    for name in ["vectors.f32.partial", "records.jsonl.partial"] {
+        assert!(
+            !merged.join(name).exists(),
+            "{name} was opened before the refusal"
+        );
+    }
+
+    // 13. A merge that fails *after* it has written bytes leaves nothing behind — not the
+    //     final names, not a partial. Without this, the whole point of writing to `.partial`
+    //     was untested: disabling the cleanup left every other test green.
+    //
+    //     The shard is real except for its last record, which is replaced by text that is
+    //     not JSON and is the same length, so the line count and the vector file still agree
+    //     with the manifest and only the merge itself can refuse.
+    let doctored = dir.at("doctored");
+    let doctored_shard = doctored.join("0");
+    std::fs::create_dir_all(&doctored_shard).unwrap();
+    std::fs::copy(
+        shard.join("vectors.f32"),
+        doctored_shard.join("vectors.f32"),
+    )
+    .unwrap();
+    let mut shard_records: Vec<String> = std::fs::read_to_string(shard.join("records.jsonl"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let last = shard_records.last_mut().unwrap();
+    *last = format!("{{{}", " ".repeat(last.len() - 1));
+    std::fs::write(
+        doctored_shard.join("records.jsonl"),
+        format!("{}\n", shard_records.join("\n")),
+    )
+    .unwrap();
+    let mut shard_manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(shard.join("shard-manifest.json")).unwrap())
+            .unwrap();
+    shard_manifest["records_sha256"] =
+        serde_json::json!(sha256_of(&doctored_shard.join("records.jsonl")));
+    std::fs::write(
+        doctored_shard.join("shard-manifest.json"),
+        serde_json::to_vec_pretty(&shard_manifest).unwrap(),
+    )
+    .unwrap();
+
+    let broken = dir.at("merged-broken");
+    refused(
+        &[
+            "assemble",
+            "--shards",
+            &doctored.display().to_string(),
+            "--plan-sha256",
+            &sha256_of(&plan),
+            "--embed-records",
+            &records.to_string(),
+            "--model",
+            &model_path.display().to_string(),
+            "--out",
+            &broken.display().to_string(),
+        ],
+        "Assembly failed",
+    );
+    for leftover in [
+        "vectors.f32",
+        "records.jsonl",
+        "vectors.f32.partial",
+        "records.jsonl.partial",
+    ] {
+        assert!(
+            !broken.join(leftover).exists(),
+            "{leftover} survived a merge that failed part-way through"
+        );
+    }
+
+    // 14. And a finished shard is not silently re-embedded over. Retrying a window is
+    //     normal — a Kaggle session that timed out gets another account — so leftovers are
+    //     fair game and only all three files together are protected.
+    refused(
+        &[
+            "embed-shard",
+            "--plan",
+            &plan.display().to_string(),
+            "--model",
+            &model_path.display().to_string(),
+            "--model-file",
+            &model_file.display().to_string(),
+            "--out",
+            &shard.display().to_string(),
+            "--allow-non-semantic",
+        ],
+        "already holds a finished shard",
     );
 }

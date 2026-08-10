@@ -95,7 +95,9 @@ Options for 'embed-shard':
   --skip <N>                 Records to skip (default: 0)
   --take <N>                 Records to embed (default: all that remain)
   --batch <N>                Texts per inference call (default: 32)
-  --out <dir>                Receives vectors.f32, records.jsonl, shard-manifest.json
+  --out <dir>                Receives vectors.f32, records.jsonl, shard-manifest.json.
+                             Leftovers from a session that died are overwritten — retrying a
+                             window is normal — but a directory holding all three is not.
   --allow-non-semantic       As for 'build'
 
 Options for 'plan-split':
@@ -112,10 +114,13 @@ Options for 'assemble':
                              the width every file is strided by. There is no --dim: a
                              width the model does not declare is not a width.
   --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
-  --base-vectors <path>      vectors.f32 of the release being reused from
-  --out <dir>                Receives vectors.f32 and records.jsonl, and may hold neither
-                             already: the two are one fact, and a record is bound to a
-                             vector by position alone. To merge again, remove both first.
+  --ledger <path>            With --ledger-manifest and --base-vectors: the release being
+  --ledger-manifest <path>   reused from. All three or none, and --model with them.
+  --base-vectors <path>      vectors.f32 of that release
+  --out <dir>                Receives vectors.f32 and records.jsonl, and may hold neither —
+                             nor a .partial of either. The two files are one fact, and a
+                             record is bound to its vector by position alone, so nothing is
+                             overwritten: to merge again, remove what is there first.
 
 Options for 'ledger':
   --artifact <dir>           A packed artifact; its metadata.jsonl order is the payload's
@@ -591,6 +596,25 @@ fn run_embed_shard(args: &[String]) {
         std::fs::File::open(&plan_path)
             .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
     );
+    // A finished shard is three files, and this refuses to write over one. Unlike the merge,
+    // *re-running* is normal here — a session that timed out gets retried on another account
+    // — so a directory holding leftovers is fair game and only a complete shard is protected.
+    // Overwriting one silently discarded an hour of GPU time and reported success.
+    let manifest_path = out.join("shard-manifest.json");
+    if [
+        &out.join("vectors.f32"),
+        &out.join("records.jsonl"),
+        &manifest_path,
+    ]
+    .iter()
+    .all(|path| path.symlink_metadata().is_ok())
+    {
+        exit_with(
+            &format!("{} already holds a finished shard", out.display()),
+            "its vectors, records and manifest are all there; embed into another directory, \
+             or remove them to re-run this window",
+        );
+    }
     // `.partial` until the counts and digests are known: a shard killed by a session
     // timeout must not leave a file the merge could mistake for a finished one.
     let vectors_partial = out.join("vectors.f32.partial");
@@ -617,8 +641,16 @@ fn run_embed_shard(args: &[String]) {
         &mut records,
     )
     .unwrap_or_else(|error| exit_with("The shard failed", error));
-    drop((vectors, records));
-
+    // Onto the disk before either name is published, and the manifest last: it is the digest
+    // witness for both files, so a crash between the renames leaves a pair with the previous
+    // manifest — which `verify_shards` refuses, loudly, because the digests will not match.
+    for writer in [vectors, records] {
+        writer
+            .into_inner()
+            .unwrap_or_else(|error| exit_with("Could not finish writing the shard", error))
+            .sync_all()
+            .unwrap_or_else(|error| exit_with("Could not flush the shard to disk", error));
+    }
     for (partial, final_name) in [
         (&vectors_partial, "vectors.f32"),
         (&records_partial, "records.jsonl"),
@@ -626,11 +658,8 @@ fn run_embed_shard(args: &[String]) {
         std::fs::rename(partial, out.join(final_name))
             .unwrap_or_else(|error| exit_with("Could not publish the shard", error));
     }
-    std::fs::write(
-        out.join("shard-manifest.json"),
-        serde_json::to_vec_pretty(&report).unwrap(),
-    )
-    .unwrap_or_else(|error| exit_with("Could not write the shard manifest", error));
+    write_and_sync(&manifest_path, &serde_json::to_vec_pretty(&report).unwrap());
+    sync_directory(&out);
 
     println!("\n=== Embedded a shard ===");
     println!("Path:            {}", out.display());
@@ -684,6 +713,28 @@ fn run_plan_split(args: &[String]) {
 fn run_assemble(args: &[String]) {
     let out = PathBuf::from(require_arg(args, "--out"));
     let shard_root = PathBuf::from(require_arg(args, "--shards"));
+    // Before the base artifact is hashed and every shard is read, not after: this is the one
+    // refusal that can be decided in a second, and deciding it late meant tens of gigabytes
+    // of verification followed by "already exists".
+    //
+    // Nothing here overwrites, for the reason the ledger does not: the two files are one
+    // fact and two renames are not one commit. Into a directory that already holds a pair, a
+    // crash after the first rename would leave the new vectors beside the *old* records —
+    // and a record is bound to its vector by position alone, so nothing downstream can prove
+    // the floats do not belong to those ids.
+    let vectors_final = out.join("vectors.f32");
+    let records_final = out.join("records.jsonl");
+    let vectors_partial = out.join("vectors.f32.partial");
+    let records_partial = out.join("records.jsonl.partial");
+    require_free(
+        &[
+            &vectors_final,
+            &records_final,
+            &vectors_partial,
+            &records_partial,
+        ],
+        "the merged vectors and their records are published as a pair",
+    );
     // The width comes from the identity the shards were verified against, not from the
     // command line. It was a `--dim` argument, and a `--dim` that disagreed with the model
     // made every stride through the base and the shards the wrong length — while the
@@ -760,29 +811,6 @@ fn run_assemble(args: &[String]) {
     // as it reads, so anything it refuses part-way through has already put bytes on disk —
     // and a truncated pair under the final names is one a later `pack` would read as the
     // whole release.
-    let vectors_final = out.join("vectors.f32");
-    let records_final = out.join("records.jsonl");
-    let vectors_partial = out.join("vectors.f32.partial");
-    let records_partial = out.join("records.jsonl.partial");
-    // Nothing here overwrites, for the reason the ledger does not: the two files are one
-    // fact and two renames are not one commit. Into a directory that already holds a pair,
-    // a crash after the first rename would leave the new vectors beside the *old* records —
-    // and a record and a vector are bound only by their position, so nothing downstream can
-    // prove the floats do not belong to the ids.
-    for existing in [
-        &vectors_final,
-        &records_final,
-        &vectors_partial,
-        &records_partial,
-    ] {
-        if existing.exists() {
-            exit_with(
-                &format!("{} already exists", existing.display()),
-                "the merged vectors and their records are published as a pair; --out must \
-                 hold neither, or remove both first",
-            );
-        }
-    }
     let mut vectors = std::io::BufWriter::new(
         std::fs::File::create(&vectors_partial)
             .unwrap_or_else(|error| exit_with("Could not write vectors.f32", error)),
@@ -822,16 +850,19 @@ fn run_assemble(args: &[String]) {
                 abandon("Could not flush the merge to disk", error.to_string())
             });
     }
+    // `abandon` here too, not a plain exit: if the first rename lands and the second fails,
+    // what is left is a published `vectors.f32` and a stray `records.jsonl.partial`. The
+    // guard above proves the directory held neither file, so this cannot be the dangerous
+    // pairing — but leaving the partial would make the next run refuse for the wrong reason.
     for (partial, published) in [
         (&vectors_partial, &vectors_final),
         (&records_partial, &records_final),
     ] {
-        std::fs::rename(partial, published)
-            .unwrap_or_else(|error| exit_with("Could not publish the merged vectors", error));
+        std::fs::rename(partial, published).unwrap_or_else(|error| {
+            abandon("Could not publish the merged vectors", error.to_string())
+        });
     }
-    if let Ok(handle) = std::fs::File::open(&out) {
-        let _ = handle.sync_all();
-    }
+    sync_directory(&out);
 
     println!("\n=== Assembled a release's vectors ===");
     println!("Vectors:   {}", report.vectors);
@@ -867,15 +898,10 @@ fn run_ledger(args: &[String]) {
     // then leaves a ledger with no manifest, which is a missing file and unambiguous, and
     // the caller who really wants to rebuild in place deletes them first — deliberately,
     // which is the point.
-    for existing in [&out, &manifest_path] {
-        if existing.exists() {
-            exit_with(
-                &format!("{} already exists", existing.display()),
-                "a ledger and its manifest are published as a pair; name a path that holds \
-                 neither, or remove both first",
-            );
-        }
-    }
+    require_free(
+        &[&out, &manifest_path, &out.with_extension("partial")],
+        "a ledger and its manifest are published as a pair",
+    );
 
     // The artifact first, and every byte of it. Nothing about the ledger is worth deriving
     // from an artifact that does not verify, and the identity below has to come from the
@@ -970,19 +996,60 @@ fn run_ledger(args: &[String]) {
     std::fs::rename(&manifest_partial, &manifest_path)
         .unwrap_or_else(|error| exit_with("Could not put the ledger manifest in place", error));
     // The renames themselves, so a power loss after this command returns cannot lose the
-    // directory entries it just created. Best effort: a directory is not openable as a file
-    // on every platform, and there is nothing to do about it where it is not.
-    if let Some(directory) = out.parent() {
-        if let Ok(handle) = std::fs::File::open(directory) {
-            let _ = handle.sync_all();
-        }
-    }
+    // directory entries it just created.
+    sync_directory(out.parent().unwrap_or(Path::new(".")));
 
     println!("\n=== Built a ledger from the artifact ===");
     println!("Ledger:   {}", out.display());
     println!("Manifest: {}", manifest_path.display());
     println!("Entries:  {entries}");
 }
+
+/// Refuse if any of these paths is taken, naming the first one that is.
+///
+/// `symlink_metadata`, not `exists`: `exists` follows a link, so a dangling symlink under
+/// one of the published names reads as "free" and the write then lands wherever the link
+/// points — outside the directory the caller named.
+fn require_free(paths: &[&Path], published_as: &str) {
+    for path in paths {
+        if path.symlink_metadata().is_ok() {
+            exit_with(
+                &format!("{} already exists", path.display()),
+                format!(
+                    "{published_as}; name a destination that holds none of them, or remove \
+                     them first"
+                ),
+            );
+        }
+    }
+}
+
+/// Flush a directory entry, so a rename this command has already reported survives a power
+/// loss.
+///
+/// Unix only, and fatal there rather than best-effort — the same rule
+/// [`crate::semantic::manifest`] follows: Windows cannot open a directory as a file, so the
+/// rename is left as the filesystem's own guarantee, and where the call *is* available a
+/// failure is not quietly downgraded to "probably durable".
+#[cfg(unix)]
+fn sync_directory(dir: &Path) {
+    let handle = std::fs::File::open(dir).unwrap_or_else(|error| {
+        exit_with(
+            &format!("Could not open {} to flush its entries", dir.display()),
+            error,
+        )
+    });
+    handle.sync_all().unwrap_or_else(|error| {
+        exit_with(
+            &format!("Could not flush the directory entries of {}", dir.display()),
+            error,
+        )
+    });
+}
+
+/// See the Unix implementation. Nothing to do here; documented, not silent.
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) {}
 
 /// Write a small file and get it onto the disk before anything renames it into place.
 fn write_and_sync(path: &Path, bytes: &[u8]) {
