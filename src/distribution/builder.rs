@@ -257,7 +257,7 @@ impl CorpusBooks for PlannedCorpus<'_> {
 /// Hoisted out of [`BuildPlan::compute`] so [`build`] can ask it before opening a model or
 /// reading a corpus: it costs one hash of five integers, and it is the check most likely to
 /// fail on a misconfigured build.
-fn ensure_recipe_matches(
+pub(crate) fn ensure_recipe_matches(
     chunking: &ChunkerConfig,
     model: &ModelIdentity,
 ) -> Result<u64, PackError> {
@@ -403,7 +403,7 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
 /// and content hash are discarded here, and the packer reads every stored field from
 /// [`CorpusIndex::line`] instead. What the chunker actually consumes is each line's text,
 /// its `section_id` and its position in the list.
-fn chunks_for_book(
+pub(crate) fn chunks_for_book(
     corpus: &dyn CorpusBooks,
     chunker: &Chunker,
     book_key: &str,
@@ -645,12 +645,15 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
+            // The clock alone collided: macOS ticks coarser than a test takes to start.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "otzaria_builder_{name}_{}",
+                "otzaria_builder_{name}_{}_{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)

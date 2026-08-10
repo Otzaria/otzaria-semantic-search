@@ -58,10 +58,27 @@ jobs:
       - name: Test (mock-embedding)
         run: cargo test --lib --tests --features mock-embedding
 
-      # Also the only step in this job that compiles llama.cpp, since
-      # `--all-features` turns on `llama-backend`.
+      # `py_compile` proves the operational tools parse; these prove they fail. A tool
+      # that reports a failure and exits zero is one somebody reads by eye, and that is
+      # how four accounts with no GPU were scheduled work during the v1 campaign.
+      #
+      # Linux only. These are operator scripts run from one machine against Kaggle, not
+      # anything the crate ships, so a second platform adds no signal — and `python3` is
+      # not reliably on PATH on the Windows runner without `setup-python`.
+      - name: Test the operational tools
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest tools/kaggle/test_queue.py -q
+
+      # Also the only step in this job that compiles llama.cpp.
+      #
+      # The feature list is spelled out rather than `--all-features`, because `cuda`
+      # cannot be one of them: it sets `GGML_CUDA=ON`, and a runner without `nvcc`
+      # fails cmake configure before a single doc comment is read. Cargo has no way to
+      # hold a feature back from `--all-features`, so the caller has to.
       - name: Check Documentation
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --features mock-embedding,llama-backend
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -73,7 +90,7 @@ jobs:
   # Separate job: `llama-backend` builds llama.cpp through cmake, which is minutes
   # of C++ per runner, and its failures are almost never OS-specific. ubuntu for
   # the general coverage, macos because it is the only runner compiling the Metal
-  # path. Windows gets the backend via the `cargo doc --all-features` step above.
+  # path. Windows gets the backend via the `cargo doc` step above.
   llama-backend:
     name: Inference Backend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

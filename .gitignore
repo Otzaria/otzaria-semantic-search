@@ -27,3 +27,4 @@ semantic_db/
 # otherwise committable — it has already been staged accidentally once.
 __pycache__/
 *.pyc
+.DS_Store

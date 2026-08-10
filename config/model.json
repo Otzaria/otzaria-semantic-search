@@ -1,0 +1,12 @@
+{
+  "model_id": "EMD123/Otzaria-Embedding-V1-Flash-0.6B",
+  "model_checksum": "a1a89520be990087b0a54cc2635513e6eddbfae598fe979b44c52c6bd224b064",
+  "model_quantization": "Q4_K_M",
+  "embedding_backend": "llama-cpp-qwen3-last-v1",
+  "embedding_dim": 1024,
+  "pooling": "last-token",
+  "max_tokens": 512,
+  "embedding_text_version": 1,
+  "normalization_version": 1,
+  "chunking_identity": 6636791861761206090
+}

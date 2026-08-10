@@ -458,6 +458,41 @@ pub enum PackError {
     #[error("There is nothing to pack: the input holds no vectors")]
     NoVectors,
 
+    /// The ledger being reused from describes a different vector space.
+    ///
+    /// A digest names a vector only within one model, one backend, one pooling and one
+    /// recipe. Two artifacts can agree that a line's embedding text hashes to the same
+    /// value and still hold vectors that cannot be compared to each other — so reuse is
+    /// refused unless every field of the identity matches, including the ones that look
+    /// cosmetic.
+    #[error(
+        "The ledger was built under {field}={ledger:?} and this build uses {build:?}: its \
+         vectors describe a different space and cannot be reused"
+    )]
+    LedgerDisagreesWithBuild {
+        field: &'static str,
+        ledger: String,
+        build: String,
+    },
+
+    /// A plan record's text is not the text its digest names.
+    ///
+    /// The digest travels beside the text precisely so that the machine holding no
+    /// corpus can still tell that what reached it is what was exported. Without the
+    /// comparison a plan file damaged in transit — truncated mid-record, re-encoded,
+    /// edited — would be embedded happily, and the resulting vector would describe a
+    /// passage the library does not contain while carrying a `chunk_hash` that says
+    /// otherwise.
+    #[error(
+        "The plan's text for line {line_id} hashes to {actual}, and the plan declares \
+         {declared}: what reached this worker is not what was exported"
+    )]
+    PlanTextChanged {
+        line_id: u64,
+        declared: String,
+        actual: String,
+    },
+
     /// The chunker configuration a build was handed is not the one the artifact declares.
     ///
     /// `chunking_identity` is a one-way hash of the whole configuration, so nothing can

@@ -957,12 +957,15 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
+            // The clock alone collided: macOS ticks coarser than a test takes to start.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "otzaria_embed_test_{name}_{}",
+                "otzaria_embed_test_{name}_{}_{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             let _ = std::fs::create_dir_all(&path);
             Self(path)
