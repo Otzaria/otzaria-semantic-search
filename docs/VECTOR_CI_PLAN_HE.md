@@ -80,6 +80,11 @@ occurrenceIdx)`, נשמר ב־`build_state.db`, נזרע מנכס ה־release ה
 
 ## 5. הצינור
 
+> **ה־workflow עצמו אינו בענף הזה.** הוא יושב ב־`vector-release-ci` עד שששת הפגמים
+> שנמצאו בסקירה נסגרים — job שמניח קבצים מ־job אחר, העברת 28 GB ל־runner מתארח,
+> `wait` שמסתיר כשל של כרטיס אחד, ותווית runner שאינה ייחודית. workflow על `main`
+> נרשם ב־GitHub וניתן להפעלה, ולכן אחד שאינו יכול לרוץ מקצה לקצה אינו נכנס לשם.
+
 ```
 repository_dispatch (PAT) מ־SeforimLibrary
   │
@@ -94,8 +99,19 @@ repository_dispatch (PAT) מ־SeforimLibrary
 מחדש מפיק אותו digest כמו build בתהליך אחד. גבול shard חייב ליפול על כפולה של גודל
 ה־batch — פלט llama.cpp תלוי בהרכב ה־batch, ופיצול שחותך batch אינו משחזר.
 
-**שלושה שלבים עדיין חסרים בקוד:** ‏`ledger` (הפקת המפתח מארטיפקט), `plan-split`
-(פיצול לפי ה־ledger) ו־`assemble` (הרכבה משני מקורות בסדר ה־plan).
+שלושת השלבים שהיו חסרים — `ledger`, `plan-split` ו־`assemble` — קיימים עכשיו כתת־פקודות.
+
+**ה־ledger נבנה אחרי האריזה ולא לפניה.** ‏`pack` ממיין את ה־payload לפי `semantic_id`,
+ולכן הסדר ש־`assemble` מייצר אינו הסדר שמישהו מוריד. ledger שנבנה מן ה־assembler
+פורסם פעם אחת וכל אחת מרשומותיו הצביעה על שורה אחרת — 20,000 מתוך 20,000 במדגם.
+‏`ledger_from_artifact` קורא את `metadata.jsonl` של הארטיפקט ומצטרף אליו את
+`records.jsonl` בשביל ה־digest המלא: ה־payload שומר `chunk_hash` של 32 תווים, שמספיק
+להשוואה בזמן ריצה ואינו מספיק כדי להחליט מה לדלג עליו.
+
+**ומיחזור מחייב `ledger-manifest.json`.** offsets ו־digests לבדם אינם אומרים מאיזה מודל
+הווקטורים באו, ולכן ledger ממודל אחר היה נקלט בשקט לספרייה של שני מרחבים לא תואמים.
+‏`plan-split` משווה כל שדה של `ModelIdentity` — כולל `pooling` ו־`max_tokens`, שנראים
+קוסמטיים ואינם.
 
 ## 6. Kaggle
 
