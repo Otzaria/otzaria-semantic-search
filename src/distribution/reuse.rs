@@ -558,9 +558,19 @@ pub fn plan_split(
 /// finite, or two shards covering one window and none covering another all merged
 /// cleanly — the packer re-normalises the floats and the id set can still be complete.
 ///
-/// What is checked: one plan and one model across every shard, each file matching the
-/// digest its own manifest recorded, and the windows tiling `[0, total)` exactly — no
+/// What is checked, per shard: the plan it was cut from, its model *and* the width that
+/// model declares, that it wrote exactly the records its window asked for, that
+/// `vectors.f32` is that many vectors wide, and that both files hash to what its own
+/// manifest recorded. Then, across shards: the windows tile `[0, total)` exactly — no
 /// hole, no overlap.
+///
+/// Nothing in [`ShardReport`] is read and then ignored. `take` and `embedding_dim` were,
+/// for a while, and a manifest field nobody compares is a field that can say anything.
+///
+/// The one thing left implicit is the *line count* of `records.jsonl`: `vectors.f32` is
+/// held to `records × dim × 4` bytes here, and [`assemble`] reads the two files in
+/// lockstep and refuses a leftover byte, so a records file of the wrong length is caught
+/// on both sides without a third pass over it.
 ///
 /// # Errors
 ///
@@ -610,6 +620,38 @@ pub fn verify_shards(
                 reason: format!("{named} was embedded by a different model identity"),
             });
         }
+        // The width the worker actually got back from its backend, against the width the
+        // model promises. `assemble` strides through both files by this number, so a shard
+        // that disagrees would be read at the wrong offset from its first vector on.
+        if manifest.embedding_dim != model.embedding_dim as usize {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named} holds {}-wide vectors and the model declares {}",
+                    manifest.embedding_dim, model.embedding_dim
+                ),
+            });
+        }
+        // The window, held to the plan. `read_plan` skips and takes over *records*, so a
+        // shard covers exactly what remains of the plan after its skip, capped by its take
+        // — and a shard that stopped early is a truncated GPU session, not a short window.
+        let remaining =
+            total
+                .checked_sub(manifest.skip)
+                .ok_or_else(|| PackError::MalformedInput {
+                    reason: format!(
+                        "{named} starts at {} and the plan holds {total} record(s)",
+                        manifest.skip
+                    ),
+                })?;
+        let owed = manifest.take.min(remaining);
+        if manifest.records != owed {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named} was given {} record(s) from {} and wrote {}",
+                    owed, manifest.skip, manifest.records
+                ),
+            });
+        }
         // Opened once, hashed through the handle, rewound, and carried out of here. The
         // caller cannot reopen by path, so the file that was checked is the file that is
         // read.
@@ -631,11 +673,33 @@ pub fn verify_shards(
             handles.push(handle);
         }
         let mut handles = handles.into_iter();
+        let vectors = handles.next().expect("two handles were opened");
+        // Through the handle that was hashed, before a byte is copied: a file of the wrong
+        // length would otherwise surface as `assemble` running out of vectors halfway.
+        let owed_bytes = (manifest.records as u64)
+            .checked_mul(manifest.embedding_dim as u64)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| PackError::MalformedInput {
+                reason: format!(
+                    "{named} declares {} vectors of {} floats, which is no file",
+                    manifest.records, manifest.embedding_dim
+                ),
+            })?;
+        let length = vectors.metadata().map_err(read_error)?.len();
+        if length != owed_bytes {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named}/vectors.f32 is {length} bytes and {} vector(s) of {} floats \
+                     are {owed_bytes}",
+                    manifest.records, manifest.embedding_dim
+                ),
+            });
+        }
         checked.push((
             manifest.skip,
             manifest.records,
             dir.as_path(),
-            handles.next().expect("two handles were opened"),
+            vectors,
             handles.next().expect("two handles were opened"),
         ));
     }
@@ -658,7 +722,11 @@ pub fn verify_shards(
                 },
             });
         }
-        covered += records;
+        covered = covered
+            .checked_add(*records)
+            .ok_or_else(|| PackError::MalformedInput {
+                reason: format!("the shards claim more records than a count can hold: {covered}"),
+            })?;
     }
     if covered != total {
         return Err(PackError::MalformedInput {
@@ -1194,6 +1262,80 @@ mod tests {
             verify_shards(&[a, b], "plan", &model, 6),
             "cover 4 record(s)",
         );
+    }
+
+    /// A manifest field nobody compares is a field that can say anything. Every shard
+    /// below is internally consistent — both digests match its own two files — and every
+    /// one of them is refused, because the *plan* says something else.
+    #[test]
+    fn a_shard_manifest_that_disagrees_with_the_plan_is_refused() {
+        let dir = TempDir::new("fields");
+        let model = model_for(&"ab".repeat(32), &ChunkerConfig::default());
+        // `vectors` vectors and `lines` records on disk, hashed honestly, with a manifest
+        // the caller then bends one field of.
+        let write = |name: &str, vectors: usize, lines: usize, bend: &dyn Fn(&mut ShardReport)| {
+            let at = dir.0.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            let floats = vectors_of(&vec![[1.0, 1.0]; vectors]);
+            let body: String = (0..lines)
+                .map(|i| format!("{{\"line_id\":{i},\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"d\"}}\n"))
+                .collect();
+            std::fs::write(at.join("vectors.f32"), &floats).unwrap();
+            std::fs::write(at.join("records.jsonl"), &body).unwrap();
+            let mut manifest = ShardReport {
+                plan_sha256: "plan".to_string(),
+                skip: 0,
+                take: lines,
+                records: lines,
+                embedding_dim: DIM,
+                vectors_sha256: sha256_hex(&floats),
+                records_sha256: sha256_hex(body.as_bytes()),
+                model: model.clone(),
+            };
+            bend(&mut manifest);
+            vec![(at, manifest)]
+        };
+
+        // A width the model does not declare. `assemble` strides by this number, so every
+        // vector after the first would be read from the middle of its neighbour.
+        expect_reason(
+            verify_shards(
+                &write("wide", 2, 2, &|m| m.embedding_dim = 4),
+                "plan",
+                &model,
+                2,
+            ),
+            "holds 4-wide vectors and the model declares 2",
+        );
+
+        // A session that stopped early: the window asked for four records and two came
+        // back. Nothing else in the set would notice, because this shard is the whole set.
+        expect_reason(
+            verify_shards(&write("short", 2, 2, &|m| m.take = 4), "plan", &model, 4),
+            "was given 4 record(s) from 0 and wrote 2",
+        );
+
+        // A window that begins past the end of the plan.
+        expect_reason(
+            verify_shards(&write("beyond", 2, 2, &|m| m.skip = 8), "plan", &model, 4),
+            "starts at 8 and the plan holds 4",
+        );
+
+        // Three records, three lines, and a vectors file holding two — every digest
+        // honest. Before the length check this reached `assemble` and ran out of floats
+        // halfway through the merge.
+        expect_reason(
+            verify_shards(
+                &write("truncated", 2, 3, &|m| m.records = 3),
+                "plan",
+                &model,
+                3,
+            ),
+            "is 16 bytes and 3 vector(s) of 2 floats are 24",
+        );
+
+        // The same shard, honest about all of it, is accepted.
+        assert!(verify_shards(&write("whole", 2, 2, &|_| {}), "plan", &model, 2).is_ok());
     }
 
     fn expect_reason<T>(outcome: Result<T, PackError>, expected: &str) {

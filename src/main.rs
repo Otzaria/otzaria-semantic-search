@@ -29,6 +29,7 @@ use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRun
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
 use otzaria_semantic_search::semantic::versioning::ModelIdentity;
+use otzaria_semantic_search::semantic::zevc_store::VECTORS_FILENAME;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -105,10 +106,11 @@ Options for 'plan-split':
 
 Options for 'assemble':
   --shards <dir>             Root holding every shard's output, at any depth
-  --dim <N>                  Embedding dimension, so a truncated file is arithmetic
   --plan-sha256 <hex>        The digest every shard's manifest must name
   --embed-records <N>        How many records the shards must cover, with no hole
-  --model <path>             The identity every shard must have been embedded under
+  --model <path>             The identity every shard must have been embedded under, and
+                             the width every file is strided by. There is no --dim: a
+                             width the model does not declare is not a width.
   --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
   --base-vectors <path>      vectors.f32 of the release being reused from
   --out <dir>                Receives vectors.f32 and records.jsonl
@@ -640,9 +642,6 @@ fn run_embed_shard(args: &[String]) {
 fn run_plan_split(args: &[String]) {
     let out = PathBuf::from(require_arg(args, "--out"));
     let plan = require_arg(args, "--plan");
-    // A ledger is optional, and its absence is the first build rather than a mistake.
-    let ledger = parse_arg(args, "--ledger");
-    let ledger_present = ledger.is_some();
 
     std::fs::create_dir_all(&out)
         .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
@@ -651,8 +650,9 @@ fn run_plan_split(args: &[String]) {
             .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
     );
     // A ledger without its manifest, its vectors and the model is a set of integers
-    // nothing can check, so reuse requires all of them or none.
-    let base = verified_base(args, ledger.as_deref(), ledger_present);
+    // nothing can check, so reuse requires all of them or none. No ledger at all is the
+    // first build rather than a mistake.
+    let base = verified_base(args);
     let mut reuse = std::io::BufWriter::new(
         std::fs::File::create(out.join("reuse.jsonl"))
             .unwrap_or_else(|error| exit_with("Could not write reuse.jsonl", error)),
@@ -679,9 +679,20 @@ fn run_plan_split(args: &[String]) {
 fn run_assemble(args: &[String]) {
     let out = PathBuf::from(require_arg(args, "--out"));
     let shard_root = PathBuf::from(require_arg(args, "--shards"));
-    let embedding_dim: usize = require_arg(args, "--dim")
-        .parse()
-        .unwrap_or_else(|_| exit_with("--dim", "not a number"));
+    // The width comes from the identity the shards were verified against, not from the
+    // command line. It was a `--dim` argument, and a `--dim` that disagreed with the model
+    // made every stride through the base and the shards the wrong length — while the
+    // identity the artifact publishes still said the model's number.
+    let shard_model = read_model(&require_arg(args, "--model"));
+    let embedding_dim = shard_model.embedding_dim as usize;
+    if let Some(given) = parse_arg(args, "--dim") {
+        if given.parse::<usize>() != Ok(embedding_dim) {
+            exit_with(
+                "--dim disagrees with the model and is no longer needed",
+                format!("{given} against the model's {embedding_dim}"),
+            );
+        }
+    }
 
     let reuse: Vec<ReuseEntry> = match parse_arg(args, "--reuse") {
         Some(path) => std::fs::read_to_string(&path)
@@ -696,7 +707,7 @@ fn run_assemble(args: &[String]) {
         None => Vec::new(),
     };
     // The same verified bundle `plan-split` used. Reuse cannot be handed a bare file.
-    let base = verified_base(args, parse_arg(args, "--ledger").as_deref(), true);
+    let base = verified_base(args);
 
     // Every `vectors.f32` under the root, at any depth: a shard produced by a
     // multi-GPU session is a directory of directories, and flattening it here means the
@@ -731,7 +742,6 @@ fn run_assemble(args: &[String]) {
         })
         .collect();
     let plan_sha256 = require_arg(args, "--plan-sha256");
-    let shard_model = read_model(&require_arg(args, "--model"));
     let expected: usize = require_arg(args, "--embed-records")
         .parse()
         .unwrap_or_else(|_| exit_with("--embed-records", "not a number"));
@@ -783,6 +793,39 @@ fn run_ledger(args: &[String]) {
     let records = require_arg(args, "--records");
     let out = PathBuf::from(require_arg(args, "--out"));
 
+    // The artifact first, and every byte of it. Nothing about the ledger is worth deriving
+    // from an artifact that does not verify, and the identity below has to come from the
+    // package rather than from the caller: `--model` and `--artifact-digest` used to be
+    // copied into the manifest unchecked, which let a manifest declare model B over
+    // vectors built by model A of the same width — and `VerifiedBase` would then verify
+    // the ledger perfectly against that lie.
+    let package = IndexPackage::read(&artifact)
+        .unwrap_or_else(|error| exit_with("The artifact could not be read", error));
+    println!("Verifying the artifact: reading every payload…");
+    package
+        .verify_integrity(&artifact)
+        .unwrap_or_else(|error| exit_with("The artifact does not verify", error));
+    let identity = package.manifest.identity.clone();
+    let digest = package.digest();
+    // An external anchor is compared, not copied. If the caller has the published digest,
+    // a mismatch means this is not the artifact they think it is — and it is worth learning
+    // that before the ledger is derived rather than after.
+    if let Some(published) = parse_arg(args, "--artifact-digest") {
+        if published != digest {
+            exit_with(
+                "This is not the artifact that digest was published for",
+                format!("published {published}, computed {digest}"),
+            );
+        }
+    }
+    // Already read and checked by `verify_integrity`, one line above. Hashing the file a
+    // second time cost another pass over 23.5 GB and could only agree.
+    let vectors_sha256 = package
+        .payloads
+        .get(VECTORS_FILENAME)
+        .map(|payload| payload.sha256.clone())
+        .unwrap_or_else(|| exit_with("The artifact has no vectors payload", VECTORS_FILENAME));
+
     let metadata = std::io::BufReader::new(
         std::fs::File::open(artifact.join("metadata.jsonl")).unwrap_or_else(|error| {
             exit_with("Could not read the artifact's metadata.jsonl", error)
@@ -792,26 +835,24 @@ fn run_ledger(args: &[String]) {
         std::fs::File::open(&records)
             .unwrap_or_else(|error| exit_with("Could not read the records", error)),
     );
+    // Both files land by rename, and only once both are known good. Writing the ledger
+    // first meant a failure here — a records file from another build, a digest that did not
+    // match — left a new ledger beside the previous manifest, which is the one pairing
+    // `VerifiedBase` cannot detect: each file is internally valid.
+    let partial = out.with_extension("partial");
     let mut sink = std::io::BufWriter::new(
-        std::fs::File::create(&out)
+        std::fs::File::create(&partial)
             .unwrap_or_else(|error| exit_with("Could not write the ledger", error)),
     );
 
     let entries = ledger_from_artifact(metadata, records, &mut sink)
         .unwrap_or_else(|error| exit_with("The ledger could not be built", error));
-    drop(sink);
-
-    // Read from the package, never taken from the caller. `--model` and
-    // `--artifact-digest` were copied into the manifest unchecked, which let a manifest
-    // declare model B over vectors built by model A of the same width — and `VerifiedBase`
-    // would then verify the ledger perfectly against that lie.
-    let package = IndexPackage::read(&artifact)
-        .unwrap_or_else(|error| exit_with("The artifact could not be read", error));
-    package
-        .verify_integrity(&artifact)
-        .unwrap_or_else(|error| exit_with("The artifact does not verify", error));
-    let identity = package.manifest.identity.clone();
-    let digest = package.digest();
+    std::io::Write::flush(&mut sink)
+        .unwrap_or_else(|error| exit_with("Could not finish writing the ledger", error));
+    sink.into_inner()
+        .unwrap_or_else(|error| exit_with("Could not finish writing the ledger", error))
+        .sync_all()
+        .unwrap_or_else(|error| exit_with("Could not flush the ledger to disk", error));
 
     if entries != package.manifest.vector_count as usize {
         exit_with(
@@ -822,36 +863,45 @@ fn run_ledger(args: &[String]) {
             ),
         );
     }
-    // An external anchor is compared, not copied. If the caller has the published digest,
-    // a mismatch means this is not the artifact they think it is.
-    if let Some(published) = parse_arg(args, "--artifact-digest") {
-        if published != digest {
-            exit_with(
-                "This is not the artifact that digest was published for",
-                format!("published {published}, computed {digest}"),
-            );
-        }
-    }
-
     let manifest = LedgerManifest {
         artifact_digest: digest,
-        vectors_sha256: sha256_of(&artifact.join("vectors.bin")),
-        ledger_sha256: sha256_of(&out),
+        vectors_sha256,
+        // The bytes that are about to be renamed into place, which are the bytes
+        // `VerifiedBase` will hash when it opens them.
+        ledger_sha256: sha256_of(&partial),
         vector_count: entries,
         embedding_dim: identity.model.embedding_dim,
         model: identity.model,
     };
     let manifest_path = out.with_extension("manifest.json");
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap_or_else(|error| exit_with("Could not write the ledger manifest", error));
+    let manifest_partial = out.with_extension("manifest.partial");
+    write_and_sync(
+        &manifest_partial,
+        &serde_json::to_vec_pretty(&manifest).unwrap(),
+    );
+    // The ledger before the manifest: a manifest with no ledger beside it is a missing
+    // file, and a ledger with no manifest is one command away from being described. A
+    // manifest describing the *previous* ledger is neither.
+    std::fs::rename(&partial, &out)
+        .unwrap_or_else(|error| exit_with("Could not put the ledger in place", error));
+    std::fs::rename(&manifest_partial, &manifest_path)
+        .unwrap_or_else(|error| exit_with("Could not put the ledger manifest in place", error));
 
     println!("\n=== Built a ledger from the artifact ===");
     println!("Ledger:   {}", out.display());
     println!("Manifest: {}", manifest_path.display());
     println!("Entries:  {entries}");
+}
+
+/// Write a small file and get it onto the disk before anything renames it into place.
+fn write_and_sync(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)
+        .unwrap_or_else(|error| exit_with(&format!("Could not write {}", path.display()), error));
+    file.write_all(bytes)
+        .unwrap_or_else(|error| exit_with(&format!("Could not write {}", path.display()), error));
+    file.sync_all()
+        .unwrap_or_else(|error| exit_with(&format!("Could not flush {}", path.display()), error));
 }
 
 /// SHA-256 of a file, streamed.
@@ -879,21 +929,42 @@ fn sha256_of(path: &Path) -> String {
 /// out of four is a check that cannot be performed, so it is refused rather than skipped.
 fn verified_base(
     args: &[String],
-    ledger: Option<&str>,
-    wanted: bool,
 ) -> Option<otzaria_semantic_search::distribution::reuse::VerifiedBase> {
+    let ledger = parse_arg(args, "--ledger");
     let manifest = parse_arg(args, "--ledger-manifest");
     let vectors = parse_arg(args, "--base-vectors");
     let model = parse_arg(args, "--model");
-    if !wanted || ledger.is_none() {
+    // Asking for reuse at all means asking for all of it. Returning early on a missing
+    // `--ledger` ignored the other two in silence, so `--ledgr ledger.jsonl` — with the
+    // manifest and the vectors both correctly named — read as "there is no base" and spent
+    // a full rebuild on a typo.
+    let named: Vec<&str> = [
+        ("--ledger", ledger.is_some()),
+        ("--ledger-manifest", manifest.is_some()),
+        ("--base-vectors", vectors.is_some()),
+    ]
+    .iter()
+    .filter_map(|(name, given)| given.then_some(*name))
+    .collect();
+    if !named.is_empty() && named.len() < 3 {
+        exit_with(
+            "Reuse needs --ledger, --ledger-manifest, --base-vectors and --model together",
+            format!(
+                "only {} was given, and offsets cannot be checked without the file they \
+                 index and the identity they were built under",
+                named.join(", ")
+            ),
+        )
+    }
+    if named.is_empty() {
         return None;
     }
     let (Some(manifest_path), Some(vectors_path), Some(model_path)) = (manifest, vectors, model)
     else {
         exit_with(
-            "--ledger needs --ledger-manifest, --base-vectors and --model",
-            "offsets cannot be checked without the file they index and the identity they \
-             were built under",
+            "Reuse also needs --model",
+            "the identity the base was built under is what makes its vectors comparable \
+             with the ones about to be embedded",
         )
     };
     let manifest: LedgerManifest = serde_json::from_str(
@@ -906,7 +977,7 @@ fn verified_base(
     println!("Verifying the base artifact: hashing its ledger and its vectors…");
     let base = VerifiedBase::open(
         manifest,
-        Path::new(ledger.expect("checked above")),
+        Path::new(ledger.as_deref().expect("named holds all three")),
         Path::new(&vectors_path),
         &model,
     )
