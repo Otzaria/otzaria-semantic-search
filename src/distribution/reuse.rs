@@ -53,7 +53,7 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 /// build can decide what to skip, and a user's installation has nothing to decide.
 ///
 /// **The offset is into the artifact, not into whatever `assemble` wrote.** `pack` sorts
-/// the payload by `semantic_id` before writing it ([`ZevcStore::save_to_disk`]), so the
+/// the payload by `semantic_id` before writing it (`ZevcStore::save_to_disk`), so the
 /// order `assemble` produced is not the order anybody can download. A ledger built from
 /// the assembler's order was published once and is wrong in every entry: 20 000 of 20 000
 /// sampled offsets named a different line. It is therefore built by
