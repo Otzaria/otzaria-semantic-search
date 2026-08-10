@@ -321,7 +321,9 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
         "the manifest describes the ledger that was written"
     );
 
-    // 6. A digest that names another artifact is refused — and leaves what was there.
+    // 6. A ledger and its manifest are one fact in two files, and two renames are not one
+    //    commit. Writing only where there is nothing to overwrite is what makes the pair
+    //    atomic, so the published pair is untouchable rather than carefully replaced.
     let before = std::fs::read(&ledger).unwrap();
     refused(
         &[
@@ -332,25 +334,42 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
             &merged.join("records.jsonl").display().to_string(),
             "--out",
             &ledger.display().to_string(),
+        ],
+        "already exists",
+    );
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        before,
+        "and the ledger that is already published stays exactly as it was"
+    );
+
+    // 6b. A digest that names another artifact, at a path that is free. Nothing is left
+    //     behind — not the ledger, not the manifest, not a `.partial`.
+    refused(
+        &[
+            "ledger",
+            "--artifact",
+            &artifact.display().to_string(),
+            "--records",
+            &merged.join("records.jsonl").display().to_string(),
+            "--out",
+            &dir.at("wrong-digest.jsonl").display().to_string(),
             "--artifact-digest",
             &"ab".repeat(32),
         ],
         "This is not the artifact that digest was published for",
     );
-    assert_eq!(
-        std::fs::read(&ledger).unwrap(),
-        before,
-        "a refusal must not replace the ledger it refused to rebuild"
-    );
-    assert!(
-        !dir.at("ledger.partial").exists(),
-        "and must not leave a half-written one either"
-    );
+    for leftover in [
+        "wrong-digest.jsonl",
+        "wrong-digest.manifest.json",
+        "wrong-digest.partial",
+    ] {
+        assert!(!dir.at(leftover).exists(), "{leftover} was left behind");
+    }
 
-    // 6b. A records file that does not describe this artifact fails *after* the entries
-    //     have been written, which is what the `.partial` is for: the previous ledger has
-    //     to survive it, because a new ledger beside the previous manifest is the one
-    //     pairing nothing downstream can detect — each file is internally valid.
+    // 6c. A records file that does not describe this artifact fails *after* the entries
+    //     have been written, which is what the `.partial` is for: the refusal has to leave
+    //     the directory as it found it, or the next run reads a file nothing describes.
     let short = dir.at("short-records.jsonl");
     let all = std::fs::read_to_string(merged.join("records.jsonl")).unwrap();
     let kept: Vec<&str> = all.lines().take(records - 1).collect();
@@ -363,15 +382,16 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
             "--records",
             &short.display().to_string(),
             "--out",
-            &ledger.display().to_string(),
+            &dir.at("short.jsonl").display().to_string(),
         ],
         "The ledger could not be built",
     );
-    assert_eq!(
-        std::fs::read(&ledger).unwrap(),
-        before,
-        "the ledger that was already good must still be there"
-    );
+    for leftover in ["short.jsonl", "short.manifest.json", "short.partial"] {
+        assert!(
+            !dir.at(leftover).exists(),
+            "{leftover} survived a refusal that happened after the write began"
+        );
+    }
 
     // 7. The same corpus again. Every digest is known, so nothing is embedded.
     let split = dir.at("split2");

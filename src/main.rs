@@ -122,7 +122,10 @@ Options for 'ledger':
   --artifact-digest <hex>    Optional. The digest published outside the artifact; it is
                              compared against the computed one, never copied into the
                              manifest. The model identity comes from the package.
-  --out <path>               ledger.jsonl; the manifest is written beside it
+  --out <path>               ledger.jsonl; the manifest is written beside it, and neither
+                             may exist yet. The pair is published as one fact and two
+                             renames are not one commit, so nothing is overwritten: to
+                             rebuild in place, delete both first.
 
 Build the ledger from the artifact and never from 'assemble': packing sorts the payload by
 semantic_id, so the assembler's order is not the published one.
@@ -751,23 +754,41 @@ fn run_assemble(args: &[String]) {
 
     std::fs::create_dir_all(&out)
         .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
+    // `.partial` until the merge has finished, like a shard's own output. `assemble` writes
+    // as it reads, so anything it refuses part-way through has already put bytes on disk —
+    // and a truncated pair under the final names is one a later `pack` would read as the
+    // whole release.
+    let vectors_partial = out.join("vectors.f32.partial");
+    let records_partial = out.join("records.jsonl.partial");
     let mut vectors = std::io::BufWriter::new(
-        std::fs::File::create(out.join("vectors.f32"))
+        std::fs::File::create(&vectors_partial)
             .unwrap_or_else(|error| exit_with("Could not write vectors.f32", error)),
     );
     let mut records = std::io::BufWriter::new(
-        std::fs::File::create(out.join("records.jsonl"))
+        std::fs::File::create(&records_partial)
             .unwrap_or_else(|error| exit_with("Could not write records.jsonl", error)),
     );
-    let report = assemble(
+    let outcome = assemble(
         reuse,
         base.as_ref(),
         opened,
         embedding_dim,
         &mut vectors,
         &mut records,
-    )
-    .unwrap_or_else(|error| exit_with("Assembly failed", error));
+    );
+    drop((vectors, records));
+    let report = outcome.unwrap_or_else(|error| {
+        let _ = std::fs::remove_file(&vectors_partial);
+        let _ = std::fs::remove_file(&records_partial);
+        exit_with("Assembly failed", error)
+    });
+    for (partial, final_name) in [
+        (&vectors_partial, "vectors.f32"),
+        (&records_partial, "records.jsonl"),
+    ] {
+        std::fs::rename(partial, out.join(final_name))
+            .unwrap_or_else(|error| exit_with("Could not publish the merged vectors", error));
+    }
 
     println!("\n=== Assembled a release's vectors ===");
     println!("Vectors:   {}", report.vectors);
@@ -792,6 +813,26 @@ fn run_ledger(args: &[String]) {
     let artifact = PathBuf::from(require_arg(args, "--artifact"));
     let records = require_arg(args, "--records");
     let out = PathBuf::from(require_arg(args, "--out"));
+    let manifest_path = out.with_extension("manifest.json");
+
+    // A ledger and its manifest are one fact in two files, and two `rename` calls are not
+    // one commit: a crash between them would leave a new ledger beside the manifest of the
+    // *previous* one. `VerifiedBase` refuses that pairing — the digests will not match — so
+    // it is not silent, but it is a release nobody can build from and no message says why.
+    //
+    // Writing only where there is nothing to overwrite removes the case entirely. A crash
+    // then leaves a ledger with no manifest, which is a missing file and unambiguous, and
+    // the caller who really wants to rebuild in place deletes them first — deliberately,
+    // which is the point.
+    for existing in [&out, &manifest_path] {
+        if existing.exists() {
+            exit_with(
+                &format!("{} already exists", existing.display()),
+                "a ledger and its manifest are published as a pair; name a path that holds \
+                 neither, or remove both first",
+            );
+        }
+    }
 
     // The artifact first, and every byte of it. Nothing about the ledger is worth deriving
     // from an artifact that does not verify, and the identity below has to come from the
@@ -835,27 +876,30 @@ fn run_ledger(args: &[String]) {
         std::fs::File::open(&records)
             .unwrap_or_else(|error| exit_with("Could not read the records", error)),
     );
-    // Both files land by rename, and only once both are known good. Writing the ledger
-    // first meant a failure here — a records file from another build, a digest that did not
-    // match — left a new ledger beside the previous manifest, which is the one pairing
-    // `VerifiedBase` cannot detect: each file is internally valid.
+    // Written to `.partial` and renamed, so an interrupted derivation is not a file under
+    // the published name, and removed if anything below refuses — a `.partial` left in a
+    // CI workspace is the next run's confusion.
     let partial = out.with_extension("partial");
     let mut sink = std::io::BufWriter::new(
         std::fs::File::create(&partial)
             .unwrap_or_else(|error| exit_with("Could not write the ledger", error)),
     );
+    let abandon = |what: &str, why: String| -> ! {
+        let _ = std::fs::remove_file(&partial);
+        exit_with(what, why)
+    };
 
     let entries = ledger_from_artifact(metadata, records, &mut sink)
-        .unwrap_or_else(|error| exit_with("The ledger could not be built", error));
+        .unwrap_or_else(|error| abandon("The ledger could not be built", error.to_string()));
     std::io::Write::flush(&mut sink)
-        .unwrap_or_else(|error| exit_with("Could not finish writing the ledger", error));
+        .unwrap_or_else(|error| abandon("Could not finish writing the ledger", error.to_string()));
     sink.into_inner()
-        .unwrap_or_else(|error| exit_with("Could not finish writing the ledger", error))
+        .unwrap_or_else(|error| abandon("Could not finish writing the ledger", error.to_string()))
         .sync_all()
-        .unwrap_or_else(|error| exit_with("Could not flush the ledger to disk", error));
+        .unwrap_or_else(|error| abandon("Could not flush the ledger to disk", error.to_string()));
 
     if entries != package.manifest.vector_count as usize {
-        exit_with(
+        abandon(
             "The ledger does not describe this artifact",
             format!(
                 "{entries} entry(ies) against {} vector(s)",
@@ -873,19 +917,23 @@ fn run_ledger(args: &[String]) {
         embedding_dim: identity.model.embedding_dim,
         model: identity.model,
     };
-    let manifest_path = out.with_extension("manifest.json");
     let manifest_partial = out.with_extension("manifest.partial");
     write_and_sync(
         &manifest_partial,
         &serde_json::to_vec_pretty(&manifest).unwrap(),
     );
-    // The ledger before the manifest: a manifest with no ledger beside it is a missing
-    // file, and a ledger with no manifest is one command away from being described. A
-    // manifest describing the *previous* ledger is neither.
     std::fs::rename(&partial, &out)
         .unwrap_or_else(|error| exit_with("Could not put the ledger in place", error));
     std::fs::rename(&manifest_partial, &manifest_path)
         .unwrap_or_else(|error| exit_with("Could not put the ledger manifest in place", error));
+    // The renames themselves, so a power loss after this command returns cannot lose the
+    // directory entries it just created. Best effort: a directory is not openable as a file
+    // on every platform, and there is nothing to do about it where it is not.
+    if let Some(directory) = out.parent() {
+        if let Ok(handle) = std::fs::File::open(directory) {
+            let _ = handle.sync_all();
+        }
+    }
 
     println!("\n=== Built a ledger from the artifact ===");
     println!("Ledger:   {}", out.display());

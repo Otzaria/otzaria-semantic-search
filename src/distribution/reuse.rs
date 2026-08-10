@@ -468,16 +468,41 @@ impl VerifiedBase {
 }
 
 fn sha256_reader(file: &mut impl Read) -> Result<String, PackError> {
+    Ok(sha256_and_lines(file)?.0)
+}
+
+/// The digest and the number of non-empty lines, from one pass over the bytes.
+///
+/// Both facts come from the same read because the second one is not optional: the digest
+/// says the file is the file its manifest describes, and the count says how many vectors
+/// [`assemble`] will pair with it. Hashing without counting left that to be discovered
+/// mid-merge, with output already written.
+///
+/// "Non-empty" is the same test `assemble` applies when it walks the records — a line of
+/// nothing but whitespace is skipped there and not counted here.
+fn sha256_and_lines(file: &mut impl Read) -> Result<(String, usize), PackError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
+    let mut lines = 0usize;
+    let mut has_content = false;
     loop {
         let read = file.read(&mut buffer).map_err(read_error)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                lines += usize::from(has_content);
+                has_content = false;
+            } else if !byte.is_ascii_whitespace() {
+                has_content = true;
+            }
+        }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    // A last line with no newline after it is still a line.
+    lines += usize::from(has_content);
+    Ok((format!("{:x}", hasher.finalize()), lines))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -560,17 +585,16 @@ pub fn plan_split(
 ///
 /// What is checked, per shard: the plan it was cut from, its model *and* the width that
 /// model declares, that it wrote exactly the records its window asked for, that
-/// `vectors.f32` is that many vectors wide, and that both files hash to what its own
-/// manifest recorded. Then, across shards: the windows tile `[0, total)` exactly — no
-/// hole, no overlap.
+/// `vectors.f32` holds that many vectors and `records.jsonl` that many records, and that
+/// both files hash to what its own manifest recorded. Then, across shards: the windows
+/// tile `[0, total)` exactly — no hole, no overlap.
 ///
 /// Nothing in [`ShardReport`] is read and then ignored. `take` and `embedding_dim` were,
 /// for a while, and a manifest field nobody compares is a field that can say anything.
 ///
-/// The one thing left implicit is the *line count* of `records.jsonl`: `vectors.f32` is
-/// held to `records × dim × 4` bytes here, and [`assemble`] reads the two files in
-/// lockstep and refuses a leftover byte, so a records file of the wrong length is caught
-/// on both sides without a third pass over it.
+/// Every one of those is checked before a byte is copied, which is the point of doing it
+/// here rather than leaving it to [`assemble`]: the merge writes as it reads, so a shard it
+/// refuses halfway has already put output on disk.
 ///
 /// # Errors
 ///
@@ -655,14 +679,10 @@ pub fn verify_shards(
         // Opened once, hashed through the handle, rewound, and carried out of here. The
         // caller cannot reopen by path, so the file that was checked is the file that is
         // read.
-        let mut handles = Vec::with_capacity(2);
-        for (file, declared) in [
-            ("vectors.f32", &manifest.vectors_sha256),
-            ("records.jsonl", &manifest.records_sha256),
-        ] {
+        let open = |file: &str, declared: &str| -> Result<(std::fs::File, usize), PackError> {
             let mut handle = std::fs::File::open(dir.join(file)).map_err(read_error)?;
-            let actual = sha256_reader(&mut handle)?;
-            if &actual != declared {
+            let (actual, lines) = sha256_and_lines(&mut handle)?;
+            if actual != declared {
                 return Err(PackError::MalformedInput {
                     reason: format!(
                         "{named}/{file} hashes to {actual} and its manifest declares {declared}"
@@ -670,10 +690,21 @@ pub fn verify_shards(
                 });
             }
             handle.seek(SeekFrom::Start(0)).map_err(read_error)?;
-            handles.push(handle);
+            Ok((handle, lines))
+        };
+        let (vectors, _) = open("vectors.f32", &manifest.vectors_sha256)?;
+        let (records, lines) = open("records.jsonl", &manifest.records_sha256)?;
+        // The count `assemble` will actually pair with vectors, from the pass that hashed
+        // the file. A shard with three vectors, a manifest saying three, and two records in
+        // it used to reach the merge — which copied part of its output before noticing.
+        if lines != manifest.records {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named}/records.jsonl holds {lines} record(s) and its manifest declares {}",
+                    manifest.records
+                ),
+            });
         }
-        let mut handles = handles.into_iter();
-        let vectors = handles.next().expect("two handles were opened");
         // Through the handle that was hashed, before a byte is copied: a file of the wrong
         // length would otherwise surface as `assemble` running out of vectors halfway.
         let owed_bytes = (manifest.records as u64)
@@ -700,7 +731,7 @@ pub fn verify_shards(
             manifest.records,
             dir.as_path(),
             vectors,
-            handles.next().expect("two handles were opened"),
+            records,
         ));
     }
 
@@ -1319,6 +1350,28 @@ mod tests {
         expect_reason(
             verify_shards(&write("beyond", 2, 2, &|m| m.skip = 8), "plan", &model, 4),
             "starts at 8 and the plan holds 4",
+        );
+
+        // A record lost from the file its own manifest counted: three vectors, three
+        // declared, two written. Both digests honest.
+        expect_reason(
+            verify_shards(
+                &write("missing", 3, 2, &|m| {
+                    m.records = 3;
+                    m.take = 3;
+                }),
+                "plan",
+                &model,
+                3,
+            ),
+            "records.jsonl holds 2 record(s) and its manifest declares 3",
+        );
+
+        // And one too many, which is the same defect from the other side: the merge would
+        // have paired the third record with the first vector of whatever came next.
+        expect_reason(
+            verify_shards(&write("extra", 2, 3, &|m| m.records = 2), "plan", &model, 2),
+            "records.jsonl holds 3 record(s) and its manifest declares 2",
         );
 
         // Three records, three lines, and a vectors file holding two — every digest
