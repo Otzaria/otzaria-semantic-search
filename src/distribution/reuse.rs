@@ -19,28 +19,45 @@
 //! embedded, after context and truncation, which is exactly what the vector depends on.
 //!
 //! ```text
-//! plan_split   plan + previous ledger -> reuse.jsonl + embed.jsonl
-//! embed_shard  embed.jsonl            -> vectors + records          (GPU)
-//! assemble     reuse + base + shards  -> vectors + records + ledger
+//! plan_split           plan + ledger + its manifest -> reuse.jsonl + embed.jsonl
+//! embed_shard          embed.jsonl                  -> vectors + records     (GPU)
+//! assemble             reuse + base + shards        -> vectors + records
+//! pack                 those two                    -> artifact
+//! ledger_from_artifact artifact + records           -> the next ledger
 //! ```
 //!
 //! `assemble` writes in whatever order is cheapest, because
 //! [`pack`](super::packer::pack) compares the *set* of ids it was handed against the
 //! recipe's expected set and sorts internally. What it may not do is pair a vector with
 //! the wrong record, which is why the two files are written in lockstep here as well.
+//!
+//! **And that sort is why the ledger is built last.** `pack` orders the payload by
+//! `semantic_id`, so the offsets `assemble` could report are not offsets into anything
+//! downloadable. The first published ledger was built from the assembler and every entry
+//! was wrong. [`ledger_from_artifact`] reads the artifact's own order instead, and joins
+//! it to `records.jsonl` for the full digest — the payload keeps a 32-hex `chunk_hash`,
+//! which is enough to compare at runtime and not enough to decide what to skip.
 
 use crate::distribution::packer::VectorInputRecord;
 use crate::distribution::shard::PlannedChunk;
 use crate::errors::PackError;
+use crate::semantic::versioning::ModelIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 
-/// One line of a ledger: a digest, and where its vector sits in that release's
-/// `vectors.f32`.
+/// One line of a ledger: a digest, and where its vector sits in the **published**
+/// `vectors.bin`.
 ///
 /// Published beside an artifact and never shipped to a user — it exists so the *next*
 /// build can decide what to skip, and a user's installation has nothing to decide.
+///
+/// **The offset is into the artifact, not into whatever `assemble` wrote.** `pack` sorts
+/// the payload by `semantic_id` before writing it ([`ZevcStore::save_to_disk`]), so the
+/// order `assemble` produced is not the order anybody can download. A ledger built from
+/// the assembler's order was published once and is wrong in every entry: 20 000 of 20 000
+/// sampled offsets named a different line. It is therefore built by
+/// [`ledger_from_artifact`], after packing, from the artifact itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub embedding_text_sha256: String,
@@ -76,6 +93,176 @@ pub struct AssembleReport {
     pub embedding_dim: usize,
 }
 
+/// Everything a ledger's offsets are only meaningful against.
+///
+/// Published beside the ledger, and checked before a single vector is copied. Without it
+/// `plan_split` sees digests and integers: an artifact built by a different model, or a
+/// `vectors.bin` that is not the file the ledger was written from, both reuse cleanly and
+/// silently, and the result is a library of vectors from two incompatible spaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LedgerManifest {
+    /// Digest of the artifact this ledger describes, as published outside it.
+    pub artifact_digest: String,
+    /// SHA-256 of the `vectors.bin` the offsets index into.
+    pub vectors_sha256: String,
+    pub vector_count: usize,
+    pub embedding_dim: u32,
+    /// The whole vector space, not a summary of it. Compared field by field.
+    pub model: ModelIdentity,
+}
+
+impl LedgerManifest {
+    /// Refuse a ledger that describes a different vector space from the one being built.
+    ///
+    /// Every field of [`ModelIdentity`] is compared, and deliberately: the ones that look
+    /// cosmetic are not. A different `pooling` reads a different token, a different
+    /// `max_tokens` truncates elsewhere, and a different `chunking_identity` means the text
+    /// that produced the digest was assembled by another recipe. Two vectors can agree on
+    /// their embedding text and still be incomparable.
+    ///
+    /// # Errors
+    ///
+    /// [`PackError::LedgerDisagreesWithBuild`], naming the first field that differs.
+    pub fn ensure_matches(&self, model: &ModelIdentity, dim: u32) -> Result<(), PackError> {
+        for (field, base, target) in [
+            ("model_id", &self.model.model_id, &model.model_id),
+            (
+                "model_checksum",
+                &self.model.model_checksum,
+                &model.model_checksum,
+            ),
+            (
+                "model_quantization",
+                &self.model.model_quantization,
+                &model.model_quantization,
+            ),
+            (
+                "embedding_backend",
+                &self.model.embedding_backend,
+                &model.embedding_backend,
+            ),
+            ("pooling", &self.model.pooling, &model.pooling),
+        ] {
+            if base != target {
+                return Err(PackError::LedgerDisagreesWithBuild {
+                    field,
+                    ledger: base.clone(),
+                    build: target.clone(),
+                });
+            }
+        }
+        for (field, base, target) in [
+            (
+                "embedding_dim",
+                u64::from(self.model.embedding_dim),
+                u64::from(model.embedding_dim),
+            ),
+            (
+                "max_tokens",
+                self.model.max_tokens as u64,
+                model.max_tokens as u64,
+            ),
+            (
+                "embedding_text_version",
+                u64::from(self.model.embedding_text_version),
+                u64::from(model.embedding_text_version),
+            ),
+            (
+                "normalization_version",
+                u64::from(self.model.normalization_version),
+                u64::from(model.normalization_version),
+            ),
+            (
+                "chunking_identity",
+                self.model.chunking_identity,
+                model.chunking_identity,
+            ),
+            (
+                "declared embedding_dim",
+                u64::from(self.embedding_dim),
+                u64::from(dim),
+            ),
+        ] {
+            if base != target {
+                return Err(PackError::LedgerDisagreesWithBuild {
+                    field,
+                    ledger: base.to_string(),
+                    build: target.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build the ledger from the artifact that was actually published.
+///
+/// `metadata` is the artifact's own `metadata.jsonl`, whose order **is** the order of
+/// `vectors.bin`; `records` is the pairing that travelled with the vectors, and the only
+/// place the full digest exists — the artifact stores a 32-hex `chunk_hash`, which is
+/// enough to compare at runtime and not enough to decide whether inference can be skipped.
+/// The join is on `line_id`, so no text is re-read and no vector is re-embedded.
+///
+/// # Errors
+///
+/// [`PackError::Corpus`] for malformed input, and
+/// [`PackError::LineNotInCorpus`] for an artifact record whose `line_id` the records file
+/// does not describe — which would otherwise become a ledger entry pointing at a vector
+/// nobody can identify.
+pub fn ledger_from_artifact(
+    metadata: impl BufRead,
+    records: impl BufRead,
+    sink: &mut dyn Write,
+) -> Result<usize, PackError> {
+    let mut digests: HashMap<u64, String> = HashMap::new();
+    for line in records.lines() {
+        let line = line.map_err(read_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: VectorInputRecord =
+            serde_json::from_str(&line).map_err(|error| PackError::Corpus {
+                reason: format!("a record is malformed: {error}"),
+            })?;
+        digests.insert(record.line_id, record.embedding_text_sha256);
+    }
+
+    let mut offset = 0u64;
+    for line in metadata.lines() {
+        let line = line.map_err(read_error)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Only the id is needed, and only from the nested record the payload stores.
+        #[derive(Deserialize)]
+        struct Stored {
+            metadata: StoredMetadata,
+        }
+        #[derive(Deserialize)]
+        struct StoredMetadata {
+            line_id: u64,
+        }
+        let stored: Stored = serde_json::from_str(&line).map_err(|error| PackError::Corpus {
+            reason: format!("an artifact metadata record is malformed: {error}"),
+        })?;
+        let line_id = stored.metadata.line_id;
+        let embedding_text_sha256 = digests
+            .get(&line_id)
+            .ok_or(PackError::LineNotInCorpus { line_id })?
+            .clone();
+        write_json(
+            sink,
+            &LedgerEntry {
+                embedding_text_sha256,
+                offset,
+            },
+        )?;
+        offset += 1;
+    }
+    sink.flush().map_err(read_error)?;
+    Ok(offset as usize)
+}
+
 /// Split a plan against a ledger: what can be copied, and what has to be embedded.
 ///
 /// Streams the plan, so the memory cost is the ledger alone — 32 bytes of digest and 8 of
@@ -91,9 +278,16 @@ pub struct AssembleReport {
 pub fn plan_split(
     plan: impl BufRead,
     ledger: impl BufRead,
+    base: Option<(&LedgerManifest, &ModelIdentity)>,
     reuse_sink: &mut dyn Write,
     embed_sink: &mut dyn Write,
 ) -> Result<SplitReport, PackError> {
+    // Before a single vector is named for reuse. A ledger from another model reuses just
+    // as cleanly as one from this model, and nothing downstream can tell the difference:
+    // the digests match, the counts match, and the vectors are from another space.
+    if let Some((manifest, model)) = base {
+        manifest.ensure_matches(model, model.embedding_dim)?;
+    }
     let mut known: HashMap<String, u64> = HashMap::new();
     for line in ledger.lines() {
         let line = line.map_err(read_error)?;
@@ -169,14 +363,12 @@ pub fn assemble(
     embedding_dim: usize,
     vectors_sink: &mut dyn Write,
     records_sink: &mut dyn Write,
-    ledger_sink: &mut dyn Write,
 ) -> Result<AssembleReport, PackError> {
     let width = embedding_dim
         .checked_mul(4)
         .ok_or_else(|| PackError::MalformedInput {
             reason: format!("an embedding dimension of {embedding_dim} has no byte width"),
         })?;
-    let mut offset = 0u64;
     let mut buffer = vec![0u8; width];
 
     let reused = reuse.len();
@@ -205,17 +397,9 @@ pub fn assemble(
                 &VectorInputRecord {
                     line_id: entry.line_id,
                     source_line_sha256: entry.source_line_sha256,
-                    embedding_text_sha256: entry.embedding_text_sha256.clone(),
-                },
-            )?;
-            write_json(
-                ledger_sink,
-                &LedgerEntry {
                     embedding_text_sha256: entry.embedding_text_sha256,
-                    offset,
                 },
             )?;
-            offset += 1;
         }
     }
 
@@ -241,15 +425,7 @@ pub fn assemble(
                     ),
                 })?;
             vectors_sink.write_all(&buffer).map_err(read_error)?;
-            write_json(
-                ledger_sink,
-                &LedgerEntry {
-                    embedding_text_sha256: record.embedding_text_sha256.clone(),
-                    offset,
-                },
-            )?;
             write_json(records_sink, &record)?;
-            offset += 1;
             embedded += 1;
         }
         let mut tail = [0u8; 1];
@@ -262,7 +438,6 @@ pub fn assemble(
 
     vectors_sink.flush().map_err(read_error)?;
     records_sink.flush().map_err(read_error)?;
-    ledger_sink.flush().map_err(read_error)?;
 
     Ok(AssembleReport {
         vectors: reused + embedded,
@@ -289,9 +464,13 @@ fn read_error(error: std::io::Error) -> PackError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::chunker::ChunkerConfig;
     use std::io::Cursor;
 
     const DIM: usize = 2;
+    /// The identity tests speak in `u32`, as `ModelIdentity` does.
+    #[allow(clippy::cast_possible_truncation)]
+    const DIM_U32: u32 = DIM as u32;
 
     fn planned(line_id: u64, text: &str) -> String {
         serde_json::to_string(&PlannedChunk {
@@ -323,6 +502,7 @@ mod tests {
         let report = plan_split(
             Cursor::new(plan),
             Cursor::new(ledger),
+            None,
             &mut reuse,
             &mut embed,
         )
@@ -374,7 +554,7 @@ mod tests {
                 base_offset: 1,
             },
         ];
-        let (mut vectors, mut records, mut ledger) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut vectors, mut records) = (Vec::new(), Vec::new());
 
         let report = assemble(
             reuse,
@@ -383,7 +563,6 @@ mod tests {
             DIM,
             &mut vectors,
             &mut records,
-            &mut ledger,
         )
         .unwrap();
 
@@ -400,6 +579,28 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec![11, 10], "the record must follow its own vector");
+    }
+
+    /// The bug that was published once, as a test.
+    ///
+    /// `assemble` writes in one order and `pack` sorts the payload by `semantic_id`, so a
+    /// ledger built from the assembler is wrong in every entry. This builds one from the
+    /// artifact's own order and asserts the offsets follow *that* — with the two orders
+    /// deliberately different, because identical orders would pass either way.
+    #[test]
+    fn the_ledger_follows_the_artifact_order_and_not_the_assembler_s() {
+        // What `assemble` wrote: line 10 first, then 11.
+        let records = "{\"line_id\":10,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"aaa\"}\n\
+                       {\"line_id\":11,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"bbb\"}\n";
+        // What `pack` published: 11 first, because `semantic_id` sorted it there.
+        let metadata = "{\"metadata\":{\"line_id\":11},\"metadata_sha256\":\"x\",\"vector_sha256\":\"y\"}\n\
+                        {\"metadata\":{\"line_id\":10},\"metadata_sha256\":\"x\",\"vector_sha256\":\"y\"}\n";
+
+        let mut ledger = Vec::new();
+        let written =
+            ledger_from_artifact(Cursor::new(metadata), Cursor::new(records), &mut ledger).unwrap();
+
+        assert_eq!(written, 2);
         let entries: Vec<LedgerEntry> = String::from_utf8(ledger)
             .unwrap()
             .lines()
@@ -410,9 +611,73 @@ mod tests {
                 .iter()
                 .map(|e| (e.embedding_text_sha256.as_str(), e.offset))
                 .collect::<Vec<_>>(),
-            vec![("d1", 0), ("d3", 1)],
-            "the new ledger must describe this artifact, not the base it copied from"
+            vec![("bbb", 0), ("aaa", 1)],
+            "offset 0 must name the line the artifact holds at offset 0"
         );
+    }
+
+    /// A ledger from another model reuses just as cleanly as one from this model, and
+    /// nothing downstream can tell: the digests match and the counts match. So the refusal
+    /// has to happen here, before a vector is named.
+    #[test]
+    fn a_ledger_from_a_different_vector_space_is_refused() {
+        let chunking = ChunkerConfig::default();
+        let mine = model_for(&"ab".repeat(32), &chunking);
+        let manifest = LedgerManifest {
+            artifact_digest: "d".repeat(64),
+            vectors_sha256: "e".repeat(64),
+            vector_count: 2,
+            embedding_dim: DIM_U32,
+            model: ModelIdentity {
+                // Same texts, same digests, different weights.
+                model_checksum: "cd".repeat(32),
+                ..mine.clone()
+            },
+        };
+        match manifest.ensure_matches(&mine, DIM_U32) {
+            Err(PackError::LedgerDisagreesWithBuild { field, .. }) => {
+                assert_eq!(field, "model_checksum");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let pooling_differs = LedgerManifest {
+            model: ModelIdentity {
+                pooling: "mean".to_string(),
+                ..mine.clone()
+            },
+            ..manifest.clone()
+        };
+        match pooling_differs.ensure_matches(&mine, DIM_U32) {
+            Err(PackError::LedgerDisagreesWithBuild { field, .. }) => {
+                assert_eq!(
+                    field, "pooling",
+                    "a different token pooled is a different vector"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let same = LedgerManifest {
+            model: mine.clone(),
+            ..manifest
+        };
+        assert!(same.ensure_matches(&mine, DIM_U32).is_ok());
+    }
+
+    fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
+        ModelIdentity {
+            model_id: "otzaria-embedding-v1".to_string(),
+            model_checksum: checksum.to_string(),
+            model_quantization: "Q4_K_M".to_string(),
+            embedding_backend: "mock-hash-v1".to_string(),
+            embedding_dim: DIM_U32,
+            pooling: "last-token".to_string(),
+            max_tokens: 512,
+            embedding_text_version: 1,
+            normalization_version: 1,
+            chunking_identity: chunking.identity(),
+        }
     }
 
     /// A shard whose two files disagree on length would shift every pairing after it, and
@@ -426,7 +691,7 @@ mod tests {
             Box::new(Cursor::new(vectors_of(&[[1.0, 1.0], [2.0, 2.0]]))),
             Box::new(Cursor::new(records)),
         )];
-        let (mut vectors, mut out_records, mut ledger) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut vectors, mut out_records) = (Vec::new(), Vec::new());
 
         let outcome = assemble(
             Vec::new(),
@@ -435,7 +700,6 @@ mod tests {
             DIM,
             &mut vectors,
             &mut out_records,
-            &mut ledger,
         );
         match outcome {
             Err(PackError::MalformedInput { reason }) => {

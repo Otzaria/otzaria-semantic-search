@@ -14,7 +14,9 @@ use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
-use otzaria_semantic_search::distribution::reuse::{assemble, plan_split, ReuseEntry};
+use otzaria_semantic_search::distribution::reuse::{
+    assemble, ledger_from_artifact, plan_split, LedgerManifest, ReuseEntry,
+};
 use otzaria_semantic_search::distribution::shard::{embed_shard, export_plan, read_plan};
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::Pooling;
@@ -46,7 +48,9 @@ Commands:
   embed-shard [options]               Embed one window of an exported plan.
   plan-split [options]                Split a plan against a previous release's ledger.
   assemble [options]                  Gather reused and freshly embedded vectors into one
-                                      pair of files, and write the next ledger.
+                                      pair of files.
+  ledger [options]                    Build the next release's reuse ledger from a packed
+                                      artifact.
   pack [options]                      Build an official artifact from ready-made vectors.
   validate [options]                  Verify an artifact against a corpus and a model.
 
@@ -100,7 +104,22 @@ Options for 'assemble':
   --dim <N>                  Embedding dimension, so a truncated file is arithmetic
   --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
   --base-vectors <path>      vectors.f32 of the release being reused from
-  --out <dir>                Receives vectors.f32, records.jsonl and ledger.jsonl
+  --out <dir>                Receives vectors.f32 and records.jsonl
+
+Options for 'ledger':
+  --artifact <dir>           A packed artifact; its metadata.jsonl order is the payload's
+  --records <path>           records.jsonl from 'assemble' — the only place the full
+                             64-hex digest exists, since the payload stores 32
+  --out <path>               ledger.jsonl
+
+Build the ledger from the artifact and never from 'assemble': packing sorts the payload by
+semantic_id, so the assembler's order is not the published one.
+
+Options for 'plan-split' (continued):
+  --ledger-manifest <path>   Required with --ledger. Names the artifact digest, the
+                             vectors.bin digest and the model identity the offsets mean
+                             something under.
+  --model <path>             Required with --ledger-manifest, to compare against.
 
 The reuse key is embedding_text_sha256, not a line id: a vector is a function of the text
 that was embedded and nothing else, so a digest the previous ledger knows names a vector
@@ -345,6 +364,7 @@ fn main() {
         "embed-shard" => run_embed_shard(&args),
         "plan-split" => run_plan_split(&args),
         "assemble" => run_assemble(&args),
+        "ledger" => run_ledger(&args),
         "pack" => run_pack(&args),
         "validate" => run_validate(&args),
         "help" | "-h" | "--help" => {
@@ -607,6 +627,7 @@ fn run_plan_split(args: &[String]) {
     let plan = require_arg(args, "--plan");
     // A ledger is optional, and its absence is the first build rather than a mistake.
     let ledger = parse_arg(args, "--ledger");
+    let ledger_present = ledger.is_some();
 
     std::fs::create_dir_all(&out)
         .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
@@ -614,13 +635,37 @@ fn run_plan_split(args: &[String]) {
         std::fs::File::open(&plan)
             .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
     );
-    let ledger: Box<dyn std::io::BufRead> = match ledger {
+    let ledger: Box<dyn std::io::BufRead> = match &ledger {
         Some(path) => Box::new(std::io::BufReader::new(
-            std::fs::File::open(&path)
+            std::fs::File::open(path)
                 .unwrap_or_else(|error| exit_with("Could not read the ledger", error)),
         )),
         None => Box::new(std::io::empty()),
     };
+    // A ledger without its manifest is a set of integers whose meaning cannot be checked,
+    // so reuse requires both or neither.
+    let base = match (ledger_present, parse_arg(args, "--ledger-manifest")) {
+        (true, Some(path)) => {
+            let manifest: LedgerManifest =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    exit_with("Could not read the ledger manifest", error)
+                }))
+                .unwrap_or_else(|error| exit_with("That is not a ledger manifest", error));
+            Some(manifest)
+        }
+        (true, None) => exit_with(
+            "--ledger needs --ledger-manifest",
+            "a ledger's offsets mean nothing without the identity they were built under",
+        ),
+        _ => None,
+    };
+    let model = parse_arg(args, "--model").map(|path| read_model(&path));
+    if base.is_some() && model.is_none() {
+        exit_with(
+            "--ledger-manifest needs --model",
+            "there is nothing to compare the ledger's identity against",
+        );
+    }
     let mut reuse = std::io::BufWriter::new(
         std::fs::File::create(out.join("reuse.jsonl"))
             .unwrap_or_else(|error| exit_with("Could not write reuse.jsonl", error)),
@@ -630,8 +675,14 @@ fn run_plan_split(args: &[String]) {
             .unwrap_or_else(|error| exit_with("Could not write embed.jsonl", error)),
     );
 
-    let report = plan_split(plan, ledger, &mut reuse, &mut embed)
-        .unwrap_or_else(|error| exit_with("The split failed", error));
+    let report = plan_split(
+        plan,
+        ledger,
+        base.as_ref().zip(model.as_ref()),
+        &mut reuse,
+        &mut embed,
+    )
+    .unwrap_or_else(|error| exit_with("The split failed", error));
 
     println!("\n=== Split a plan against a ledger ===");
     println!("Planned:   {}", report.planned);
@@ -708,11 +759,6 @@ fn run_assemble(args: &[String]) {
         std::fs::File::create(out.join("records.jsonl"))
             .unwrap_or_else(|error| exit_with("Could not write records.jsonl", error)),
     );
-    let mut ledger = std::io::BufWriter::new(
-        std::fs::File::create(out.join("ledger.jsonl"))
-            .unwrap_or_else(|error| exit_with("Could not write ledger.jsonl", error)),
-    );
-
     let report = assemble(
         reuse,
         base.as_mut(),
@@ -720,7 +766,6 @@ fn run_assemble(args: &[String]) {
         embedding_dim,
         &mut vectors,
         &mut records,
-        &mut ledger,
     )
     .unwrap_or_else(|error| exit_with("Assembly failed", error));
 
@@ -729,7 +774,50 @@ fn run_assemble(args: &[String]) {
     println!("Reused:    {}", report.reused);
     println!("Embedded:  {}", report.embedded);
     println!("Dimension: {}", report.embedding_dim);
-    println!("\nPack them against the corpus next; nothing here checked them against it.");
+    println!(
+        "\nPack them against the corpus next; nothing here checked them against it — and \
+         build the\nledger from the packed artifact, not from this, because packing \
+         reorders the payload."
+    );
+}
+
+/// Build the ledger the next release will reuse from, out of the artifact that was
+/// published.
+///
+/// A separate command from `assemble`, and that is the whole point: `pack` sorts the
+/// payload by `semantic_id`, so the order `assemble` wrote is not the order anybody can
+/// download. A ledger built from the assembler's order was published once and every one
+/// of its offsets named a different line.
+fn run_ledger(args: &[String]) {
+    let artifact = PathBuf::from(require_arg(args, "--artifact"));
+    let records = require_arg(args, "--records");
+    let out = PathBuf::from(require_arg(args, "--out"));
+
+    let metadata = std::io::BufReader::new(
+        std::fs::File::open(artifact.join("metadata.jsonl")).unwrap_or_else(|error| {
+            exit_with("Could not read the artifact's metadata.jsonl", error)
+        }),
+    );
+    let records = std::io::BufReader::new(
+        std::fs::File::open(&records)
+            .unwrap_or_else(|error| exit_with("Could not read the records", error)),
+    );
+    let mut sink = std::io::BufWriter::new(
+        std::fs::File::create(&out)
+            .unwrap_or_else(|error| exit_with("Could not write the ledger", error)),
+    );
+
+    let entries = ledger_from_artifact(metadata, records, &mut sink)
+        .unwrap_or_else(|error| exit_with("The ledger could not be built", error));
+
+    println!("\n=== Built a ledger from the artifact ===");
+    println!("Path:    {}", out.display());
+    println!("Entries: {entries}");
+    println!(
+        "\nPublish it beside a ledger-manifest.json naming the artifact digest, the \
+         vectors.bin\ndigest and the whole model identity. Offsets without that identity \
+         cannot be checked."
+    );
 }
 
 /// Every directory holding a `vectors.f32`, depth-first.
