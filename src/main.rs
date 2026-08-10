@@ -15,9 +15,12 @@ use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
 use otzaria_semantic_search::distribution::reuse::{
-    assemble, ledger_from_artifact, plan_split, LedgerManifest, ReuseEntry, VerifiedBase,
+    assemble, ledger_from_artifact, plan_split, verify_shards, LedgerManifest, ReuseEntry,
+    VerifiedBase,
 };
-use otzaria_semantic_search::distribution::shard::{embed_shard, export_plan, read_plan};
+use otzaria_semantic_search::distribution::shard::{
+    embed_shard, export_plan, read_plan, ShardReport,
+};
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
@@ -102,6 +105,9 @@ Options for 'plan-split':
 Options for 'assemble':
   --shards <dir>             Root holding every shard's output, at any depth
   --dim <N>                  Embedding dimension, so a truncated file is arithmetic
+  --plan-sha256 <hex>        The digest every shard's manifest must name
+  --embed-records <N>        How many records the shards must cover, with no hole
+  --model <path>             The identity every shard must have been embedded under
   --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
   --base-vectors <path>      vectors.f32 of the release being reused from
   --out <dir>                Receives vectors.f32 and records.jsonl
@@ -590,8 +596,13 @@ fn run_embed_shard(args: &[String]) {
             .unwrap_or_else(|error| exit_with("Could not write the records", error)),
     );
 
+    // The plan's own digest travels into the manifest, so the merge can tell a shard of
+    // this export from a shard of another export with the same window.
+    let plan_sha256 = sha256_of(Path::new(&plan_path));
     let report = embed_shard(
         read_plan(plan, skip, take),
+        (plan_sha256, skip, take),
+        &model,
         &runtime,
         runtime.batch_size(),
         &mut vectors,
@@ -697,6 +708,35 @@ fn run_assemble(args: &[String]) {
         shards.len(),
         shard_root.display()
     );
+    // Read every manifest and hold the set to the plan before a byte is copied. Opening
+    // the two files directly — which is what this did — left the manifests as decoration:
+    // a shard from another export, a corrupted vector that stayed finite, or two shards
+    // covering one window and none covering another all merged without a word.
+    let manifests: Vec<(PathBuf, ShardReport)> = shards
+        .iter()
+        .map(|dir| {
+            let path = dir.join("shard-manifest.json");
+            let manifest: ShardReport =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    exit_with(&format!("Could not read {}", path.display()), error)
+                }))
+                .unwrap_or_else(|error| {
+                    exit_with(
+                        &format!("{} is not a shard manifest", path.display()),
+                        error,
+                    )
+                });
+            (dir.clone(), manifest)
+        })
+        .collect();
+    let plan_sha256 = require_arg(args, "--plan-sha256");
+    let shard_model = read_model(&require_arg(args, "--model"));
+    let expected: usize = require_arg(args, "--embed-records")
+        .parse()
+        .unwrap_or_else(|_| exit_with("--embed-records", "not a number"));
+    verify_shards(&manifests, &plan_sha256, &shard_model, expected)
+        .unwrap_or_else(|error| exit_with("The shards do not cover this plan", error));
+    println!("Shards verified: {expected} record(s), one plan, one model, no hole");
 
     /// One shard's two files, opened. Named because the pair is what `assemble` takes,
     /// and clippy is right that the tuple of boxes is unreadable inline.

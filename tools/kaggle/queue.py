@@ -5,10 +5,9 @@ One job is one kernel run. A job names the account that owns it, the accelerator
 asks for, and the directory holding its `kernel-metadata.json`; everything else —
 which shard it takes, where its output lands — travels in the kernel's own script.
 
-Accounts are directories, not global state. `kaggle` reads its credentials from
-`$KAGGLE_CONFIG_DIR/kaggle.json`, so a second account is a second directory and
-never a re-login: `accounts/<name>/kaggle.json`. That is what lets the pool grow
-without any job knowing about it.
+Accounts are directories, not global state: `~/.kaggle-accounts/<name>/access_token`,
+one per account, so a second account is a second directory and never a re-login. That
+is what lets the pool grow without any job knowing about it. See ACCOUNTS.md.
 
     ./queue.py add   <name> <account> <accelerator> <dir>
     ./queue.py push  [name ...]     # default: everything queued
@@ -23,6 +22,7 @@ and a job that is refused stays queued rather than being lost.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,8 +50,19 @@ def load():
 
 
 def save(jobs):
+    """Write through a temporary file and rename.
+
+    The state file records which shards have already been paid for in GPU hours. A
+    truncated write — an interrupt in the middle of `write_text` — loses that, and the
+    recovery is to re-run work that was already done.
+    """
     STATE.mkdir(parents=True, exist_ok=True)
-    JOBS.write_text(json.dumps(jobs, indent=2))
+    temporary = JOBS.with_suffix(".tmp")
+    with open(temporary, "w") as handle:
+        json.dump(jobs, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(JOBS)
 
 
 def kaggle(account, *args, capture=True):
@@ -190,8 +201,21 @@ def cmd_fetch(names):
         if job["state"] not in ("complete", "error"):
             continue
         target = STATE / "output" / job["name"]
-        target.mkdir(parents=True, exist_ok=True)
-        kaggle(job["account"], "kernels", "output", job["slug"], "-p", str(target))
+        staging = target.with_suffix(".partial")
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        result = kaggle(job["account"], "kernels", "output", job["slug"], "-p", str(staging))
+        # Checked, not assumed. Marking a job `fetched` on a failed download is how a hole
+        # in the vectors reaches the merge looking like a complete set of shards.
+        if result.returncode != 0 or not any(staging.iterdir()):
+            print(f"fetch {job['name']}: FAILED ({result.stderr.strip()[-120:] or 'no files'})")
+            shutil.rmtree(staging, ignore_errors=True)
+            continue
+        if target.exists():
+            shutil.rmtree(target)
+        staging.rename(target)
         print(f"fetch {job['name']} -> {target}")
         if job["state"] == "complete":
             job["state"] = "fetched"

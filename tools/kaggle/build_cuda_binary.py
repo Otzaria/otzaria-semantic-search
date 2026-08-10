@@ -172,3 +172,7 @@ for config in CONFIGS:
 )
 print(json.dumps({"gpu": gpu, "runs": results}, indent=2), flush=True)
 run(f"ls -la {OUT}")
+
+# The binary is the deliverable, and a kernel that finishes without one has not built it.
+if not (OUT / "otzaria-semantic-search").exists():
+    raise SystemExit("the build produced no binary")

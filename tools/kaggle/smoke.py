@@ -22,3 +22,11 @@ verdict = {"gpus": names, "gpu_count": len(names), "internet": internet}
 print(json.dumps(verdict, indent=2))
 with open("/kaggle/working/smoke.json", "w") as handle:
     json.dump(verdict, handle, indent=2)
+
+# A check that reports and exits 0 is a check somebody reads by eye, and the whole reason
+# this exists is that an unverified account looks healthy from the outside. The exit code
+# is the answer; the JSON is the detail.
+if not names or internet is not True:
+    raise SystemExit(
+        f"this account is not usable for a shard: {len(names)} GPU(s), internet={internet}"
+    )

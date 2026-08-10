@@ -122,3 +122,10 @@ for config in CONFIGS:
     json.dumps({"gpu": gpu, "runs": results}, indent=2)
 )
 print(json.dumps(results, indent=2), flush=True)
+
+# Exit non-zero if any configuration failed. A benchmark that reports three failures and
+# still succeeds is one whose result gets read out of the logs by eye — which is how a
+# stale binary produced three usage screens and looked like a completed run.
+failed = [run["name"] for run in results if not run.get("ok")]
+if failed:
+    raise SystemExit(f"configuration(s) failed: {', '.join(failed)}")

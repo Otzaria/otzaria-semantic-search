@@ -89,12 +89,23 @@ pub struct PlanReport {
 }
 
 /// What one worker produced, for the merge that has to prove nothing was lost.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardReport {
+    /// The `plan_sha256` of the file this window was taken from, so the merge can refuse a
+    /// shard that belongs to another export. Two exports of a changed corpus produce
+    /// windows of the same shape over different text.
+    pub plan_sha256: String,
+    /// The window, as it was asked for. `records` is what was actually written, and the
+    /// two differ legitimately only for the last shard of a plan.
+    pub skip: usize,
+    pub take: usize,
     pub records: usize,
     pub embedding_dim: usize,
     pub vectors_sha256: String,
     pub records_sha256: String,
+    /// What produced the floats. A shard embedded by another model is arithmetically
+    /// unrelated to its neighbours, and nothing about the vectors says so.
+    pub model: ModelIdentity,
 }
 
 /// Apply the recipe to the whole corpus and write one JSON object per line that gets a
@@ -284,11 +295,14 @@ pub fn read_plan(
 /// window, and [`PackError::Corpus`] for a sink that will not accept bytes.
 pub fn embed_shard(
     plan: impl Iterator<Item = Result<PlannedChunk, PackError>>,
+    window: (String, usize, usize),
+    model: &ModelIdentity,
     runtime: &EmbeddingRuntime,
     batch_size: usize,
     vectors: &mut dyn Write,
     records: &mut dyn Write,
 ) -> Result<ShardReport, PackError> {
+    let (plan_sha256, skip, take) = window;
     let mut vector_hasher = Sha256::new();
     let mut record_hasher = Sha256::new();
     let mut written = 0usize;
@@ -360,10 +374,14 @@ pub fn embed_shard(
     flush(records)?;
 
     Ok(ShardReport {
+        plan_sha256,
+        skip,
+        take,
         records: written,
         embedding_dim: dim,
         vectors_sha256: format!("{:x}", vector_hasher.finalize()),
         records_sha256: format!("{:x}", record_hasher.finalize()),
+        model: model.clone(),
     })
 }
 
@@ -591,6 +609,8 @@ mod tests {
             let file = std::io::BufReader::new(std::fs::File::open(&plan_path).unwrap());
             let report = embed_shard(
                 read_plan(file, skip, 2),
+                ("plan".to_string(), skip, 2),
+                &model,
                 &runtime,
                 2,
                 &mut vectors,
@@ -652,6 +672,8 @@ mod tests {
         let file = std::io::BufReader::new(std::fs::File::open(&plan_path).unwrap());
         embed_shard(
             read_plan(file, 0, plan.records - 1),
+            ("plan".to_string(), 0, plan.records - 1),
+            &model,
             &runtime,
             2,
             &mut vectors,
@@ -701,6 +723,8 @@ mod tests {
         let mut records = Vec::new();
         let outcome = embed_shard(
             [Ok(honest), Ok(tampered)].into_iter(),
+            ("plan".to_string(), 0, 2),
+            &model_for(&"ab".repeat(32), &ChunkerConfig::default()),
             &runtime,
             2,
             &mut vectors,

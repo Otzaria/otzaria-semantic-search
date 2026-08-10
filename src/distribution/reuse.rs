@@ -39,7 +39,7 @@
 //! which is enough to compare at runtime and not enough to decide what to skip.
 
 use crate::distribution::packer::VectorInputRecord;
-use crate::distribution::shard::PlannedChunk;
+use crate::distribution::shard::{PlannedChunk, ShardReport};
 use crate::errors::PackError;
 use crate::semantic::versioning::ModelIdentity;
 use serde::{Deserialize, Serialize};
@@ -529,6 +529,91 @@ pub fn plan_split(
     })
 }
 
+/// Every shard's manifest, checked against the plan they claim to cover.
+///
+/// Before this, `assemble` opened `vectors.f32` and `records.jsonl` directly and never
+/// read `shard-manifest.json` at all: its counts and digests were written and then
+/// believed by nobody. A shard from another export, a corrupted vector that stayed
+/// finite, or two shards covering one window and none covering another all merged
+/// cleanly — the packer re-normalises the floats and the id set can still be complete.
+///
+/// What is checked: one plan and one model across every shard, each file matching the
+/// digest its own manifest recorded, and the windows tiling `[0, total)` exactly — no
+/// hole, no overlap.
+///
+/// # Errors
+///
+/// [`PackError::MalformedInput`], naming the shard and what disagreed.
+pub fn verify_shards(
+    shards: &[(std::path::PathBuf, ShardReport)],
+    plan_sha256: &str,
+    model: &ModelIdentity,
+    total: usize,
+) -> Result<(), PackError> {
+    if shards.is_empty() {
+        return Err(PackError::NoVectors);
+    }
+    let mut windows: Vec<(usize, usize, &std::path::Path)> = Vec::with_capacity(shards.len());
+
+    for (dir, manifest) in shards {
+        let named = dir.display();
+        if manifest.plan_sha256 != plan_sha256 {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named} was embedded from plan {} and this build's plan is {plan_sha256}",
+                    manifest.plan_sha256
+                ),
+            });
+        }
+        if manifest.model != *model {
+            return Err(PackError::MalformedInput {
+                reason: format!("{named} was embedded by a different model identity"),
+            });
+        }
+        for (file, declared) in [
+            ("vectors.f32", &manifest.vectors_sha256),
+            ("records.jsonl", &manifest.records_sha256),
+        ] {
+            let actual = sha256_file(&dir.join(file))?;
+            if &actual != declared {
+                return Err(PackError::MalformedInput {
+                    reason: format!(
+                        "{named}/{file} hashes to {actual} and its manifest declares {declared}"
+                    ),
+                });
+            }
+        }
+        windows.push((manifest.skip, manifest.records, dir.as_path()));
+    }
+
+    windows.sort_unstable();
+    let mut covered = 0usize;
+    for (skip, records, dir) in &windows {
+        if *skip != covered {
+            return Err(PackError::MalformedInput {
+                reason: if *skip > covered {
+                    format!(
+                        "records {covered}..{skip} are covered by no shard; {} starts at {skip}",
+                        dir.display()
+                    )
+                } else {
+                    format!(
+                        "{} starts at {skip} and records up to {covered} are already covered",
+                        dir.display()
+                    )
+                },
+            });
+        }
+        covered += records;
+    }
+    if covered != total {
+        return Err(PackError::MalformedInput {
+            reason: format!("the shards cover {covered} record(s) and the plan holds {total}"),
+        });
+    }
+    Ok(())
+}
+
 /// Copy the reusable vectors out of the base artifact, append this run's shards, and
 /// write the ledger the *next* release will split against.
 ///
@@ -955,6 +1040,107 @@ mod tests {
             vec![(b, 0), (a, 1)],
             "offset 0 must name the line the artifact holds at offset 0"
         );
+    }
+
+    /// Every one of these merged cleanly while the manifests were decoration: the packer
+    /// re-normalises the floats and the id set can still come out complete.
+    #[test]
+    fn shards_that_do_not_tile_this_plan_are_refused() {
+        let dir = TempDir::new("shards");
+        let model = model_for(&"ab".repeat(32), &ChunkerConfig::default());
+        let write = |name: &str, skip: usize, records: usize, plan: &str, model: &ModelIdentity| {
+            let at = dir.0.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            let vectors = vectors_of(&vec![[1.0, 1.0]; records]);
+            let body: String = (0..records)
+                .map(|i| {
+                    format!("{{\"line_id\":{i},\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"d\"}}\n")
+                })
+                .collect();
+            std::fs::write(at.join("vectors.f32"), &vectors).unwrap();
+            std::fs::write(at.join("records.jsonl"), &body).unwrap();
+            (
+                at,
+                ShardReport {
+                    plan_sha256: plan.to_string(),
+                    skip,
+                    take: records,
+                    records,
+                    embedding_dim: DIM,
+                    vectors_sha256: sha256_hex(&vectors),
+                    records_sha256: sha256_hex(body.as_bytes()),
+                    model: model.clone(),
+                },
+            )
+        };
+
+        let a = write("a", 0, 2, "plan", &model);
+        let b = write("b", 2, 2, "plan", &model);
+        assert!(verify_shards(&[a.clone(), b.clone()], "plan", &model, 4).is_ok());
+
+        // A hole: nothing covers records 2..4.
+        let far = write("far", 4, 2, "plan", &model);
+        expect_reason(
+            verify_shards(&[a.clone(), far], "plan", &model, 6),
+            "covered by no shard",
+        );
+
+        // An overlap: two shards claim the same window.
+        let again = write("again", 0, 2, "plan", &model);
+        expect_reason(
+            verify_shards(&[a.clone(), again], "plan", &model, 4),
+            "already covered",
+        );
+
+        // A shard of another export, with a window of exactly the right shape.
+        let foreign = write("foreign", 2, 2, "other-plan", &model);
+        expect_reason(
+            verify_shards(&[a.clone(), foreign], "plan", &model, 4),
+            "and this build's plan is",
+        );
+
+        // A shard embedded by another model.
+        let other_model = ModelIdentity {
+            model_checksum: "cd".repeat(32),
+            ..model.clone()
+        };
+        let mixed = write("mixed", 2, 2, "plan", &other_model);
+        expect_reason(
+            verify_shards(&[a.clone(), mixed], "plan", &model, 4),
+            "different model identity",
+        );
+
+        // A bit flipped in a vector, leaving it finite — which is what the packer would
+        // have normalised and accepted.
+        let flipped = write("flipped", 2, 2, "plan", &model);
+        std::fs::write(
+            flipped.0.join("vectors.f32"),
+            vectors_of(&[[1.0, 1.0], [2.0, 2.0]]),
+        )
+        .unwrap();
+        expect_reason(
+            verify_shards(&[a.clone(), flipped], "plan", &model, 4),
+            "hashes to",
+        );
+
+        // Short of the plan.
+        expect_reason(
+            verify_shards(&[a, b], "plan", &model, 6),
+            "cover 4 record(s)",
+        );
+    }
+
+    fn expect_reason(outcome: Result<(), PackError>, expected: &str) {
+        match outcome {
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains(expected),
+                    "expected {expected:?}, got {text:?}"
+                );
+            }
+            Ok(()) => panic!("expected a refusal"),
+        }
     }
 
     /// A records file from another build shares the line ids and describes other text.
