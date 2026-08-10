@@ -43,6 +43,7 @@ use crate::distribution::shard::PlannedChunk;
 use crate::errors::PackError;
 use crate::semantic::versioning::ModelIdentity;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 
@@ -105,6 +106,9 @@ pub struct LedgerManifest {
     pub artifact_digest: String,
     /// SHA-256 of the `vectors.bin` the offsets index into.
     pub vectors_sha256: String,
+    /// SHA-256 of the ledger itself. Without it the manifest binds the file the offsets
+    /// point *into* and not the offsets, so a single edited line reuses cleanly.
+    pub ledger_sha256: String,
     pub vector_count: usize,
     pub embedding_dim: u32,
     /// The whole vector space, not a summary of it. Compared field by field.
@@ -224,7 +228,25 @@ pub fn ledger_from_artifact(
             serde_json::from_str(&line).map_err(|error| PackError::Corpus {
                 reason: format!("a record is malformed: {error}"),
             })?;
-        digests.insert(record.line_id, record.embedding_text_sha256);
+        if !is_sha256_hex(&record.embedding_text_sha256) {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "line {}'s digest is {:?}, which is not 64 lowercase hex digits",
+                    record.line_id, record.embedding_text_sha256
+                ),
+            });
+        }
+        // A `HashMap` would have taken the last quietly. Two records for one line is a
+        // records file assembled from more than one run, and which digest wins decides
+        // which vector a future build reuses.
+        if digests
+            .insert(record.line_id, record.embedding_text_sha256)
+            .is_some()
+        {
+            return Err(PackError::DuplicateLineId {
+                line_id: record.line_id,
+            });
+        }
     }
 
     let mut offset = 0u64;
@@ -233,7 +255,7 @@ pub fn ledger_from_artifact(
         if line.trim().is_empty() {
             continue;
         }
-        // Only the id is needed, and only from the nested record the payload stores.
+        // Only what is needed: the id, and the truncated digest the payload already holds.
         #[derive(Deserialize)]
         struct Stored {
             metadata: StoredMetadata,
@@ -241,15 +263,33 @@ pub fn ledger_from_artifact(
         #[derive(Deserialize)]
         struct StoredMetadata {
             line_id: u64,
+            chunk_hash: String,
         }
         let stored: Stored = serde_json::from_str(&line).map_err(|error| PackError::Corpus {
             reason: format!("an artifact metadata record is malformed: {error}"),
         })?;
         let line_id = stored.metadata.line_id;
         let embedding_text_sha256 = digests
-            .get(&line_id)
-            .ok_or(PackError::LineNotInCorpus { line_id })?
-            .clone();
+            .remove(&line_id)
+            .ok_or(PackError::LineNotInCorpus { line_id })?;
+
+        // The join is on `line_id`, which a records file from another build shares. This
+        // is what makes it a join and not a coincidence: the artifact's own `chunk_hash`
+        // is the first 32 characters of the full digest, so a records file describing
+        // different text for the same id cannot pass.
+        let prefix = stored
+            .metadata
+            .chunk_hash
+            .len()
+            .min(embedding_text_sha256.len());
+        if stored.metadata.chunk_hash != embedding_text_sha256[..prefix] {
+            return Err(PackError::LineTextMismatch {
+                line_id,
+                declared: embedding_text_sha256,
+                actual: stored.metadata.chunk_hash,
+            });
+        }
+
         write_json(
             sink,
             &LedgerEntry {
@@ -259,8 +299,168 @@ pub fn ledger_from_artifact(
         )?;
         offset += 1;
     }
+
+    // Everything left over described a vector the artifact does not hold. A records file
+    // longer than the payload is one that belongs to a different build, and a ledger built
+    // from it would be complete, well-formed and about something else.
+    if let Some(line_id) = digests.keys().min().copied() {
+        return Err(PackError::MalformedInput {
+            reason: format!(
+                "{} record(s) describe lines the artifact does not hold, the first being {line_id}",
+                digests.len()
+            ),
+        });
+    }
     sink.flush().map_err(read_error)?;
     Ok(offset as usize)
+}
+
+/// 64 lowercase hex digits, and nothing else.
+///
+/// A digest is compared as a string everywhere it is used, so `"ABC…"` and `"abc…"` are
+/// two different keys for one vector — and a truncated one silently matches a prefix.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The lookup a first build gets: nothing to reuse from.
+static EMPTY_OFFSETS: std::sync::LazyLock<HashMap<String, u64>> =
+    std::sync::LazyLock::new(HashMap::new);
+
+/// A base artifact that has been checked, and the only thing reuse can be given.
+///
+/// The point is that it cannot be constructed without the check. Before this type
+/// existed, `LedgerManifest` declared `vectors_sha256`, `ledger_sha256` and
+/// `vector_count` and nothing compared any of them: a foreign `vectors.bin` of the same
+/// length, or one offset moved to another in-range value, was copied and then accepted —
+/// the packer re-normalises what it is handed and the record still names the right line,
+/// so nothing downstream could see it.
+///
+/// So the fields are private and [`Self::open`] is the only way in.
+pub struct VerifiedBase {
+    manifest: LedgerManifest,
+    /// Digest to offset, already bounds-checked against `vector_count`.
+    offsets: HashMap<String, u64>,
+    vectors: std::fs::File,
+}
+
+impl VerifiedBase {
+    /// Hash both files, bound every offset, and hold the model to the manifest.
+    ///
+    /// Hashing 23 GB of vectors is minutes, once per release, and it is the only thing
+    /// that distinguishes the base artifact from a file of the same size. Skipping it
+    /// would leave the manifest as documentation.
+    ///
+    /// # Errors
+    ///
+    /// [`PackError::LedgerDisagreesWithBuild`] for an identity mismatch, and
+    /// [`PackError::MalformedInput`] for a digest that does not match, a vector file whose
+    /// length is not `vector_count * dim * 4`, or an offset outside it.
+    pub fn open(
+        manifest: LedgerManifest,
+        ledger_path: &std::path::Path,
+        vectors_path: &std::path::Path,
+        model: &ModelIdentity,
+    ) -> Result<Self, PackError> {
+        manifest.ensure_matches(model, model.embedding_dim)?;
+
+        let ledger_bytes = std::fs::read(ledger_path).map_err(read_error)?;
+        let actual = sha256_hex(&ledger_bytes);
+        if actual != manifest.ledger_sha256 {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "the ledger hashes to {actual} and its manifest declares {}",
+                    manifest.ledger_sha256
+                ),
+            });
+        }
+
+        let width = u64::from(manifest.embedding_dim) * 4;
+        let expected_bytes = (manifest.vector_count as u64)
+            .checked_mul(width)
+            .ok_or_else(|| PackError::MalformedInput {
+                reason: "the declared vector count and width overflow a file length".to_string(),
+            })?;
+        let vectors = std::fs::File::open(vectors_path).map_err(read_error)?;
+        let length = vectors.metadata().map_err(read_error)?.len();
+        if length != expected_bytes {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "the base holds {length} byte(s) and {} vector(s) of width {width} need \
+                     {expected_bytes}",
+                    manifest.vector_count
+                ),
+            });
+        }
+        let actual = sha256_file(vectors_path)?;
+        if actual != manifest.vectors_sha256 {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "the base vectors hash to {actual} and the manifest declares {}",
+                    manifest.vectors_sha256
+                ),
+            });
+        }
+
+        let mut offsets = HashMap::new();
+        for line in ledger_bytes.split(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let entry: LedgerEntry =
+                serde_json::from_slice(line).map_err(|error| PackError::Corpus {
+                    reason: format!("a ledger entry is malformed: {error}"),
+                })?;
+            if entry.offset >= manifest.vector_count as u64 {
+                return Err(PackError::MalformedInput {
+                    reason: format!(
+                        "ledger offset {} is outside the {} vector(s) the base holds",
+                        entry.offset, manifest.vector_count
+                    ),
+                });
+            }
+            // Last writer wins, and it does not matter: one digest is one text and
+            // therefore one vector, wherever a healthy ledger records it.
+            offsets.insert(entry.embedding_text_sha256, entry.offset);
+        }
+
+        Ok(Self {
+            manifest,
+            offsets,
+            vectors,
+        })
+    }
+
+    /// The artifact digest this base was published under, for the run manifest.
+    pub fn artifact_digest(&self) -> &str {
+        &self.manifest.artifact_digest
+    }
+
+    /// Digest to offset, every one of them already inside `vector_count`.
+    pub(crate) fn offsets(&self) -> &HashMap<String, u64> {
+        &self.offsets
+    }
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String, PackError> {
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).map_err(read_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Split a plan against a ledger: what can be copied, and what has to be embedded.
@@ -277,31 +477,17 @@ pub fn ledger_from_artifact(
 /// accept bytes.
 pub fn plan_split(
     plan: impl BufRead,
-    ledger: impl BufRead,
-    base: Option<(&LedgerManifest, &ModelIdentity)>,
+    base: Option<&VerifiedBase>,
     reuse_sink: &mut dyn Write,
     embed_sink: &mut dyn Write,
 ) -> Result<SplitReport, PackError> {
-    // Before a single vector is named for reuse. A ledger from another model reuses just
-    // as cleanly as one from this model, and nothing downstream can tell the difference:
-    // the digests match, the counts match, and the vectors are from another space.
-    if let Some((manifest, model)) = base {
-        manifest.ensure_matches(model, model.embedding_dim)?;
-    }
-    let mut known: HashMap<String, u64> = HashMap::new();
-    for line in ledger.lines() {
-        let line = line.map_err(read_error)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: LedgerEntry =
-            serde_json::from_str(&line).map_err(|error| PackError::Corpus {
-                reason: format!("a ledger entry is malformed: {error}"),
-            })?;
-        // Last writer wins, and it does not matter: two entries with one digest describe
-        // the same text and therefore the same vector.
-        known.insert(entry.embedding_text_sha256, entry.offset);
-    }
+    // A [`VerifiedBase`] or nothing. There is no way to hand this function a ledger whose
+    // digests, length and offsets have not already been checked against the artifact they
+    // claim to describe, because that type cannot be built without checking them.
+    let known: &HashMap<String, u64> = match base {
+        Some(base) => base.offsets(),
+        None => &EMPTY_OFFSETS,
+    };
 
     let (mut planned, mut reused) = (0usize, 0usize);
     for line in plan.lines() {
@@ -358,7 +544,7 @@ pub fn plan_split(
 /// for, and [`PackError::Corpus`] for unreadable input or an unwritable sink.
 pub fn assemble(
     mut reuse: Vec<ReuseEntry>,
-    base_vectors: Option<&mut (impl Read + Seek)>,
+    base: Option<&VerifiedBase>,
     shards: Vec<ShardStreams>,
     embedding_dim: usize,
     vectors_sink: &mut dyn Write,
@@ -373,9 +559,10 @@ pub fn assemble(
 
     let reused = reuse.len();
     if reused > 0 {
-        let base = base_vectors.ok_or_else(|| PackError::MalformedInput {
-            reason: format!("{reused} vector(s) are to be reused and no base was given"),
+        let base = base.ok_or_else(|| PackError::MalformedInput {
+            reason: format!("{reused} vector(s) are to be reused and no verified base was given"),
         })?;
+        let mut base = &base.vectors;
         reuse.sort_unstable_by_key(|entry| entry.base_offset);
         for entry in reuse {
             let at = entry.base_offset.checked_mul(width as u64).ok_or_else(|| {
@@ -468,15 +655,50 @@ mod tests {
     use std::io::Cursor;
 
     const DIM: usize = 2;
-    /// The identity tests speak in `u32`, as `ModelIdentity` does.
-    #[allow(clippy::cast_possible_truncation)]
-    const DIM_U32: u32 = DIM as u32;
+    const DIM_U32: u32 = 2;
 
-    fn planned(line_id: u64, text: &str) -> String {
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "otzaria_reuse_{name}_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
+        ModelIdentity {
+            model_id: "otzaria-embedding-v1".to_string(),
+            model_checksum: checksum.to_string(),
+            model_quantization: "Q4_K_M".to_string(),
+            embedding_backend: "mock-hash-v1".to_string(),
+            embedding_dim: DIM_U32,
+            pooling: "last-token".to_string(),
+            max_tokens: 512,
+            embedding_text_version: 1,
+            normalization_version: 1,
+            chunking_identity: chunking.identity(),
+        }
+    }
+
+    fn planned(line_id: u64, digest: &str) -> String {
         serde_json::to_string(&PlannedChunk {
             line_id,
             source_line_sha256: format!("{line_id:064}"),
-            embedding_text_sha256: text.to_string(),
+            embedding_text_sha256: digest.to_string(),
             embedding_text: format!("text of {line_id}"),
         })
         .unwrap()
@@ -490,23 +712,81 @@ mod tests {
             .collect()
     }
 
+    /// A base on disk, with an honest manifest. Tests then damage one thing at a time.
+    struct Base {
+        dir: TempDir,
+        manifest: LedgerManifest,
+        model: ModelIdentity,
+    }
+
+    fn base_with(entries: &[(&str, u64)], values: &[[f32; DIM]]) -> Base {
+        let dir = TempDir::new("base");
+        let ledger: String = entries
+            .iter()
+            .map(|(digest, offset)| {
+                serde_json::to_string(&LedgerEntry {
+                    embedding_text_sha256: (*digest).to_string(),
+                    offset: *offset,
+                })
+                .unwrap()
+                    + "\n"
+            })
+            .collect();
+        let ledger_path = dir.0.join("ledger.jsonl");
+        std::fs::write(&ledger_path, &ledger).unwrap();
+        std::fs::write(dir.0.join("vectors.bin"), vectors_of(values)).unwrap();
+        // From the bytes on disk, which is what `open` reads. Hashing the in-memory
+        // string instead would make a difference between them invisible to the test.
+        let ledger_on_disk = std::fs::read(&ledger_path).unwrap();
+        let model = model_for(&"ab".repeat(32), &ChunkerConfig::default());
+        Base {
+            manifest: LedgerManifest {
+                artifact_digest: "d".repeat(64),
+                vectors_sha256: sha256_hex(&vectors_of(values)),
+                ledger_sha256: sha256_hex(&ledger_on_disk),
+                vector_count: values.len(),
+                embedding_dim: DIM_U32,
+                model: model.clone(),
+            },
+            model,
+            dir,
+        }
+    }
+
+    impl Base {
+        fn open(&self) -> Result<VerifiedBase, PackError> {
+            VerifiedBase::open(
+                self.manifest.clone(),
+                &self.dir.0.join("ledger.jsonl"),
+                &self.dir.0.join("vectors.bin"),
+                &self.model,
+            )
+        }
+    }
+
     /// The whole point, as one assertion: a line whose embedding text is unchanged does
     /// not reach the GPU, and one whose text is new does.
     #[test]
     fn only_the_digests_the_ledger_does_not_know_are_sent_to_be_embedded() {
+        let base = base_with(
+            &[("aa", 7), ("cc", 0)],
+            &[
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [2.0, 2.0],
+                [3.0, 3.0],
+                [4.0, 4.0],
+                [5.0, 5.0],
+                [6.0, 6.0],
+                [7.0, 7.0],
+            ],
+        );
+        let verified = base.open().unwrap();
         let plan = planned(1, "aa") + &planned(2, "bb") + &planned(3, "cc");
-        let ledger = "{\"embedding_text_sha256\":\"aa\",\"offset\":7}\n\
-                      {\"embedding_text_sha256\":\"cc\",\"offset\":0}\n";
         let (mut reuse, mut embed) = (Vec::new(), Vec::new());
 
-        let report = plan_split(
-            Cursor::new(plan),
-            Cursor::new(ledger),
-            None,
-            &mut reuse,
-            &mut embed,
-        )
-        .unwrap();
+        let report =
+            plan_split(Cursor::new(plan), Some(&verified), &mut reuse, &mut embed).unwrap();
 
         assert_eq!((report.planned, report.reused, report.to_embed), (3, 2, 1));
         let reused: Vec<ReuseEntry> = String::from_utf8(reuse)
@@ -535,11 +815,14 @@ mod tests {
         );
     }
 
-    /// A reused vector must be the base vector its offset names — the failure this whole
-    /// mechanism risks is copying the wrong float and calling it unchanged.
+    /// A reused vector must be the base vector its offset names.
     #[test]
     fn a_reused_vector_is_the_one_its_offset_points_at() {
-        let base = vectors_of(&[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]);
+        let base = base_with(
+            &[("d1", 1), ("d3", 3)],
+            &[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+        );
+        let verified = base.open().unwrap();
         let reuse = vec![
             ReuseEntry {
                 line_id: 10,
@@ -558,7 +841,7 @@ mod tests {
 
         let report = assemble(
             reuse,
-            Some(&mut Cursor::new(base)),
+            Some(&verified),
             Vec::new(),
             DIM,
             &mut vectors,
@@ -581,6 +864,57 @@ mod tests {
         assert_eq!(ids, vec![11, 10], "the record must follow its own vector");
     }
 
+    /// Each of these was reusable before `VerifiedBase` existed, and none of them is
+    /// visible afterwards: the packer re-normalises whatever it is handed and the record
+    /// still names the right line, so a wrong vector is accepted in silence.
+    #[test]
+    fn a_base_that_is_not_the_one_the_manifest_describes_is_refused() {
+        let values = [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]];
+        let entries = [("d1", 1), ("d3", 3)];
+
+        // A different file of exactly the same length.
+        let swapped = base_with(&entries, &values);
+        std::fs::write(
+            swapped.dir.0.join("vectors.bin"),
+            vectors_of(&[[9.0, 9.0], [8.0, 8.0], [7.0, 7.0], [6.0, 6.0]]),
+        )
+        .unwrap();
+        expect_refusal(swapped.open(), "hash to");
+
+        // One offset moved to another value that is still in range.
+        let mut moved = base_with(&[("d1", 2), ("d3", 3)], &values);
+        moved.manifest.ledger_sha256 = sha256_hex(
+            &std::fs::read(base_with(&entries, &values).dir.0.join("ledger.jsonl")).unwrap(),
+        );
+        expect_refusal(moved.open(), "ledger hashes to");
+
+        // An offset outside the vectors the base holds.
+        let outside = base_with(&[("d1", 99)], &values);
+        expect_refusal(outside.open(), "outside");
+
+        // A count that does not match the file.
+        let mut short = base_with(&entries, &values);
+        short.manifest.vector_count = 3;
+        expect_refusal(short.open(), "byte(s)");
+
+        // And the honest one still opens, so the tests above are not all failing for some
+        // shared reason.
+        assert!(base_with(&entries, &values).open().is_ok());
+    }
+
+    fn expect_refusal(outcome: Result<VerifiedBase, PackError>, expected: &str) {
+        match outcome {
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains(expected),
+                    "expected a refusal mentioning {expected:?}, got {text:?}"
+                );
+            }
+            Ok(_) => panic!("a base that is not the one described must not open"),
+        }
+    }
+
     /// The bug that was published once, as a test.
     ///
     /// `assemble` writes in one order and `pack` sorts the payload by `semantic_id`, so a
@@ -589,12 +923,19 @@ mod tests {
     /// deliberately different, because identical orders would pass either way.
     #[test]
     fn the_ledger_follows_the_artifact_order_and_not_the_assembler_s() {
-        // What `assemble` wrote: line 10 first, then 11.
-        let records = "{\"line_id\":10,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"aaa\"}\n\
-                       {\"line_id\":11,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"bbb\"}\n";
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let records = format!(
+            "{{\"line_id\":10,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"{a}\"}}\n\
+             {{\"line_id\":11,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"{b}\"}}\n"
+        );
         // What `pack` published: 11 first, because `semantic_id` sorted it there.
-        let metadata = "{\"metadata\":{\"line_id\":11},\"metadata_sha256\":\"x\",\"vector_sha256\":\"y\"}\n\
-                        {\"metadata\":{\"line_id\":10},\"metadata_sha256\":\"x\",\"vector_sha256\":\"y\"}\n";
+        let metadata = format!(
+            "{{\"metadata\":{{\"line_id\":11,\"chunk_hash\":\"{}\"}}}}\n\
+             {{\"metadata\":{{\"line_id\":10,\"chunk_hash\":\"{}\"}}}}\n",
+            &b[..32],
+            &a[..32]
+        );
 
         let mut ledger = Vec::new();
         let written =
@@ -609,16 +950,71 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|e| (e.embedding_text_sha256.as_str(), e.offset))
+                .map(|e| (e.embedding_text_sha256.clone(), e.offset))
                 .collect::<Vec<_>>(),
-            vec![("bbb", 0), ("aaa", 1)],
+            vec![(b, 0), (a, 1)],
             "offset 0 must name the line the artifact holds at offset 0"
         );
     }
 
+    /// A records file from another build shares the line ids and describes other text.
+    /// The artifact's own truncated `chunk_hash` is what makes the join checkable, and
+    /// each of these was accepted before it was compared.
+    #[test]
+    fn a_records_file_that_does_not_describe_this_artifact_is_refused() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let record = |id: u64, digest: &str| {
+            format!("{{\"line_id\":{id},\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"{digest}\"}}\n")
+        };
+        let stored = |id: u64, hash: &str| {
+            format!("{{\"metadata\":{{\"line_id\":{id},\"chunk_hash\":\"{hash}\"}}}}\n")
+        };
+        let build = |metadata: String, records: String| {
+            let mut out = Vec::new();
+            ledger_from_artifact(Cursor::new(metadata), Cursor::new(records), &mut out)
+        };
+
+        // Right ids, wrong text: the digest does not begin with the stored chunk_hash.
+        match build(stored(10, &b[..32]), record(10, &a)) {
+            Err(PackError::LineTextMismatch { line_id, .. }) => assert_eq!(line_id, 10),
+            other => panic!("expected a text mismatch, got {other:?}"),
+        }
+
+        // Two records for one line — a `HashMap` took the last one silently.
+        match build(stored(10, &a[..32]), record(10, &a) + &record(10, &b)) {
+            Err(PackError::DuplicateLineId { line_id }) => assert_eq!(line_id, 10),
+            other => panic!("expected a duplicate, got {other:?}"),
+        }
+
+        // A records file longer than the payload belongs to a different build.
+        match build(stored(10, &a[..32]), record(10, &a) + &record(11, &b)) {
+            Err(PackError::MalformedInput { reason }) => {
+                assert!(reason.contains("11"), "{reason}");
+            }
+            other => panic!("expected leftover records to be refused, got {other:?}"),
+        }
+
+        // An artifact line no record describes.
+        match build(stored(10, &a[..32]) + &stored(11, &b[..32]), record(10, &a)) {
+            Err(PackError::LineNotInCorpus { line_id }) => assert_eq!(line_id, 11),
+            other => panic!("expected a missing record, got {other:?}"),
+        }
+
+        // A digest that is not 64 lowercase hex is not a digest.
+        match build(stored(10, &a[..32]), record(10, &"A".repeat(64))) {
+            Err(PackError::MalformedInput { reason }) => {
+                assert!(reason.contains("lowercase hex"), "{reason}");
+            }
+            other => panic!("expected a malformed digest to be refused, got {other:?}"),
+        }
+
+        // And the honest pair still builds.
+        assert_eq!(build(stored(10, &a[..32]), record(10, &a)).unwrap(), 1);
+    }
+
     /// A ledger from another model reuses just as cleanly as one from this model, and
-    /// nothing downstream can tell: the digests match and the counts match. So the refusal
-    /// has to happen here, before a vector is named.
+    /// nothing downstream can tell: the digests match and the counts match.
     #[test]
     fn a_ledger_from_a_different_vector_space_is_refused() {
         let chunking = ChunkerConfig::default();
@@ -626,6 +1022,7 @@ mod tests {
         let manifest = LedgerManifest {
             artifact_digest: "d".repeat(64),
             vectors_sha256: "e".repeat(64),
+            ledger_sha256: "f".repeat(64),
             vector_count: 2,
             embedding_dim: DIM_U32,
             model: ModelIdentity {
@@ -665,21 +1062,6 @@ mod tests {
         assert!(same.ensure_matches(&mine, DIM_U32).is_ok());
     }
 
-    fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
-        ModelIdentity {
-            model_id: "otzaria-embedding-v1".to_string(),
-            model_checksum: checksum.to_string(),
-            model_quantization: "Q4_K_M".to_string(),
-            embedding_backend: "mock-hash-v1".to_string(),
-            embedding_dim: DIM_U32,
-            pooling: "last-token".to_string(),
-            max_tokens: 512,
-            embedding_text_version: 1,
-            normalization_version: 1,
-            chunking_identity: chunking.identity(),
-        }
-    }
-
     /// A shard whose two files disagree on length would shift every pairing after it, and
     /// nothing downstream could see it: the ids would all be present and the count would
     /// be right.
@@ -687,7 +1069,7 @@ mod tests {
     fn a_shard_with_more_vectors_than_records_is_refused() {
         let records =
             "{\"line_id\":1,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"d\"}\n";
-        let shards: Vec<(Box<dyn Read>, Box<dyn BufRead>)> = vec![(
+        let shards: Vec<ShardStreams> = vec![(
             Box::new(Cursor::new(vectors_of(&[[1.0, 1.0], [2.0, 2.0]]))),
             Box::new(Cursor::new(records)),
         )];
@@ -695,7 +1077,7 @@ mod tests {
 
         let outcome = assemble(
             Vec::new(),
-            None::<&mut Cursor<Vec<u8>>>,
+            None,
             shards,
             DIM,
             &mut vectors,
