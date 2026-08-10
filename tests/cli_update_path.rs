@@ -524,4 +524,40 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
         ],
         "--dim disagrees with the model",
     );
+
+    // 12. Merging again into a directory that already holds a pair is refused, and the pair
+    //     that is there survives byte for byte. Two renames are not one commit: publishing
+    //     new vectors over old records leaves floats bound by position to ids they do not
+    //     belong to, and nothing downstream can prove otherwise.
+    let pair: Vec<Vec<u8>> = ["vectors.f32", "records.jsonl"]
+        .iter()
+        .map(|name| std::fs::read(merged.join(name)).unwrap())
+        .collect();
+    refused(
+        &[
+            "assemble",
+            "--shards",
+            &dir.at("shards").display().to_string(),
+            "--plan-sha256",
+            &sha256_of(&plan),
+            "--embed-records",
+            &records.to_string(),
+            "--model",
+            &model_path.display().to_string(),
+            "--out",
+            &merged.display().to_string(),
+        ],
+        "already exists",
+    );
+    for (name, before) in ["vectors.f32", "records.jsonl"].iter().zip(&pair) {
+        assert_eq!(
+            &std::fs::read(merged.join(name)).unwrap(),
+            before,
+            "{name} was touched by a merge that refused to run"
+        );
+    }
+    assert!(
+        !merged.join("vectors.f32.partial").exists(),
+        "and no partial was opened before the refusal"
+    );
 }

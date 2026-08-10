@@ -113,7 +113,9 @@ Options for 'assemble':
                              width the model does not declare is not a width.
   --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
   --base-vectors <path>      vectors.f32 of the release being reused from
-  --out <dir>                Receives vectors.f32 and records.jsonl
+  --out <dir>                Receives vectors.f32 and records.jsonl, and may hold neither
+                             already: the two are one fact, and a record is bound to a
+                             vector by position alone. To merge again, remove both first.
 
 Options for 'ledger':
   --artifact <dir>           A packed artifact; its metadata.jsonl order is the payload's
@@ -758,8 +760,29 @@ fn run_assemble(args: &[String]) {
     // as it reads, so anything it refuses part-way through has already put bytes on disk —
     // and a truncated pair under the final names is one a later `pack` would read as the
     // whole release.
+    let vectors_final = out.join("vectors.f32");
+    let records_final = out.join("records.jsonl");
     let vectors_partial = out.join("vectors.f32.partial");
     let records_partial = out.join("records.jsonl.partial");
+    // Nothing here overwrites, for the reason the ledger does not: the two files are one
+    // fact and two renames are not one commit. Into a directory that already holds a pair,
+    // a crash after the first rename would leave the new vectors beside the *old* records —
+    // and a record and a vector are bound only by their position, so nothing downstream can
+    // prove the floats do not belong to the ids.
+    for existing in [
+        &vectors_final,
+        &records_final,
+        &vectors_partial,
+        &records_partial,
+    ] {
+        if existing.exists() {
+            exit_with(
+                &format!("{} already exists", existing.display()),
+                "the merged vectors and their records are published as a pair; --out must \
+                 hold neither, or remove both first",
+            );
+        }
+    }
     let mut vectors = std::io::BufWriter::new(
         std::fs::File::create(&vectors_partial)
             .unwrap_or_else(|error| exit_with("Could not write vectors.f32", error)),
@@ -776,18 +799,38 @@ fn run_assemble(args: &[String]) {
         &mut vectors,
         &mut records,
     );
-    drop((vectors, records));
-    let report = outcome.unwrap_or_else(|error| {
+    let abandon = |what: &str, why: String| -> ! {
         let _ = std::fs::remove_file(&vectors_partial);
         let _ = std::fs::remove_file(&records_partial);
-        exit_with("Assembly failed", error)
-    });
-    for (partial, final_name) in [
-        (&vectors_partial, "vectors.f32"),
-        (&records_partial, "records.jsonl"),
+        exit_with(what, why)
+    };
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error) => {
+            drop((vectors, records));
+            abandon("Assembly failed", error.to_string())
+        }
+    };
+    // Both files onto the disk before either name is published: a rename that survives a
+    // power loss while its contents do not is the same half-published pair by another route.
+    for writer in [vectors, records] {
+        writer
+            .into_inner()
+            .unwrap_or_else(|error| abandon("Could not finish the merge", error.to_string()))
+            .sync_all()
+            .unwrap_or_else(|error| {
+                abandon("Could not flush the merge to disk", error.to_string())
+            });
+    }
+    for (partial, published) in [
+        (&vectors_partial, &vectors_final),
+        (&records_partial, &records_final),
     ] {
-        std::fs::rename(partial, out.join(final_name))
+        std::fs::rename(partial, published)
             .unwrap_or_else(|error| exit_with("Could not publish the merged vectors", error));
+    }
+    if let Ok(handle) = std::fs::File::open(&out) {
+        let _ = handle.sync_all();
     }
 
     println!("\n=== Assembled a release's vectors ===");
