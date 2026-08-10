@@ -114,61 +114,55 @@ pub struct ShardReport {
 /// for a corpus where two books claim one line, [`PackError::NothingToEmbed`] for a corpus
 /// the recipe empties, and [`PackError::Corpus`] for a sink that will not accept bytes.
 pub fn export_plan(
-    corpus: &dyn CorpusBooks,
+    corpus: &(dyn CorpusBooks + Sync),
     chunking: &ChunkerConfig,
     model: &ModelIdentity,
     sink: &mut dyn Write,
 ) -> Result<PlanReport, PackError> {
     let chunking_identity = ensure_recipe_matches(chunking, model)?;
-    let chunker = Chunker::new(chunking.clone())?;
+    let books = corpus.book_keys()?;
 
     // Hashing the bytes as they are written, rather than reading the file back: the digest
     // then describes what was actually sent, including a partial write that a later read
     // would not have distinguished from a short plan.
     let mut hasher = Sha256::new();
     let mut records = 0usize;
-    let mut books = 0usize;
     let (mut min_line_id, mut max_line_id) = (u64::MAX, 0u64);
     // Ids only. Holding the text as well would be a second copy of the corpus in memory,
     // which is the cost this whole module exists to avoid.
     let mut seen = std::collections::BTreeSet::new();
 
-    for book_key in corpus.book_keys()? {
-        books += 1;
-        for chunk in chunks_for_book(corpus, &chunker, &book_key)? {
-            if !seen.insert(chunk.line_id) {
-                return Err(PackError::DuplicateLineId {
-                    line_id: chunk.line_id,
-                });
-            }
-            let planned = PlannedChunk {
-                line_id: chunk.line_id,
-                source_line_sha256: sha256_hex(chunk.anchor_text.as_bytes()),
-                embedding_text_sha256: sha256_hex(chunk.embedding_text.as_bytes()),
-                embedding_text: chunk.embedding_text,
-            };
-            let mut line = serde_json::to_vec(&planned).map_err(|error| PackError::Corpus {
-                reason: format!(
-                    "line {} could not be written to the plan: {error}",
-                    planned.line_id
-                ),
-            })?;
-            line.push(b'\n');
-            hasher.update(&line);
-            write(sink, &line)?;
+    // Books are resolved in parallel and written in order. Applying the recipe to a book
+    // touches nothing outside it, so the only sequential parts left are the ones whose
+    // *value* depends on order — the digest of the file, and the file itself. A window at
+    // a time rather than the whole library at once, so the peak cost is a few dozen books
+    // of serialized text rather than six million lines of it.
+    let width = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let window = width.saturating_mul(4).max(1);
 
-            records += 1;
-            min_line_id = min_line_id.min(planned.line_id);
-            max_line_id = max_line_id.max(planned.line_id);
+    for batch in books.chunks(window) {
+        let resolved = resolve_books(corpus, chunking, batch, width)?;
+        for (line_ids, body) in resolved {
+            for line_id in line_ids {
+                // Two books claiming one line, or one book listing it twice. The packer
+                // would reject it later as a duplicate; saying so here names the recipe's
+                // input instead of the vector stream, which is where the fault is.
+                if !seen.insert(line_id) {
+                    return Err(PackError::DuplicateLineId { line_id });
+                }
+                records += 1;
+                min_line_id = min_line_id.min(line_id);
+                max_line_id = max_line_id.max(line_id);
+            }
+            hasher.update(&body);
+            write(sink, &body)?;
         }
     }
 
     if records == 0 {
-        return Err(PackError::NothingToEmbed { books });
+        return Err(PackError::NothingToEmbed { books: books.len() });
     }
-    sink.flush().map_err(|error| PackError::Corpus {
-        reason: format!("the plan could not be flushed: {error}"),
-    })?;
+    flush(sink)?;
 
     Ok(PlanReport {
         records,
@@ -177,6 +171,79 @@ pub fn export_plan(
         plan_sha256: format!("{:x}", hasher.finalize()),
         chunking_identity,
     })
+}
+
+/// One book's contribution to the plan: the ids it produced, and its records already
+/// serialized. Held as bytes rather than as values because the only thing left to do
+/// with them is hash them and write them, both in order.
+type ResolvedBook = (Vec<u64>, Vec<u8>);
+
+/// Apply the recipe to one window of books, `width` at a time, and return each book's ids
+/// and its serialized records **in the order the window gave them**.
+///
+/// `std::thread::scope` rather than a work-stealing pool: this crate is compiled into the
+/// application, and a build-side pass is not a reason to put a thread pool in a phone.
+fn resolve_books(
+    corpus: &(dyn CorpusBooks + Sync),
+    chunking: &ChunkerConfig,
+    batch: &[String],
+    width: usize,
+) -> Result<Vec<ResolvedBook>, PackError> {
+    let mut slots: Vec<Option<Result<ResolvedBook, PackError>>> =
+        (0..batch.len()).map(|_| None).collect();
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_of_books, chunk_of_slots) in batch
+            .chunks(batch.len().div_ceil(width.max(1)).max(1))
+            .zip(slots.chunks_mut(batch.len().div_ceil(width.max(1)).max(1)))
+        {
+            handles.push(scope.spawn(move || {
+                for (book_key, slot) in chunk_of_books.iter().zip(chunk_of_slots.iter_mut()) {
+                    *slot = Some(resolve_book(corpus, chunking, book_key));
+                }
+            }));
+        }
+        for handle in handles {
+            // A panicking worker is not a build error; it is a bug, and it must not be
+            // reported as a corpus that could not be read.
+            handle.join().expect("a book resolver must not panic");
+        }
+    });
+
+    slots
+        .into_iter()
+        .map(|slot| slot.expect("every book was assigned to a worker"))
+        .collect()
+}
+
+fn resolve_book(
+    corpus: &dyn CorpusBooks,
+    chunking: &ChunkerConfig,
+    book_key: &str,
+) -> Result<ResolvedBook, PackError> {
+    // One per worker: resolving a recipe is a few enum lookups, and sharing one would
+    // mean sharing it across threads for no gain.
+    let chunker = Chunker::new(chunking.clone())?;
+    let mut line_ids = Vec::new();
+    let mut body = Vec::new();
+    for chunk in chunks_for_book(corpus, &chunker, book_key)? {
+        let planned = PlannedChunk {
+            line_id: chunk.line_id,
+            source_line_sha256: sha256_hex(chunk.anchor_text.as_bytes()),
+            embedding_text_sha256: sha256_hex(chunk.embedding_text.as_bytes()),
+            embedding_text: chunk.embedding_text,
+        };
+        serde_json::to_writer(&mut body, &planned).map_err(|error| PackError::Corpus {
+            reason: format!(
+                "line {} could not be written to the plan: {error}",
+                planned.line_id
+            ),
+        })?;
+        body.push(b'\n');
+        line_ids.push(planned.line_id);
+    }
+    Ok((line_ids, body))
 }
 
 /// Read a plan back, one record per line, skipping `skip` and yielding at most `take`.

@@ -14,6 +14,7 @@ use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
+use otzaria_semantic_search::distribution::reuse::{assemble, plan_split, ReuseEntry};
 use otzaria_semantic_search::distribution::shard::{embed_shard, export_plan, read_plan};
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::Pooling;
@@ -43,6 +44,9 @@ Commands:
   export-plan [options]               Apply the recipe and write the work out, for a
                                       machine that will embed it elsewhere.
   embed-shard [options]               Embed one window of an exported plan.
+  plan-split [options]                Split a plan against a previous release's ledger.
+  assemble [options]                  Gather reused and freshly embedded vectors into one
+                                      pair of files, and write the next ledger.
   pack [options]                      Build an official artifact from ready-made vectors.
   validate [options]                  Verify an artifact against a corpus and a model.
 
@@ -84,6 +88,24 @@ Options for 'embed-shard':
   --batch <N>                Texts per inference call (default: 32)
   --out <dir>                Receives vectors.f32, records.jsonl, shard-manifest.json
   --allow-non-semantic       As for 'build'
+
+Options for 'plan-split':
+  --plan <path>              plan.jsonl for the release being built
+  --ledger <path>            ledger.jsonl of the release to reuse from. Omit it for a
+                             full baseline: every line then goes to the GPU.
+  --out <dir>                Receives reuse.jsonl and embed.jsonl
+
+Options for 'assemble':
+  --shards <dir>             Root holding every shard's output, at any depth
+  --dim <N>                  Embedding dimension, so a truncated file is arithmetic
+  --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
+  --base-vectors <path>      vectors.f32 of the release being reused from
+  --out <dir>                Receives vectors.f32, records.jsonl and ledger.jsonl
+
+The reuse key is embedding_text_sha256, not a line id: a vector is a function of the text
+that was embedded and nothing else, so a digest the previous ledger knows names a vector
+that is already correct — whatever id it now carries. It also catches what an id-keyed
+diff misses silently, a line whose own text is unchanged but whose neighbour moved.
 
 A shard is a window of *records*, not of line_ids. Merge by concatenating every shard's
 vectors.f32 and records.jsonl in any order, then 'pack' the pair: it compares the ids it
@@ -321,6 +343,8 @@ fn main() {
         "build" => run_build(&args),
         "export-plan" => run_export_plan(&args),
         "embed-shard" => run_embed_shard(&args),
+        "plan-split" => run_plan_split(&args),
+        "assemble" => run_assemble(&args),
         "pack" => run_pack(&args),
         "validate" => run_validate(&args),
         "help" | "-h" | "--help" => {
@@ -572,6 +596,156 @@ fn run_embed_shard(args: &[String]) {
     println!("Dimension:       {}", report.embedding_dim);
     println!("vectors SHA-256: {}", report.vectors_sha256);
     println!("records SHA-256: {}", report.records_sha256);
+}
+
+/// Split a plan against the previous release's ledger.
+///
+/// The half of an update that decides what does not have to be embedded again. Reads no
+/// model and touches no GPU: it is a digest lookup per line.
+fn run_plan_split(args: &[String]) {
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let plan = require_arg(args, "--plan");
+    // A ledger is optional, and its absence is the first build rather than a mistake.
+    let ledger = parse_arg(args, "--ledger");
+
+    std::fs::create_dir_all(&out)
+        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
+    let plan = std::io::BufReader::new(
+        std::fs::File::open(&plan)
+            .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
+    );
+    let ledger: Box<dyn std::io::BufRead> = match ledger {
+        Some(path) => Box::new(std::io::BufReader::new(
+            std::fs::File::open(&path)
+                .unwrap_or_else(|error| exit_with("Could not read the ledger", error)),
+        )),
+        None => Box::new(std::io::empty()),
+    };
+    let mut reuse = std::io::BufWriter::new(
+        std::fs::File::create(out.join("reuse.jsonl"))
+            .unwrap_or_else(|error| exit_with("Could not write reuse.jsonl", error)),
+    );
+    let mut embed = std::io::BufWriter::new(
+        std::fs::File::create(out.join("embed.jsonl"))
+            .unwrap_or_else(|error| exit_with("Could not write embed.jsonl", error)),
+    );
+
+    let report = plan_split(plan, ledger, &mut reuse, &mut embed)
+        .unwrap_or_else(|error| exit_with("The split failed", error));
+
+    println!("\n=== Split a plan against a ledger ===");
+    println!("Planned:   {}", report.planned);
+    println!("Reused:    {}", report.reused);
+    println!("To embed:  {}", report.to_embed);
+}
+
+/// Assemble one release's vectors from what was reused and what was embedded.
+///
+/// Shard directories are taken in sorted order, and each is expected to hold a
+/// `vectors.f32` and a `records.jsonl` of matching length — a pair that disagrees is
+/// refused rather than shifting every pairing after it.
+fn run_assemble(args: &[String]) {
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let shard_root = PathBuf::from(require_arg(args, "--shards"));
+    let embedding_dim: usize = require_arg(args, "--dim")
+        .parse()
+        .unwrap_or_else(|_| exit_with("--dim", "not a number"));
+
+    let reuse: Vec<ReuseEntry> = match parse_arg(args, "--reuse") {
+        Some(path) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| exit_with("Could not read the reuse list", error))
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|error| exit_with("A reuse entry is malformed", error))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut base = parse_arg(args, "--base-vectors").map(|path| {
+        std::fs::File::open(&path)
+            .unwrap_or_else(|error| exit_with("Could not read the base vectors", error))
+    });
+
+    // Every `vectors.f32` under the root, at any depth: a shard produced by a
+    // multi-GPU session is a directory of directories, and flattening it here means the
+    // caller does not have to.
+    let mut shards = Vec::new();
+    collect_shards(&shard_root, &mut shards);
+    shards.sort();
+    println!(
+        "Shards: {} half-shard(s) under {}",
+        shards.len(),
+        shard_root.display()
+    );
+
+    /// One shard's two files, opened. Named because the pair is what `assemble` takes,
+    /// and clippy is right that the tuple of boxes is unreadable inline.
+    type ShardStreams = (Box<dyn std::io::Read>, Box<dyn std::io::BufRead>);
+
+    let opened: Vec<ShardStreams> = shards
+        .iter()
+        .map(|dir| {
+            let vectors = std::fs::File::open(dir.join("vectors.f32"))
+                .unwrap_or_else(|error| exit_with("Could not read a shard's vectors", error));
+            let records = std::fs::File::open(dir.join("records.jsonl"))
+                .unwrap_or_else(|error| exit_with("Could not read a shard's records", error));
+            (
+                Box::new(std::io::BufReader::new(vectors)) as Box<dyn std::io::Read>,
+                Box::new(std::io::BufReader::new(records)) as Box<dyn std::io::BufRead>,
+            )
+        })
+        .collect();
+
+    std::fs::create_dir_all(&out)
+        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
+    let mut vectors = std::io::BufWriter::new(
+        std::fs::File::create(out.join("vectors.f32"))
+            .unwrap_or_else(|error| exit_with("Could not write vectors.f32", error)),
+    );
+    let mut records = std::io::BufWriter::new(
+        std::fs::File::create(out.join("records.jsonl"))
+            .unwrap_or_else(|error| exit_with("Could not write records.jsonl", error)),
+    );
+    let mut ledger = std::io::BufWriter::new(
+        std::fs::File::create(out.join("ledger.jsonl"))
+            .unwrap_or_else(|error| exit_with("Could not write ledger.jsonl", error)),
+    );
+
+    let report = assemble(
+        reuse,
+        base.as_mut(),
+        opened,
+        embedding_dim,
+        &mut vectors,
+        &mut records,
+        &mut ledger,
+    )
+    .unwrap_or_else(|error| exit_with("Assembly failed", error));
+
+    println!("\n=== Assembled a release's vectors ===");
+    println!("Vectors:   {}", report.vectors);
+    println!("Reused:    {}", report.reused);
+    println!("Embedded:  {}", report.embedded);
+    println!("Dimension: {}", report.embedding_dim);
+    println!("\nPack them against the corpus next; nothing here checked them against it.");
+}
+
+/// Every directory holding a `vectors.f32`, depth-first.
+fn collect_shards(root: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    if root.join("vectors.f32").is_file() {
+        found.push(root.to_path_buf());
+        return;
+    }
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            collect_shards(&entry.path(), found);
+        }
+    }
 }
 
 fn run_build(args: &[String]) {

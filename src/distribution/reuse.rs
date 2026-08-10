@@ -65,6 +65,9 @@ pub struct SplitReport {
     pub to_embed: usize,
 }
 
+/// One shard's vectors and the records that pair with them, already opened.
+pub type ShardStreams = (Box<dyn Read>, Box<dyn BufRead>);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssembleReport {
     pub vectors: usize,
@@ -162,7 +165,7 @@ pub fn plan_split(
 pub fn assemble(
     mut reuse: Vec<ReuseEntry>,
     base_vectors: Option<&mut (impl Read + Seek)>,
-    shards: Vec<(Box<dyn Read>, Box<dyn BufRead>)>,
+    shards: Vec<ShardStreams>,
     embedding_dim: usize,
     vectors_sink: &mut dyn Write,
     records_sink: &mut dyn Write,
