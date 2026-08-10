@@ -11,6 +11,7 @@
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::distribution::builder::{build, BuildRequest, PlannedCorpus};
 use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
+use otzaria_semantic_search::distribution::package::IndexPackage;
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
@@ -116,9 +117,9 @@ Options for 'ledger':
   --artifact <dir>           A packed artifact; its metadata.jsonl order is the payload's
   --records <path>           records.jsonl from 'assemble' — the only place the full
                              64-hex digest exists, since the payload stores 32
-  --artifact-digest <hex>    The digest published outside the artifact, which the
-                             manifest binds the ledger to
-  --model <path>             The identity the vectors were built under
+  --artifact-digest <hex>    Optional. The digest published outside the artifact; it is
+                             compared against the computed one, never copied into the
+                             manifest. The model identity comes from the package.
   --out <path>               ledger.jsonl; the manifest is written beside it
 
 Build the ledger from the artifact and never from 'assemble': packing sorts the payload by
@@ -734,27 +735,9 @@ fn run_assemble(args: &[String]) {
     let expected: usize = require_arg(args, "--embed-records")
         .parse()
         .unwrap_or_else(|_| exit_with("--embed-records", "not a number"));
-    verify_shards(&manifests, &plan_sha256, &shard_model, expected)
+    let opened = verify_shards(&manifests, &plan_sha256, &shard_model, expected)
         .unwrap_or_else(|error| exit_with("The shards do not cover this plan", error));
     println!("Shards verified: {expected} record(s), one plan, one model, no hole");
-
-    /// One shard's two files, opened. Named because the pair is what `assemble` takes,
-    /// and clippy is right that the tuple of boxes is unreadable inline.
-    type ShardStreams = (Box<dyn std::io::Read>, Box<dyn std::io::BufRead>);
-
-    let opened: Vec<ShardStreams> = shards
-        .iter()
-        .map(|dir| {
-            let vectors = std::fs::File::open(dir.join("vectors.f32"))
-                .unwrap_or_else(|error| exit_with("Could not read a shard's vectors", error));
-            let records = std::fs::File::open(dir.join("records.jsonl"))
-                .unwrap_or_else(|error| exit_with("Could not read a shard's records", error));
-            (
-                Box::new(std::io::BufReader::new(vectors)) as Box<dyn std::io::Read>,
-                Box::new(std::io::BufReader::new(records)) as Box<dyn std::io::BufRead>,
-            )
-        })
-        .collect();
 
     std::fs::create_dir_all(&out)
         .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
@@ -818,17 +801,45 @@ fn run_ledger(args: &[String]) {
         .unwrap_or_else(|error| exit_with("The ledger could not be built", error));
     drop(sink);
 
-    // Written here, not by hand. A manifest typed beside a ledger is a manifest that can
-    // disagree with it, and the disagreement is exactly what reuse trusts.
-    let digest = require_arg(args, "--artifact-digest");
-    let model = read_model(&require_arg(args, "--model"));
+    // Read from the package, never taken from the caller. `--model` and
+    // `--artifact-digest` were copied into the manifest unchecked, which let a manifest
+    // declare model B over vectors built by model A of the same width — and `VerifiedBase`
+    // would then verify the ledger perfectly against that lie.
+    let package = IndexPackage::read(&artifact)
+        .unwrap_or_else(|error| exit_with("The artifact could not be read", error));
+    package
+        .verify_integrity(&artifact)
+        .unwrap_or_else(|error| exit_with("The artifact does not verify", error));
+    let identity = package.manifest.identity.clone();
+    let digest = package.digest();
+
+    if entries != package.manifest.vector_count as usize {
+        exit_with(
+            "The ledger does not describe this artifact",
+            format!(
+                "{entries} entry(ies) against {} vector(s)",
+                package.manifest.vector_count
+            ),
+        );
+    }
+    // An external anchor is compared, not copied. If the caller has the published digest,
+    // a mismatch means this is not the artifact they think it is.
+    if let Some(published) = parse_arg(args, "--artifact-digest") {
+        if published != digest {
+            exit_with(
+                "This is not the artifact that digest was published for",
+                format!("published {published}, computed {digest}"),
+            );
+        }
+    }
+
     let manifest = LedgerManifest {
         artifact_digest: digest,
         vectors_sha256: sha256_of(&artifact.join("vectors.bin")),
         ledger_sha256: sha256_of(&out),
         vector_count: entries,
-        embedding_dim: model.embedding_dim,
-        model,
+        embedding_dim: identity.model.embedding_dim,
+        model: identity.model,
     };
     let manifest_path = out.with_extension("manifest.json");
     std::fs::write(

@@ -277,12 +277,19 @@ pub fn ledger_from_artifact(
         // is what makes it a join and not a coincidence: the artifact's own `chunk_hash`
         // is the first 32 characters of the full digest, so a records file describing
         // different text for the same id cannot pass.
-        let prefix = stored
-            .metadata
-            .chunk_hash
-            .len()
-            .min(embedding_text_sha256.len());
-        if stored.metadata.chunk_hash != embedding_text_sha256[..prefix] {
+        // Exactly 32, compared directly. `min(a.len(), b.len())` accepted an empty
+        // `chunk_hash` — the empty prefix equals the empty prefix — and any short one that
+        // happened to match, which is the prefix check quietly not happening.
+        if !is_chunk_hash(&stored.metadata.chunk_hash) {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "line {line_id}'s stored chunk_hash is {:?}, which is not 32 lowercase \
+                     hex digits",
+                    stored.metadata.chunk_hash
+                ),
+            });
+        }
+        if stored.metadata.chunk_hash != embedding_text_sha256[..CHUNK_HASH_LEN] {
             return Err(PackError::LineTextMismatch {
                 line_id,
                 declared: embedding_text_sha256,
@@ -315,15 +322,26 @@ pub fn ledger_from_artifact(
     Ok(offset as usize)
 }
 
+/// How much of the digest the payload keeps. Enough to compare at runtime, and not
+/// enough to decide whether inference can be skipped — which is why the ledger needs the
+/// records file as well as the artifact.
+const CHUNK_HASH_LEN: usize = 32;
+
+/// Exactly [`CHUNK_HASH_LEN`] lowercase hex digits.
+fn is_chunk_hash(value: &str) -> bool {
+    value.len() == CHUNK_HASH_LEN && value.bytes().all(is_lower_hex)
+}
+
 /// 64 lowercase hex digits, and nothing else.
 ///
 /// A digest is compared as a string everywhere it is used, so `"ABC…"` and `"abc…"` are
 /// two different keys for one vector — and a truncated one silently matches a prefix.
 fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64 && value.bytes().all(is_lower_hex)
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
 
 /// The lookup a first build gets: nothing to reuse from.
@@ -384,7 +402,7 @@ impl VerifiedBase {
             .ok_or_else(|| PackError::MalformedInput {
                 reason: "the declared vector count and width overflow a file length".to_string(),
             })?;
-        let vectors = std::fs::File::open(vectors_path).map_err(read_error)?;
+        let mut vectors = std::fs::File::open(vectors_path).map_err(read_error)?;
         let length = vectors.metadata().map_err(read_error)?.len();
         if length != expected_bytes {
             return Err(PackError::MalformedInput {
@@ -395,7 +413,11 @@ impl VerifiedBase {
                 ),
             });
         }
-        let actual = sha256_file(vectors_path)?;
+        // Hashed through the handle that will later be read from, and rewound — not
+        // reopened by path. Reopening leaves a window in which the file that was checked
+        // and the file that is used are two different files.
+        let actual = sha256_reader(&mut vectors)?;
+        vectors.seek(SeekFrom::Start(0)).map_err(read_error)?;
         if actual != manifest.vectors_sha256 {
             return Err(PackError::MalformedInput {
                 reason: format!(
@@ -445,8 +467,7 @@ impl VerifiedBase {
     }
 }
 
-fn sha256_file(path: &std::path::Path) -> Result<String, PackError> {
-    let mut file = std::fs::File::open(path).map_err(read_error)?;
+fn sha256_reader(file: &mut impl Read) -> Result<String, PackError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
@@ -549,11 +570,30 @@ pub fn verify_shards(
     plan_sha256: &str,
     model: &ModelIdentity,
     total: usize,
-) -> Result<(), PackError> {
+) -> Result<Vec<ShardStreams>, PackError> {
+    // A release where no embedding text changed needs no GPU at all: every vector comes
+    // from the base and there are no shard directories. That is the cheapest path there
+    // is, and refusing an empty set unconditionally made it the one path that could not
+    // run.
+    if total == 0 {
+        return if shards.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(PackError::MalformedInput {
+                reason: format!(
+                    "{} shard(s) were produced for a plan that needs no embedding",
+                    shards.len()
+                ),
+            })
+        };
+    }
     if shards.is_empty() {
         return Err(PackError::NoVectors);
     }
-    let mut windows: Vec<(usize, usize, &std::path::Path)> = Vec::with_capacity(shards.len());
+    // Path, window, and the two handles that were hashed. Ordering happens after every
+    // shard has been checked, so a refusal never depends on which one came first.
+    let mut checked: Vec<(usize, usize, &std::path::Path, std::fs::File, std::fs::File)> =
+        Vec::with_capacity(shards.len());
 
     for (dir, manifest) in shards {
         let named = dir.display();
@@ -570,11 +610,16 @@ pub fn verify_shards(
                 reason: format!("{named} was embedded by a different model identity"),
             });
         }
+        // Opened once, hashed through the handle, rewound, and carried out of here. The
+        // caller cannot reopen by path, so the file that was checked is the file that is
+        // read.
+        let mut handles = Vec::with_capacity(2);
         for (file, declared) in [
             ("vectors.f32", &manifest.vectors_sha256),
             ("records.jsonl", &manifest.records_sha256),
         ] {
-            let actual = sha256_file(&dir.join(file))?;
+            let mut handle = std::fs::File::open(dir.join(file)).map_err(read_error)?;
+            let actual = sha256_reader(&mut handle)?;
             if &actual != declared {
                 return Err(PackError::MalformedInput {
                     reason: format!(
@@ -582,13 +627,22 @@ pub fn verify_shards(
                     ),
                 });
             }
+            handle.seek(SeekFrom::Start(0)).map_err(read_error)?;
+            handles.push(handle);
         }
-        windows.push((manifest.skip, manifest.records, dir.as_path()));
+        let mut handles = handles.into_iter();
+        checked.push((
+            manifest.skip,
+            manifest.records,
+            dir.as_path(),
+            handles.next().expect("two handles were opened"),
+            handles.next().expect("two handles were opened"),
+        ));
     }
 
-    windows.sort_unstable();
+    checked.sort_by_key(|(skip, records, dir, _, _)| (*skip, *records, *dir));
     let mut covered = 0usize;
-    for (skip, records, dir) in &windows {
+    for (skip, records, dir, _, _) in &checked {
         if *skip != covered {
             return Err(PackError::MalformedInput {
                 reason: if *skip > covered {
@@ -611,7 +665,16 @@ pub fn verify_shards(
             reason: format!("the shards cover {covered} record(s) and the plan holds {total}"),
         });
     }
-    Ok(())
+
+    Ok(checked
+        .into_iter()
+        .map(|(_, _, _, vectors, records)| {
+            (
+                Box::new(std::io::BufReader::new(vectors)) as Box<dyn Read>,
+                Box::new(std::io::BufReader::new(records)) as Box<dyn BufRead>,
+            )
+        })
+        .collect())
 }
 
 /// Copy the reusable vectors out of the base artifact, append this run's shards, and
@@ -1130,7 +1193,7 @@ mod tests {
         );
     }
 
-    fn expect_reason(outcome: Result<(), PackError>, expected: &str) {
+    fn expect_reason<T>(outcome: Result<T, PackError>, expected: &str) {
         match outcome {
             Err(error) => {
                 let text = error.to_string();
@@ -1139,7 +1202,7 @@ mod tests {
                     "expected {expected:?}, got {text:?}"
                 );
             }
-            Ok(()) => panic!("expected a refusal"),
+            Ok(_) => panic!("expected a refusal"),
         }
     }
 
@@ -1197,6 +1260,38 @@ mod tests {
 
         // And the honest pair still builds.
         assert_eq!(build(stored(10, &a[..32]), record(10, &a)).unwrap(), 1);
+    }
+
+    /// An empty or short `chunk_hash` compared equal under `min(a.len(), b.len())`, which
+    /// is the whole prefix check quietly not happening.
+    #[test]
+    fn a_chunk_hash_that_is_not_32_lowercase_hex_is_refused() {
+        let a = "a".repeat(64);
+        let record = format!(
+            "{{\"line_id\":10,\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"{a}\"}}\n"
+        );
+        for stored in ["", "a", &a[..31], &a[..33], &"A".repeat(32)] {
+            let metadata =
+                format!("{{\"metadata\":{{\"line_id\":10,\"chunk_hash\":\"{stored}\"}}}}\n");
+            let mut out = Vec::new();
+            match ledger_from_artifact(Cursor::new(metadata), Cursor::new(record.clone()), &mut out)
+            {
+                Err(PackError::MalformedInput { reason }) => {
+                    assert!(reason.contains("32 lowercase hex"), "{stored:?}: {reason}");
+                }
+                other => panic!("{stored:?} must be refused, got {other:?}"),
+            }
+        }
+        // And exactly 32 lowercase hex, matching, still passes.
+        let metadata = format!(
+            "{{\"metadata\":{{\"line_id\":10,\"chunk_hash\":\"{}\"}}}}\n",
+            &a[..32]
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            ledger_from_artifact(Cursor::new(metadata), Cursor::new(record), &mut out).unwrap(),
+            1
+        );
     }
 
     /// A ledger from another model reuses just as cleanly as one from this model, and
