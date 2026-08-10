@@ -58,6 +58,14 @@ jobs:
       - name: Test (mock-embedding)
         run: cargo test --lib --tests --features mock-embedding
 
+      # `py_compile` proves the operational tools parse; these prove they fail. A tool
+      # that reports a failure and exits zero is one somebody reads by eye, and that is
+      # how four accounts with no GPU were scheduled work during the v1 campaign.
+      - name: Test the operational tools
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest tools/kaggle/test_queue.py -q
+
       # Also the only step in this job that compiles llama.cpp.
       #
       # The feature list is spelled out rather than `--all-features`, because `cuda`
