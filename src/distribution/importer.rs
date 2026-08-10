@@ -627,12 +627,15 @@ mod tests {
         /// (`C:\Users\RUNNER~1\...`), and `/var` on macOS is a symlink, so an unresolved
         /// fixture root names the same directory differently than the code does.
         fn new(name: &str) -> Self {
+            // The clock alone collided: macOS ticks coarser than a test takes to start.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "otzaria_test_imp_{name}_{}",
+                "otzaria_test_imp_{name}_{}_{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).unwrap();
             Self(std::fs::canonicalize(&path).unwrap())
