@@ -181,10 +181,13 @@ optional = true
 #
 # `default-features = false` drops `onig` (C, built through `cc`), `esaxx_fast` (C++)
 # and `progressbar`. Exactly one regex engine has to be enabled or the crate refuses to
-# compile, hence `fancy-regex`, which is pure Rust. A BERT normalizer and pre-tokenizer
-# use no regex at all, so for this model family the engine cannot change an id; the
-# token-id parity checks against the Python reference are what would say otherwise.
-# The same targets as `ort`, since nothing else uses it.
+# compile, hence `fancy-regex`, which is pure Rust — and the engine is not idle: the
+# production tokenizer's normalizer runs five regex `Replace` rules (niqqud and
+# cantillation, bidi and zero-width controls, the two quote marks, dashes). They are
+# plain character classes, which both engines read the same way, and measured so: 57,348
+# inputs from the library, niqqud, cantillation and all, gave ids identical to the
+# Python package (onig). Changing the engine means re-running that comparison; see
+# `docs/ONNX_BACKEND.md`. The same targets as `ort`, since nothing else uses it.
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.tokenizers]
 version = "=0.23.2"
 default-features = false

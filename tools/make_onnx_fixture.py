@@ -25,6 +25,11 @@ What is written:
 * `token_types.onnx` — `dynamic.onnx` plus a declared `token_type_ids` input and a type
   embedding whose row 0 is zero, so its vectors equal `dynamic.onnx`'s exactly when, and
   only when, the backend feeds zeros.
+* `tokenizer_unigram.json` — a second tokenizer, shaped like the production model's
+  rather than like BERT: a Unigram model, a Metaspace pre-tokenizer, and a normalizer of
+  NFKC plus regex `Replace` rules over the Hebrew marks, bidi controls, quote marks and
+  dashes. It is what makes the build's regex engine (`fancy-regex`, not the reference's
+  onig) face the same patterns in every test run. No graph uses it.
 * `expected.json` — the Python references' answers for a set of texts: the token ids
   from the `tokenizers` package at a given cap, and `dynamic.onnx`'s vector from the
   `onnxruntime` package. The Rust tests assert the ids exactly and the vectors to a
@@ -119,6 +124,44 @@ def build_tokenizer() -> Tokenizer:
     # Deliberately on: the backend must override both.
     tokenizer.enable_padding(pad_id=vocab["[PAD]"], pad_token="[PAD]", length=16)
     tokenizer.enable_truncation(max_length=512)
+    return tokenizer
+
+
+# The production tokenizer's normalizer, rule for rule, spelled from the Unicode ranges:
+# cantillation and points (U+0591–U+05BD, U+05BF–U+05C7; U+05BE, the maqaf, is kept for
+# the dash rule), zero-width and bidi controls, then the quote marks and dashes folded to
+# ASCII, and sof pasuq by plain string.
+UNIGRAM_NORMALIZER = [
+    normalizers.NFKC(),
+    normalizers.Replace(tokenizers.Regex("[\u0591-\u05BD\u05BF-\u05C7]"), ""),
+    normalizers.Replace(tokenizers.Regex("[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]"), ""),
+    normalizers.Replace(tokenizers.Regex("[\u05F3\u2018\u2019`]"), "'"),
+    normalizers.Replace(tokenizers.Regex("[\u05F4\u201C\u201D]"), '"'),
+    normalizers.Replace(tokenizers.Regex("[\u05BE\u2013\u2014\u2212]"), "-"),
+    normalizers.Replace("\u05C3", ":"),
+]
+UNIGRAM_WORDS = ["בראשית", "ברא", "אלהים", "את", "השמים", "ואת", "הארץ", "תורה", "משה", "ישראל"]
+
+
+def build_unigram_tokenizer() -> Tokenizer:
+    pieces = [(token, 0.0) for token in SPECIALS]
+    pieces += [("\u2581" + word, -2.0) for word in UNIGRAM_WORDS]
+    pieces += [(word, -3.0) for word in UNIGRAM_WORDS]
+    pieces.append(("\u2581", -4.0))
+    for letter in HEBREW_LETTERS + LATIN_LETTERS + DIGITS + PUNCTUATION:
+        pieces += [(letter, -6.0), ("\u2581" + letter, -5.5)]
+    tokenizer = Tokenizer(models.Unigram(pieces, unk_id=SPECIALS.index("[UNK]"), byte_fallback=False))
+    tokenizer.normalizer = normalizers.Sequence(UNIGRAM_NORMALIZER)
+    tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
+        replacement="\u2581", prepend_scheme="always", split=True
+    )
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="[CLS] $A [SEP]",
+        special_tokens=[("[CLS]", SPECIALS.index("[CLS]")), ("[SEP]", SPECIALS.index("[SEP]"))],
+    )
+    tokenizer.add_special_tokens(
+        [AddedToken(token, special=True, normalized=False) for token in SPECIALS]
+    )
     return tokenizer
 
 
@@ -287,6 +330,36 @@ CASES = [
 ]
 
 
+# Every rule of the normalizer, alone and together, through the regex engine.
+UNIGRAM_CASES = [
+    ("plain", "בראשית ברא אלהים את השמים ואת הארץ"),
+    ("points", "בְּרֵאשִׁית בָּרָא אֱלֹהִים"),
+    ("cantillation", "בְּרֵאשִׁ֖ית בָּרָ֣א אֱלֹהִ֑ים אֵ֥ת הַשָּׁמַ֖יִם"),
+    ("sof_pasuq_and_meteg", "וְאֵ֥ת הָאָֽרֶץ׃"),
+    ("maqaf_and_dashes", "אֶת־הַשָּׁמַיִם – ואת — הארץ − 1"),
+    ("geresh_and_gershayim", "ר׳ משה ז״ל ‘ישראל’ “תורה”"),
+    ("bidi_and_zero_width", "\u200fמשה\u200e \u202bישראל\u202c \u2066תורה\u2069\ufeff"),
+    ("nfkc_compatibility", "ﬁle ① ｔｅｘｔ ﬀ"),
+    ("prefix_passage", "[PASSAGE] בְּרֵאשִׁ֖ית בָּרָ֣א"),
+    ("prefix_query", "[QUERY] ר׳ משה"),
+    ("prefix_without_space", "[QUERY]תורה"),
+    ("literal_special_inside", "משה [SEP] ישראל [CLS]"),
+    ("unknown_letters", "Здравствуй مرحبا"),
+    ("empty", ""),
+]
+
+
+def unigram_cases(tokenizer_json: str) -> list[dict]:
+    out = []
+    for name, text in UNIGRAM_CASES:
+        tokenizer = Tokenizer.from_str(tokenizer_json)
+        tokenizer.no_padding()
+        tokenizer.enable_truncation(max_length=64, strategy="longest_first", direction="right")
+        ids = tokenizer.encode(text, add_special_tokens=True).ids
+        out.append({"name": name, "text": text, "max_tokens": 64, "token_ids": ids})
+    return out
+
+
 def reference_cases(tokenizer_json: str, graph: bytes) -> list[dict]:
     session = onnxruntime.InferenceSession(graph, providers=["CPUExecutionProvider"])
     out = []
@@ -328,6 +401,8 @@ def generate() -> dict[str, bytes]:
     }
     files = {name: graph.SerializeToString() for name, graph in graphs.items()}
     files["tokenizer.json"] = tokenizer_json.encode("utf-8")
+    unigram_json = build_unigram_tokenizer().to_str(pretty=True) + "\n"
+    files["tokenizer_unigram.json"] = unigram_json.encode("utf-8")
 
     expected = {
         "generator": "tools/make_onnx_fixture.py",
@@ -340,6 +415,8 @@ def generate() -> dict[str, bytes]:
         "tokenizers_version": tokenizers.__version__,
         "onnxruntime_version": onnxruntime.__version__,
         "cases": reference_cases(tokenizer_json, files["dynamic.onnx"]),
+        "unigram_tokenizer": "tokenizer_unigram.json",
+        "unigram_cases": unigram_cases(unigram_json),
     }
     files["expected.json"] = (
         json.dumps(expected, ensure_ascii=False, indent=1) + "\n"

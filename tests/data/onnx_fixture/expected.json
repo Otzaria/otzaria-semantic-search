@@ -311,5 +311,205 @@
     -0.32763800024986267
    ]
   }
+ ],
+ "unigram_tokenizer": "tokenizer_unigram.json",
+ "unigram_cases": [
+  {
+   "name": "plain",
+   "text": "בראשית ברא אלהים את השמים ואת הארץ",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    3
+   ]
+  },
+  {
+   "name": "points",
+   "text": "בְּרֵאשִׁית בָּרָא אֱלֹהִים",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    7,
+    8,
+    9,
+    3
+   ]
+  },
+  {
+   "name": "cantillation",
+   "text": "בְּרֵאשִׁ֖ית בָּרָ֣א אֱלֹהִ֑ים אֵ֥ת הַשָּׁמַ֖יִם",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    7,
+    8,
+    9,
+    10,
+    11,
+    3
+   ]
+  },
+  {
+   "name": "sof_pasuq_and_meteg",
+   "text": "וְאֵ֥ת הָאָֽרֶץ׃",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    12,
+    13,
+    3
+   ]
+  },
+  {
+   "name": "maqaf_and_dashes",
+   "text": "אֶת־הַשָּׁמַיִם – ואת — הארץ − 1",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    10,
+    166,
+    21,
+    167,
+    12,
+    167,
+    13,
+    167,
+    137,
+    3
+   ]
+  },
+  {
+   "name": "geresh_and_gershayim",
+   "text": "ר׳ משה ז״ל ‘ישראל’ “תורה”",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    77,
+    176,
+    15,
+    41,
+    178,
+    52,
+    177,
+    26,
+    176,
+    179,
+    24,
+    178,
+    3
+   ]
+  },
+  {
+   "name": "bidi_and_zero_width",
+   "text": "‏משה‎ ‫ישראל‬ ⁦תורה⁩﻿",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    15,
+    16,
+    14,
+    3
+   ]
+  },
+  {
+   "name": "nfkc_compatibility",
+   "text": "ﬁle ① ｔｅｘｔ ﬀ",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    93,
+    98,
+    104,
+    90,
+    137,
+    121,
+    90,
+    128,
+    120,
+    93,
+    92,
+    3
+   ]
+  },
+  {
+   "name": "prefix_passage",
+   "text": "[PASSAGE] בְּרֵאשִׁ֖ית בָּרָ֣א",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    6,
+    7,
+    8,
+    3
+   ]
+  },
+  {
+   "name": "prefix_query",
+   "text": "[QUERY] ר׳ משה",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    5,
+    77,
+    176,
+    15,
+    3
+   ]
+  },
+  {
+   "name": "prefix_without_space",
+   "text": "[QUERY]תורה",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    5,
+    14,
+    3
+   ]
+  },
+  {
+   "name": "literal_special_inside",
+   "text": "משה [SEP] ישראל [CLS]",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    15,
+    27,
+    3,
+    16,
+    27,
+    2,
+    3
+   ]
+  },
+  {
+   "name": "unknown_letters",
+   "text": "Здравствуй مرحبا",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    27,
+    1,
+    27,
+    1,
+    3
+   ]
+  },
+  {
+   "name": "empty",
+   "text": "",
+   "max_tokens": 64,
+   "token_ids": [
+    2,
+    3
+   ]
+  }
  ]
 }

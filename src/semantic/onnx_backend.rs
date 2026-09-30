@@ -1548,6 +1548,32 @@ mod tests {
         }
     }
 
+    /// A tokenizer shaped like the production model's — Unigram, Metaspace, and a
+    /// normalizer of NFKC plus regex `Replace` rules over niqqud, cantillation, bidi
+    /// controls, quote marks and dashes — through this build's regex engine
+    /// (`fancy-regex`), against the Python package's (onig) ids. Needs no runtime, so the
+    /// engine choice is checked in every run, not only where the real model is.
+    #[test]
+    fn a_production_shaped_tokenizer_matches_the_python_reference_id_for_id() {
+        let data = expected();
+        let cases = data["unigram_cases"].as_array().expect("unigram_cases");
+        assert!(cases.len() >= 10, "the regex rules need their cases");
+        let tokenizer_path = fixture(data["unigram_tokenizer"].as_str().expect("its file"));
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let cap = case["max_tokens"].as_u64().unwrap() as usize;
+            let (tokenizer, specials) =
+                load_tokenizer(&fixture("dynamic.onnx"), &tokenizer_path, cap).unwrap();
+            assert_eq!(specials, 2);
+            let produced = tokenizer
+                .encode(case["text"].as_str().unwrap(), true)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            assert_eq!(produced, ids_of(&case["token_ids"]), "{name}");
+        }
+    }
+
     /// The stand-in's stub package reaches this backend first in a mock + ONNX build, so
     /// its tokenizer — WordLevel, no post-processor, hence no special tokens — must load
     /// with this crate's `tokenizers`, and the refusal come from the graph.
