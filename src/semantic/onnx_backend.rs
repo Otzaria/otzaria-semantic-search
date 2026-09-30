@@ -1548,6 +1548,23 @@ mod tests {
         }
     }
 
+    /// The stand-in's stub package reaches this backend first in a mock + ONNX build, so
+    /// its tokenizer — WordLevel, no post-processor, hence no special tokens — must load
+    /// with this crate's `tokenizers`, and the refusal come from the graph.
+    #[test]
+    fn the_stand_ins_stub_tokenizer_loads() {
+        let dir = TempDir::new("stub_tokenizer");
+        let graph = crate::semantic::embedding::mock::write_stub_onnx_package(&dir.0);
+        let (tokenizer, specials) =
+            load_tokenizer(&graph, &dir.0.join("tokenizer.json"), 256).expect("it loads");
+        assert_eq!(specials, 0);
+        assert!(!tokenizer
+            .encode("[QUERY] x", true)
+            .unwrap()
+            .get_ids()
+            .is_empty());
+    }
+
     /// The tokenizer file sets padding to 16 and truncation to 512; neither may survive.
     #[test]
     fn the_files_own_padding_is_turned_off_and_its_truncation_replaced() {
@@ -2040,11 +2057,25 @@ mod tests {
         if !runtime_configured() {
             return;
         }
-        // Parses as nothing the runtime can load.
-        match open_fixture("expected.json", 32, &tuning(1, 1)) {
-            Err(EmbeddingError::InvalidModelFile { path, reason }) => {
-                assert!(path.ends_with("expected.json"), "{path}");
-                assert!(reason.contains("could not load the graph"), "{reason}");
+        // Named as a graph, as every path the selection table sends here is.
+        let dir = TempDir::new("not_a_graph");
+        let graph = dir.0.join("not_a_graph.onnx");
+        std::fs::write(&graph, b"{\"this is\": \"not protobuf\"}").unwrap();
+        match OnnxBackend::open(
+            &graph,
+            &fixture("tokenizer.json"),
+            32,
+            Pooling::InGraph,
+            &tuning(1, 1),
+        ) {
+            Err(error @ EmbeddingError::InvalidModelFile { .. }) => {
+                let message = error.to_string();
+                assert!(
+                    message.starts_with("Not a valid ONNX model file"),
+                    "{message}"
+                );
+                assert!(message.contains("could not load the graph"), "{message}");
+                assert!(message.contains(&graph.display().to_string()), "{message}");
             }
             other => panic!("expected InvalidModelFile, got {other:?}"),
         }

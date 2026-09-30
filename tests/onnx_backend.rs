@@ -314,32 +314,95 @@ mod with_the_backend {
         assert_eq!(vectors[0].len(), 4);
     }
 
-    /// End to end through `EmbeddingRuntime::load`, which validates and checksums the
-    /// model file before selecting a backend.
-    ///
-    /// **Ignored until the ONNX package validator lands** (design D3/D4, in a separate
-    /// change): until then `load` validates every model file as GGUF and refuses an
-    /// ONNX graph before the backend is reached. Remove the `#[ignore]` with that merge.
+    /// End to end through `EmbeddingRuntime::load`: the package is validated and
+    /// checksummed as one (design D3/D4), the table builds this backend for it, and the
+    /// runtime normalizes what the backend returns raw.
     #[test]
-    #[ignore = "needs the ONNX package validator (design D3/D4); load() still validates every model as GGUF"]
     fn the_runtime_loads_an_onnx_package_and_normalizes_its_vectors() {
         if !runtime_configured() {
             return;
         }
         let _guard = lock_env();
         let dir = TempDir::new("runtime");
-        let mut runtime = EmbeddingRuntime::new(config_for(package(&dir, "dynamic.onnx")));
+        let model = package(&dir, "dynamic.onnx");
+        let mut runtime = EmbeddingRuntime::new(config_for(model.clone()));
         runtime
             .load()
             .expect("the fixture package loads end to end");
 
         assert_eq!(runtime.backend_id(), Some("onnxruntime-sentence-v1"));
         assert!(runtime.backend_is_semantic());
-        assert!(runtime.model_checksum().is_some());
+        assert_eq!(runtime.pooling(), Pooling::InGraph);
+        assert_eq!(runtime.max_tokens(), 32);
+
+        // The recorded checksum is the package's, computed here from the D4 recipe
+        // itself: the graph and the tokenizer, not the graph alone.
+        let line = |name: &str| {
+            let bytes = std::fs::read(dir.0.join(name)).unwrap();
+            format!("{name}\t{}\t{}\n", bytes.len(), sha256_hex(&bytes))
+        };
+        let manifest = format!(
+            "otzaria-onnx-package-v1\n{}{}",
+            line("model.onnx"),
+            line("tokenizer.json")
+        );
+        assert_eq!(
+            runtime.model_checksum(),
+            Some(sha256_hex(manifest.as_bytes()).as_str())
+        );
+
         let vectors = runtime.embed_batch(&["the fox", "תורה"]).unwrap();
-        for vector in vectors {
+        for vector in &vectors {
             let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((norm - 1.0).abs() < 1e-5, "the runtime normalizes: {norm}");
+        }
+        assert_ne!(vectors[0], vectors[1]);
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The stand-in's stub package — a graph with no nodes, a WordLevel tokenizer —
+    /// sent to the real row, as a `mock-embedding,onnx-backend` build does: its
+    /// tokenizer loads, its graph is refused as an invalid ONNX model naming the graph,
+    /// and nothing panics. Without a runtime the refusal is `BackendUnavailable`, which
+    /// `tests/backend_selection.rs` accepts as well.
+    #[cfg(feature = "mock-embedding")]
+    #[test]
+    fn the_stand_ins_stub_package_is_refused_by_the_real_backend() {
+        use otzaria_semantic_search::semantic::embedding::mock;
+
+        let _guard = lock_env();
+        let dir = TempDir::new("stub");
+        let model = mock::write_stub_onnx_package(&dir.0);
+        let refused = select_backend(&EmbeddingConfig {
+            model_path: model.clone(),
+            embedding_dim: 256,
+            max_tokens: 256,
+            batch_size: 4,
+            pooling: Pooling::InGraph,
+        })
+        .map(|backend| backend.id());
+        match refused {
+            Err(error @ EmbeddingError::InvalidModelFile { .. }) => {
+                let message = error.to_string();
+                assert!(
+                    message.starts_with("Not a valid ONNX model file"),
+                    "{message}"
+                );
+                assert!(message.contains(&model.display().to_string()), "{message}");
+            }
+            Err(EmbeddingError::BackendUnavailable { reason })
+                if std::env::var_os(RUNTIME_ENV).is_none() =>
+            {
+                assert!(reason.contains(RUNTIME_ENV), "{reason}");
+            }
+            other => panic!("the stub package must be refused by the real backend, got {other:?}"),
         }
     }
 }
