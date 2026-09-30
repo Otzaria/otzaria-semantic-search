@@ -15,18 +15,26 @@
 //! (`embedding::MIN_VECTOR_NORM`), because it is public and sees vectors this
 //! runtime never produced.
 //!
-//! | build | backend | [`select_backend`] |
+//! | build | GGUF model | ONNX model |
 //! |---|---|---|
-//! | default | none | `Err(EmbeddingError::BackendUnavailable)` |
-//! | `--features llama-backend` | `LlamaCppBackend` | `Ok`, or why the model cannot be served |
-//! | `--features mock-embedding` (and in-crate tests) | `MockHashBackend` | `Ok` |
+//! | default | `Err(BackendUnavailable)` | `Err(BackendUnavailable)` |
+//! | `--features llama-backend` | `LlamaCppBackend` | `Err(BackendUnavailable)` |
+//! | `--features onnx-backend` | `Err(BackendUnavailable)` | `OnnxBackend` |
+//! | `--features mock-embedding` (and in-crate tests) | `MockHashBackend` | `MockHashBackend` |
 //!
-//! The stand-in is gated so a release build cannot serve fake vectors; real
-//! inference is gated because it compiles llama.cpp through cmake. With both
-//! enabled the real one wins, since `CANDIDATES` is ordered by preference.
+//! A real backend's cell means `Ok`, or why that backend cannot serve the model.
+//!
+//! **The model's format picks the column, not trial and error**: a path ending in
+//! `.onnx` is ONNX and every other path is GGUF
+//! ([`ModelFormat::of`](crate::semantic::model_package::ModelFormat::of)), and only the
+//! candidates serving that format are walked. The stand-in is gated so a release build
+//! cannot serve fake vectors; real inference is gated because it links a large native
+//! runtime. With a real backend and the stand-in both enabled the real one wins, since
+//! `CANDIDATES` is ordered by preference.
 
 use crate::errors::EmbeddingError;
 use crate::semantic::embedding::EmbeddingConfig;
+use crate::semantic::model_package::ModelFormat;
 
 /// How a model's per-token hidden states are collapsed into one vector.
 ///
@@ -45,12 +53,22 @@ pub enum Pooling {
     /// with its backend, leaving [`EmbeddingError::PoolingMismatch`] and the
     /// load-time agreement check dead code.
     Mean,
+    /// Nothing is pooled outside the model: its graph ends in the pooling (and any
+    /// projection and normalization after it) and emits the finished sentence vector,
+    /// which the backend takes as it is.
+    ///
+    /// A variant of its own rather than a claim to [`Self::Mean`] even when the graph
+    /// happens to mean-pool inside: the manifest records who *performs* the pooling,
+    /// and a backend that mean-pooled token states itself would produce different
+    /// vectors from the same weights. Configurable — the ONNX backend serves exactly
+    /// this — and the one strategy a token-level output can never satisfy.
+    InGraph,
 }
 
 impl Pooling {
     /// What [`Self::parse`] searches, so a variant left out cannot be read back.
     /// The compiler misses that; `every_variant_is_listed_and_parseable` does not.
-    pub const ALL: [Self; 2] = [Self::LastToken, Self::Mean];
+    pub const ALL: [Self; 3] = [Self::LastToken, Self::Mean, Self::InGraph];
 
     /// The exact string persisted in the manifest. These spellings are already on
     /// disk; changing one invalidates every existing index.
@@ -58,6 +76,7 @@ impl Pooling {
         match self {
             Self::LastToken => "last-token",
             Self::Mean => "mean",
+            Self::InGraph => "in-graph",
         }
     }
 
@@ -165,6 +184,10 @@ struct BackendCandidate {
     /// in an error message without constructing anything.
     /// `every_candidate_describes_the_backend_it_builds` holds the two together.
     id: &'static str,
+    /// The model formats this candidate is asked to serve. [`select_backend`] walks
+    /// only the candidates for the model path's format, so a backend never has to
+    /// recognize — and never gets to half-load — a file of another format.
+    formats: &'static [ModelFormat],
     /// A set, not one value: a real backend reports what the *loaded model*
     /// requires, so one implementation can serve several poolings. This only
     /// decides which configurations are worth attempting.
@@ -184,22 +207,40 @@ struct BackendCandidate {
 type Constructed = Option<Result<Box<dyn EmbeddingBackend>, EmbeddingError>>;
 
 /// Every backend this crate implements, in preference order. **A real backend
-/// must come first**, or enabling `mock-embedding` on top of a real build indexes
-/// fake vectors unknowingly.
+/// must come before the stand-in serving the same format**, or enabling
+/// `mock-embedding` on top of a real build indexes fake vectors unknowingly.
 ///
 /// Deliberately not feature-gated: the table describes the implementations that
 /// *exist*, which is what "a pooling no backend implements" means. Gating it
 /// would make a default build reject `"last-token"` as unimplemented — reporting
 /// a missing backend as a bad configuration value.
+///
+/// The stand-in has one row per format, each claiming what that format's real
+/// backend claims, so a mock build runs the pooling agreement check for real.
 const CANDIDATES: &[BackendCandidate] = &[
     BackendCandidate {
         id: "llama-cpp-qwen3-last-v1",
+        formats: &[ModelFormat::Gguf],
         poolings: &[Pooling::LastToken],
         construct: llama_cpp_backend,
     },
     BackendCandidate {
+        // `OnnxBackend::ID`, spelled out because this table is not feature-gated.
+        id: "onnxruntime-sentence-v1",
+        formats: &[ModelFormat::Onnx],
+        poolings: &[Pooling::InGraph],
+        construct: onnx_backend,
+    },
+    BackendCandidate {
         id: "mock-hash-v1",
+        formats: &[ModelFormat::Gguf],
         poolings: &[Pooling::LastToken],
+        construct: mock_hash_backend,
+    },
+    BackendCandidate {
+        id: "mock-hash-v1",
+        formats: &[ModelFormat::Onnx],
+        poolings: &[Pooling::InGraph],
         construct: mock_hash_backend,
     },
 ];
@@ -256,8 +297,9 @@ fn describe_implemented_poolings() -> String {
     }
 }
 
-/// Choose the backend this build can offer for `config`, by walking `CANDIDATES`
-/// rather than through `#[cfg]` blocks inside an inference call.
+/// Choose the backend this build can offer for `config`, by walking the `CANDIDATES`
+/// that serve its model's format rather than through `#[cfg]` blocks inside an
+/// inference call.
 ///
 /// `config` is validated here too: this function is public and reachable without
 /// [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load),
@@ -266,26 +308,31 @@ fn describe_implemented_poolings() -> String {
 ///
 /// # Errors
 ///
-/// [`EmbeddingError::BackendUnavailable`] when nothing is compiled in — every
-/// default build, the guarantee `tests/production_backend_gate.rs` holds.
-/// Otherwise whatever the first compiled-in candidate, or
+/// [`EmbeddingError::BackendUnavailable`] when nothing serving the model's format is
+/// compiled in — every default build, the guarantee
+/// `tests/production_backend_gate.rs` holds — naming the feature that would serve it.
+/// Otherwise whatever the first compiled-in candidate for the format, or
 /// [`EmbeddingConfig::validate`], failed with.
 pub fn select_backend(
     config: &EmbeddingConfig,
 ) -> Result<Box<dyn EmbeddingBackend>, EmbeddingError> {
     config.validate()?;
+    let format = ModelFormat::of(&config.model_path);
 
     // `Some(Err(_))` stops the walk just as `Some(Ok(_))` does — see
     // `BackendCandidate::construct`.
     CANDIDATES
         .iter()
+        .filter(|candidate| candidate.formats.contains(&format))
         .find_map(|candidate| (candidate.construct)(config))
         .unwrap_or_else(|| {
+            // For GGUF this is, byte for byte, the message from before formats existed.
             Err(EmbeddingError::BackendUnavailable {
                 reason: format!(
                     "this build has no inference backend compiled in (enable the \
-                     `llama-backend` feature for real GGUF inference); model file {} \
+                     `{}` feature for real {format} inference); model file {} \
                      validated but cannot be executed",
+                    format.backend_feature(),
                     config.model_path.display()
                 ),
             })
@@ -320,9 +367,51 @@ fn llama_cpp_backend(_config: &EmbeddingConfig) -> Constructed {
     None
 }
 
+// ── ONNX Runtime: the constructor pair ──────────────────────────────────────────
+//
+// The two `cfg`s below are exact complements and must stay so, and the `mod
+// onnx_backend` line in `semantic/mod.rs` must carry the same feature/target
+// condition as the first one. A target restriction goes into all three.
+
+/// Real ONNX inference, in a build that compiled it in.
+///
+/// `not(test)` for the reason `llama_cpp_backend` has it: the in-crate suite drives
+/// this module with stub packages that no real backend could load. Integration tests
+/// link the library without `cfg(test)` and so see the real table.
+///
+/// The package's tokenizer is `tokenizer.json` beside the graph — see
+/// [`onnx_tokenizer_path`](crate::semantic::model_package::onnx_tokenizer_path).
+#[cfg(all(feature = "onnx-backend", not(test)))]
+fn onnx_backend(config: &EmbeddingConfig) -> Constructed {
+    use crate::semantic::model_package::onnx_tokenizer_path;
+    use crate::semantic::onnx_backend::{OnnxBackend, OnnxBackendConfig};
+
+    // As for llama: the table can pass only an `EmbeddingConfig`, so the runtime's own
+    // knobs come from the environment; typed callers use `OnnxBackend::open`.
+    Some(OnnxBackendConfig::from_env_for(config).and_then(|tuning| {
+        OnnxBackend::open(
+            &config.model_path,
+            &onnx_tokenizer_path(&config.model_path),
+            config.max_tokens,
+            config.pooling,
+            &tuning,
+        )
+        .map(|backend| Box::new(backend) as Box<dyn EmbeddingBackend>)
+    }))
+}
+
+/// `None`, not `Some(Err(_))`: without the feature there is no such implementation.
+#[cfg(not(all(feature = "onnx-backend", not(test))))]
+fn onnx_backend(_config: &EmbeddingConfig) -> Constructed {
+    None
+}
+
+// ── end of the ONNX Runtime constructor pair ────────────────────────────────────
+
 #[cfg(any(test, feature = "mock-embedding"))]
 fn mock_hash_backend(config: &EmbeddingConfig) -> Constructed {
-    Some(Ok(Box::new(MockHashBackend::new(
+    Some(Ok(Box::new(MockHashBackend::standing_in_for(
+        ModelFormat::of(&config.model_path),
         config.embedding_dim,
         config.max_tokens,
     ))))
@@ -342,6 +431,7 @@ fn mock_hash_backend(_config: &EmbeddingConfig) -> Constructed {
 pub struct MockHashBackend {
     dim: u32,
     max_tokens: usize,
+    pooling: Pooling,
 }
 
 #[cfg(any(test, feature = "mock-embedding"))]
@@ -350,10 +440,26 @@ impl MockHashBackend {
     /// invalidates those indexes.
     pub const ID: &'static str = "mock-hash-v1";
 
-    /// `dim` is echoed back from [`EmbeddingBackend::dim`] so the load-time
-    /// agreement check passes; a real backend reads it from the model.
+    /// The stand-in for a GGUF model. `dim` is echoed back from
+    /// [`EmbeddingBackend::dim`] so the load-time agreement check passes; a real
+    /// backend reads it from the model.
     pub fn new(dim: u32, max_tokens: usize) -> Self {
-        Self { dim, max_tokens }
+        Self::standing_in_for(ModelFormat::Gguf, dim, max_tokens)
+    }
+
+    /// The stand-in for `format`'s real backend, claiming the pooling that one
+    /// performs: [`Pooling::LastToken`] for GGUF, [`Pooling::InGraph`] for ONNX. Its
+    /// vectors are the same hash either way.
+    pub fn standing_in_for(format: ModelFormat, dim: u32, max_tokens: usize) -> Self {
+        let pooling = match format {
+            ModelFormat::Gguf => Pooling::LastToken,
+            ModelFormat::Onnx => Pooling::InGraph,
+        };
+        Self {
+            dim,
+            max_tokens,
+            pooling,
+        }
     }
 }
 
@@ -377,11 +483,12 @@ impl EmbeddingBackend for MockHashBackend {
         self.max_tokens
     }
 
-    /// A word-hash pools nothing. Claiming [`Pooling::LastToken`] is what makes
-    /// the default configuration load and the agreement check run for real
-    /// instead of being trivially satisfied.
+    /// A word-hash pools nothing. Claiming what the real backend for the model's
+    /// format claims — [`Pooling::LastToken`] for GGUF — is what makes the default
+    /// configuration load and the agreement check run for real instead of being
+    /// trivially satisfied.
     fn pooling(&self) -> Pooling {
-        Pooling::LastToken
+        self.pooling
     }
 
     /// Invented ids would turn stage 4's parity assertion into a comparison
@@ -426,11 +533,13 @@ mod tests {
     fn every_variant_is_listed_and_parseable() {
         fn listed(strategy: Pooling) -> bool {
             match strategy {
-                Pooling::LastToken | Pooling::Mean => Pooling::ALL.contains(&strategy),
+                Pooling::LastToken | Pooling::Mean | Pooling::InGraph => {
+                    Pooling::ALL.contains(&strategy)
+                }
             }
         }
 
-        for strategy in [Pooling::LastToken, Pooling::Mean] {
+        for strategy in [Pooling::LastToken, Pooling::Mean, Pooling::InGraph] {
             assert!(listed(strategy), "{strategy} is missing from Pooling::ALL");
             assert!(
                 Pooling::parse(strategy.as_str()).is_ok(),
@@ -443,6 +552,7 @@ mod tests {
     fn pooling_round_trips_through_the_exact_string_the_manifest_stores() {
         assert_eq!(Pooling::LastToken.as_str(), "last-token");
         assert_eq!(Pooling::Mean.as_str(), "mean");
+        assert_eq!(Pooling::InGraph.as_str(), "in-graph");
 
         for strategy in Pooling::ALL {
             let rendered = strategy.as_str();
@@ -480,6 +590,10 @@ mod tests {
             " last-token ",
             "cls",
             "none",
+            "in_graph",
+            "ingraph",
+            "In-Graph",
+            "in graph",
         ] {
             match Pooling::parse(wrong) {
                 Err(EmbeddingError::UnknownPooling { found, supported }) => {
@@ -523,8 +637,12 @@ mod tests {
             other => panic!("a pooling nothing performs must be refused, got {other:?}"),
         }
 
-        assert_eq!(implemented_poolings(), vec![Pooling::LastToken]);
+        assert_eq!(
+            implemented_poolings(),
+            vec![Pooling::LastToken, Pooling::InGraph]
+        );
         assert!(ensure_pooling_is_implemented(Pooling::LastToken).is_ok());
+        assert!(ensure_pooling_is_implemented(Pooling::InGraph).is_ok());
     }
 
     /// The table states what a backend pools without building it, and two
@@ -532,48 +650,83 @@ mod tests {
     /// configuration the backend then refuses at load time.
     #[test]
     fn every_candidate_describes_the_backend_it_builds() {
-        let config = EmbeddingConfig {
-            embedding_dim: 8,
-            max_tokens: 64,
-            ..Default::default()
-        };
-
         let mut constructed = 0usize;
         for candidate in CANDIDATES {
-            let Some(built) = (candidate.construct)(&config) else {
-                continue; // not compiled into this build
-            };
-            // "compiled in, but cannot serve this config" — expected for a real
-            // backend handed a nonexistent default `model_path`, and no evidence
-            // about the row's accuracy.
-            let Ok(backend) = built else {
-                continue;
-            };
-            constructed += 1;
-
-            assert_eq!(
-                backend.id(),
-                candidate.id,
-                "the table names a backend that reports itself as {}",
-                backend.id()
-            );
-            assert!(
-                candidate.poolings.contains(&backend.pooling()),
-                "{} pools {} , which its row does not declare",
-                candidate.id,
-                backend.pooling()
-            );
             assert!(
                 !candidate.poolings.is_empty(),
                 "{} declares no pooling, so no configuration could ever select it",
                 candidate.id
             );
+            assert!(
+                !candidate.formats.is_empty(),
+                "{} declares no format, so no model could ever reach it",
+                candidate.id
+            );
+
+            // Built once per format it claims, from a model path of that format.
+            for format in candidate.formats {
+                let config = EmbeddingConfig {
+                    model_path: match format {
+                        ModelFormat::Gguf => "absent/model.gguf".into(),
+                        ModelFormat::Onnx => "absent/model.onnx".into(),
+                    },
+                    embedding_dim: 8,
+                    max_tokens: 64,
+                    pooling: candidate.poolings[0],
+                    ..Default::default()
+                };
+                let Some(built) = (candidate.construct)(&config) else {
+                    continue; // not compiled into this build
+                };
+                // "compiled in, but cannot serve this config" — expected for a real
+                // backend handed a nonexistent `model_path`, and no evidence about
+                // the row's accuracy.
+                let Ok(backend) = built else {
+                    continue;
+                };
+                constructed += 1;
+
+                assert_eq!(
+                    backend.id(),
+                    candidate.id,
+                    "the table names a backend that reports itself as {}",
+                    backend.id()
+                );
+                assert!(
+                    candidate.poolings.contains(&backend.pooling()),
+                    "{} pools {} for a {format} model, which its row does not declare",
+                    candidate.id,
+                    backend.pooling()
+                );
+            }
         }
 
         assert!(
             constructed > 0,
             "in-crate tests compile the stand-in, so at least one candidate must build"
         );
+    }
+
+    /// The format picks the rows walked: every format has a stand-in row, and a real
+    /// backend for each format precedes the stand-in for it.
+    #[test]
+    fn every_format_is_served_and_a_real_backend_precedes_its_stand_in() {
+        for format in ModelFormat::ALL {
+            let rows: Vec<&str> = CANDIDATES
+                .iter()
+                .filter(|candidate| candidate.formats.contains(&format))
+                .map(|candidate| candidate.id)
+                .collect();
+            assert_eq!(
+                rows.last(),
+                Some(&MockHashBackend::ID),
+                "the stand-in must be the last resort for {format}, got {rows:?}"
+            );
+            assert!(
+                rows.len() >= 2,
+                "{format} has no real backend in the table: {rows:?}"
+            );
+        }
     }
 
     /// The no-backend arm cannot be checked here — `#[cfg(test)]` enables the
@@ -599,6 +752,34 @@ mod tests {
         );
         assert_eq!(backend.max_tokens(), 128);
         assert_eq!(backend.pooling(), Pooling::LastToken);
+    }
+
+    /// The stand-in serves an ONNX model too, claiming the pooling the real ONNX
+    /// backend performs, so an ONNX configuration loads in a mock build.
+    #[test]
+    fn selection_yields_the_stand_in_for_an_onnx_model_claiming_in_graph_pooling() {
+        let config = EmbeddingConfig {
+            model_path: "absent/model.ONNX".into(),
+            embedding_dim: 24,
+            max_tokens: 256,
+            pooling: Pooling::InGraph,
+            ..Default::default()
+        };
+        let backend = select_backend(&config).expect("in-crate tests compile the stand-in");
+
+        assert_eq!(backend.id(), "mock-hash-v1");
+        assert!(!backend.is_semantic());
+        assert_eq!(backend.dim(), 24);
+        assert_eq!(backend.max_tokens(), 256);
+        assert_eq!(backend.pooling(), Pooling::InGraph);
+
+        // The same stand-in for a GGUF path claims last-token, as llama.cpp would.
+        let gguf = select_backend(&EmbeddingConfig {
+            embedding_dim: 24,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(gguf.pooling(), Pooling::LastToken);
     }
 
     #[test]

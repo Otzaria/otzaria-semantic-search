@@ -32,6 +32,17 @@ mock-embedding = []
 # on with no backend behind it; `semantic::backend` gates on the same condition.
 llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 
+# Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer. Non-default
+# for the reason `llama-backend` is: it links a large native runtime into every
+# downstream build.
+#
+# Empty for now: the ONNX Runtime and tokenizer dependencies arrive with the backend
+# implementation, and until then `OnnxBackend::open` refuses every model with
+# `BackendUnavailable`. Which backend serves a model is decided by the model file's
+# format — `.onnx` is ONNX, every other path GGUF — not by which features are on; see
+# `semantic::backend`.
+onnx-backend = []
+
 # CUDA offload, for the build machine that produces the library's vectors — never
 # for the application, which ships no CUDA runtime.
 #

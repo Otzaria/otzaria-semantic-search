@@ -9,6 +9,8 @@
 //! - Embedding backend contract (what an inference implementation must provide)
 //! - Embedding runtime (model validation, batching, normalization)
 //! - Real GGUF inference through llama.cpp (behind the `llama-backend` feature)
+//! - Real ONNX inference through ONNX Runtime (behind the `onnx-backend` feature)
+//! - What a model path names on disk: its format, and an ONNX model's package
 //! - Vector store backend contract, split into a read side the runtime gets and a
 //!   write side only a builder gets, plus an in-memory and a snapshot-persisting
 //!   implementation. Neither is an ANN index, and neither is the `zvec` library.
@@ -36,7 +38,17 @@ pub mod engine;
 #[cfg(all(feature = "llama-backend", not(target_arch = "arm")))]
 pub mod llama_backend;
 pub mod manifest;
+pub mod model_package;
 pub mod official_index;
+// Real ONNX inference through ONNX Runtime. Compiled only with
+// `--features onnx-backend`; which backend a model gets is decided in `backend`, by
+// the model's format.
+//
+// `backend::onnx_backend` is gated on the same condition, so a target restriction
+// added here must be added there too. A plain comment for the reason given above
+// `llama_backend`.
+#[cfg(feature = "onnx-backend")]
+pub mod onnx_backend;
 pub mod recipe;
 pub mod store;
 pub mod store_backend;

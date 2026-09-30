@@ -25,7 +25,7 @@
 #[test]
 fn the_manifest_enables_no_embedding_backend_by_default() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
-    const BACKENDS: [&str; 2] = ["mock-embedding", "llama-backend"];
+    const BACKENDS: [&str; 3] = ["mock-embedding", "llama-backend", "onnx-backend"];
 
     // Enough of a TOML reader for one key. Comments are stripped first because
     // `# llama-backend` in prose must not count as an entry.
