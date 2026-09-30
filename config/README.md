@@ -1,15 +1,39 @@
-# The frozen production identity
+# Model identities
 
-`model.json` and `chunking.json` are what the library's vectors were built under, and
-what every later release must be built under to reuse any of them. They are checked in
-rather than passed as workflow inputs for one reason: a recipe that can be typed at
-dispatch time is a recipe that can be typed wrong, and the failure is silent — the build
-succeeds, declares its own hash, and produces vectors nothing else can use.
+Each directory here holds one pair: `model.json`, the `ModelIdentity` an artifact
+declares, and `chunking.json`, the `ChunkerConfig` it was built under. A build is handed
+one pair, never a mix of two.
 
-`chunking_identity` in `model.json` is the SHA-256 prefix of every field of
+| Directory | Model | Status |
+|---|---|---|
+| `config/` | `EMD123/Otzaria-Embedding-V1-Flash-0.6B`, GGUF `Q4_K_M`, llama.cpp, 1024 dimensions | **the frozen production identity** — what the library's vectors were built under |
+| `config/models/meivin-round2-onnx/` | Meivin Round 2, ONNX fp32 through ONNX Runtime, 256 dimensions | the identity of an artifact built with the ONNX model; see its README |
+
+The two differ in every field that describes the model, in `embedding_text_version` (1
+against 2, the role prefixes) and so in `chunking_identity`. Every one of those is an identity field an
+installation compares, so an artifact built under one pair can never pass for one built
+under the other.
+
+## Why they are files
+
+They are checked in rather than passed as workflow inputs for one reason: a recipe that
+can be typed at dispatch time is a recipe that can be typed wrong, and the failure is
+silent — the build succeeds, declares its own hash, and produces vectors nothing else can
+use.
+
+`chunking_identity` in `model.json` is the SHA-256 prefix of every field of its
 `chunking.json`. `Chunker::new` refuses a configuration whose hash is not the one the
 model declares, so the two cannot drift apart unnoticed.
 
-Changing any field here invalidates every stored vector. That is not a warning to be
-careful; it is the mechanism — `docs/ARTIFACT_CONTRACT.md` and
-`src/semantic/recipe.rs`.
+`model_checksum` is the SHA-256 of the file for a GGUF model, and for an ONNX model the
+package checksum over the graph, its `tokenizer.json` and any external-data file.
+`cargo run -- model-checksum --model-file <path>` prints the value for either, and
+`tools/onnx_package_checksum.py` computes the ONNX one independently.
+
+## Changing them
+
+Changing any field in `config/` invalidates every stored vector. That is not a warning to
+be careful; it is the mechanism — `docs/ARTIFACT_CONTRACT.md` and
+`src/semantic/recipe.rs`. Leave the production pair alone: a new model is a new
+directory under `config/models/`, and becomes production by being chosen, not by
+overwriting what the stored vectors were built under.

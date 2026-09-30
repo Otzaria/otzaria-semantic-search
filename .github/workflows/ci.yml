@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # For the golden-vector job, which needs the gated 396 MB model.
+  # For the golden-vector jobs, which need the gated models.
   # No inputs by design: the credential belongs in a secret, and inputs are not
   # secrets — they land in the event payload and are not redacted.
   workflow_dispatch:
@@ -62,23 +62,30 @@ jobs:
       # that reports a failure and exits zero is one somebody reads by eye, and that is
       # how four accounts with no GPU were scheduled work during the v1 campaign.
       #
-      # Linux only. These are operator scripts run from one machine against Kaggle, not
-      # anything the crate ships, so a second platform adds no signal — and `python3` is
-      # not reliably on PATH on the Windows runner without `setup-python`.
+      # The ONNX package checksum has a second implementation in Python, for the build
+      # machine and for CI to check a download with, and its test reproduces the digest
+      # `model_package.rs` pins from the same bytes. Two implementations that drift apart
+      # name different files with values that look equally right.
+      #
+      # Linux only. These are operator scripts run from one machine, not anything the
+      # crate ships, so a second platform adds no signal — and `python3` is not reliably
+      # on PATH on the Windows runner without `setup-python`.
       - name: Test the operational tools
         if: runner.os == 'Linux'
         run: |
           python3 -m pip install --quiet pytest
-          python3 -m pytest tools/kaggle/test_queue.py -q
+          python3 -m pytest tools/kaggle/test_queue.py tools/test_onnx_package_checksum.py -q
 
-      # Also the only step in this job that compiles llama.cpp.
+      # Also the only step in this job that compiles llama.cpp, and the one that
+      # compiles the ONNX backend on every platform. That needs no runtime and no
+      # network: ONNX Runtime is loaded when a model is, never linked.
       #
       # The feature list is spelled out rather than `--all-features`, because `cuda`
       # cannot be one of them: it sets `GGML_CUDA=ON`, and a runner without `nvcc`
       # fails cmake configure before a single doc comment is read. Cargo has no way to
       # hold a feature back from `--all-features`, so the caller has to.
       - name: Check Documentation
-        run: cargo doc --no-deps --features mock-embedding,llama-backend
+        run: cargo doc --no-deps --features mock-embedding,llama-backend,onnx-backend
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -130,6 +137,121 @@ jobs:
 
       - name: Test (mock-embedding + llama-backend)
         run: cargo test --lib --tests --features mock-embedding,llama-backend
+
+  # Separate job, on all three runners. Nothing native is built here — ONNX Runtime is
+  # a shared library the backend loads at run time, never links — so what differs by
+  # platform is exactly what this job exercises: finding that library, loading it and
+  # running a graph through it. The tests that run a graph skip without
+  # `OTZARIA_ONNX_RUNTIME`, so the runtime is fetched first, or this job would be green
+  # having run none of them.
+  #
+  # The runtime is Microsoft's official 1.28.0 release, the backend's reference: it
+  # needs glibc >= 2.27 and dispatches CPU features at run time. Asset names and SHA-256
+  # digests are from the v1.28.0 release page, pinned for the reason the actions are
+  # pinned: a re-uploaded asset is a different runtime. Not cached — 9 to 79 MB, and a
+  # verified download is as good as a cache hit.
+  onnx-backend:
+    name: ONNX Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            ort_archive: onnxruntime-linux-x64-1.28.0.tgz
+            ort_sha256: a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407
+            ort_library: onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+          # arm64: there is no macOS x86_64 build of 1.28.0.
+          - os: macos-latest
+            ort_archive: onnxruntime-osx-arm64-1.28.0.tgz
+            ort_sha256: 1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8
+            ort_library: onnxruntime-osx-arm64-1.28.0/lib/libonnxruntime.1.28.0.dylib
+          - os: windows-latest
+            ort_archive: onnxruntime-win-x64-1.28.0.zip
+            ort_sha256: abef733dacbe2f571547a7150b479b5cb9cc0df22f96c24983a42cadb1b4f8bc
+            ort_library: onnxruntime-win-x64-1.28.0/lib/onnxruntime.dll
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: onnx-backend
+
+      # Only the library is extracted from the archive.
+      - name: Fetch ONNX Runtime 1.28.0
+        if: runner.os != 'Windows'
+        run: |
+          archive="$RUNNER_TEMP/${{ matrix.ort_archive }}"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/${{ matrix.ort_archive }}"
+          echo "${{ matrix.ort_sha256 }}  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" "${{ matrix.ort_library }}"
+          test -f "$RUNNER_TEMP/${{ matrix.ort_library }}"
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/${{ matrix.ort_library }}" >> "$GITHUB_ENV"
+
+      # PowerShell and .NET's zip reader rather than bash: the Windows runner's bash has
+      # no dependable zip tool, and the archive also holds a 408 MB PDB that extracting
+      # everything would write out. The path handed on is a native Windows one, which
+      # the loader needs; an MSYS-style `/d/a/...` is not.
+      - name: Fetch ONNX Runtime 1.28.0 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP '${{ matrix.ort_archive }}'
+          curl.exe -fSL --retry 5 --retry-all-errors --output $archive `
+            'https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/${{ matrix.ort_archive }}'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ matrix.ort_sha256 }}') {
+            Write-Output "::error::${{ matrix.ort_archive }}: SHA-256 $actual, expected ${{ matrix.ort_sha256 }}"
+            exit 1
+          }
+          $member = '${{ matrix.ort_library }}'
+          $folder = $member.Substring(0, $member.LastIndexOf('/'))
+          $target = Join-Path $env:RUNNER_TEMP ($folder -replace '/', '\')
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            foreach ($entry in $zip.Entries) {
+              if ($entry.FullName -like "$folder/*.dll") {
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $target $entry.Name), $true)
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          $library = Join-Path $env:RUNNER_TEMP ($member -replace '/', '\')
+          if (-not (Test-Path -LiteralPath $library)) {
+            Write-Output "::error::$member is not in ${{ matrix.ort_archive }}"
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "OTZARIA_ONNX_RUNTIME=$library"
+
+      - name: Clippy (onnx-backend)
+        run: cargo clippy --all-targets --features onnx-backend -- -D warnings
+
+      # The real-model tests are `#[ignore]`d and skip loudly without
+      # `OTZARIA_TEST_ONNX_MODEL`; everything else runs the fixture packages in
+      # tests/data/onnx_fixture/ through the runtime fetched above.
+      - name: Test (onnx-backend)
+        run: cargo test --lib --tests --features onnx-backend
+
+      # With the stand-in compiled in, an `.onnx` model must still reach the real ONNX
+      # row first, and a real backend that refuses a model must say why rather than
+      # fall through to the stand-in.
+      - name: Clippy (mock-embedding + onnx-backend)
+        run: cargo clippy --all-targets --features mock-embedding,onnx-backend -- -D warnings
+
+      - name: Test (mock-embedding + onnx-backend)
+        run: cargo test --lib --tests --features mock-embedding,onnx-backend
 
   # `token_ids` exact equality against tests/data/golden_vectors.json is the primary
   # correctness gate for the backend (docs/P2_INFERENCE_SPIKE.md §2) — it catches a
@@ -214,3 +336,110 @@ jobs:
         env:
           OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
         run: cargo test --test artifact_builder --features llama-backend -- --ignored --nocapture
+
+  # The ONNX backend's parity gate: tests/data/onnx_golden_vectors.json holds the Python
+  # reference's answers (`tools/generate_onnx_golden_vectors.py`) for the production
+  # graph, and `semantic::onnx_backend::golden` requires the same token ids exactly, then
+  # every vector within cosine 0.99999. Truncation at the 256-token cap, the role tokens
+  # and special-token matching are all decided before the graph runs, and the ids are
+  # where an error in any of them shows.
+  #
+  # The same policy as `golden-vectors`, for the same reasons: the model is gated, so the
+  # job runs off the OTZARIA_HF_TOKEN secret on every push and same-repo PR, fails rather
+  # than skips when the secret is unset, and is skipped only for pull requests from
+  # forks, which get no secrets.
+  #
+  # The files come from the project's private mirror,
+  # `otzaria/judaic-semantic-round2-onnx-zayit`, never from the gated original
+  # (`ArieLLL123/judaic-semantic-round2-onnx-zayit`), whose access is one person's manual
+  # approval. So this job needs that mirror to exist, holding the same bytes — the SHA-256
+  # check below is what says so — and an OTZARIA_HF_TOKEN that can read it.
+  golden-onnx:
+    name: Golden Vectors (ONNX model)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: onnx-backend
+
+      # The package — the fp32 graph and the tokenizer.json beside it — downloaded fresh
+      # every run and deliberately NOT cached, as in `golden-vectors`: an Actions cache
+      # on `main` is readable by a run from a fork's pull request, and caching these
+      # would publish a gated model to anyone who opens one. The token reaches curl
+      # through a config on stdin, never argv; `--retry` because HuggingFace rate-limits
+      # with a 429 that is not a refusal.
+      - name: Fetch the model package
+        id: model
+        env:
+          HF_TOKEN: ${{ secrets.OTZARIA_HF_TOKEN }}
+        run: |
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The ONNX golden gate cannot run, and is NOT being reported as passing."
+            exit 1
+          fi
+          mkdir -p onnx-model
+          for file in seforim-embed-round2-fp32.onnx tokenizer.json; do
+            printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+              curl -fSL --retry 5 --retry-all-errors --output "onnx-model/$file" -K - \
+                "https://huggingface.co/otzaria/judaic-semantic-round2-onnx-zayit/resolve/main/$file"
+          done
+          # A mismatch must read as "wrong model" rather than as confusing id and vector diffs.
+          verify() {
+            expected=$(python3 -c "import json,sys; print(json.load(open('tests/data/onnx_golden_vectors.json'))['header'][sys.argv[1]])" "$2")
+            actual=$(sha256sum "onnx-model/$1" | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::$1: SHA-256 mismatch. The goldens expect $expected, got $actual."
+              exit 1
+            fi
+          }
+          verify seforim-embed-round2-fp32.onnx graph_sha256
+          verify tokenizer.json tokenizer_sha256
+          echo "path=$(pwd)/onnx-model/seforim-embed-round2-fp32.onnx" >> "$GITHUB_OUTPUT"
+
+      # The linux-x64 row of the `onnx-backend` matrix; bump the two together.
+      - name: Fetch ONNX Runtime 1.28.0
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+          echo "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
+
+      # The package checksum is what an artifact built from this model declares as
+      # `model_checksum`, and it has two implementations: the crate's and
+      # tools/onnx_package_checksum.py. Both must reach the value
+      # config/models/meivin-round2-onnx/model.json declares and the goldens record, from
+      # the real 168 MB package — the unit tests only reach it from a 241-byte one.
+      - name: The package checksum, by both implementations
+        env:
+          GRAPH: ${{ steps.model.outputs.path }}
+        run: |
+          declared=$(python3 -c "import json; print(json.load(open('config/models/meivin-round2-onnx/model.json'))['model_checksum'])")
+          recorded=$(python3 -c "import json; print(json.load(open('tests/data/onnx_golden_vectors.json'))['header']['package_checksum'])")
+          if [ "$declared" != "$recorded" ]; then
+            echo "::error::model.json declares $declared, the goldens record $recorded."
+            exit 1
+          fi
+          python3 tools/onnx_package_checksum.py --expect "$declared" "$GRAPH"
+          computed=$(cargo run --quiet --features onnx-backend -- model-checksum --model-file "$GRAPH" | awk '$1 == "model_checksum:" { print $2 }')
+          if [ "$computed" != "$declared" ]; then
+            echo "::error::The crate computes model_checksum '$computed'; model.json declares $declared."
+            exit 1
+          fi
+
+      # `--ignored` is what selects them; the name selects the ONNX gate alone.
+      - name: Golden parity (token ids exact, then cosine)
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.path }}
+        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
