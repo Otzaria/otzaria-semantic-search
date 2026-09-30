@@ -2,8 +2,8 @@
 
 These scripts produce and verify `tests/data/golden_vectors.json`, the reference data
 that the Rust GGUF embedding backend is asserted against. The ONNX backend's
-counterparts — its goldens and the package checksum — are in
-[their own section](#onnx-the-package-checksum-and-the-meivin-round-2-goldens) below.
+counterparts — its goldens, the package checksum and the fixture its ordinary tests run —
+are in [their own section](#onnx-the-package-checksum-and-the-meivin-round-2-goldens) below.
 
 The golden generators never run in CI or at build time. They are developer tools, invoked
 by hand when the model file or the corpus changes. They require a model file that is
@@ -147,6 +147,7 @@ deliberately — do not relax the assertion.
 | `test_onnx_package_checksum.py` | Reproduces the crate's golden digest from the same bytes, and pins which files are in a package and which references are refused. CI runs it. |
 | `onnx_golden_cases.json` | The ONNX goldens' inputs. Most take their text from `golden_corpus.json` by id. Plain data. |
 | `generate_onnx_golden_vectors.py` | The Python reference for the ONNX backend. Writes `tests/data/onnx_golden_vectors.json`. |
+| `make_onnx_fixture.py` | Writes the tiny ONNX packages in `tests/data/onnx_fixture/` that the ordinary ONNX tests run — five graphs of about 8 KB, a BERT-style and a production-shaped (Unigram) tokenizer, and `expected.json`, the Python references' ids and vectors. Byte-stable for the package versions in its docstring (`onnx`, `tokenizers`, `onnxruntime`, `numpy`); `--check` compares with the committed files and writes nothing. |
 
 ### The package checksum
 
