@@ -42,8 +42,11 @@ pub struct SemanticManifest {
 
     // ── Model metadata ──
     pub embedding_model_id: String,
-    /// SHA-256 of the model file, once a model has been loaded. Guards what the model
-    /// id alone cannot: same id, different weights behind the same path.
+    /// The model's checksum, once a model has been loaded: the file's SHA-256 for a
+    /// GGUF, the package checksum for an ONNX graph — see
+    /// [`EmbeddingRuntime::model_checksum`](crate::semantic::embedding::EmbeddingRuntime::model_checksum).
+    /// Guards what the model id alone cannot: same id, different weights behind the same
+    /// path.
     pub model_checksum: Option<String>,
     /// Backend that produced the vectors, once a model is loaded (`"mock-hash-v1"`).
     pub embedding_backend: Option<String>,
