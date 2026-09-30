@@ -178,7 +178,7 @@ otzaria-semantic-search/
     │   ├── embedding_cache.rs          ➜ LRU cache of recently embedded texts
     │   ├── backend.rs                  ➜ EmbeddingBackend contract & backend selection
     │   ├── llama_backend.rs            ➜ Real llama.cpp inference (feature `llama-backend`)
-    │   ├── engine.rs                   ➜ SemanticEngine: the build-side orchestrator
+    │   ├── engine.rs                   ➜ SemanticEngine: the build-side orchestrator; its indexing API is a prototype scaffold
     │   ├── official_index.rs           ➜ The application's read path over a verified artifact
     │   ├── manifest.rs                 ➜ Atomic JSON manifest versioning & Tantivy diff tracker
     │   ├── store.rs                    ➜ Pre-normalized vector database & BinaryHeap Top-K search
@@ -211,7 +211,7 @@ otzaria-semantic-search/
 | **Official Read Path** | [`src/semantic/official_index.rs`](src/semantic/official_index.rs) | `OfficialSemanticIndex`, `LocalModel` | Opens a `VerifiedPackage` — never a path — checks the manifest's counts against the payload's content, and refuses every build-side operation by name |
 | **Artifact Identity** | [`src/semantic/versioning.rs`](src/semantic/versioning.rs) | `IndexVersion`, `IdentityField`, `verify_matches` | Corpus, Tantivy schema, id scheme, model file, backend and store format an artifact declares. Every field compared, all mismatches named |
 | **Index Manifest** | [`src/semantic/manifest.rs`](src/semantic/manifest.rs) | `SemanticManifest`, `BookManifestEntry`, `validate` | Atomic JSON tracking (`.tmp` write + rename) & Tantivy incremental diffing |
-| **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Master sidecar engine orchestrating chunking, embedding & storage |
+| **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Chunking, embedding and storage in one engine — a **prototype scaffold**: the library's vectors are built on the build machine only (`build`, `embed-shard`), and the application opens a prebuilt artifact read-only through `OfficialSemanticIndex`, embedding nothing but the query |
 | **Embedding Cache** | [`src/semantic/embedding_cache.rs`](src/semantic/embedding_cache.rs) | `EmbeddingCache` | LRU cache over recently embedded query texts |
 | **Search Profiles** | [`src/config/profiles.rs`](src/config/profiles.rs) | `SearchProfile`, `RankingProfile`, `FusionStrategy` | Fast/Balanced/Best presets and the weighted / RRF / adaptive fusion choice |
 | **Feature Flags** | [`src/config/feature_flags.rs`](src/config/feature_flags.rs) | `FeatureFlags::apply` | Per-run overrides onto a profile, without a second source of defaults |
@@ -330,6 +330,11 @@ Which backend a model gets is decided by its path, not by the features: `.onnx` 
 case is an ONNX package — the graph, the `tokenizer.json` beside it and any external data
 it names — and every other path is GGUF. A build without the backend for a model's format
 says which feature to enable.
+
+The application embeds only queries — the library's vectors are built on the build
+machine, and the app opens them read-only — so an ONNX model needs **one session** there,
+the default; `OTZARIA_ONNX_SESSIONS` above 1 is a build-machine knob, worth it only for
+callers that embed concurrently ([docs/ONNX_BACKEND.md](docs/ONNX_BACKEND.md) §6).
 
 The ONNX model, Meivin Round 2, ships as its **int8 graph** by default
 ([`config/models/meivin-round2-onnx/`](config/models/meivin-round2-onnx/README.md)): 42 MB

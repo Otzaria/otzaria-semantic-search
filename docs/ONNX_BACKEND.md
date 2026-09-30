@@ -311,19 +311,34 @@ A batch dimension is therefore only inspected (a fixed batch above 1 is refused)
 
 ## 6. Concurrency and tuning
 
+**Who embeds what.** The library's vectors are built on the build machine only — the
+`build`, `export-plan` and `embed-shard` commands, in CI or on Kaggle. The application never
+builds them: it opens a prebuilt artifact read-only through `OfficialSemanticIndex` and
+embeds one thing, the query (`docs/PRODUCT_CONTRACT.md` §2, §4). `SemanticEngine`'s own
+indexing API (`index_books`) is a prototype scaffold, not an application path. So:
+
+- **the application needs one session**, the default: it embeds one query at a time, and
+  every further session would hold another copy of the weights (+74 MiB for int8, +202 MiB
+  for fp32, §7.2) for nothing;
+- **more sessions are a build-machine knob**, and pay only where several callers embed at
+  once. The build commands embed one batch at a time per process, so there throughput comes
+  from `OTZARIA_ONNX_THREADS` and from running several `embed-shard` windows side by side,
+  each with its own session.
+
 `Session::run` takes `&mut self` (upstream considers concurrent `Run` on one session
 unsound), while `EmbeddingBackend` is `&self` and `Sync`. The sessions sit in a bounded
-pool **leased one text at a time**, first come first served: a search query queued behind
-an indexing batch waits for one inference, not for the batch — with a plain mutex the
-caller that just returned a session is already running and takes it straight back. A lease
-returns its session when dropped, during unwinding too, so the pool never shrinks and a
-caller waits rather than fails. The tokenizer is `Sync` with a `&self` `encode` and is
-shared without a lock.
+pool **leased one text at a time**, first come first served: where one caller embeds a
+batch while another embeds a query — the prototype engine indexing while it searches —
+the query waits for one inference, not for the batch; with a plain mutex the caller that
+just returned a session is already running and takes it straight back. A lease returns its
+session when dropped, during unwinding too, so the pool never shrinks and a caller waits
+rather than fails. The tokenizer is `Sync` with a `&self` `encode` and is shared without a
+lock.
 
 | variable | meaning | default |
 |---|---|---|
 | `OTZARIA_ONNX_THREADS` | intra-op threads per session | min(4, cores) |
-| `OTZARIA_ONNX_SESSIONS` | sessions in the pool: concurrent inferences | 1 |
+| `OTZARIA_ONNX_SESSIONS` | sessions in the pool: concurrent inferences. Leave it at 1 in the application; a build-machine knob for concurrent callers | 1 |
 | `OTZARIA_ONNX_RUNTIME` | the runtime library (§3) | beside the graph |
 
 Anything but a positive integer is refused, naming the variable. They are deployment
@@ -397,8 +412,9 @@ input takes 16.2–16.6 ms at six, eight and ten — hence the default cap of 4.
 faster here** except on short inputs: dynamic quantization re-quantizes every activation,
 and this CPU's fp32 matrix multiply is fast. Its case is size, not speed.
 
-**A query while indexing runs** — a 14-token query issued every 7 ms while another thread
-embeds 32 × 256-token passages in a loop, 40 queries:
+**A query while indexing runs** — the prototype engine's shape, not the application's,
+which never indexes (§6); kept as the measurement of the lease. A 14-token query issued
+every 7 ms while another thread embeds 32 × 256-token passages in a loop, 40 queries:
 
 | sessions × threads | p50 | p95 | max |
 |---|---:|---:|---:|
@@ -409,7 +425,8 @@ embeds 32 × 256-token passages in a loop, 40 queries:
 
 With one session the query waits for at most one passage, not for the batch of 32 (~525 ms
 of inference) — the per-text FIFO lease doing its job. A second session removes most of
-the wait, for ~200 MiB.
+the wait, for ~200 MiB — a trade no shipped configuration has to make, since the
+application embeds only queries.
 
 **Identity.** 600 inputs (300 library texts as passages and queries), against 1 thread × 1
 session, for both graphs: **bit-identical** at threads 1/2/4/8 × sessions 1/2, batched vs

@@ -176,6 +176,13 @@ So concurrency is opt-in via `OTZARIA_LLAMA_CONTEXTS` or `LlamaBackendConfig`, a
 the host raises it after measuring on the device it ships to. One context is not a
 throughput cliff: callers queue on the pool's condvar rather than failing.
 
+> **Since then, settled:** the application never indexes. The library's vectors are built
+> on the build machine only (`build`, `embed-shard`, in CI or on Kaggle); the app opens a
+> prebuilt artifact read-only through `OfficialSemanticIndex` and embeds nothing but the
+> query ([`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §2, §4). "One caller indexing, one
+> searching" above is the prototype `SemanticEngine`'s shape, not the app's, so the app's
+> setting is one context; more are a build-machine knob, for callers that embed at once.
+
 Even 1.20 GB is not obviously affordable on the smallest targets, and it is
 dominated by buffers this backend does not use (see below). Bringing it down is
 genuinely open work, not a solved problem.

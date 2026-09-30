@@ -336,7 +336,9 @@ otzaria-semantic-search/
 * [`src/semantic/onnx_backend.rs`](../src/semantic/onnx_backend.rs) — inference אמיתי
   ל-ONNX דרך ONNX Runtime, מאחורי `--features onnx-backend`. `OnnxBackend::ID` הוא
   `"onnxruntime-sentence-v1"`; `OnnxBackendConfig::from_env_for` קורא את
-  `OTZARIA_ONNX_THREADS` ו-`OTZARIA_ONNX_SESSIONS` ודוחה ערך שאינו מספר חיובי.
+  `OTZARIA_ONNX_THREADS` ו-`OTZARIA_ONNX_SESSIONS` ודוחה ערך שאינו מספר חיובי. באפליקציה
+  session אחד (ברירת המחדל) — היא מטמיעה רק שאילתות; יותר מ-session אחד הוא כפתור של
+  מכונת ה-build, ומשתלם רק כשכמה קוראים מטמיעים בו-זמנית.
 
 * [`src/semantic/llama_backend.rs`](../src/semantic/llama_backend.rs) — inference אמיתי,
   מאחורי `--features llama-backend` (ראו [`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md)).
@@ -467,7 +469,10 @@ otzaria-semantic-search/
 
 * [`src/semantic/engine.rs`](../src/semantic/engine.rs)
   - `SemanticEngine` & `SemanticConfig` — מנוע **צד ה-build**: מאגד את ה-Chunker,
-    ה-Runtime, store כותב וה-Manifest. מסלול האפליקציה הוא `official_index.rs`.
+    ה-Runtime, store כותב וה-Manifest. מסלול האפליקציה הוא `official_index.rs`. ה-API
+    של האינדוקס שלו (`index_books`) הוא **פיגום אב-טיפוס**: וקטורי הספרייה נבנים רק
+    במכונת ה-build (`build`, `embed-shard`), והאפליקציה פותחת ארטיפקט מוכן read-only דרך
+    `OfficialSemanticIndex` ומטמיעה רק את השאילתה.
   - `with_store()` — פתיחה מעל backend שהקורא מספק. זה מה שהופך ריצת אינדוקס למשהו
     שאפשר לארוז ממנו ארטיפקט: עם store מתמיד הווקטורים שורדים restart. ה-manifest
     רושם את ה-backend שנפתח **בפועל**, ולכן פתיחה מחדש עם backend אחר היא אי-תאימות

@@ -53,13 +53,20 @@
 //!
 //! # Concurrency
 //!
+//! Who embeds what decides how many sessions there are. The library's vectors are built on
+//! the build machine only; the application opens a prebuilt artifact read-only
+//! (`OfficialSemanticIndex`) and embeds nothing but queries, one at a time — so it needs
+//! one session, the default. More are a build-machine knob, for callers that embed at the
+//! same time.
+//!
 //! `ort` 2.0.0-rc.13's `Session::run` takes `&mut self` (upstream considers concurrent
 //! `Run` on one session unsound), while [`EmbeddingBackend`] is `&self` and `Sync`. So
-//! the backend owns a bounded pool of sessions (`Pool`), one lease per *text*: an
-//! indexing batch holds a session for one inference at a time, and a search query
-//! queued behind it waits for one text rather than for the batch. The queue is FIFO, so
-//! the batch cannot take the session straight back. The tokenizer is `Sync` with a
-//! `&self` `encode` and is shared without a lock.
+//! the backend owns a bounded pool of sessions (`Pool`), one lease per *text*: where one
+//! caller embeds a batch while another embeds a query — the prototype engine indexing as
+//! it searches — the batch holds a session for one inference at a time, and the query
+//! waits for one text rather than for the batch. The queue is FIFO, so the batch cannot
+//! take the session straight back. The tokenizer is `Sync` with a `&self` `encode` and is
+//! shared without a lock.
 //!
 //! # Special tokens inside text
 //!
@@ -97,11 +104,13 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 /// eight, so it cannot change a stored vector.
 const DEFAULT_THREADS_CAP: usize = 4;
 
-/// Default number of sessions, i.e. concurrent inferences: one, because the smallest
-/// target is a phone and each session holds its own copy of the weights — about 200 MiB
-/// more peak footprint for the fp32 production graph (387 → 589 MiB). One is not a
-/// cliff: runs are leased one text at a time, so a query waits for one inference
-/// behind an indexing batch (measured at most 14.7 ms), not for the batch.
+/// Default number of sessions, i.e. concurrent inferences: one — what the application
+/// needs, since it embeds only queries, one at a time, and never the library. Each
+/// session holds its own copy of the weights: a second one adds 74 MiB of peak footprint
+/// for the int8 graph (169 → 243 MiB) and 202 MiB for fp32 (387 → 589 MiB). More are a
+/// build-machine knob, worth it only for callers that embed at the same time; and even
+/// then one is not a cliff: runs are leased one text at a time, so a query waits for one
+/// inference behind a batch (measured at most 14.7 ms), not for the batch.
 const DEFAULT_SESSIONS: usize = 1;
 
 /// Environment variable naming the ONNX Runtime shared library to load. Read by
@@ -142,7 +151,8 @@ pub struct OnnxBackendConfig {
     /// ONNX Runtime intra-op threads per session. At least one.
     pub intra_threads: usize,
     /// Sessions in the pool: how many `embed_batch_raw` calls run at once. At least
-    /// one. Each costs roughly the graph's size in memory.
+    /// one. Each costs roughly the graph's size in memory. One in the application, which
+    /// embeds only queries; more only on a build machine whose callers embed concurrently.
     pub sessions: usize,
 }
 
@@ -720,7 +730,7 @@ struct PoolState<T> {
 /// A checkout pool rather than a shared session, because `Session::run` needs `&mut`;
 /// FIFO rather than whoever wakes first, because the caller that just returned a
 /// session is already running and would otherwise take it straight back, starving a
-/// query queued behind an indexing batch. Never fails and never blocks forever: every
+/// query queued behind another caller's batch. Never fails and never blocks forever: every
 /// [`Lease`] returns its item when dropped — during unwinding too — so the pool cannot
 /// shrink, and a caller that finds every item lent out waits for one.
 struct Pool<T> {
