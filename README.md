@@ -311,6 +311,10 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 - [Rust Toolchain](https://rustup.rs/) (Stable 2021 Edition)
 - For `--features llama-backend` only: **cmake** and a C++ toolchain. `llama-cpp-2`
   builds llama.cpp and ggml from source (~1–2 minutes cold).
+- For `--features onnx-backend`: nothing at build time. ONNX Runtime is a shared library
+  loaded when an ONNX model is, never linked, so running a graph needs one at run time —
+  Microsoft's official [1.28.0 release](https://github.com/microsoft/onnxruntime/releases/tag/v1.28.0)
+  is the reference. See [`docs/ONNX_BACKEND.md`](docs/ONNX_BACKEND.md).
 
 ### Feature matrix
 
@@ -319,7 +323,13 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 | default | none | `Err(BackendUnavailable)` — a release build cannot serve fake vectors |
 | `--features mock-embedding` | deterministic hash stand-in | `Ok` — **not a semantic model**, development and testing only |
 | `--features llama-backend` | real llama.cpp GGUF inference | `Ok` |
-| both | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
+| `--features onnx-backend` | real ONNX Runtime inference for an ONNX model package (desktop targets) | `Ok` once the runtime library is found — `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and `Err(BackendUnavailable)` naming both otherwise |
+| `mock-embedding` with a real backend | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
+
+Which backend a model gets is decided by its path, not by the features: `.onnx` in any
+case is an ONNX package — the graph, the `tokenizer.json` beside it and any external data
+it names — and every other path is GGUF. A build without the backend for a model's format
+says which feature to enable.
 
 ### Commands
 
@@ -333,6 +343,9 @@ cargo test --lib --tests
 cargo test --lib --tests --features mock-embedding
 cargo test --lib --tests --features llama-backend
 cargo test --lib --tests --features mock-embedding,llama-backend
+# The ONNX tests that run a graph skip without a runtime library to load
+OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib cargo test --lib --tests --features onnx-backend
+OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib cargo test --lib --tests --features mock-embedding,onnx-backend
 
 # Verify formatting
 cargo fmt --check
@@ -447,6 +460,21 @@ reference, so no cosine threshold can separate them. See
 [`docs/P2_REFERENCE_VECTORS.md`](docs/P2_REFERENCE_VECTORS.md) for the measurements
 and [`tools/README.md`](tools/README.md) for regenerating the goldens.
 
+The ONNX backend has its own gate against
+[`tests/data/onnx_golden_vectors.json`](tests/data/onnx_golden_vectors.json), the answers
+of a Python reference (`tokenizers` and `onnxruntime`) for the Meivin Round 2 fp32 graph.
+It needs the graph, with its `tokenizer.json` beside it, and a runtime library:
+
+```bash
+OTZARIA_TEST_ONNX_MODEL=/abs/path/seforim-embed-round2-fp32.onnx \
+OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
+  cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+```
+
+Token ids must match exactly, then every vector within cosine 0.99999. The model's
+package, checksum and licence are in
+[`config/models/meivin-round2-onnx/`](config/models/meivin-round2-onnx/README.md).
+
 ---
 
 ## 🤖 CI Pipeline
@@ -462,12 +490,15 @@ Clippy and tests; rustdoc links; and a release build of all targets. Tests use
 `--lib --tests`: `--all-targets` would execute the large benchmark rather than
 merely compile it.
 
-Two further jobs: an **inference backend** job that builds and tests
-`llama-backend` on Linux and macOS, and a **golden vectors** job that runs the
-real-model parity gate. The golden job needs the `OTZARIA_HF_TOKEN` secret; when
-the secret is absent it fails loudly rather than reporting a skip as a pass. That
-gate is a reason the model's distribution route matters — see
-[docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md).
+Further jobs: an **inference backend** job that builds and tests `llama-backend` on
+Linux and macOS; an **ONNX backend** job that tests `onnx-backend` on all three, against
+Microsoft's ONNX Runtime 1.28.0 fetched per platform and checked against a pinned
+SHA-256; and two **golden vectors** jobs that run the real-model parity gates, one per
+model — the second also checks that the crate and `tools/onnx_package_checksum.py`
+compute the same package checksum for the real ONNX model. The golden jobs need the
+`OTZARIA_HF_TOKEN` secret; when the secret is absent they fail loudly rather than
+reporting a skip as a pass. That gate is a reason the model's distribution route
+matters — see [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md).
 
 ---
 
@@ -478,7 +509,9 @@ For detailed architectural invariants, subsystem separation rules, and developme
 - [docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md) — Artifact identity fields, verification order and what is not yet enforced (Hebrew)
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — Comprehensive developer guide & status (Hebrew)
 - [docs/CODE_MAP.md](docs/CODE_MAP.md) — Detailed code map and component descriptions
-- [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md) — How the embedding model reaches the device (Hebrew)
+- [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md) — How the embedding model reaches the device, and what an ONNX model package is (Hebrew)
+- [docs/ONNX_BACKEND.md](docs/ONNX_BACKEND.md) — The ONNX Runtime backend: the runtime library, tuning and determinism
+- [config/README.md](config/README.md) — The model identities: production, and the ONNX model's
 - [שלבי ויעדי התקדמות.md](שלבי%20ויעדי%20התקדמות.md) — Staged plan S0–S8 across the three repositories (Hebrew)
 
 ---

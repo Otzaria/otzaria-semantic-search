@@ -122,6 +122,97 @@ S3 (זהות הארטיפקט) ו־S6 (התקנה באפליקציה).
 
 - ב־CI: לאחר פתיחת הגישה, שער ה־Golden Vectors מפסיק להיות תלוי בסוד ומפסיק להיות
   מדולג. עד אז הוא מדווח כישלון ולא כהצלחה.
-- בפיתוח מקומי: `OTZARIA_TEST_MODEL` ממשיך להיות הדרך להצביע על הקובץ.
+- בפיתוח מקומי: `OTZARIA_TEST_MODEL` ממשיך להיות הדרך להצביע על הקובץ, ולמודל ONNX —
+  `OTZARIA_TEST_ONNX_MODEL` על הגרף ו־`OTZARIA_ONNX_RUNTIME` על ספריית הריצה (§6).
 - ב־S6: מסך/זרימה של „הפעלת חיפוש סמנטי” כוללת הורדת מודל **וגם** ארטיפקט, ולא
   אינדוקס. אין מסך התקדמות אינדוקס — אין אינדוקס.
+
+## 6. מודל ONNX: חבילה, לא קובץ
+
+> נוסף עם ה־backend של ONNX (`--features onnx-backend`). ההכרעות של §2 חלות עליו כמו
+> שהן: המודל אינו מצורף למתקין, וה־crate אינו מוריד אותו — הוא מקבל נתיב.
+
+| | |
+|---|---|
+| מודל | **Meivin Round 2** — המקודד השלם, כולל ה־pooling, ההטלה ל־256 ממדים והנרמול, בגרף ONNX אחד |
+| מקור | `ArieLLL123/judaic-semantic-round2-onnx-zayit` ב־HuggingFace, revision `1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca`, `gated: manual` |
+| מראה | `otzaria/judaic-semantic-round2-onnx-zayit`, פרטית — ממנה מוריד ה־CI, ועבודת `golden-onnx` תלויה בקיומה ובטוקן `OTZARIA_HF_TOKEN` שיכול לקרוא אותה |
+| זהות | [`config/models/meivin-round2-onnx/`](../config/models/meivin-round2-onnx/) — לצד זהות הייצור ב־`config/`, לא במקומה |
+
+### 6.1 מה בחבילה
+
+מודל GGUF הוא קובץ אחד, והטוקנייזר בתוכו. מודל ONNX הוא **חבילה**: `model_path` מצביע על
+הגרף, והחבילה היא התיקייה שלו.
+
+| קובץ | בחבילה | למה |
+|---|---|---|
+| הגרף — `seforim-embed-round2-fp32.onnx`, 168,177,986 בתים | ✅ | |
+| `tokenizer.json` שלצדו, 2,191,362 בתים | ✅ חובה | ה־ids נקבעים בו; טוקנייזר אחר הוא מודל אחר |
+| כל קובץ external data שטנזורים בגרף מפנים אליו | ✅ | במודל הזה אין |
+| `README.md`, `LICENSE.md`, `manifest.json`, `.gitattributes`, סקריפט הייצוא | ❌ | אינם מגיעים לשום וקטור |
+| הגרף השני, `seforim-embed-round2-int8.onnx` | ❌ | מודל אחר: וקטורים אחרים (cosine 0.9991 במקרה הגרוע על מקרי הזהב), ולכן זהות משלו |
+| ספריית ONNX Runtime | ❌ | §6.3 |
+
+### 6.2 ה־checksum
+
+`model_checksum` של מודל ONNX הוא ה־SHA-256 של מניפסט קנוני של החבילה:
+
+```text
+otzaria-onnx-package-v1
+<relpath>\t<size_in_bytes>\t<sha256>        שורה לכל קובץ, ממוינות לפי relpath בסדר בתים
+```
+
+`relpath` יחסי לתיקיית הגרף ומופרד ב־`/`. לגרף ה־fp32 של Meivin הערך הוא
+`4a4a2ae88a86f15ffe6069bfcefc3abd13c207cec5d7aaef52c0c59d752ade46`.
+
+יש לו **שני מימושים עצמאיים**, ושניהם חייבים להגיע לאותו ערך מאותם בתים: ה־crate
+([`validate_onnx_package`](../src/semantic/model_package.rs), וב־CLI
+`model-checksum --model-file`) ו־[`tools/onnx_package_checksum.py`](../tools/onnx_package_checksum.py),
+בספרייה הסטנדרטית של Python בלבד, בשביל מכונת הבנייה וה־CI. שניהם מקובעים לאותו digest
+של חבילת זהב בבדיקות, ועבודת `golden-onnx` ב־CI מריצה את שניהם על החבילה האמיתית מול
+הערך ש־`model.json` מצהיר.
+
+כמו ב־GGUF, זה **אינו אימות הורדה**: ה־checksum מזהה בתים, ואינו מעיד שהם הבתים
+שפורסמו. אימות מול hash מפורסם נשאר של S6 (§2.2).
+
+### 6.3 ONNX Runtime — נפרד מהחבילה, ואינו חלק מהזהות
+
+ה־backend טוען את ספריית ONNX Runtime בזמן ריצה, ואינו מקשר אותה לבינארי. הוא מחפש אותה
+לפי הסדר:
+
+1. משתנה הסביבה `OTZARIA_ONNX_RUNTIME` — הנתיב המלא לספרייה;
+2. שם הקובץ של הפלטפורמה בתיקיית החבילה, לצד הגרף: `onnxruntime.dll`, `libonnxruntime.so`
+   או `libonnxruntime.dylib`;
+3. אחרת — `BackendUnavailable`, שמציין את שתי האפשרויות. רק החיפוש הסמנטי אינו זמין;
+   החיפוש הלקסיקלי ממשיך לעבוד.
+
+הספרייה **אינה** נכנסת ל־checksum. היא קוד ולא נתוני מודל, היא שונה בכל פלטפורמה, וזהות
+המודל חייבת להיות זהה במכונת הבנייה ובכל מכשיר. ספרייה שמונחת לצד הגרף אינה משנה את
+ה־checksum.
+
+גרסת הריצה כן משפיעה על הספרות האחרונות של וקטור, ולכן יש לה גרסת ייחוס:
+**ONNX Runtime 1.28.0** הרשמי של Microsoft מ־GitHub. וקטורי הזהב הופקו בה, ועבודת
+`onnx-backend` ב־CI מורידה אותה (לפי digest מקובע) לכל שלוש הפלטפורמות. מובייל
+(Android/iOS) — אין ספרייה ב־v1.
+
+איך הספרייה מגיעה למכשיר היא שאלה של S6, כמו המודל עצמו (§3). ONNX Runtime מופץ ברישיון
+MIT, והפצתו עם האפליקציה מחייבת לצרף את הודעת הרישיון שלו.
+
+### 6.4 רישוי
+
+- **המודל והטוקנייזר:** [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) —
+  שימוש לא־מסחרי בלבד, עם ייחוס, ויצירות נגזרות באותו רישיון. הייחוס הנדרש:
+  **"Judaic Semantic Embedding project, Otzaria (https://otzaria.org/)"**, בכל מקום שקובצי
+  המודל מגיעים אליו.
+- **סקריפט הייצוא** (`export_round2_onnx.py`) ברישיון לשימוש אישי. אין ממנו דבר במאגר
+  הזה, הוא אינו חלק מהחבילה, ואינו מופץ עם המודל.
+- קובצי המודל אינם נכנסים ל־git לעולם; `.gitignore` מונה אותם בשמם.
+
+### 6.5 וקטורי הזהב
+
+[`tests/data/onnx_golden_vectors.json`](../tests/data/onnx_golden_vectors.json) הוא התשובה
+של רפרנס Python — `tokenizers` 0.23.2 ו־`onnxruntime` 1.28.0, אותן גרסאות שה־backend
+מקובע אליהן — ל־41 קלטים, והוא מופק ב־[`tools/generate_onnx_golden_vectors.py`](../tools/generate_onnx_golden_vectors.py).
+הבדיקה `semantic::onnx_backend::golden` דורשת ids זהים בדיוק, ואחר כך cosine ≥ 0.99999
+לכל וקטור. עבודת `golden-onnx` ב־CI מריצה אותה, באותה מדיניות סוד כמו `golden-vectors`
+(§2.5, §5): בלי `OTZARIA_HF_TOKEN` היא נכשלת, ולא מדווחת הצלחה.
