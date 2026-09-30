@@ -68,10 +68,13 @@ otzaria-semantic-search/
     ├── semantic/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Semantic
     │   ├── chunker.rs                      # Anchored Chunking & SHA256 IDs
-    │   ├── embedding.rs                    # אימות GGUF, batching ונרמול
+    │   ├── recipe.rs                       # גרסאות המתכון: chunking, טקסט (כולל תחיליות תפקיד), נרמול
+    │   ├── embedding.rs                    # אימות המודל, batching ונרמול
+    │   ├── model_package.rs                # פורמט המודל; חבילת ONNX: אימות ו-checksum
     │   ├── embedding_cache.rs              # cache לווקטורים של טקסטים שהוטמעו
-    │   ├── backend.rs                      # חוזה ה-backend ובחירתו
-    │   ├── llama_backend.rs                # inference אמיתי (feature `llama-backend`)
+    │   ├── backend.rs                      # חוזה ה-backend ובחירתו לפי פורמט המודל
+    │   ├── llama_backend.rs                # inference אמיתי ל-GGUF (feature `llama-backend`)
+    │   ├── onnx_backend.rs                 # inference אמיתי ל-ONNX (feature `onnx-backend`)
     │   ├── engine.rs                       # מתאם צד ה-build: chunk → embed → כתיבה
     │   ├── official_index.rs               # מסלול האפליקציה: פתיחת ארטיפקט מאומת, read-only
     │   ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
@@ -241,8 +244,42 @@ otzaria-semantic-search/
   - `ChunkerConfig::identity()` — טביעת אצבע u64 של כל שדות החלוקה; נשמרת ב־manifest כזהות האינדקס.
   - `truncate_to_chars()` — חיתוך UTF-8 יעיל במעבר יחיד.
 
+* [`src/semantic/recipe.rs`](../src/semantic/recipe.rs)
+  - `EmbeddingTextRecipe` — אילו טקסט מגיע למודל, משני הצדדים. גרסה 1: השורה או השורה
+    בהקשר; גרסה 2 (`RolePrefixedLineOrNeighbourContext`): `"[PASSAGE] "` + בדיוק הטקסט של
+    גרסה 1 לכל מסמך, ו-`"[QUERY] "` + השאילתה המנורמלת לכל שאילתה. `passage_text()` מופעל
+    ב-chunker **אחרי** הקיטום והנרמול, ולכן התחילית אינה נספרת בתקרת התווים ואינה מנורמלת.
+  - `query_input()` — הפונקציה היחידה שדרכה כל מסלול מטמיע שאילתה (המנוע וה-
+    `OfficialSemanticIndex`; הקואורדינטור מגיע למודל רק דרכם): נרמול, ואז התחילית. שאילתה
+    שאין בה טקסט אחרי הנרמול נדחית כאן, בכל גרסה — אחרת תחילית הייתה מטמיעה את עצמה.
+  - `chunk_hash` ו-`embedding_text_sha256` מכסים את התחילית (הם מתארים את מה שהמודל מקבל);
+    `source_line_sha256` ו-`line_hash` אינם (הם מתארים את שורת הקורפוס).
+
+* [`src/semantic/model_package.rs`](../src/semantic/model_package.rs) — מה נתיב מודל אומר
+  על הדיסק. מקומפל תמיד, בלי תלות inference.
+  - `ModelFormat::of()` — סיומת `onnx` (בכל רישיות ASCII) היא ONNX, **כל נתיב אחר הוא
+    GGUF**. אותו כלל בוחר את ה-validator ואת ה-backend.
+  - `validate_model()` — נקודת הכניסה של `EmbeddingRuntime::load()`: GGUF הולך
+    ל-`validate_and_checksum_gguf` ללא שינוי, ONNX ל-`validate_onnx_package`.
+  - `validate_onnx_package()` — החבילה היא הגרף, `tokenizer.json` שלידו (חובה —
+    `TokenizerNotFound`, נבדק ראשון) וכל קובץ external-data שהגרף מצביע עליו. הגרף נקרא
+    ב-**protobuf walk** חסום וזורם, ומגובב באותו מעבר: אורך שחורג מסוף הקובץ = הורדה שלא
+    הושלמה, אורך שחורג מההודעה שמכילה אותו = קובץ פגום, שדה ראשון שאינו של `ModelProto` =
+    לא ONNX כלל (Git LFS pointer, דף שגיאה ו-GGUF מזוהים בשמם). מספרי השדות מ-
+    `onnx/onnx.proto3`; `raw_data` מדולג ב-64 KiB, לעולם לא מוחזק. טנזורי external-data
+    נמצאים בכל מקום שטנזור יכול להיות: initializers, sparse initializers, attributes, תת-גרפים,
+    functions ו-training graphs. כל `location` חייב להיות יחסי ובתוך התיקייה (לא מוחלט, לא
+    `..`, לא symlink החוצה), והקובץ חייב להגיע לבית הרחוק ביותר שהפניה צריכה — ובלי `length`,
+    ביט אחד לאיבר, מתחת לכל טיפוס ONNX.
+  - `OnnxPackage` / `onnx_package_manifest()` / `onnx_package_checksum()` — ה-checksum של
+    החבילה: SHA-256 של manifest קנוני (`otzaria-onnx-package-v1`, שורה לכל קובץ לפי relpath:
+    נתיב, גודל, SHA-256). שום קובץ אחר בתיקייה — README, גרף שני, ספריית ONNX Runtime — אינו
+    נכנס. ההגדרה המלאה: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §4.2.1.
+
 * [`src/semantic/embedding.rs`](../src/semantic/embedding.rs)
-  - `EmbeddingRuntime` & `EmbeddingConfig` — ממשק הרצת מודל GGUF מקומי.
+  - `EmbeddingRuntime` & `EmbeddingConfig` — ממשק הרצת מודל מקומי, GGUF או חבילת ONNX.
+    `load()` מאמת ומחשב את `model_checksum` דרך `model_package::validate_model`, לפי
+    הפורמט שהנתיב אומר.
   - `validate_and_checksum_gguf()` — אימות קונטיינר וחישוב SHA-256 **במעבר אחד** על
     הקובץ (מודל של מאות MB נקרא פעם אחת בלבד). ה-header נבדק אחרי 24 בייטים, לפני
     שממשיכים; אחריו נפרסר כל אזור ה-descriptors, ומתוך ה-offsets המוצהרים נגזר חסם
@@ -264,7 +301,9 @@ otzaria-semantic-search/
     נורמל — ונכנס לאינדקס כשהציון שלו הוא הגודל שלו ולא קוסינוס.
   - `l2_normalize()` — נורמליזציית L2, מחזירה את הנורמה שהייתה לפני כן.
   - `mock` — ה-stand-in הדטרמיניסטי, זמין רק תחת `cfg(test)` או
-    `--features mock-embedding`. **אינו מודל סמנטי.**
+    `--features mock-embedding`. **אינו מודל סמנטי.** לצידו ה-fixtures: `write_stub_gguf`,
+    ו-`write_stub_onnx_package` שכותב חבילת ONNX מינימלית ותקינה (גרף מקודד ביד ו-
+    `tokenizer.json`) ומחזיר את נתיב הגרף.
 
 * [`src/semantic/backend.rs`](../src/semantic/backend.rs) — החוזה שכל backend מקיים.
   - `EmbeddingBackend` — trait עם `Send + Sync`, כי הקואורדינטור מחזיק את המנוע
@@ -274,16 +313,30 @@ otzaria-semantic-search/
   - `tokenize()` — קיים כי בדיקת ה-parity של P2 מחייבת שוויון `token_ids`, ואין דרך
     לאמת אותה בלי לחשוף את הטוקנייזר. ה-stand-in מחזיר `TokenizationUnsupported`
     ולא מימוש מנוון — ids "סבירים" היו הופכים את הבדיקה להשוואה בין שתי המצאות.
-  - `Pooling` — `LastToken` / `Mean`, עם התאמת מחרוזות **מדויקת** (לא case-insensitive
-    ובלי trim): אותה מחרוזת נשמרת ב-manifest ומושווית תו-בתו בסשן הבא, כך שקבלת
-    `"Last-Token"` כאליאס הייתה מייצרת mismatch מדומה ובנייה מחדש של האינדקס.
-    `Mean` בר-ייצוג ובלתי-שמיש: הוא מה שמאפשר לבטא "הקונפיג חולק על ה-backend".
+  - `Pooling` — `LastToken` / `Mean` / `InGraph`, עם התאמת מחרוזות **מדויקת** (לא
+    case-insensitive ובלי trim): אותה מחרוזת נשמרת ב-manifest ומושווית תו-בתו בסשן הבא, כך
+    שקבלת `"Last-Token"` כאליאס הייתה מייצרת mismatch מדומה ובנייה מחדש של האינדקס.
+    `Mean` בר-ייצוג ובלתי-שמיש: הוא מה שמאפשר לבטא "הקונפיג חולק על ה-backend". `InGraph`
+    (`"in-graph"`) — הגרף עצמו מוציא את וקטור המשפט הגמור; זה מה ש-backend ה-ONNX משרת.
+  - `ensure_pooling_is_implemented_for()` — ה-pooling נבדק מול **פורמט המודל**, כי הוא נכתב
+    ל-manifest לפני שנשאל backend כלשהו: `"in-graph"` ליד GGUF הוא `PoolingNotForFormat`
+    שנוקב בשני חצאי הזיווג, ו-pooling שאיש אינו מבצע נשאר `PoolingNotImplemented` —
+    ב-GGUF באותו נוסח בדיוק כמו קודם.
   - `CANDIDATES` / `select_backend()` — טבלה אחת שממנה קוראים גם הבחירה וגם בדיקת
-    ה-pooling, ולכן הוספת backend היא שורה. הטבלה **אינה** מותנית ב-feature: היא
+    ה-pooling, ולכן הוספת backend היא שורה. כל שורה מצהירה על **הפורמטים** שהיא משרתת,
+    ו-`select_backend` עובר רק על השורות של פורמט הנתיב — backend של פורמט אחד לעולם אינו
+    נשאל על מודל של האחר. ה-stand-in מופיע פעם לכל פורמט, וטוען מה שה-backend האמיתי של
+    אותו פורמט טוען (`last-token` ל-GGUF, `in-graph` ל-ONNX). אין backend לפורמט →
+    `BackendUnavailable` שנוקב ב-feature (`llama-backend` / `onnx-backend`). הטבלה **אינה** מותנית ב-feature: היא
     מתארת אילו מימושים קיימים ב-crate, אחרת "אין backend" היה מדווח כ"קונפיגורציה
     שגויה". מחזירה `Option<Result<..>>` — `None` = לא מקומפל (המשך לחפש),
     `Some(Err)` = מקומפל ונכשל (עצור ודווח). עם `Option` בלבד, backend אמיתי שנכשל
     היה נראה כחסר, וה-stand-in היה עונה על מודל שבור בווקטורי האש בשקט.
+
+* [`src/semantic/onnx_backend.rs`](../src/semantic/onnx_backend.rs) — inference אמיתי
+  ל-ONNX דרך ONNX Runtime, מאחורי `--features onnx-backend`. `OnnxBackend::ID` הוא
+  `"onnxruntime-sentence-v1"`; `OnnxBackendConfig::from_env_for` קורא את
+  `OTZARIA_ONNX_THREADS` ו-`OTZARIA_ONNX_SESSIONS` ודוחה ערך שאינו מספר חיובי.
 
 * [`src/semantic/llama_backend.rs`](../src/semantic/llama_backend.rs) — inference אמיתי,
   מאחורי `--features llama-backend` (ראו [`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md)).
@@ -757,11 +810,13 @@ cargo run --release --features llama-backend -- build \
 
 * `chunking.json` — `ChunkerConfig`, כלומר המתכון עצמו ולא תיאור שלו:
   `{"min_meaningful_chars": 20, "context_window_lines": 2, "max_chunk_chars": 512,
-  "min_embeddable_chars": 5, "chunking_version": 1}`. הוא חייב לגבב ל-`chunking_identity`
-  שהמודל מצהיר, אחרת הבנייה נדחית — ארטיפקט רושם את ה-hash, ו-hash אינו הפיך לחמישה
-  מספרים.
-* `--model-file` הוא ה-GGUF שממנו נוצרים הווקטורים בפועל. ה-checksum שלו חייב להיות זה
-  שב-`model.json`, וכך גם ה-backend, הרוחב, ה-pooling ותקרת ה-tokens האפקטיבית.
+  "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 1,
+  "normalization_version": 1}` — כל השדות חובה. הוא חייב לגבב ל-`chunking_identity`
+  שהמודל מצהיר, אחרת הבנייה נדחית — ארטיפקט רושם את ה-hash, ו-hash אינו הפיך למתכון.
+* `--model-file` הוא המודל שממנו נוצרים הווקטורים בפועל: קובץ GGUF, או גרף ONNX עם החבילה
+  שלידו. ה-checksum שלו חייב להיות זה שב-`model.json`, וכך גם ה-backend, הרוחב, ה-pooling
+  ותקרת ה-tokens האפקטיבית. `model-checksum --model-file <path>` מדפיס את ה-checksum
+  שצריך להצהיר — וב-ONNX גם כל קובץ בחבילה ואת ה-manifest המדויק — בבנייה רגילה.
 * מי מקבל וקטור **נגזר**: ה-`Chunker` מוחל על הקורפוס לפני כל inference. שורה קצרה מדי
   מכדי לשאת משמעות מדולגת, וארטיפקט שדילג עליה שלם ולא חסר.
 * דורש backend inference, כי בנייה היא inference. `pack` ו-`validate` אינם.
@@ -784,8 +839,8 @@ cargo run --release -- validate \
 * `vectors.jsonl` — שורה לכל וקטור, **באותו סדר**:
   `{"line_id": N, "source_line_sha256": "...", "embedding_text_sha256": "..."}`.
   הראשון הוא SHA-256 של טקסט השורה בקורפוס ונבדק מולו; בלעדיו קובץ וקטורים שנסע בשורה
-  אחת היה נארז בלי תלונה. השני הוא של הטקסט שהוטמע בפועל (אחרי כותרת/הקשר/קיטום) ונרשם
-  כ-`chunk_hash` של הרשומה.
+  אחת היה נארז בלי תלונה. השני הוא של הטקסט שהוטמע בפועל (אחרי הקשר/קיטום/תחילית
+  תפקיד) ונרשם כ-`chunk_hash` של הרשומה.
 * `corpus-lines.jsonl` — `{"line_id": N, "source_book_key": ..., "title": ...,
   "reference": ..., "section_id": N, "segment": N, "is_pdf": bool, "line_hash": N,
   "content_hash": N, "facets": [...], "text": "..."}` לכל מסמך.
