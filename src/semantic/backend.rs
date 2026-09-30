@@ -28,9 +28,9 @@
 //! `.onnx` is ONNX and every other path is GGUF
 //! ([`ModelFormat::of`](crate::semantic::model_package::ModelFormat::of)), and only the
 //! candidates serving that format are walked. The stand-in is gated so a release build
-//! cannot serve fake vectors; real inference is gated because it links a large native
-//! runtime. With a real backend and the stand-in both enabled the real one wins, since
-//! `CANDIDATES` is ordered by preference.
+//! cannot serve fake vectors; real inference is gated because it brings a large native
+//! runtime into the build. With a real backend and the stand-in both enabled the real
+//! one wins, since `CANDIDATES` is ordered by preference.
 
 use crate::errors::EmbeddingError;
 use crate::semantic::embedding::EmbeddingConfig;
@@ -137,7 +137,9 @@ pub trait EmbeddingBackend: Send + Sync {
     /// wrong-width vectors reach the store mid-index.
     fn dim(&self) -> u32;
 
-    /// The token cap this backend applies to a single input.
+    /// The token cap this backend applies to a single input: the **total** sequence
+    /// length, counting every special token the backend adds around the text —
+    /// llama.cpp's appended EOS, a BERT tokenizer's `[CLS]` and `[SEP]`.
     ///
     /// A contract the *backend* implements, not something this layer enforces:
     /// the runtime has no tokenizer, and `Chunker`'s character limit is a
@@ -245,22 +247,41 @@ const CANDIDATES: &[BackendCandidate] = &[
     },
 ];
 
-/// Ordered by [`Pooling::ALL`] so error messages are stable.
+/// Every pooling some backend performs, for a model of any format. Ordered by
+/// [`Pooling::ALL`] so error messages are stable.
 pub fn implemented_poolings() -> Vec<Pooling> {
+    poolings_served(None)
+}
+
+/// Every pooling a backend performs for a `format` model, ordered by [`Pooling::ALL`].
+pub fn implemented_poolings_for(format: ModelFormat) -> Vec<Pooling> {
+    poolings_served(Some(format))
+}
+
+fn poolings_served(format: Option<ModelFormat>) -> Vec<Pooling> {
     Pooling::ALL
         .into_iter()
         .filter(|strategy| {
-            CANDIDATES
-                .iter()
-                .any(|candidate| candidate.poolings.contains(strategy))
+            candidates_for(format).any(|candidate| candidate.poolings.contains(strategy))
         })
         .collect()
+}
+
+/// The candidates serving `format`, or every candidate for `None`.
+fn candidates_for(format: Option<ModelFormat>) -> impl Iterator<Item = &'static BackendCandidate> {
+    CANDIDATES
+        .iter()
+        .filter(move |candidate| format.is_none_or(|format| candidate.formats.contains(&format)))
 }
 
 /// Refuse a pooling no backend implements while it is still only a configuration
 /// value. `pooling = "mean"` parses, so without this it reached the manifest as
 /// the index's identity; correcting the configuration then made the manifest
 /// disagree with it, recoverable only by discarding the index.
+///
+/// Format-blind: it answers whether *any* backend performs `pooling`. A configuration
+/// names a model, and [`ensure_pooling_is_implemented_for`] is the check that holds it
+/// to that model's format.
 ///
 /// # Errors
 ///
@@ -271,22 +292,64 @@ pub fn ensure_pooling_is_implemented(pooling: Pooling) -> Result<(), EmbeddingEr
     }
     Err(EmbeddingError::PoolingNotImplemented {
         pooling: pooling.to_string(),
-        implemented: describe_implemented_poolings(),
+        implemented: describe_implemented_poolings(None),
+    })
+}
+
+/// [`ensure_pooling_is_implemented`], for a model of `format`: the check
+/// [`EmbeddingConfig::validate`] and the engine's configuration make, because the
+/// pooling reaches the manifest before any backend is asked.
+///
+/// Without it `pooling = "in-graph"` beside a GGUF model validated — an ONNX backend
+/// implements it — was written into the index identity, and failed only at load, as a
+/// mismatch against a manifest that then outlived the correction: the trap the
+/// format-blind check closed for `"mean"`, reopened by a pooling only one format has.
+///
+/// # Errors
+///
+/// [`EmbeddingError::PoolingNotImplemented`] for a pooling nothing performs, naming what
+/// `format` does implement — for GGUF, the message this crate has always given — and
+/// [`EmbeddingError::PoolingNotForFormat`] for one only another format's backends
+/// perform, naming both.
+pub fn ensure_pooling_is_implemented_for(
+    pooling: Pooling,
+    format: ModelFormat,
+) -> Result<(), EmbeddingError> {
+    if implemented_poolings_for(format).contains(&pooling) {
+        return Ok(());
+    }
+    if !implemented_poolings().contains(&pooling) {
+        return Err(EmbeddingError::PoolingNotImplemented {
+            pooling: pooling.to_string(),
+            implemented: describe_implemented_poolings(Some(format)),
+        });
+    }
+    let implemented_elsewhere: Vec<String> = ModelFormat::ALL
+        .into_iter()
+        .filter(|other| *other != format && implemented_poolings_for(*other).contains(&pooling))
+        .map(|other| {
+            format!(
+                "{other} models ({})",
+                backends_performing(pooling, Some(other))
+            )
+        })
+        .collect();
+    Err(EmbeddingError::PoolingNotForFormat {
+        pooling: pooling.to_string(),
+        format: format.to_string(),
+        implemented: describe_implemented_poolings(Some(format)),
+        implemented_elsewhere: implemented_elsewhere.join("; "),
     })
 }
 
 /// Attributed per backend, because "implemented: last-token" reads as a limit of
 /// the build while "last-token (mock-hash-v1)" names the implementation.
-fn describe_implemented_poolings() -> String {
+fn describe_implemented_poolings(format: Option<ModelFormat>) -> String {
     let described: Vec<String> = Pooling::ALL
         .into_iter()
         .filter_map(|strategy| {
-            let backends: Vec<&str> = CANDIDATES
-                .iter()
-                .filter(|candidate| candidate.poolings.contains(&strategy))
-                .map(|candidate| candidate.id)
-                .collect();
-            (!backends.is_empty()).then(|| format!("{strategy} ({})", backends.join(", ")))
+            let backends = backends_performing(strategy, format);
+            (!backends.is_empty()).then(|| format!("{strategy} ({backends})"))
         })
         .collect();
 
@@ -297,6 +360,18 @@ fn describe_implemented_poolings() -> String {
     }
 }
 
+/// The ids of the backends performing `pooling` for `format`, in table order, each
+/// once: the stand-in has a row per format.
+fn backends_performing(pooling: Pooling, format: Option<ModelFormat>) -> String {
+    let mut ids: Vec<&str> = Vec::new();
+    for candidate in candidates_for(format) {
+        if candidate.poolings.contains(&pooling) && !ids.contains(&candidate.id) {
+            ids.push(candidate.id);
+        }
+    }
+    ids.join(", ")
+}
+
 /// Choose the backend this build can offer for `config`, by walking the `CANDIDATES`
 /// that serve its model's format rather than through `#[cfg]` blocks inside an
 /// inference call.
@@ -304,7 +379,7 @@ fn describe_implemented_poolings() -> String {
 /// `config` is validated here too: this function is public and reachable without
 /// [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load),
 /// so a direct caller could otherwise get a backend built for `max_tokens: 1`,
-/// which embeds every text as a bare EOS.
+/// which embeds every text as a bare special token.
 ///
 /// # Errors
 ///
@@ -321,9 +396,7 @@ pub fn select_backend(
 
     // `Some(Err(_))` stops the walk just as `Some(Ok(_))` does — see
     // `BackendCandidate::construct`.
-    CANDIDATES
-        .iter()
-        .filter(|candidate| candidate.formats.contains(&format))
+    candidates_for(Some(format))
         .find_map(|candidate| (candidate.construct)(config))
         .unwrap_or_else(|| {
             // For GGUF this is, byte for byte, the message from before formats existed.
@@ -683,6 +756,85 @@ mod tests {
         assert!(ensure_pooling_is_implemented(Pooling::InGraph).is_ok());
     }
 
+    #[test]
+    fn each_format_implements_exactly_the_pooling_its_backends_perform() {
+        assert_eq!(
+            implemented_poolings_for(ModelFormat::Gguf),
+            vec![Pooling::LastToken]
+        );
+        assert_eq!(
+            implemented_poolings_for(ModelFormat::Onnx),
+            vec![Pooling::InGraph]
+        );
+        assert!(ensure_pooling_is_implemented_for(Pooling::LastToken, ModelFormat::Gguf).is_ok());
+        assert!(ensure_pooling_is_implemented_for(Pooling::InGraph, ModelFormat::Onnx).is_ok());
+    }
+
+    /// A pooling nothing performs keeps the exact message it always had for GGUF: the
+    /// list of what GGUF backends implement is what it was before ONNX existed.
+    #[test]
+    fn a_pooling_nothing_performs_reads_as_it_always_has_for_gguf() {
+        match ensure_pooling_is_implemented_for(Pooling::Mean, ModelFormat::Gguf) {
+            Err(error @ EmbeddingError::PoolingNotImplemented { .. }) => assert_eq!(
+                error.to_string(),
+                "No embedding backend implements pooling 'mean' (implemented: last-token \
+                 (llama-cpp-qwen3-last-v1, mock-hash-v1))"
+            ),
+            other => panic!("expected PoolingNotImplemented, got {other:?}"),
+        }
+        match ensure_pooling_is_implemented_for(Pooling::Mean, ModelFormat::Onnx) {
+            Err(EmbeddingError::PoolingNotImplemented { implemented, .. }) => assert_eq!(
+                implemented,
+                "in-graph (onnxruntime-sentence-v1, mock-hash-v1)"
+            ),
+            other => panic!("expected PoolingNotImplemented, got {other:?}"),
+        }
+    }
+
+    /// Both halves of the pairing are named, because either may be the one to change.
+    #[test]
+    fn a_pooling_the_models_format_does_not_serve_is_refused_by_name() {
+        let refused = ensure_pooling_is_implemented_for(Pooling::InGraph, ModelFormat::Gguf)
+            .expect_err("a GGUF backend pools last-token");
+        let message = refused.to_string();
+        match refused {
+            EmbeddingError::PoolingNotForFormat {
+                pooling,
+                format,
+                implemented,
+                implemented_elsewhere,
+            } => {
+                assert_eq!(pooling, "in-graph");
+                assert_eq!(format, "GGUF");
+                assert_eq!(
+                    implemented,
+                    "last-token (llama-cpp-qwen3-last-v1, mock-hash-v1)"
+                );
+                assert_eq!(
+                    implemented_elsewhere,
+                    "ONNX models (onnxruntime-sentence-v1, mock-hash-v1)"
+                );
+                assert!(
+                    message.contains("in-graph") && message.contains("GGUF"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected PoolingNotForFormat, got {other:?}"),
+        }
+
+        match ensure_pooling_is_implemented_for(Pooling::LastToken, ModelFormat::Onnx) {
+            Err(EmbeddingError::PoolingNotForFormat {
+                format,
+                implemented_elsewhere,
+                ..
+            }) => {
+                assert_eq!(format, "ONNX");
+                assert!(implemented_elsewhere.starts_with("GGUF models"));
+            }
+            other => panic!("expected PoolingNotForFormat, got {other:?}"),
+        }
+    }
+
     /// The table states what a backend pools without building it, and two
     /// statements of one fact can drift: an overstated row would accept a
     /// configuration the backend then refuses at load time.
@@ -831,7 +983,7 @@ mod tests {
                 },
             ),
             (
-                // The cap counts the EOS, so 1 leaves no content budget at all.
+                // The cap counts the special tokens, so 1 leaves no content budget at all.
                 "a token cap of one",
                 EmbeddingConfig {
                     max_tokens: 1,
@@ -849,6 +1001,21 @@ mod tests {
                 "a pooling nothing performs",
                 EmbeddingConfig {
                     pooling: Pooling::Mean,
+                    ..Default::default()
+                },
+            ),
+            (
+                "a pooling only another format's backends perform",
+                EmbeddingConfig {
+                    pooling: Pooling::InGraph,
+                    ..Default::default()
+                },
+            ),
+            (
+                "an ONNX model asked to pool like a GGUF",
+                EmbeddingConfig {
+                    model_path: "absent/model.onnx".into(),
+                    pooling: Pooling::LastToken,
                     ..Default::default()
                 },
             ),

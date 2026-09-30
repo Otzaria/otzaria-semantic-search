@@ -77,8 +77,12 @@ pub struct CorpusIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelIdentity {
     pub model_id: String,
-    /// SHA-256 of the model file the vectors were produced with, as 64 lowercase hex
-    /// digits. Guards what `model_id` cannot: the same id over different weights.
+    /// Checksum of the model the vectors were produced with, as 64 lowercase hex digits:
+    /// the file's SHA-256 for a GGUF, and for an ONNX graph the checksum of its whole
+    /// package — graph, external data and `tokenizer.json` — as
+    /// [`model_package`](crate::semantic::model_package) defines it. Guards what
+    /// `model_id` cannot: the same id over different weights, or the same weights read
+    /// through a different tokenizer.
     pub model_checksum: String,
     /// Quantization the vectors were produced under (e.g. `"Q4_K_M"`). Redundant
     /// against `model_checksum` by design — it is what makes a rejection readable.

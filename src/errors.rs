@@ -3,6 +3,7 @@
 //! Design: errors are categorized by subsystem so callers can decide
 //! whether to propagate, log, or gracefully degrade.
 
+use crate::semantic::model_package::ModelFormat;
 use crate::semantic::versioning::{describe_identity_mismatches, IdentityField, IdentityMismatch};
 use thiserror::Error;
 
@@ -62,15 +63,30 @@ pub enum EmbeddingError {
     #[error("Model file not found: {path}")]
     ModelNotFound { path: String },
 
-    #[error("Tokenizer file not found: {path}")]
+    /// An ONNX package without its tokenizer. The tokenizer is part of the package —
+    /// it decides which token ids the graph sees, and the package checksum covers it —
+    /// so it is looked for in one place only, and never substituted.
+    #[error(
+        "Tokenizer file not found: {path} (an ONNX model is a package, and its \
+         tokenizer.json must sit beside the graph file)"
+    )]
     TokenizerNotFound { path: String },
 
     #[error("Model loading failed: {reason}")]
     LoadFailed { reason: String },
 
-    /// The file exists but is not a usable GGUF container. Guards against a
+    /// The file exists but is not a usable model of the format its path names: a GGUF
+    /// container, or an ONNX package — for which `path` is always the graph, and the
+    /// reason names whichever file of the package was at fault. Guards against a
     /// truncated download or a placeholder file being accepted as a model.
-    #[error("Not a valid GGUF model file ({path}): {reason}")]
+    ///
+    /// The format in the message is derived from `path` by the rule that chose the
+    /// validator ([`ModelFormat::of`]), so a GGUF refusal reads exactly as it always has
+    /// and no variant or field had to be added for ONNX.
+    #[error(
+        "Not a valid {} model file ({path}): {reason}",
+        ModelFormat::of(std::path::Path::new(path))
+    )]
     InvalidModelFile { path: String, reason: String },
 
     /// No inference backend is compiled in. A default build has none by choice, so
@@ -107,6 +123,25 @@ pub enum EmbeddingError {
     PoolingNotImplemented {
         pooling: String,
         implemented: String,
+    },
+
+    /// A pooling some backend performs, but none that serves this model's format.
+    ///
+    /// Distinct from [`Self::PoolingNotImplemented`] because the fix is: `in-graph` is
+    /// exactly right for an ONNX graph that pools inside itself and meaningless for a
+    /// GGUF, so the value is not wrong — the pairing is, and either half may be the one
+    /// to change. Refused while it is still a configuration, for the reason that variant
+    /// is: a manifest written with it would outlive the mistake.
+    #[error(
+        "Pooling '{pooling}' is not available for {format} models (for {format}: \
+         {implemented}); it is implemented for {implemented_elsewhere}. Configure the \
+         pooling this model's format uses, or a model of the format that uses this one"
+    )]
+    PoolingNotForFormat {
+        pooling: String,
+        format: String,
+        implemented: String,
+        implemented_elsewhere: String,
     },
 
     /// The loaded backend pools differently from the configuration it was loaded

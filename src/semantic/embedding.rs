@@ -2,12 +2,14 @@
 //! itself — model-file validation and checksumming, the batch API, and the single
 //! place a vector's dimension, finiteness and norm are checked before it can
 //! enter the index. What an implementation must provide, and which one a build
-//! gets, live in [`backend`](crate::semantic::backend).
+//! gets, live in [`backend`](crate::semantic::backend); what an ONNX model *is* on
+//! disk, in [`model_package`](crate::semantic::model_package).
 
 use crate::errors::EmbeddingError;
 use crate::semantic::backend::{
-    ensure_pooling_is_implemented, select_backend, EmbeddingBackend, Pooling,
+    ensure_pooling_is_implemented_for, select_backend, EmbeddingBackend, Pooling,
 };
+use crate::semantic::model_package::{validate_model, ModelFormat};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -40,7 +42,7 @@ const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 
 /// Read buffer for hashing, large enough that hashing is bound by the hash rather
 /// than by syscalls.
-const HASH_BUFFER_BYTES: usize = 1 << 20;
+pub(crate) const HASH_BUFFER_BYTES: usize = 1 << 20;
 
 /// At or below this L2 norm a vector carries no direction and cannot be
 /// normalized.
@@ -60,11 +62,12 @@ pub struct EmbeddingConfig {
     /// the model file, and a silent disagreement fills the index with wrong-width
     /// vectors.
     pub embedding_dim: u32,
-    /// Token cap *requested* for a single input. This layer never enforces it —
-    /// it has no tokenizer; it is a contract the backend implements, spelled out
-    /// at [`EmbeddingBackend::max_tokens`]. Here it only travels: the backend
-    /// reports it back and the manifest records it, so a change is detected as an
-    /// incompatibility instead of silently changing what gets embedded.
+    /// Token cap *requested* for a single input — the total sequence length, special
+    /// tokens included. This layer never enforces it — it has no tokenizer; it is a
+    /// contract the backend implements, spelled out at
+    /// [`EmbeddingBackend::max_tokens`]. Here it only travels: the backend reports it
+    /// back and the manifest records it, so a change is detected as an incompatibility
+    /// instead of silently changing what gets embedded.
     pub max_tokens: usize,
     /// Number of texts handed to the backend per inference call.
     pub batch_size: usize,
@@ -92,9 +95,9 @@ impl EmbeddingConfig {
     /// `batch_size` is deliberately absent: zero there is recoverable and means
     /// "one text per call" ([`EmbeddingRuntime::batch_size`] clamps it), whereas a
     /// zero dimensionality or token cap makes every embedding degenerate. The
-    /// pooling check asks whether any backend *performs* the strategy, and belongs
-    /// here because the value is persisted as the index's identity — see
-    /// [`ensure_pooling_is_implemented`].
+    /// pooling check asks whether a backend for the model's format *performs* the
+    /// strategy, and belongs here because the value is persisted as the index's
+    /// identity — see [`ensure_pooling_is_implemented_for`].
     pub fn validate(&self) -> Result<(), EmbeddingError> {
         if self.embedding_dim == 0 {
             return Err(EmbeddingError::LoadFailed {
@@ -103,19 +106,23 @@ impl EmbeddingConfig {
                     .to_string(),
             });
         }
-        // 2, not 1: the cap counts the appended EOS, so a cap of 1 leaves no budget
-        // for content and embeds every text as a bare `[eos]` — a plausible-looking
-        // vector carrying nothing of the input.
+        // 2, not 1: the cap is the total sequence length, and every backend spends at
+        // least one token of it on a special token — llama.cpp's appended EOS, a BERT
+        // tokenizer's [CLS] and [SEP]. A cap of 1 leaves no budget for content and
+        // embeds every text as a bare special token: a plausible-looking vector
+        // carrying nothing of the input. A backend whose specials take more refuses
+        // the cap at load, where it knows how many it adds.
         if self.max_tokens < 2 {
             return Err(EmbeddingError::LoadFailed {
                 reason: format!(
-                    "max_tokens is {}; the cap includes the EOS token, so at least 2 are \
-                     needed for any content to reach the model",
+                    "max_tokens is {}; the cap counts the special tokens the model adds \
+                     around the text, so at least 2 are needed for any content to reach the \
+                     model",
                     self.max_tokens
                 ),
             });
         }
-        ensure_pooling_is_implemented(self.pooling)?;
+        ensure_pooling_is_implemented_for(self.pooling, ModelFormat::of(&self.model_path))?;
         Ok(())
     }
 }
@@ -129,7 +136,8 @@ pub struct EmbeddingRuntime {
     /// parameter would push a build-time choice into every signature above this
     /// one, up through `SemanticEngine` and the coordinator.
     backend: Option<Box<dyn EmbeddingBackend>>,
-    /// SHA-256 of the model file, computed by [`Self::load`].
+    /// The model's `model_checksum`, computed by [`Self::load`] — see
+    /// [`Self::model_checksum`] for what it covers per format.
     model_checksum: Option<String>,
 }
 
@@ -157,9 +165,11 @@ impl EmbeddingRuntime {
             });
         }
 
-        let checksum = validate_and_checksum_gguf(&self.config.model_path)?;
+        // By the format the path names: a GGUF file, or an ONNX graph with the package
+        // around it. The same rule picks the backend below.
+        let validated = validate_model(&self.config.model_path)?;
         let backend = select_backend(&self.config)?;
-        self.adopt(backend, Some(checksum))
+        self.adopt(backend, Some(validated.checksum().to_string()))
     }
 
     /// Install a backend after checking it agrees with this configuration.
@@ -254,7 +264,18 @@ impl EmbeddingRuntime {
             .is_some_and(|backend| backend.is_semantic())
     }
 
-    /// SHA-256 of the loaded model file, or `None` before a successful load.
+    /// The loaded model's `model_checksum`, or `None` before a successful load:
+    ///
+    /// * **GGUF** — the SHA-256 of the file, from
+    ///   [`validate_and_checksum_gguf`];
+    /// * **ONNX** — the package checksum: the SHA-256 of a canonical manifest listing
+    ///   the graph, every external-data file it names and `tokenizer.json`, each with
+    ///   its size and SHA-256 — see
+    ///   [`model_package`](crate::semantic::model_package). Nothing else in the
+    ///   directory is covered, because nothing else reaches a vector.
+    ///
+    /// Either way lowercase hex, 64 digits, and a statement that the bytes behind the
+    /// model path are the ones an index was built with — not a download verification.
     pub fn model_checksum(&self) -> Option<&str> {
         self.model_checksum.as_deref()
     }
@@ -794,21 +815,22 @@ fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> Ski
 
 /// EOF inside a structure the file itself declared is proof of truncation; an I/O
 /// error is a fact about the disk. Only the first condemns the model.
-enum ReadError {
+pub(crate) enum ReadError {
     Eof { at: u64 },
     Io(std::io::Error),
 }
 
 /// Buffered forward reader that hashes everything it passes over, so validating
-/// and checksumming a multi-hundred-megabyte model reads it once.
-struct HashingReader {
+/// and checksumming a multi-hundred-megabyte model reads it once. Shared with the
+/// ONNX package walk in [`model_package`](crate::semantic::model_package).
+pub(crate) struct HashingReader {
     inner: std::io::BufReader<std::fs::File>,
     hasher: sha2::Sha256,
     consumed: u64,
 }
 
 impl HashingReader {
-    fn new(file: std::fs::File) -> Self {
+    pub(crate) fn new(file: std::fs::File) -> Self {
         use sha2::Digest;
         Self {
             inner: std::io::BufReader::with_capacity(HASH_BUFFER_BYTES, file),
@@ -818,7 +840,7 @@ impl HashingReader {
     }
 
     /// Bytes read — and therefore hashed — so far.
-    fn consumed(&self) -> u64 {
+    pub(crate) fn consumed(&self) -> u64 {
         self.consumed
     }
 
@@ -830,7 +852,7 @@ impl HashingReader {
         Ok(())
     }
 
-    fn fill(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
+    pub(crate) fn fill(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
         match self.read_exact_hashed(buf) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -860,7 +882,7 @@ impl HashingReader {
     }
 
     /// Skip `len` bytes, hashing them.
-    fn skip(&mut self, mut len: u64) -> Result<(), ReadError> {
+    pub(crate) fn skip(&mut self, mut len: u64) -> Result<(), ReadError> {
         const CHUNK: usize = 64 << 10;
         let mut scratch = vec![0u8; (len.min(CHUNK as u64)) as usize];
         while len > 0 {
@@ -872,7 +894,7 @@ impl HashingReader {
     }
 
     /// Hash whatever is left; returns the digest and the total byte count.
-    fn finish(mut self) -> std::io::Result<(String, u64)> {
+    pub(crate) fn finish(mut self) -> std::io::Result<(String, u64)> {
         use sha2::Digest;
         let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
         loop {
@@ -888,7 +910,7 @@ impl HashingReader {
 }
 
 /// Lower-case hex encoding.
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -947,6 +969,214 @@ pub mod mock {
         }
         bytes.extend_from_slice(&0f32.to_le_bytes());
         std::fs::write(path, bytes)
+    }
+
+    /// Just enough of the protobuf wire format to hand-encode ONNX fixtures.
+    ///
+    /// Written independently of the walk in
+    /// [`model_package`](crate::semantic::model_package), so a fixture cannot share the
+    /// walk's mistakes about the format.
+    pub mod proto {
+        pub const VARINT: u8 = 0;
+        pub const FIXED64: u8 = 1;
+        pub const LEN: u8 = 2;
+        pub const START_GROUP: u8 = 3;
+        pub const END_GROUP: u8 = 4;
+        pub const FIXED32: u8 = 5;
+
+        pub fn varint(out: &mut Vec<u8>, mut value: u64) {
+            loop {
+                let low = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(low);
+                    return;
+                }
+                out.push(low | 0x80);
+            }
+        }
+
+        pub fn key(out: &mut Vec<u8>, field: u32, wire: u8) {
+            varint(out, (u64::from(field) << 3) | u64::from(wire));
+        }
+
+        pub fn uint(out: &mut Vec<u8>, field: u32, value: u64) {
+            key(out, field, VARINT);
+            varint(out, value);
+        }
+
+        /// An `int64`: a negative value is written as its ten-byte two's complement.
+        pub fn int(out: &mut Vec<u8>, field: u32, value: i64) {
+            uint(out, field, value as u64);
+        }
+
+        pub fn bytes(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
+            key(out, field, LEN);
+            varint(out, payload.len() as u64);
+            out.extend_from_slice(payload);
+        }
+
+        pub fn string(out: &mut Vec<u8>, field: u32, value: &str) {
+            bytes(out, field, value.as_bytes());
+        }
+    }
+
+    /// ONNX messages for fixtures, built from [`proto`] with the field numbers of
+    /// `onnx/onnx.proto3`.
+    pub mod onnx {
+        use super::proto;
+
+        /// `TensorProto.DataType.FLOAT`.
+        pub const FLOAT: u64 = 1;
+        /// `TensorProto.DataType.INT64`.
+        pub const INT64: u64 = 7;
+
+        /// One dimension of a declared shape.
+        pub enum Dim<'a> {
+            Fixed(i64),
+            Named(&'a str),
+        }
+
+        /// A `ValueInfoProto` declaring a tensor of `elem_type` and `dims`.
+        pub fn value_info(name: &str, elem_type: u64, dims: &[Dim<'_>]) -> Vec<u8> {
+            let mut shape = Vec::new();
+            for dim in dims {
+                let mut dimension = Vec::new();
+                match dim {
+                    Dim::Fixed(value) => proto::int(&mut dimension, 1, *value),
+                    Dim::Named(param) => proto::string(&mut dimension, 2, param),
+                }
+                proto::bytes(&mut shape, 1, &dimension);
+            }
+            let mut tensor_type = Vec::new();
+            proto::uint(&mut tensor_type, 1, elem_type);
+            proto::bytes(&mut tensor_type, 2, &shape);
+            let mut type_proto = Vec::new();
+            proto::bytes(&mut type_proto, 1, &tensor_type);
+
+            let mut value_info = Vec::new();
+            proto::string(&mut value_info, 1, name);
+            proto::bytes(&mut value_info, 2, &type_proto);
+            value_info
+        }
+
+        /// An `OperatorSetIdProto`.
+        pub fn opset(domain: &str, version: u64) -> Vec<u8> {
+            let mut opset = Vec::new();
+            proto::string(&mut opset, 1, domain);
+            proto::uint(&mut opset, 2, version);
+            opset
+        }
+
+        /// A `StringStringEntryProto`.
+        pub fn entry(key: &str, value: &str) -> Vec<u8> {
+            let mut entry = Vec::new();
+            proto::string(&mut entry, 1, key);
+            proto::string(&mut entry, 2, value);
+            entry
+        }
+
+        /// A float `TensorProto` of `dims` whose data lives in `location`, at `offset`
+        /// for `length` bytes when given.
+        pub fn external_tensor(
+            name: &str,
+            dims: &[i64],
+            location: &str,
+            offset: Option<u64>,
+            length: Option<u64>,
+        ) -> Vec<u8> {
+            let mut tensor = Vec::new();
+            for dim in dims {
+                proto::int(&mut tensor, 1, *dim);
+            }
+            proto::uint(&mut tensor, 2, FLOAT);
+            proto::string(&mut tensor, 8, name);
+            proto::bytes(&mut tensor, 13, &entry("location", location));
+            if let Some(offset) = offset {
+                proto::bytes(&mut tensor, 13, &entry("offset", &offset.to_string()));
+            }
+            if let Some(length) = length {
+                proto::bytes(&mut tensor, 13, &entry("length", &length.to_string()));
+            }
+            proto::uint(&mut tensor, 14, 1); // data_location = EXTERNAL
+            tensor
+        }
+
+        /// A `GraphProto` with the given inputs, outputs and initializers.
+        pub fn graph(
+            name: &str,
+            inputs: &[Vec<u8>],
+            outputs: &[Vec<u8>],
+            initializers: &[Vec<u8>],
+        ) -> Vec<u8> {
+            let mut graph = Vec::new();
+            proto::string(&mut graph, 2, name);
+            for initializer in initializers {
+                proto::bytes(&mut graph, 5, initializer);
+            }
+            for input in inputs {
+                proto::bytes(&mut graph, 11, input);
+            }
+            for output in outputs {
+                proto::bytes(&mut graph, 12, output);
+            }
+            graph
+        }
+
+        /// A `ModelProto`, its fields in the order a protobuf serializer writes them.
+        pub fn model(ir_version: u64, graph: &[u8], opsets: &[Vec<u8>]) -> Vec<u8> {
+            let mut model = Vec::new();
+            proto::uint(&mut model, 1, ir_version);
+            proto::string(&mut model, 2, "otzaria-stub");
+            proto::bytes(&mut model, 7, graph);
+            for opset in opsets {
+                proto::bytes(&mut model, 8, opset);
+            }
+            model
+        }
+
+        /// The inputs every stub graph declares: the two a sentence encoder takes.
+        pub fn encoder_inputs() -> Vec<Vec<u8>> {
+            ["input_ids", "attention_mask"]
+                .into_iter()
+                .map(|name| {
+                    value_info(name, INT64, &[Dim::Fixed(1), Dim::Named("sequence_length")])
+                })
+                .collect()
+        }
+
+        /// The graph [`super::write_stub_onnx_package`] writes: IR 8, opset 17, the
+        /// inputs `input_ids` and `attention_mask` (`int64[1, sequence_length]`) and the
+        /// output `sentence_embedding` (`float[1, 8]`). No nodes, so no runtime would
+        /// run it; the validator's structural checks all pass.
+        pub fn stub_graph() -> Vec<u8> {
+            let output = value_info("sentence_embedding", FLOAT, &[Dim::Fixed(1), Dim::Fixed(8)]);
+            model(
+                8,
+                &graph("otzaria-stub-encoder", &encoder_inputs(), &[output], &[]),
+                &[opset("", 17)],
+            )
+        }
+    }
+
+    /// A `tokenizer.json` in the shape of a Hugging Face tokenizer, and a whole JSON
+    /// object — which is all the validator asks of it.
+    pub const STUB_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"[CLS]":1,"[SEP]":2,"[QUERY]":3,"[PASSAGE]":4},"unk_token":"[UNK]"}}"#;
+
+    /// Write a minimal valid ONNX package into `dir` — [`onnx::stub_graph`] as
+    /// `model.onnx`, and [`STUB_TOKENIZER_JSON`] beside it — and return the graph's path,
+    /// which is what a configuration names.
+    ///
+    /// # Panics
+    ///
+    /// If `dir` cannot be written: a fixture for tests, not a library path.
+    pub fn write_stub_onnx_package(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).expect("the fixture directory must be writable");
+        let graph = dir.join("model.onnx");
+        std::fs::write(&graph, onnx::stub_graph()).expect("the stub graph must be writable");
+        std::fs::write(dir.join("tokenizer.json"), STUB_TOKENIZER_JSON)
+            .expect("the stub tokenizer must be writable");
+        graph
     }
 }
 
@@ -1405,6 +1635,84 @@ mod tests {
         );
     }
 
+    /// An ONNX package loads through the same `load`, and what it records is the
+    /// package checksum — not the graph's own hash, which would miss a changed tokenizer.
+    #[test]
+    fn load_accepts_an_onnx_package_and_records_its_package_checksum() {
+        let dir = TempDir::new("onnx_package");
+        let graph = mock::write_stub_onnx_package(dir.path());
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: graph.clone(),
+            embedding_dim: 16,
+            max_tokens: 256,
+            pooling: Pooling::InGraph,
+            ..Default::default()
+        });
+        rt.load()
+            .expect("the stub package loads through the stand-in");
+
+        let package = crate::semantic::model_package::validate_onnx_package(&graph).unwrap();
+        assert_eq!(rt.model_checksum(), Some(package.checksum()));
+        let graph_alone = {
+            use sha2::Digest;
+            hex_encode(&sha2::Sha256::digest(std::fs::read(&graph).unwrap()))
+        };
+        assert_ne!(
+            rt.model_checksum(),
+            Some(graph_alone.as_str()),
+            "the checksum covers the package, not the graph alone"
+        );
+        assert_eq!(rt.pooling(), Pooling::InGraph);
+        assert_eq!(rt.backend_id(), Some("mock-hash-v1"));
+        assert_eq!(rt.embed_one("שלום עולם").unwrap().len(), 16);
+    }
+
+    #[test]
+    fn load_refuses_an_onnx_package_without_its_tokenizer() {
+        let dir = TempDir::new("onnx_no_tokenizer");
+        let graph = mock::write_stub_onnx_package(dir.path());
+        std::fs::remove_file(dir.path().join("tokenizer.json")).unwrap();
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: graph,
+            embedding_dim: 16,
+            pooling: Pooling::InGraph,
+            ..Default::default()
+        });
+        assert!(matches!(
+            rt.load(),
+            Err(EmbeddingError::TokenizerNotFound { .. })
+        ));
+        assert!(!rt.is_loaded());
+        assert!(rt.model_checksum().is_none());
+    }
+
+    /// A GGUF behind an `.onnx` name is read as ONNX, because the path decides, and is
+    /// refused by what it is.
+    #[test]
+    fn a_gguf_named_like_an_onnx_graph_is_refused_as_onnx() {
+        let dir = TempDir::new("gguf_as_onnx");
+        let graph = mock::write_stub_onnx_package(dir.path());
+        mock::write_stub_gguf(&graph, 3).unwrap();
+
+        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path: graph,
+            pooling: Pooling::InGraph,
+            ..Default::default()
+        });
+        match rt.load() {
+            Err(error @ EmbeddingError::InvalidModelFile { .. }) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("ONNX") && message.contains("GGUF"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidModelFile, got {other:?}"),
+        }
+    }
+
     #[test]
     fn embed_before_load_fails() {
         let rt = EmbeddingRuntime::new(EmbeddingConfig::default());
@@ -1805,6 +2113,29 @@ mod tests {
             let mut rt = EmbeddingRuntime::new(config);
             // `LoadFailed`, not `ModelNotFound`, proves the file was never touched.
             assert!(matches!(rt.load(), Err(EmbeddingError::LoadFailed { .. })));
+        }
+    }
+
+    /// The pairing is refused before the file is opened, like a pooling nothing
+    /// performs: the model paths here do not exist, so `ModelNotFound` would prove the
+    /// check ran too late.
+    #[test]
+    fn load_refuses_a_pooling_the_models_format_does_not_serve_before_reading_it() {
+        let dir = TempDir::new("pooling_wrong_format");
+        for (model, pooling) in [
+            ("absent.gguf", Pooling::InGraph),
+            ("absent.onnx", Pooling::LastToken),
+        ] {
+            let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+                model_path: dir.path().join(model),
+                pooling,
+                ..Default::default()
+            });
+            assert!(
+                matches!(rt.load(), Err(EmbeddingError::PoolingNotForFormat { .. })),
+                "{model} with {pooling}"
+            );
+            assert!(!rt.is_loaded());
         }
     }
 

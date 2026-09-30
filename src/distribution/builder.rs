@@ -1124,19 +1124,23 @@ mod tests {
         // `embedding_text_version` lives in both the configuration and the identity, so
         // moving it alone means moving both — the disagreement between them is its own
         // rejection, tested separately in `recipe`.
+        // Version 2 of the text recipe exists — the role prefixes — so 3 is the first one
+        // nothing implements.
         let text_chunking = ChunkerConfig {
-            embedding_text_version: 2,
+            embedding_text_version: 3,
             ..ChunkerConfig::default()
         };
-        let cases: [(&str, ChunkerConfig, ModelIdentity); 3] = [
+        let cases: [(&str, ChunkerConfig, ModelIdentity, u32, &str); 3] = [
             (
                 "embedding_text_version",
                 text_chunking.clone(),
                 ModelIdentity {
-                    embedding_text_version: 2,
+                    embedding_text_version: 3,
                     chunking_identity: text_chunking.identity(),
                     ..truthful.clone()
                 },
+                3,
+                "1, 2",
             ),
             (
                 // Carried in both places, like the text version above, so both move.
@@ -1154,6 +1158,8 @@ mod tests {
                     .identity(),
                     ..truthful.clone()
                 },
+                2,
+                "1",
             ),
             (
                 // Only the configuration carries this one — the artifact carries the hash
@@ -1171,10 +1177,12 @@ mod tests {
                     .identity(),
                     ..truthful.clone()
                 },
+                2,
+                "1",
             ),
         ];
 
-        for (field, chunking, model) in cases {
+        for (field, chunking, model, unimplemented, implemented) in cases {
             let mut request = build_request(&dir, model, chunking);
             request.output_path = dir.path().join(format!("artifact_{field}"));
             match build(request, &corpus) {
@@ -1186,10 +1194,10 @@ mod tests {
                     },
                 )) => {
                     assert_eq!(named, field);
-                    assert_eq!(found, 2);
-                    assert_eq!(supported, "1");
+                    assert_eq!(found, unimplemented);
+                    assert_eq!(supported, implemented);
                 }
-                other => panic!("{field} 2 must be refused, got {other:?}"),
+                other => panic!("{field} {unimplemented} must be refused, got {other:?}"),
             }
             assert!(
                 !dir.path().join(format!("artifact_{field}")).exists(),
