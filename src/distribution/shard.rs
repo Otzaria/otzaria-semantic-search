@@ -683,7 +683,7 @@ mod tests {
             assert_eq!(new.line_id, old.line_id);
             assert_eq!(
                 new.embedding_text,
-                format!("[PASSAGE] {}", old.embedding_text)
+                format!("[PASSAGE] {}", old.embedding_text.trim())
             );
             assert_eq!(new.embedding_text.matches("[PASSAGE]").count(), 1);
             assert_eq!(
@@ -727,6 +727,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(built.vector_count as usize, v2.len());
+    }
+
+    /// A cap that ends a passage on a space: the plan hands the worker version 2's text
+    /// without it — the text the model is given — and the digest the worker checks is
+    /// that text's. Version 1's plan keeps the space, byte for byte as it always has.
+    #[test]
+    fn a_version_two_plan_carries_a_capped_passage_without_its_trailing_space() {
+        let dir = TempDir::new("plan_v2_trim");
+        let corpus = corpus(&dir);
+        let model_path = dir.0.join("model.gguf");
+        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let checksum = validate_and_checksum_gguf(&model_path).unwrap();
+        // "בראשית ברא …" capped at 7 characters is "בראשית ", space included.
+        let chunking = |embedding_text_version| ChunkerConfig {
+            max_chunk_chars: 7,
+            embedding_text_version,
+            ..ChunkerConfig::default()
+        };
+        let plan_under = |version: u32| {
+            let chunking = chunking(version);
+            let model = ModelIdentity {
+                embedding_text_version: version,
+                ..model_for(&checksum, &chunking)
+            };
+            let mut sink = Vec::new();
+            export_plan(&corpus, &chunking, &model, &mut sink).unwrap();
+            read_plan(std::io::Cursor::new(sink), 0, usize::MAX)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let (v1, v2) = (plan_under(1), plan_under(2));
+
+        let capped: Vec<_> = v1
+            .iter()
+            .zip(&v2)
+            .filter(|(old, _)| old.embedding_text.ends_with(' '))
+            .collect();
+        assert!(
+            !capped.is_empty(),
+            "the cap must end some passage on a space"
+        );
+        for (old, new) in capped {
+            assert_eq!(
+                new.embedding_text,
+                format!("[PASSAGE] {}", old.embedding_text.trim_end())
+            );
+            assert_eq!(
+                new.embedding_text_sha256,
+                sha256_hex(new.embedding_text.as_bytes())
+            );
+            assert_eq!(
+                old.embedding_text_sha256,
+                sha256_hex(old.embedding_text.as_bytes())
+            );
+        }
     }
 
     /// A shard that never ran is a hole, and `pack` is what has to see it.

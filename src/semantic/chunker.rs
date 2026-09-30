@@ -179,8 +179,9 @@ impl Chunker {
                 continue;
             }
             // The recipe's last word, after the cap and the normalization, so the content
-            // is exactly what version 1 embeds — and so is hashed with the prefix, because
-            // the digest describes the string the model is given. See
+            // is what version 1 embeds — under version 2 without the space a cap can leave
+            // at its end — and is hashed as given, prefix included, because the digest
+            // describes the string the model is given. See
             // `EmbeddingTextRecipe::passage_text`.
             let embedded_text = self.text_recipe.passage_text(&normalized).into_owned();
             let chunk_hash = compute_chunk_hash(&embedded_text);
@@ -216,7 +217,8 @@ impl Chunker {
     /// S1's measurement, and the answer becomes another [`EmbeddingTextRecipe`] with an
     /// arm here. Only a variant with an arm can be accepted as `embedding_text_version` —
     /// which is what stops an artifact declaring a recipe nobody wrote. Version 2 shares
-    /// version 1's arm on purpose: its passage is version 1's text, prefixed afterwards.
+    /// version 1's arm on purpose: its passage is version 1's text, trimmed and prefixed
+    /// afterwards.
     fn embedding_text_for(
         &self,
         book: &BookForIndexing,
@@ -571,8 +573,9 @@ mod tests {
         );
     }
 
-    /// Version 2 is version 1's text with `[PASSAGE] ` in front, once, on every chunk —
-    /// the same lines, the cap spent on content, the digest over what the model is given.
+    /// Version 2 is version 1's text, trimmed, with `[PASSAGE] ` in front, once, on every
+    /// chunk — the same lines, the cap spent on content, the digest over what the model is
+    /// given.
     #[test]
     fn version_two_prefixes_every_passage_once_and_changes_nothing_else() {
         let v1 = chunker(ChunkerConfig {
@@ -597,7 +600,7 @@ mod tests {
             assert_eq!(new.line_id, old.line_id);
             assert_eq!(
                 new.embedding_text,
-                format!("[PASSAGE] {}", old.embedding_text),
+                format!("[PASSAGE] {}", old.embedding_text.trim()),
                 "line {}",
                 old.line_id
             );
@@ -611,6 +614,31 @@ mod tests {
             // The identity folds the version in, so the two never share an id.
             assert_ne!(new.semantic_id, old.semantic_id);
         }
+    }
+
+    /// The character cap can end a line on a space. Version 1 embeds that space, as it
+    /// always has; version 2 does not — the space would reach a Metaspace tokenizer as a
+    /// lone `▁` — and its digest describes the text without it, since that is what the
+    /// model is given.
+    #[test]
+    fn version_two_drops_the_space_a_truncation_leaves_and_version_one_keeps_it() {
+        let config = |embedding_text_version| ChunkerConfig {
+            max_chunk_chars: 11,
+            embedding_text_version,
+            ..ChunkerConfig::default()
+        };
+        // Long enough to stand alone, and cut by the cap right after a space.
+        let book = dummy_book(vec![(1, "abcdefghij klmnopqrstuvwxyz0123")]);
+
+        let v1 = chunker(config(1)).chunk_book(&book);
+        assert_eq!(
+            v1[0].embedding_text, "abcdefghij ",
+            "version 1 is unchanged"
+        );
+
+        let v2 = chunker(config(2)).chunk_book(&book);
+        assert_eq!(v2[0].embedding_text, "[PASSAGE] abcdefghij");
+        assert_eq!(v2[0].chunk_hash, compute_chunk_hash("[PASSAGE] abcdefghij"));
     }
 
     /// A line whose text already reads like a prefix is content: it is embedded with the

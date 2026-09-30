@@ -1664,6 +1664,63 @@ mod tests {
         assert!(ids("[QUERY]  מצות תפילין").contains(&lone_metaspace));
     }
 
+    /// The passage side: a line the chunker's character cap ends on a space reaches the
+    /// production-shaped tokenizer, under text recipe 2, without the lone `▁` that space
+    /// would have become just before `[SEP]`.
+    #[test]
+    fn a_passage_capped_on_a_space_reaches_the_tokenizer_without_a_trailing_metaspace() {
+        use crate::semantic::chunker::{Chunker, ChunkerConfig};
+        use crate::semantic::types::{BookForIndexing, BookLine};
+
+        let (tokenizer, _) = load_tokenizer(
+            &fixture("dynamic.onnx"),
+            &fixture("tokenizer_unigram.json"),
+            64,
+        )
+        .unwrap();
+        let ids = |text: &str| tokenizer.encode(text, true).unwrap().get_ids().to_vec();
+        let lone_metaspace = tokenizer
+            .token_to_id("▁")
+            .expect("the fixture has a bare ▁");
+        let sep = tokenizer.token_to_id("[SEP]").expect("[SEP]");
+
+        let book = BookForIndexing {
+            source_book_key: "book.txt".to_string(),
+            title: "t".to_string(),
+            content_fingerprint: 1,
+            is_pdf: false,
+            topics: String::new(),
+            extra_facets: vec![],
+            lines: vec![BookLine {
+                line_id: 1,
+                section_id: 1,
+                segment: 1,
+                reference: "t 1".to_string(),
+                line_hash: 1,
+                // 12 characters in, the cap below, is the space after "תפילין".
+                text: "מצות תפילין בכל יום חוץ משבתות וימים טובים".to_string(),
+            }],
+        };
+        let chunks = Chunker::new(ChunkerConfig {
+            max_chunk_chars: 12,
+            embedding_text_version: 2,
+            ..ChunkerConfig::default()
+        })
+        .unwrap()
+        .chunk_book(&book);
+        let passage = ids(&chunks[0].embedding_text);
+        assert_eq!(passage, ids("[PASSAGE] מצות תפילין"));
+        assert_eq!(passage.last(), Some(&sep));
+        assert_ne!(passage[passage.len() - 2], lone_metaspace, "{passage:?}");
+        // The tokenizer fact the trim is for: the same passage with the space kept.
+        let untrimmed = ids("[PASSAGE] מצות תפילין ");
+        assert_eq!(
+            untrimmed[untrimmed.len() - 2],
+            lone_metaspace,
+            "{untrimmed:?}"
+        );
+    }
+
     /// The stand-in's stub package reaches this backend first in a mock + ONNX build, so
     /// its tokenizer — WordLevel, no post-processor, hence no special tokens — must load
     /// with this crate's `tokenizers`, and the refusal come from the graph.

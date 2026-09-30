@@ -260,8 +260,11 @@ backend has to agree:
   as a no-break space — when it is empty, or when it begins with another special token:
   the spaced form then carries one more `▁` id (10). The recipe uses the spaced form, as
   the model card and the model author's own export checks do, and hands the tokenizer
-  neither shape: the chunker trims every passage, and text recipe 2 trims every query
-  before prefixing it (`EmbeddingTextRecipe::query_text`). `query_leading_whitespace` is
+  neither shape: the chunker trims every line before its character cap, and text recipe 2
+  trims the capped passage and every query before prefixing them
+  (`EmbeddingTextRecipe::passage_text`, `query_text`) — a cap can end a passage on a space,
+  which would be a lone `▁` before `[SEP]`. No passage case has whitespace at either end,
+  so every passage input here is exactly what the recipe produces. `query_leading_whitespace` is
   spelled as the tokenizer receives it, so it still pins the tokenizer's side of this —
   what an untrimmed query would cost — though no search produces it any more; its
   `notes`, recorded in the goldens, predate the trim. The generator reports the comparison

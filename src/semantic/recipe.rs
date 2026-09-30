@@ -78,11 +78,12 @@ pub enum EmbeddingTextRecipe {
     /// tell the two apart, whose prefixes are learned special tokens (Meivin Round 2).
     ///
     /// The prefix goes on **last**: after the neighbour context, the character cap and
-    /// the text normalization. The passage is therefore version 1's text *exactly*, the
-    /// cap is spent on content alone, and no normalization can alter the prefix. The
-    /// token cap is another matter — it counts the prefix, because the model does. A
-    /// query is trimmed before its prefix, as a line is before the chunker caps it
-    /// ([`Self::query_text`]).
+    /// the text normalization. The passage is therefore version 1's text, trimmed — the
+    /// cap can leave a space at its end — the cap is spent on content alone, and no
+    /// normalization can alter the prefix. The token cap is another matter — it counts the
+    /// prefix, because the model does. A query is trimmed before its prefix just the same
+    /// ([`Self::passage_text`], [`Self::query_text`]): neither side hands the model
+    /// whitespace at either end.
     ///
     /// Without the prefix on either side a query lands elsewhere in the space than the
     /// passages it should find, and nothing about either vector says so. That is why the
@@ -104,11 +105,17 @@ impl EmbeddingTextRecipe {
     ///
     /// Borrowed when the recipe changes nothing, so version 1 costs no allocation and is,
     /// byte for byte, what it was before a second version existed.
+    ///
+    /// Version 2 trims that text ([`str::trim`], Unicode whitespace) behind the prefix —
+    /// the passage-side twin of [`Self::query_text`]. The chunker trims a line before it
+    /// caps it, so in practice only the end can carry whitespace: the character cap can
+    /// fall just after a space, and a Metaspace tokenizer — the production model's —
+    /// would give that space a `▁` token of its own before `[SEP]`.
     pub fn passage_text(self, text: &str) -> Cow<'_, str> {
         match self {
             Self::LineOrNeighbourContext => Cow::Borrowed(text),
             Self::RolePrefixedLineOrNeighbourContext => {
-                Cow::Owned(format!("{PASSAGE_PREFIX}{text}"))
+                Cow::Owned(format!("{PASSAGE_PREFIX}{}", text.trim()))
             }
         }
     }
@@ -466,6 +473,30 @@ mod tests {
             v2.query_text("מצות  תפילין"),
             "[QUERY] מצות  תפילין".to_string()
         );
+    }
+
+    /// The passage side of the same rule. The chunker trims a line before capping it, but
+    /// the cap can end the text on a space — "abcdefghij klm…" cut at 11 is "abcdefghij "
+    /// — and a Metaspace tokenizer gives that space a `▁` token of its own. Version 2
+    /// drops it behind the prefix; version 1 keeps the text byte for byte.
+    #[test]
+    fn version_two_trims_a_passage_as_it_trims_a_query_and_version_one_does_not() {
+        let v2 = EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext;
+        let v1 = EmbeddingTextRecipe::LineOrNeighbourContext;
+        for capped in ["מצות תפילין ", "מצות תפילין\u{00A0}", "מצות תפילין \t"]
+        {
+            assert_eq!(
+                v2.passage_text(capped),
+                "[PASSAGE] מצות תפילין",
+                "{capped:?}"
+            );
+            assert!(
+                matches!(v1.passage_text(capped), Cow::Borrowed(t) if t == capped),
+                "{capped:?}"
+            );
+        }
+        // Whitespace inside the passage is content, and stays.
+        assert_eq!(v2.passage_text("מצות  תפילין"), "[PASSAGE] מצות  תפילין");
     }
 
     /// An empty query has nothing to embed, whatever the recipe — and under version 2 a

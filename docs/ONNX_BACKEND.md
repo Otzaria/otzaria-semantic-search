@@ -244,8 +244,9 @@ On the production tokenizer, every added token is `special: true, normalized: fa
 match all the same. The file itself ships with padding `BatchLongest` (pad id 0) and
 truncation at 512; both are overridden. `"[QUERY] …"` and `"[QUERY]…"` give the same ids —
 the Metaspace pre-tokenizer prepends `▁` either way — but a second space after the prefix,
-or one at the end, is a lone `▁` id of its own; so text recipe 2 trims a query before
-prefixing it, as the chunker trims a stored line. Its normalizer, in order: NFKC; strip
+or one at the end, is a lone `▁` id of its own; so text recipe 2 trims both sides before
+the prefix — a query as typed, a passage after the character cap, which can end it on a
+space. Its normalizer, in order: NFKC; strip
 U+0591–U+05BD and U+05BF–U+05C7 (cantillation and points, not the maqaf); strip the
 zero-width and bidi controls U+200B–U+200F, U+202A–U+202E, U+2060–U+2069, U+FEFF; fold
 geresh and single curly quotes to `'`, gershayim and double curly quotes to `"`, maqaf and
@@ -399,7 +400,7 @@ reason the two graphs are different identities (`model_quantization`).
 
 | where | what | needs |
 |---|---|---|
-| `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query reaching it exactly as the bare one does, the stand-in's stub tokenizer | nothing |
+| `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query and a passage capped on a space reaching it exactly as the bare text does, the stand-in's stub tokenizer | nothing |
 | `onnx_backend::tests` | the fixture against the Python references; truncation; order; batch = single; concurrency; threads and sessions change nothing; static batch; `token_type_ids` as zeros; rank-3, extra-input, over-cap and non-ONNX refusals; one runtime per process | `OTZARIA_ONNX_RUNTIME` |
 | `onnx_backend::golden` | the production graph against `tests/data/onnx_golden_vectors.json`: sha256 of graph and tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine ≥ 0.99999 (and how many are bit-identical), batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
 | `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
