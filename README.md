@@ -331,6 +331,14 @@ case is an ONNX package — the graph, the `tokenizer.json` beside it and any ex
 it names — and every other path is GGUF. A build without the backend for a model's format
 says which feature to enable.
 
+The ONNX model, Meivin Round 2, ships as its **int8 graph** by default
+([`config/models/meivin-round2-onnx/`](config/models/meivin-round2-onnx/README.md)): 42 MB
+on disk against 168 MB for fp32, 169 against 387 MiB of peak memory, vectors within cosine
+0.999 of fp32's, and about the same speed on an Apple M4 — decided for users on weak PCs,
+where int8's latency on an old x86 CPU without VNNI is still to be measured. The fp32 graph
+is the reference, with an identity of its own; see
+[docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md) §6.0.
+
 ### Commands
 
 ```bash
@@ -460,18 +468,21 @@ reference, so no cosine threshold can separate them. See
 [`docs/P2_REFERENCE_VECTORS.md`](docs/P2_REFERENCE_VECTORS.md) for the measurements
 and [`tools/README.md`](tools/README.md) for regenerating the goldens.
 
-The ONNX backend has its own gate against
-[`tests/data/onnx_golden_vectors.json`](tests/data/onnx_golden_vectors.json), the answers
-of a Python reference (`tokenizers` and `onnxruntime`) for the Meivin Round 2 fp32 graph.
-It needs the graph, with its `tokenizer.json` beside it, and a runtime library:
+The ONNX backend has its own gate, one golden file per graph —
+[`tests/data/onnx_golden_vectors_int8.json`](tests/data/onnx_golden_vectors_int8.json) for
+the default int8 graph and [`tests/data/onnx_golden_vectors.json`](tests/data/onnx_golden_vectors.json)
+for the fp32 reference — each the answers of a Python reference (`tokenizers` and
+`onnxruntime`). The gate picks the file by the graph's SHA-256, so it takes either graph,
+with its `tokenizer.json` beside it, and a runtime library:
 
 ```bash
-OTZARIA_TEST_ONNX_MODEL=/abs/path/seforim-embed-round2-fp32.onnx \
+OTZARIA_TEST_ONNX_MODEL=/abs/path/seforim-embed-round2-int8.onnx \
 OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
   cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
 ```
 
-Token ids must match exactly, then every vector within cosine 0.99999. The model's
+Token ids must match exactly, then every vector within cosine 0.99999 — for int8 on another
+CPU family than the goldens', 0.995, because int8 vectors depend on the CPU's int8 kernels. The model's
 package, checksum and licence are in
 [`config/models/meivin-round2-onnx/`](config/models/meivin-round2-onnx/README.md).
 
@@ -494,9 +505,11 @@ Further jobs: an **inference backend** job that builds and tests `llama-backend`
 Linux and macOS; an **ONNX backend** job that tests `onnx-backend` on all three, against
 Microsoft's ONNX Runtime 1.28.0 fetched per platform and checked against a pinned
 SHA-256; and two **golden vectors** jobs that run the real-model parity gates, one per
-model — the second also checks that the crate and `tools/onnx_package_checksum.py`
-compute the same package checksum for the real ONNX model. The golden jobs need the
-`OTZARIA_HF_TOKEN` secret; when the secret is absent they fail loudly rather than
+model — the second runs the ONNX gate for both of its graphs, int8 and fp32, fetched from
+the private mirror `otzaria/judaic-semantic-round2-onnx-zayit`, and checks that the crate
+and `tools/onnx_package_checksum.py` compute the same package checksum for each, the one
+its identity declares. The golden jobs need the `OTZARIA_HF_TOKEN` secret, whose account
+must be able to read that mirror; when the secret is absent they fail loudly rather than
 reporting a skip as a pass. That gate is a reason the model's distribution route
 matters — see [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md).
 

@@ -136,8 +136,33 @@ S3 (זהות הארטיפקט) ו־S6 (התקנה באפליקציה).
 |---|---|
 | מודל | **Meivin Round 2** — המקודד השלם, כולל ה־pooling, ההטלה ל־256 ממדים והנרמול, בגרף ONNX אחד |
 | מקור | `ArieLLL123/judaic-semantic-round2-onnx-zayit` ב־HuggingFace, revision `1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca`, `gated: manual` |
-| מראה | `otzaria/judaic-semantic-round2-onnx-zayit`, פרטית — ממנה מוריד ה־CI, ועבודת `golden-onnx` תלויה בקיומה ובטוקן `OTZARIA_HF_TOKEN` שיכול לקרוא אותה |
-| זהות | [`config/models/meivin-round2-onnx/`](../config/models/meivin-round2-onnx/) — לצד זהות הייצור ב־`config/`, לא במקומה |
+| מראה | `otzaria/judaic-semantic-round2-onnx-zayit`, פרטית (commit 99b8a61, זהה בבתים למקור בכל שמונת הקבצים) — ממנה מוריד ה־CI, ולכן לחשבון שמאחורי הסוד `OTZARIA_HF_TOKEN` דרושה הרשאת קריאה אליה |
+| גרף ברירת המחדל | **`seforim-embed-round2-int8.onnx`** — §6.0 |
+| זהות | [`config/models/meivin-round2-onnx/`](../config/models/meivin-round2-onnx/) — גרף ה־int8; [`config/models/meivin-round2-onnx-fp32/`](../config/models/meivin-round2-onnx-fp32/) — גרף ה־fp32, הייחוס. שתיהן לצד זהות הייצור ב־`config/`, לא במקומה |
+
+### 6.0 ההכרעה: גרף ה־int8 הוא ברירת המחדל
+
+בחבילת המודל יש שני גרפים. **ברירת המחדל היא גרף ה־int8** (dynamic quantization): הוא
+הגרף שהאפליקציה מקבלת, ובו נבנים וקטורי הספרייה. הסיבה היא משתמשים על מחשבים חלשים —
+הגודל והזיכרון חשובים להם, והפסד הדיוק זניח:
+
+| | int8 | fp32 |
+|---|---:|---:|
+| גודל על הדיסק | 42,489,219 בתים (42 MB) | 168,177,986 בתים (168 MB) |
+| שיא זיכרון, session אחד | 169 MiB | 387 MiB |
+| התאמה ל־fp32, 600 קלטים מהספרייה | cosine 0.999067 במקרה הגרוע | — |
+| מהירות על Apple M4 | כמעט זהה: 1.7 מול 2.6 ms לשאילתה קצרה, 16.6 מול 16.4 ms לקטע של 256 טוקנים | |
+
+(המדידות: [`ONNX_BACKEND.md`](ONNX_BACKEND.md) §7.2.) **נותר למדוד על מחשב חלש:** את
+זמני ה־int8 על מעבד x86 ישן בלי VNNI, שבו אין למכפלות המכומתות הוראות ייעודיות.
+
+תכונה אחת של int8 שכדאי להכיר: הווקטורים שלו תלויים בגרעיני ה־int8 שהמעבד מריץ. על
+ה־M4 לבדו, גרעינים אחרים הזיזו אותם עד cosine 0.99896, כשגרף ה־fp32 זז בסדר גודל של
+1e-7. לכן ספרייה שנבנתה על משפחת מעבדים אחת ושאילתה שמוטמעת על אחרת נפגשות בדיוק
+הזה — אותו סדר גודל שבו int8 ו־fp32 נפרדים ממילא. גם זה חלק מהמדידה על מחשב חלש.
+
+גרף ה־fp32 נשאר **הייחוס**: ממנו כומת ה־int8, ומולו נמדד. הוא מודל אחר, עם זהות
+משלו וארטיפקט משלו אם בונים אחד — לא לערבב וקטורים של השניים באינדקס אחד.
 
 ### 6.1 מה בחבילה
 
@@ -146,11 +171,11 @@ S3 (זהות הארטיפקט) ו־S6 (התקנה באפליקציה).
 
 | קובץ | בחבילה | למה |
 |---|---|---|
-| הגרף — `seforim-embed-round2-fp32.onnx`, 168,177,986 בתים | ✅ | |
+| הגרף — `seforim-embed-round2-int8.onnx`, 42,489,219 בתים | ✅ | הגרף ש־`model_path` מצביע עליו; בזהות ה־fp32 — `seforim-embed-round2-fp32.onnx` |
 | `tokenizer.json` שלצדו, 2,191,362 בתים | ✅ חובה | ה־ids נקבעים בו; טוקנייזר אחר הוא מודל אחר |
 | כל קובץ external data שטנזורים בגרף מפנים אליו | ✅ | במודל הזה אין |
 | `README.md`, `LICENSE.md`, `manifest.json`, `.gitattributes`, סקריפט הייצוא | ❌ | אינם מגיעים לשום וקטור |
-| הגרף השני, `seforim-embed-round2-int8.onnx` | ❌ | מודל אחר: וקטורים אחרים (cosine 0.9991 במקרה הגרוע על מקרי הזהב), ולכן זהות משלו |
+| הגרף השני — לזהות ה־int8, `seforim-embed-round2-fp32.onnx` | ❌ | מודל אחר: וקטורים אחרים (cosine 0.9991 במקרה הגרוע על מקרי הזהב), ולכן זהות משלו. שני הגרפים יכולים לשבת באותה תיקייה |
 | ספריית ONNX Runtime | ❌ | §6.3 |
 
 ### 6.2 ה־checksum
@@ -162,7 +187,8 @@ otzaria-onnx-package-v1
 <relpath>\t<size_in_bytes>\t<sha256>        שורה לכל קובץ, ממוינות לפי relpath בסדר בתים
 ```
 
-`relpath` יחסי לתיקיית הגרף ומופרד ב־`/`. לגרף ה־fp32 של Meivin הערך הוא
+`relpath` יחסי לתיקיית הגרף ומופרד ב־`/`. לגרף ה־int8 של Meivin, ברירת המחדל, הערך הוא
+`9e408407922b4aab26dd148cbe4b9a0e573c65591cfc799ba28e991d77d9d065`; לגרף ה־fp32 —
 `4a4a2ae88a86f15ffe6069bfcefc3abd13c207cec5d7aaef52c0c59d752ade46`.
 
 יש לו **שני מימושים עצמאיים**, ושניהם חייבים להגיע לאותו ערך מאותם בתים: ה־crate
@@ -219,9 +245,13 @@ MIT, והפצתו עם האפליקציה מחייבת לצרף את הודעת 
 
 ### 6.5 וקטורי הזהב
 
-[`tests/data/onnx_golden_vectors.json`](../tests/data/onnx_golden_vectors.json) הוא התשובה
-של רפרנס Python — `tokenizers` 0.23.2 ו־`onnxruntime` 1.28.0, אותן גרסאות שה־backend
-מקובע אליהן — ל־41 קלטים, והוא מופק ב־[`tools/generate_onnx_golden_vectors.py`](../tools/generate_onnx_golden_vectors.py).
-הבדיקה `semantic::onnx_backend::golden` דורשת ids זהים בדיוק, ואחר כך cosine ≥ 0.99999
-לכל וקטור. עבודת `golden-onnx` ב־CI מריצה אותה, באותה מדיניות סוד כמו `golden-vectors`
-(§2.5, §5): בלי `OTZARIA_HF_TOKEN` היא נכשלת, ולא מדווחת הצלחה.
+לכל גרף קובץ זהב משלו: [`tests/data/onnx_golden_vectors_int8.json`](../tests/data/onnx_golden_vectors_int8.json)
+לגרף ה־int8 ו־[`tests/data/onnx_golden_vectors.json`](../tests/data/onnx_golden_vectors.json)
+לגרף ה־fp32. כל אחד הוא התשובה של רפרנס Python — `tokenizers` 0.23.2 ו־`onnxruntime`
+1.28.0, אותן גרסאות שה־backend מקובע אליהן — ל־41 קלטים, מופק ב־[`tools/generate_onnx_golden_vectors.py`](../tools/generate_onnx_golden_vectors.py).
+הבדיקה `semantic::onnx_backend::golden` בוחרת את הקובץ לפי ה־SHA-256 של הגרף (גרף שאין לו
+קובץ זהב נכשל בקול), דורשת ids זהים בדיוק, ואחר כך cosine לכל וקטור: ≥ 0.99999 ל־fp32
+בכל מקום ול־int8 על משפחת המעבדים שהקובץ הופק עליה, ו־≥ 0.995 ל־int8 על משפחה אחרת,
+כי גרעיני ה־int8 שם אחרים (§6.0). על ה־M4 שני הגרפים שחזרו את כל 41 הווקטורים ביט
+בביט. עבודת `golden-onnx` ב־CI מריצה את השער לכל אחד מהגרפים, באותה מדיניות סוד כמו
+`golden-vectors` (§2.5, §5): בלי `OTZARIA_HF_TOKEN` היא נכשלת, ולא מדווחת הצלחה.

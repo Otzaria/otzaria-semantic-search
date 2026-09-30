@@ -7,8 +7,11 @@ by the model path's format (`.onnx` in any ASCII case). This document is the dec
 record: what the backend promises, why it is built the way it is, and what it measured.
 
 The production model it was written for is "Meivin Round 2"
-(`ArieLLL123/judaic-semantic-round2-onnx-zayit` @ `1ec8dc6`), verified on the downloaded
-files:
+(`ArieLLL123/judaic-semantic-round2-onnx-zayit` @ `1ec8dc6`; CI reads the private mirror
+`otzaria/judaic-semantic-round2-onnx-zayit` @ `99b8a61`, the same bytes), verified on the
+downloaded files. Of its two graphs, **the int8 graph is the default** — the one the
+application ships and the library's vectors are built with; the fp32 graph is the
+reference it was quantized from (§0):
 
 | | |
 |---|---|
@@ -19,6 +22,38 @@ files:
 | int8 | dynamic quantization: 33 `DynamicQuantizeLinear`, 49 `MatMulInteger` |
 | positions | 512: a cap of 512 loads, 513 is refused at load (the `Expand` of the position ids fails) |
 | tokenizer | `tokenizer.json` (2,191,362 B, `06642879…c0e9`): **Unigram**, 32,000 pieces, Metaspace pre-tokenizer, `[CLS] $A [SEP]`; normalizer NFKC + regex `Replace` rules (§5) |
+
+---
+
+## 0. Which graph: int8, the default
+
+Decided for users on weak PCs, to whom size and memory matter and the accuracy lost is
+negligible. Measured on this backend (§7.2):
+
+| | int8 | fp32 |
+|---|---:|---:|
+| on disk | 42,489,219 B (42 MB) | 168,177,986 B (168 MB) |
+| peak footprint, one session | 169 MiB | 387 MiB |
+| first `open` in a process | 108 ms | 386 ms |
+| agreement with fp32, 600 library inputs | cosine min 0.999067, median 0.999473 | — |
+| 14-token query / 256-token passage, 4 threads, Apple M4 (p50) | 1.66 / 16.62 ms | 2.55 / 16.38 ms |
+
+About the same speed on the M4: int8 is faster on short inputs and no faster on long ones,
+because dynamic quantization re-quantizes every activation and this CPU's fp32 matrix
+multiply is fast. **Still to measure, on a weak PC:** int8 latency on an old x86 CPU without
+VNNI, where the quantized products have no dedicated instructions — the case the decision
+is for.
+
+One property int8 does not share with fp32: **its vectors depend on which int8 kernels
+run.** On the M4 alone, turning KleidiAI off moved them by up to 1.07e-2 (cosine 0.99896),
+and an unfused graph by 1.06e-2 (0.99908), where fp32 moves by a few 1e-7 (§7.2); x86 runs
+MLAS's own int8 kernels. So a library built on one CPU family and queried on another is
+compared at about cosine 0.999 — the order at which int8 and fp32 part anyway, and within
+the int8 golden gate's cross-machine bound (§8).
+
+The identities: `config/models/meivin-round2-onnx/` (int8, `model_checksum`
+`9e408407…d9d065`) and `config/models/meivin-round2-onnx-fp32/` (fp32, `4a4a2ae8…2ade46`),
+which differ in those two fields alone. Each graph has its own golden file.
 
 ---
 
@@ -384,13 +419,20 @@ one at a time, and concurrent callers vs serial.
 default session options (`ORT_ENABLE_ALL`), fp32: ids identical, and every vector
 **bit-identical** (max |Δ| 0) — with the 1.28.0 wheel, and with 1.30.0 as well.
 
-**The golden gate** (`onnx_backend::golden`, against `tests/data/onnx_golden_vectors.json`
-from `onnx/golden` @ `7e49323` — Python `onnxruntime` 1.28.0 and `tokenizers` 0.23.2 on
-Darwin arm64, `ORT_ENABLE_ALL`, one text per run): 41 cases — 26 passages, 11 queries, 4
-raw, including niqqud, cantillation, bidi marks, literal specials and the 256/257-token
-boundaries — every input's bytes, every id and the package checksum equal, and **41 of 41
-vectors bit-identical** (cosine 1.0000000000, max |Δ| 0); batched equal to single, and
-four concurrent callers over two sessions equal to serial.
+**The golden gates** (`onnx_backend::golden`, against `tests/data/onnx_golden_vectors.json`
+for fp32 and `tests/data/onnx_golden_vectors_int8.json` for int8 — Python `onnxruntime`
+1.28.0 and `tokenizers` 0.23.2 on Darwin arm64, `ORT_ENABLE_ALL`, one text per run): 41
+cases — 26 passages, 11 queries, 4 raw, including niqqud, cantillation, bidi marks,
+literal specials and the 256/257-token boundaries — every input's bytes, every id and the
+package checksum equal, and, for **each** graph, **41 of 41 vectors bit-identical**
+(cosine 1.0000000000, max |Δ| 0); batched equal to single, and four concurrent callers
+over two sessions equal to serial.
+
+**What moves an int8 vector** (the generator's `--diagnostics` on the int8 graph): repeat
+runs, fresh sessions and 1/2/4/8 threads, nothing — bit-identical; `ORT_ENABLE_EXTENDED`
+against `ORT_ENABLE_ALL`, nothing; `ORT_DISABLE_ALL` or `ORT_ENABLE_BASIC`, up to 1.06e-2
+(cosine 0.99908); KleidiAI off, up to 1.07e-2 (0.99896). The same levers move fp32 by
+2.1e-7 and 2.7e-7.
 
 **fp32 vs int8**, same 600 inputs: cosine min 0.999067, median 0.999473, max 0.999742 —
 in line with the author's own floor of 0.99863 (int8 against PyTorch, four samples), and a
@@ -404,7 +446,7 @@ reason the two graphs are different identities (`model_quantization`).
 |---|---|---|
 | `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query and a passage capped on a space reaching it exactly as the bare text does, the stand-in's stub tokenizer | nothing |
 | `onnx_backend::tests` | the fixture against the Python references; truncation; order; batch = single; concurrency; threads and sessions change nothing; static batch; `token_type_ids` as zeros; rank-3, extra-input, over-cap and non-ONNX refusals; one runtime per process | `OTZARIA_ONNX_RUNTIME` |
-| `onnx_backend::golden` | the production graph against `tests/data/onnx_golden_vectors.json`: sha256 of graph and tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine ≥ 0.99999 (and how many are bit-identical), batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
+| `onnx_backend::golden` | either production graph against its own golden file, chosen by the graph's SHA-256 (a graph no file describes fails loudly): sha256 of the tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine per graph (and how many are bit-identical), batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
 | `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
 
 The tests that run a graph skip loudly without `OTZARIA_ONNX_RUNTIME`, as the model-gated
@@ -418,17 +460,23 @@ library extracted: `lib/libonnxruntime.so.1.28.0` from `onnxruntime-linux-x64-1.
 The golden tests:
 
 ```sh
-OTZARIA_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
-OTZARIA_TEST_ONNX_MODEL=/path/to/seforim-embed-round2-fp32.onnx \
-  cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+for graph in int8 fp32; do
+  OTZARIA_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
+  OTZARIA_TEST_ONNX_MODEL=/path/to/seforim-embed-round2-$graph.onnx \
+    cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+done
 ```
 
-The cosine threshold is not 1.0 because the Python reference and this backend need not
-share an ONNX Runtime build or an instruction set — kernel choice alone moved components
-by 2.9e-6, a cosine deficit near 1e-11 — while every wiring error the ids cannot see (a mask
-or type ids fed wrong, the wrong output, a half-precision provider, the int8 graph at
-0.9986) lands far below it. Truncation and prefix errors change the ids, which are compared
-exactly and first.
+The cosine bound is per graph. For fp32 it is 0.99999 everywhere, not 1.0, because the
+Python reference and this backend need not share an ONNX Runtime build or an instruction
+set — kernel choice alone moved components by 2.9e-6, a cosine deficit near 1e-11 — while
+every wiring error the ids cannot see (a mask or type ids fed wrong, the wrong output, a
+half-precision provider) lands far below it. For int8 it is 0.99999 on the goldens' own CPU
+family, where the same kernels run and the vectors came out bit-identical, and 0.995 on
+another, whose int8 kernels differ (§0): two correct int8 approximations, each within
+0.99911 of fp32 on these cases, can be up to 0.9964 apart. A graph standing in for another
+cannot pass under the looser bound, because the golden file is chosen by the graph's hash.
+Truncation and prefix errors change the ids, which are compared exactly and first.
 
 **The fixture** is regenerated byte for byte by `tools/make_onnx_fixture.py` (the package
 versions are in its docstring; `--check` compares without writing): five graphs of about
@@ -442,6 +490,8 @@ references' ids for both and vectors for the first.
 
 ## 9. Open issues
 
+- **int8 on a weak PC** (§0): latency on an old x86 CPU without VNNI, and how far its int8
+  kernels' vectors lie from the ones the library is built with.
 - **The cap, 256 vs 128** (§5), for retrieval-quality measurement to settle.
 - **Linux and Windows** were checked to compile, not run; CI's `onnx-backend` job is what
   runs them, and it has not run yet.
