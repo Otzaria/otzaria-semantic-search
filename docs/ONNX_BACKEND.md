@@ -79,7 +79,7 @@ can run at load and take the whole application down on a pre-Haswell CPU; the Li
 need glibc ≥ 2.38; the Apple builds raise the application's floor to macOS 13.4 / iOS 15.1
 and link CoreML; and the CDN is unreachable from this build network (content filter 418,
 Cloudflare 403 through the tunnel). Loaded at run time, a missing or unusable runtime is
-`BackendUnavailable` for semantic search and nothing else, and the plugin's builds need
+`OnnxRuntimeUnavailable` for semantic search and nothing else, and the plugin's builds need
 neither network nor minimum-OS changes.
 
 **Targets.** The crates are declared for desktop targets only — the platforms Microsoft
@@ -116,7 +116,23 @@ compiles; it does not link, and nothing here ran on Linux or Windows.
    nothing, is refused — not skipped in favour of the next option.
 2. The platform's file name in the model package, beside the graph:
    `libonnxruntime.dylib`, `libonnxruntime.so`, `onnxruntime.dll`.
-3. Otherwise `BackendUnavailable`, naming both.
+3. Otherwise `OnnxRuntimeUnavailable` — "ONNX Runtime could not be loaded: …" — naming both.
+
+Every way the library can fail to load is that error: none found, not a runtime, too old,
+refused by `ort`, a different one already running. It is deliberately not
+`BackendUnavailable`, whose message says the *build* has no backend for the model: here
+the backend is compiled in, and the fix is a file or a variable, not a rebuild.
+
+**macOS: library validation.** An application built with the Hardened Runtime — which
+notarization requires — loads only libraries signed by Apple or with its own Team ID,
+unless it carries the `com.apple.security.cs.disable-library-validation` entitlement;
+the App Sandbox further limits what it may read, and a downloaded file carries a
+quarantine attribute. So `dlopen` may refuse Microsoft's `libonnxruntime.dylib` from the
+model folder even though the file is intact; the refusal arrives as
+`OnnxRuntimeUnavailable`, with the loader's reason (a code-signature or Team ID
+mismatch) in the message. What works is shipping the library inside the application
+bundle, signed with the application's identity, and pointing `OTZARIA_ONNX_RUNTIME` at it
+— or, knowingly, the entitlement above.
 
 The runtime is code, not model data: it is platform-specific and not part of the package
 checksum (design D4). The reference is **Microsoft's official ONNX Runtime 1.28.0**
@@ -177,7 +193,7 @@ be served fails at load and never in the middle of an index:
 | graph / `tokenizer.json` absent | `ModelNotFound` / `TokenizerNotFound` |
 | tokenizer not parseable | `InvalidModelFile` (the graph named, the tokenizer in the reason) |
 | `max_tokens` ≤ the special tokens the tokenizer adds | `LoadFailed` — also what keeps the tokenizer's own unchecked subtraction from wrapping |
-| no loadable runtime (§3) | `BackendUnavailable` |
+| no loadable runtime (§3) | `OnnxRuntimeUnavailable` |
 | graph the runtime cannot load | `InvalidModelFile` |
 | an input other than `input_ids`, `attention_mask`, `token_type_ids` | `InvalidModelFile`, naming the input |
 | inputs not int64 `[batch, sequence]`, a batch fixed above 1, a fixed sequence length | `InvalidModelFile` |

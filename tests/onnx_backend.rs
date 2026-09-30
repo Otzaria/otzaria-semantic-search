@@ -298,10 +298,10 @@ mod with_the_backend {
 
         // First the environment names a file that is not a runtime.
         match select_backend(&config_for(model.clone())) {
-            Err(EmbeddingError::BackendUnavailable { reason }) => {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
                 assert!(reason.contains("expected.json"), "{reason}");
             }
-            Err(other) => panic!("expected BackendUnavailable, got {other}"),
+            Err(other) => panic!("expected OnnxRuntimeUnavailable, got {other}"),
             Ok(backend) => panic!("loaded '{}' from a JSON file", backend.id()),
         }
 
@@ -370,8 +370,8 @@ mod with_the_backend {
     /// The stand-in's stub package — a graph with no nodes, a WordLevel tokenizer —
     /// sent to the real row, as a `mock-embedding,onnx-backend` build does: its
     /// tokenizer loads, its graph is refused as an invalid ONNX model naming the graph,
-    /// and nothing panics. Without a runtime the refusal is `BackendUnavailable`, which
-    /// `tests/backend_selection.rs` accepts as well.
+    /// and nothing panics. Without a runtime the refusal is `OnnxRuntimeUnavailable`,
+    /// which `tests/backend_selection.rs` accepts as well.
     #[cfg(feature = "mock-embedding")]
     #[test]
     fn the_stand_ins_stub_package_is_refused_by_the_real_backend() {
@@ -397,7 +397,7 @@ mod with_the_backend {
                 );
                 assert!(message.contains(&model.display().to_string()), "{message}");
             }
-            Err(EmbeddingError::BackendUnavailable { reason })
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason })
                 if std::env::var_os(RUNTIME_ENV).is_none() =>
             {
                 assert!(reason.contains(RUNTIME_ENV), "{reason}");

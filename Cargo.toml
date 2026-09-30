@@ -156,7 +156,7 @@ optional = true
 # * the build: they are fetched from cdn.pyke.io while cargo runs, which this build
 #   network cannot reach.
 #
-# Loaded instead, a missing or unusable runtime is `BackendUnavailable` for semantic
+# Loaded instead, a missing or unusable runtime is `OnnxRuntimeUnavailable` for semantic
 # search and nothing else. No `api-*` feature: the default API level, 17, is all the
 # backend uses, so any runtime from ONNX Runtime 1.17 on loads; the reference is
 # Microsoft's official 1.28.0 release, which dispatches CPU features at run time.

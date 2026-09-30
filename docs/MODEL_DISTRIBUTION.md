@@ -183,8 +183,17 @@ otzaria-onnx-package-v1
 1. משתנה הסביבה `OTZARIA_ONNX_RUNTIME` — הנתיב המלא לספרייה;
 2. שם הקובץ של הפלטפורמה בתיקיית החבילה, לצד הגרף: `onnxruntime.dll`, `libonnxruntime.so`
    או `libonnxruntime.dylib`;
-3. אחרת — `BackendUnavailable`, שמציין את שתי האפשרויות. רק החיפוש הסמנטי אינו זמין;
-   החיפוש הלקסיקלי ממשיך לעבוד.
+3. אחרת — `OnnxRuntimeUnavailable` („ONNX Runtime could not be loaded: …”), שמציין את
+   שתי האפשרויות. רק החיפוש הסמנטי אינו זמין; החיפוש הלקסיקלי ממשיך לעבוד. זו אינה
+   `BackendUnavailable`: ה־backend קיים בבנייה, וחסר רק קובץ.
+
+ב־macOS, אפליקציה עם Hardened Runtime (שנדרש ל־notarization) טוענת רק ספריות שחתומות
+על ידי Apple או באותו Team ID שלה, אלא אם יש לה את ה־entitlement
+`com.apple.security.cs.disable-library-validation`; גם ה־App Sandbox ותכונת ה־quarantine
+של קובץ שהורד מגבילים. לכן `dlopen` עלול לסרב ל־`libonnxruntime.dylib` של Microsoft
+מתיקיית המודל גם כשהקובץ תקין — הסירוב מגיע כ־`OnnxRuntimeUnavailable`, עם סיבת
+הטוען בהודעה. מה שעובד: לצרף את הספרייה לחבילת האפליקציה, חתומה בזהות של האפליקציה,
+ולהפנות אליה את `OTZARIA_ONNX_RUNTIME`.
 
 הספרייה **אינה** נכנסת ל־checksum. היא קוד ולא נתוני מודל, היא שונה בכל פלטפורמה, וזהות
 המודל חייבת להיות זהה במכונת הבנייה ובכל מכשיר. ספרייה שמונחת לצד הגרף אינה משנה את

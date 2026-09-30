@@ -89,12 +89,24 @@ pub enum EmbeddingError {
     )]
     InvalidModelFile { path: String, reason: String },
 
-    /// No inference backend is compiled in. A default build has none by choice, so
-    /// a production binary can never fall back to the hash-based stand-in embedder;
-    /// real inference is opt-in through `--features llama-backend`, which compiles
-    /// llama.cpp and ggml through cmake.
+    /// No inference backend for the model's format is compiled in. A default build has
+    /// none by choice, so a production binary can never fall back to the hash-based
+    /// stand-in embedder; real inference is opt-in through `--features llama-backend`,
+    /// which compiles llama.cpp and ggml through cmake, and `--features onnx-backend`.
     #[error("No embedding backend is available in this build: {reason}")]
     BackendUnavailable { reason: String },
+
+    /// The ONNX backend is compiled in, but the ONNX Runtime shared library it loads when
+    /// a model does could not be loaded: none found, not a runtime, too old, refused, or a
+    /// different one already running in this process.
+    ///
+    /// Not [`Self::BackendUnavailable`], whose message says the *build* lacks a backend:
+    /// the fix here is a file put in place or an environment variable, never a rebuild,
+    /// and a message saying otherwise sends the reader to the wrong one. The reason says
+    /// how to provide the library — `OTZARIA_ONNX_RUNTIME`, or the platform's file name
+    /// beside the graph.
+    #[error("ONNX Runtime could not be loaded: {reason}")]
+    OnnxRuntimeUnavailable { reason: String },
 
     #[error("Inference failed: {reason}")]
     InferenceFailed { reason: String },

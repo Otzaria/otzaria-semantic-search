@@ -203,14 +203,15 @@ fn onnx_config_for(dir: &TempDir, model_path: PathBuf) -> SemanticConfig {
 
 /// The ONNX backend's refusal, whichever it is: the package it is handed holds a graph
 /// with no nodes, which no runtime can run — or, where no runtime library is present,
-/// the backend's own report that it has none. What must never happen is *success*.
+/// the backend's own report that it cannot load one. What must never happen is
+/// *success*.
 #[cfg(feature = "onnx-backend")]
 fn is_the_onnx_backends_refusal(error: &EmbeddingError) -> bool {
     matches!(
         error,
         EmbeddingError::InvalidModelFile { .. }
             | EmbeddingError::LoadFailed { .. }
-            | EmbeddingError::BackendUnavailable { .. }
+            | EmbeddingError::OnnxRuntimeUnavailable { .. }
     )
 }
 

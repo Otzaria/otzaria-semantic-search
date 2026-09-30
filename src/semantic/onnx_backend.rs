@@ -2,8 +2,10 @@
 //!
 //! Behind the non-default `onnx-backend` feature, on the desktop targets its crates are
 //! declared for (`Cargo.toml` says which and why); anywhere else an ONNX model gets
-//! [`EmbeddingError::BackendUnavailable`]. Design and measurements are in
-//! `docs/ONNX_BACKEND.md`.
+//! [`EmbeddingError::BackendUnavailable`]. Where the backend is compiled in but the ONNX
+//! Runtime library cannot be loaded, the error is
+//! [`EmbeddingError::OnnxRuntimeUnavailable`] instead: the fix is a file, not a build.
+//! Design and measurements are in `docs/ONNX_BACKEND.md`.
 //!
 //! # What the backend id promises
 //!
@@ -247,7 +249,7 @@ fn resolve_runtime_path(
     env_value: Option<std::ffi::OsString>,
     graph: &Path,
 ) -> Result<PathBuf, EmbeddingError> {
-    let unavailable = |reason: String| EmbeddingError::BackendUnavailable { reason };
+    let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
     if let Some(raw) = env_value {
         let requested = PathBuf::from(&raw);
         if raw.is_empty() {
@@ -295,7 +297,7 @@ fn resolve_runtime_path(
 /// runtime's log goes to the [`log`] facade — a library linked into a Flutter application
 /// must not write to the host's stderr — and so that telemetry is off.
 fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
-    let unavailable = |reason: String| EmbeddingError::BackendUnavailable { reason };
+    let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
 
     // Held across the load, so two first loads cannot race. Recovered from poisoning:
     // the slot only ever goes from empty to one complete value.
@@ -391,7 +393,7 @@ fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
 /// (`OrtGetApiBase()->GetVersionString()`), which `ort` reads but does not expose.
 fn open_runtime_library(path: &Path) -> Result<(libloading::Library, String), EmbeddingError> {
     type GetApiBase = unsafe extern "system" fn() -> *const ort::sys::OrtApiBase;
-    let unavailable = |reason: String| EmbeddingError::BackendUnavailable { reason };
+    let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
 
     // SAFETY: loading a library runs its initializers, and there is no way to vet a file
     // before that: this is the library the process is about to run semantic search on,
@@ -864,8 +866,8 @@ impl OnnxBackend {
     /// * [`EmbeddingError::LoadFailed`] for a zero thread or session count, a cap past
     ///   any encoder's context or one that leaves no room for content, or a session that
     ///   will not allocate;
-    /// * [`EmbeddingError::BackendUnavailable`] when no ONNX Runtime can be loaded — none
-    ///   found, too old, not a runtime, or a different one already loaded;
+    /// * [`EmbeddingError::OnnxRuntimeUnavailable`] when no ONNX Runtime can be loaded —
+    ///   none found, too old, not a runtime, or a different one already loaded;
     /// * [`EmbeddingError::InvalidModelFile`] for a tokenizer or graph this backend
     ///   cannot serve, or a graph that fails the probe.
     pub fn open(
@@ -1743,12 +1745,12 @@ mod tests {
 
         // Neither: the error names both ways to provide one.
         match resolve_runtime_path(None, &graph) {
-            Err(EmbeddingError::BackendUnavailable { reason }) => {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
                 assert!(reason.contains(RUNTIME_ENV), "{reason}");
                 assert!(reason.contains(RUNTIME_FILE_NAME), "{reason}");
                 assert!(reason.contains(&dir.0.display().to_string()), "{reason}");
             }
-            other => panic!("expected BackendUnavailable, got {other:?}"),
+            other => panic!("expected OnnxRuntimeUnavailable, got {other:?}"),
         }
 
         // Beside the graph, when the variable is unset.
@@ -1771,11 +1773,52 @@ mod tests {
         // A variable naming nothing is refused, not skipped in favour of the file beside.
         for wrong in ["", "/definitely/not/here/libonnxruntime"] {
             match resolve_runtime_path(Some(wrong.into()), &graph) {
-                Err(EmbeddingError::BackendUnavailable { reason }) => {
+                Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
                     assert!(reason.contains(RUNTIME_ENV), "{reason}");
                 }
                 other => panic!("{RUNTIME_ENV}={wrong:?} must be refused, got {other:?}"),
             }
+        }
+    }
+
+    /// The backend is in this build; what is missing is the library it loads. Said as
+    /// "no embedding backend is available in this build" — what a build without the
+    /// feature says — it sends whoever reads `last_error` to rebuild an application that
+    /// only needs a file put in place.
+    #[test]
+    fn a_runtime_that_cannot_be_loaded_is_reported_as_the_runtime_not_as_a_missing_backend() {
+        let dir = TempDir::new("no_runtime");
+        let graph = dir.0.join("model.onnx");
+        std::fs::write(&graph, b"graph").unwrap();
+
+        let missing = resolve_runtime_path(None, &graph).unwrap_err();
+        assert!(
+            matches!(missing, EmbeddingError::OnnxRuntimeUnavailable { .. }),
+            "{missing:?}"
+        );
+        let missing = missing.to_string();
+        assert!(
+            missing.starts_with("ONNX Runtime could not be loaded: "),
+            "{missing}"
+        );
+        // Still both ways to provide one.
+        assert!(missing.contains(RUNTIME_ENV), "{missing}");
+        assert!(
+            missing.contains(&dir.0.join(RUNTIME_FILE_NAME).display().to_string()),
+            "{missing}"
+        );
+
+        let not_a_runtime = fixture("expected.json").canonicalize().unwrap();
+        for refused in [
+            resolve_runtime_path(Some("".into()), &graph).unwrap_err(),
+            ensure_runtime(&not_a_runtime).unwrap_err(),
+        ] {
+            let message = refused.to_string();
+            assert!(
+                message.starts_with("ONNX Runtime could not be loaded: "),
+                "{message}"
+            );
+            assert!(!message.contains("No embedding backend"), "{message}");
         }
     }
 
@@ -2210,13 +2253,13 @@ mod tests {
     fn a_file_that_is_not_a_runtime_library_is_refused_and_named() {
         let not_a_library = fixture("expected.json").canonicalize().unwrap();
         match ensure_runtime(&not_a_library) {
-            Err(EmbeddingError::BackendUnavailable { reason }) => {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
                 assert!(
                     reason.contains(&not_a_library.display().to_string()),
                     "{reason}"
                 );
             }
-            other => panic!("expected BackendUnavailable, got {other:?}"),
+            other => panic!("expected OnnxRuntimeUnavailable, got {other:?}"),
         }
     }
 
@@ -2243,7 +2286,7 @@ mod tests {
 
         let other = fixture("tokenizer.json").canonicalize().unwrap();
         match ensure_runtime(&other) {
-            Err(EmbeddingError::BackendUnavailable { reason }) => {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
                 assert!(reason.contains(&loaded.display().to_string()), "{reason}");
                 assert!(reason.contains(&other.display().to_string()), "{reason}");
             }

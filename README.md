@@ -323,7 +323,7 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 | default | none | `Err(BackendUnavailable)` — a release build cannot serve fake vectors |
 | `--features mock-embedding` | deterministic hash stand-in | `Ok` — **not a semantic model**, development and testing only |
 | `--features llama-backend` | real llama.cpp GGUF inference | `Ok` |
-| `--features onnx-backend` | real ONNX Runtime inference for an ONNX model package (desktop targets) | `Ok` once the runtime library is found — `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and `Err(BackendUnavailable)` naming both otherwise |
+| `--features onnx-backend` | real ONNX Runtime inference for an ONNX model package (desktop targets) | `Ok` once the runtime library is found — `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and `Err(OnnxRuntimeUnavailable)` naming both otherwise |
 | `mock-embedding` with a real backend | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
 
 Which backend a model gets is decided by its path, not by the features: `.onnx` in any
