@@ -43,7 +43,7 @@ llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 # no native code to the binary. Its crates are declared for desktop targets only; on
 # every other target the feature is on with no backend behind it, as `llama-backend`
 # is on 32-bit ARM.
-onnx-backend = ["dep:ort", "dep:tokenizers"]
+onnx-backend = ["dep:ort", "dep:tokenizers", "dep:libloading"]
 
 # CUDA offload, for the build machine that produces the library's vectors — never
 # for the application, which ships no CUDA runtime.
@@ -189,4 +189,13 @@ optional = true
 version = "=0.23.2"
 default-features = false
 features = ["fancy-regex"]
+optional = true
+
+# Reached directly for the one thing `ort` reads and does not expose: the runtime's
+# version string (`OrtGetApiBase()->GetVersionString()`), which the load log names —
+# `ort::info()` carries a commit id, not a version. Opened only after `ort` has loaded the
+# same file, so it bumps a reference count and runs no initializer twice. Unpinned: it
+# decides no vector, and a range lets cargo unify it with `ort`'s own.
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.libloading]
+version = "0.9"
 optional = true

@@ -644,6 +644,7 @@ checksum = "cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872"
 name = "otzaria-semantic-search"
 version = "0.1.0"
 dependencies = [
+ "libloading 0.9.0",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "log",

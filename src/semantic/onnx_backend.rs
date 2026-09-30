@@ -28,9 +28,11 @@
 //! the platform's file name (`libonnxruntime.dylib`, `libonnxruntime.so`,
 //! `onnxruntime.dll`) in the model package beside the graph — and loaded once per
 //! process: `ort` holds one runtime and can neither unload nor replace it, so a second,
-//! different library is refused rather than silently ignored (`LOADED_RUNTIME`). Until
-//! that load has succeeded no other `ort` function is called, because `ort`'s own
-//! fallback search `expect`s: a missing library would be a panic instead of an error.
+//! different library is refused rather than silently ignored (`RUNTIME`). Until that load
+//! has succeeded no other `ort` function is called, because `ort`'s own fallback search
+//! `expect`s: a missing library would be a panic instead of an error. And `ort` is handed
+//! only a library the backend has already opened and checked itself, because a refusal
+//! inside `ort` 2.0.0-rc.13 cannot be retried — its next call panics (`ensure_runtime`).
 //! The runtime is code rather than model data and is not part of the package checksum.
 //!
 //! # One text per run
@@ -198,14 +200,27 @@ fn available_parallelism() -> usize {
 struct LoadedRuntime {
     /// Canonical, so two spellings of one file compare equal.
     path: PathBuf,
-    /// `ort::info()`'s leading fields — branch, commit, build type — for log lines.
-    build: String,
+    /// Its version and build, as log lines name it: `1.28.0 (git-branch=HEAD,
+    /// git-commit-id=…, build type=Release)`.
+    description: String,
+    /// The backend's own handle from `open_runtime_library`. Kept, never dropped, so the
+    /// library's reference count never falls to zero under `ort`, which holds another.
+    _library: libloading::Library,
 }
 
-/// Every [`OnnxBackend`] in the process runs on the one runtime loaded first. `None`
-/// until a library has been loaded, so an attempt that failed before that point (a wrong
-/// path, a file that is not a runtime) can be retried with a correct one.
-static LOADED_RUNTIME: Mutex<Option<LoadedRuntime>> = Mutex::new(None);
+/// What this process knows about its ONNX Runtime.
+enum RuntimeSlot {
+    /// Loaded and handed to `ort`; every backend in the process runs on it.
+    Loaded(LoadedRuntime),
+    /// `ort` refused a library after the backend's own checks had passed it. `ort` cannot
+    /// retry within a process — see `ensure_runtime` — so every later load is refused.
+    Unusable { path: PathBuf, reason: String },
+}
+
+/// `None` until a library has been handed to `ort`, so an attempt the backend's own checks
+/// refused (a wrong path, a file that is not a runtime, one too old) touches nothing of
+/// `ort`'s and can be retried with a correct one.
+static RUNTIME: Mutex<Option<RuntimeSlot>> = Mutex::new(None);
 
 /// Where the runtime library must come from for `graph`, in order: [`RUNTIME_ENV`]
 /// (`env_value`), else [`RUNTIME_FILE_NAME`] in the package root. Taken as an argument
@@ -248,47 +263,84 @@ fn resolve_runtime_path(
 }
 
 /// Load the runtime at `path` unless this process already has — the same file again is
-/// a no-op, a different one is refused. Returns the runtime's build description.
+/// a no-op, a different one is refused. Returns the runtime's version and build, for the
+/// load log.
 ///
-/// The first successful load also commits `ort`'s process-wide environment, so that
-/// the runtime's log goes to the [`log`] facade — a library linked into a Flutter
-/// application must not write to the host's stderr — and so that telemetry is off.
+/// The library is opened and checked here first (`open_runtime_library`), and only then
+/// handed to `ort::init_from`. The order is load-bearing: `ort` 2.0.0-rc.13 cannot survive
+/// a refusal of its own. Its `OnceLock` runs the loader under `Once::call_once_force`, so a
+/// load that *fails* still completes the `Once`, leaving the library slot marked
+/// initialized with nothing in it — every later `init_from` then "succeeds" without
+/// loading, and the next `ort` call panics on the missing `OrtGetApiBase` (strictly, reads
+/// uninitialized memory) and poisons `ort`'s environment lock for the rest of the process.
+/// So `ort` is only ever given a library it will accept — loadable, exporting
+/// `OrtGetApiBase`, at least `1.{ort::MINOR_VERSION}` by `ort`'s own rule — and if it
+/// refuses one anyway, that is remembered and every later load in the process is refused.
+///
+/// The first successful load also commits `ort`'s process-wide environment, so that the
+/// runtime's log goes to the [`log`] facade — a library linked into a Flutter application
+/// must not write to the host's stderr — and so that telemetry is off.
 fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
     let unavailable = |reason: String| EmbeddingError::BackendUnavailable { reason };
 
     // Held across the load, so two first loads cannot race. Recovered from poisoning:
     // the slot only ever goes from empty to one complete value.
-    let mut loaded = LOADED_RUNTIME
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if let Some(runtime) = loaded.as_ref() {
-        if runtime.path == path {
-            return Ok(runtime.build.clone());
+    let mut slot = RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
+    match slot.as_ref() {
+        Some(RuntimeSlot::Loaded(runtime)) if runtime.path == path => {
+            return Ok(runtime.description.clone());
         }
-        return Err(unavailable(format!(
-            "this process already runs ONNX Runtime from {}, and a process can hold only one; \
-             {} was requested. Point {RUNTIME_ENV} at the library already loaded, or restart \
-             the process to switch",
-            runtime.path.display(),
-            path.display()
-        )));
+        Some(RuntimeSlot::Loaded(runtime)) => {
+            return Err(unavailable(format!(
+                "this process already runs ONNX Runtime from {}, and a process can hold only \
+                 one; {} was requested. Point {RUNTIME_ENV} at the library already loaded, or \
+                 restart the process to switch",
+                runtime.path.display(),
+                path.display()
+            )));
+        }
+        Some(RuntimeSlot::Unusable {
+            path: refused,
+            reason,
+        }) => {
+            return Err(unavailable(format!(
+                "ONNX Runtime from {} was refused earlier in this process ({reason}), and the \
+                 runtime binding cannot load another after that; restart the process with a \
+                 working library",
+                refused.display()
+            )));
+        }
+        None => {}
     }
+
+    // Nothing of `ort`'s is touched if this fails.
+    let (library, version) = open_runtime_library(path)?;
 
     // Absolute on purpose: for a relative path `ort` resolves against the executable's
     // directory through two `expect`s.
-    let environment = ort::init_from(path).map_err(|e| {
-        unavailable(format!(
-            "could not load ONNX Runtime from {}: {e} (this backend needs ONNX Runtime 1.17 \
-             or newer, built for this platform)",
-            path.display()
-        ))
-    })?;
-    // Recorded the moment the library is in, before anything else can fail: it cannot be
-    // unloaded, and `ort` would silently ignore a later, different path.
-    let runtime = loaded.insert(LoadedRuntime {
+    let environment = match ort::init_from(path) {
+        Ok(environment) => environment,
+        Err(e) => {
+            let reason = e.to_string();
+            *slot = Some(RuntimeSlot::Unusable {
+                path: path.to_path_buf(),
+                reason: reason.clone(),
+            });
+            return Err(unavailable(format!(
+                "ONNX Runtime {version} at {} passed this backend's checks but the runtime \
+                 binding refused it: {reason}",
+                path.display()
+            )));
+        }
+    };
+    // Recorded the moment `ort` holds the library, before anything else can fail: it
+    // cannot be unloaded, and `ort` would silently ignore a later, different path.
+    *slot = Some(RuntimeSlot::Loaded(LoadedRuntime {
         path: path.to_path_buf(),
-        build: "build unknown".to_string(),
-    });
+        description: version.clone(),
+        _library: library,
+    }));
+
     let committed = environment
         .with_name("otzaria-semantic-search")
         .with_telemetry(false)
@@ -312,13 +364,84 @@ fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
     })?;
     environment.set_log_level(LogLevel::Warning);
 
-    runtime.build = describe_build(ort::info());
-    Ok(runtime.build.clone())
+    let description = format!("{version} ({})", describe_build(ort::info()));
+    if let Some(RuntimeSlot::Loaded(runtime)) = slot.as_mut() {
+        runtime.description.clone_from(&description);
+    }
+    Ok(description)
 }
 
-/// The fields of `ORT Build Info: git-branch=rel-1.28.0, git-commit-id=…, build
-/// type=Release, cmake cxx flags: …` worth a log line — everything before the compiler
-/// flags, which run to hundreds of characters.
+/// Open `path` as an ONNX Runtime library and check it the way `ort::init_from` will —
+/// so that `init_from` is never handed a library it refuses (see `ensure_runtime`).
+/// Returns the handle, to be kept, and the runtime's version string
+/// (`OrtGetApiBase()->GetVersionString()`), which `ort` reads but does not expose.
+fn open_runtime_library(path: &Path) -> Result<(libloading::Library, String), EmbeddingError> {
+    type GetApiBase = unsafe extern "system" fn() -> *const ort::sys::OrtApiBase;
+    let unavailable = |reason: String| EmbeddingError::BackendUnavailable { reason };
+
+    // SAFETY: loading a library runs its initializers, and there is no way to vet a file
+    // before that: this is the library the process is about to run semantic search on,
+    // chosen by the deployment (`OTZARIA_ONNX_RUNTIME` or the package's own file), and
+    // loading it is what `ort::init_from` does next in any case.
+    let library = unsafe { libloading::Library::new(path) }.map_err(|e| {
+        unavailable(format!(
+            "{} is not a loadable shared library for this platform: {e}",
+            path.display()
+        ))
+    })?;
+    // SAFETY: the type is ONNX Runtime's C declaration of its entry point,
+    // `const OrtApiBase* ORT_API_CALL OrtGetApiBase(void)`, exactly as `ort-sys` binds it.
+    let get_api_base = unsafe { library.get::<GetApiBase>(b"OrtGetApiBase") }.map_err(|_| {
+        unavailable(format!(
+            "{} loads but does not export OrtGetApiBase, so it is not ONNX Runtime",
+            path.display()
+        ))
+    })?;
+    // SAFETY: a call with no arguments into the loaded runtime, which returns null or a
+    // pointer to a static table living as long as the library.
+    let base = unsafe { get_api_base() };
+    if base.is_null() {
+        return Err(unavailable(format!(
+            "{}: OrtGetApiBase returned nothing",
+            path.display()
+        )));
+    }
+    // SAFETY: `base` is non-null and points at that table. `GetVersionString` returns a
+    // NUL-terminated string the runtime owns ("do not deallocate"), valid while the
+    // library is loaded; it is copied out before `library` can be dropped.
+    let raw_version = unsafe { ((*base).GetVersionString)() };
+    if raw_version.is_null() {
+        return Err(unavailable(format!(
+            "{}: the runtime reports no version",
+            path.display()
+        )));
+    }
+    // SAFETY: non-null and NUL-terminated, per the contract above.
+    let version = unsafe { std::ffi::CStr::from_ptr(raw_version) }
+        .to_string_lossy()
+        .into_owned();
+
+    // `ort`'s own rule, verbatim: the second dotted field against its API level.
+    let minor = version
+        .split('.')
+        .nth(1)
+        .and_then(|field| field.parse::<u32>().ok())
+        .unwrap_or(0);
+    if minor < ort::MINOR_VERSION {
+        return Err(unavailable(format!(
+            "{} is ONNX Runtime {version}; this backend needs 1.{} or newer (the reference is \
+             Microsoft's official 1.28.0 release)",
+            path.display(),
+            ort::MINOR_VERSION
+        )));
+    }
+    Ok((library, version))
+}
+
+/// The fields of `ort::info()` worth a log line. Microsoft's 1.28.0 answers `ORT Build
+/// Info: git-branch=HEAD, git-commit-id=da9b5e364c, fp8-kv-cache=1, build type=Release`;
+/// other builds append `, cmake cxx flags: …`, which runs to hundreds of characters and
+/// is cut.
 fn describe_build(info: &str) -> String {
     let info = info.strip_prefix("ORT Build Info: ").unwrap_or(info);
     let head = info.split(", cmake").next().unwrap_or(info);
@@ -774,8 +897,8 @@ impl OnnxBackend {
         let (tokenizer_impl, special_tokens) = load_tokenizer(graph, tokenizer, max_tokens)?;
 
         // ── the runtime ──
-        let runtime = resolve_runtime_path(std::env::var_os(RUNTIME_ENV), graph)?;
-        let build = ensure_runtime(&runtime)?;
+        let runtime_path = resolve_runtime_path(std::env::var_os(RUNTIME_ENV), graph)?;
+        let runtime = ensure_runtime(&runtime_path)?;
 
         let cores = available_parallelism();
         let demand = tuning.sessions.saturating_mul(tuning.intra_threads);
@@ -839,7 +962,7 @@ impl OnnxBackend {
             special_tokens,
             intra_threads: tuning.intra_threads,
             graph: graph.to_path_buf(),
-            runtime,
+            runtime: runtime_path,
         };
 
         // ── the probe: only running the graph proves it serves this cap ──
@@ -849,8 +972,8 @@ impl OnnxBackend {
             "Embedding backend '{}' ready: {} — dim {} ({}), max_tokens {max_tokens} \
              ({special_tokens} special), batch dimension {} (one text per run), inputs \
              {INPUT_IDS} + {ATTENTION_MASK}{}, output '{}', {} session(s) x {} intra-op \
-             thread(s), graph optimization {GRAPH_OPTIMIZATION:?}; ONNX Runtime {} ({build}); \
-             loaded in {} ms",
+             thread(s), graph optimization {GRAPH_OPTIMIZATION:?}; ONNX Runtime {runtime} from \
+             {}; loaded in {} ms",
             Self::ID,
             backend.graph.display(),
             backend.dim,
@@ -1526,6 +1649,13 @@ mod tests {
             ),
             "git-branch=rel-1.28.0, git-commit-id=abc123, build type=Release"
         );
+        assert_eq!(
+            describe_build(
+                "ORT Build Info: git-branch=HEAD, git-commit-id=da9b5e364c, fp8-kv-cache=1, \
+                 build type=Release"
+            ),
+            "git-branch=HEAD, git-commit-id=da9b5e364c, fp8-kv-cache=1, build type=Release"
+        );
         assert_eq!(describe_build("something else"), "something else");
     }
 
@@ -1920,6 +2050,23 @@ mod tests {
         }
     }
 
+    /// Whether or not a runtime is already loaded in this test process, a file that is
+    /// not one is refused as unavailable and named — never a panic, which is what `ort`'s
+    /// own search would have been.
+    #[test]
+    fn a_file_that_is_not_a_runtime_library_is_refused_and_named() {
+        let not_a_library = fixture("expected.json").canonicalize().unwrap();
+        match ensure_runtime(&not_a_library) {
+            Err(EmbeddingError::BackendUnavailable { reason }) => {
+                assert!(
+                    reason.contains(&not_a_library.display().to_string()),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        }
+    }
+
     /// One runtime per process: once one is loaded, asking for another file is an
     /// error that names both, and asking for the same one again is not.
     #[test]
@@ -1928,12 +2075,14 @@ mod tests {
             return;
         }
         open_fixture("dynamic.onnx", 32, &tuning(1, 1)).expect("loads the runtime");
-        let loaded = LOADED_RUNTIME
+        let loaded = match RUNTIME
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map(|runtime| runtime.path.clone())
-            .expect("a runtime is loaded");
+        {
+            Some(RuntimeSlot::Loaded(runtime)) => runtime.path.clone(),
+            _ => panic!("a runtime is loaded"),
+        };
         assert!(
             ensure_runtime(&loaded).is_ok(),
             "the same library is a no-op"

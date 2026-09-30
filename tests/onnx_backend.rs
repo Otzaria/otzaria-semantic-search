@@ -11,7 +11,7 @@
 //! named by `OTZARIA_ONNX_RUNTIME`. Without one they skip loudly, as the model-gated
 //! tests do; the refusals that happen before a runtime is touched run regardless.
 
-/// Where the target condition lives. All six must be the same expression: `mod.rs` and
+/// Where the target condition lives. All seven must be the same expression: `mod.rs` and
 /// the constructor pair name the module that exists only where `Cargo.toml` declares its
 /// crates, and a mismatch is a build break on exactly the targets nobody compiles
 /// locally — or a backend compiled where its crates are absent.
@@ -40,11 +40,13 @@ fn the_target_condition_is_spelled_identically_everywhere() {
     }
 
     let condition = manifest_condition("ort");
-    assert_eq!(
-        manifest_condition("tokenizers"),
-        condition,
-        "`ort` and `tokenizers` are declared for different targets in Cargo.toml"
-    );
+    for dependency in ["tokenizers", "libloading"] {
+        assert_eq!(
+            manifest_condition(dependency),
+            condition,
+            "`ort` and `{dependency}` are declared for different targets in Cargo.toml"
+        );
+    }
     assert!(
         condition.starts_with("any("),
         "the condition is expected to be a list of platforms: {condition}"
@@ -244,6 +246,72 @@ mod with_the_backend {
                 backend.id()
             ),
         }
+    }
+
+    /// Set by the parent test for its child: the runtime to load after the refused one.
+    const GOOD_RUNTIME_ENV: &str = "OTZARIA_TEST_GOOD_ONNX_RUNTIME";
+
+    /// A refused runtime must leave the process able to load a correct one afterwards.
+    ///
+    /// `ort` 2.0.0-rc.13 alone cannot: after one failed `init_from` its library slot reads
+    /// as loaded and empty, the next `init_from` "succeeds" without loading anything, and
+    /// the first call after that panics (`dlsym(0x0, OrtGetApiBase)`). The backend checks
+    /// a library itself before `ort` ever sees it. Only a process that has loaded nothing
+    /// can show the difference, so the check runs in a child of this test binary, alone.
+    #[test]
+    fn a_refused_runtime_leaves_the_process_able_to_load_a_correct_one() {
+        if !runtime_configured() {
+            return;
+        }
+        let good = std::env::var_os(RUNTIME_ENV).expect("checked above");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "with_the_backend::a_correct_runtime_loads_after_a_refused_one_in_a_fresh_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(RUNTIME_ENV, fixture("expected.json"))
+            .env(GOOD_RUNTIME_ENV, good)
+            .output()
+            .expect("the test binary can run itself");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child process failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The child half of `a_refused_runtime_leaves_the_process_able_to_load_a_correct_one`,
+    /// meaningless anywhere but in a process of its own.
+    #[test]
+    #[ignore = "run by a_refused_runtime_leaves_the_process_able_to_load_a_correct_one"]
+    fn a_correct_runtime_loads_after_a_refused_one_in_a_fresh_process() {
+        let Some(good) = std::env::var_os(GOOD_RUNTIME_ENV) else {
+            println!("SKIPPED: only meaningful as the child of the test that spawns it");
+            return;
+        };
+        let dir = TempDir::new("retry");
+        let model = package(&dir, "dynamic.onnx");
+
+        // First the environment names a file that is not a runtime.
+        match select_backend(&config_for(model.clone())) {
+            Err(EmbeddingError::BackendUnavailable { reason }) => {
+                assert!(reason.contains("expected.json"), "{reason}");
+            }
+            Err(other) => panic!("expected BackendUnavailable, got {other}"),
+            Ok(backend) => panic!("loaded '{}' from a JSON file", backend.id()),
+        }
+
+        // Then a real one, in the same process. A test alone in its process may write
+        // the environment.
+        std::env::set_var(RUNTIME_ENV, good);
+        let backend = select_backend(&config_for(model))
+            .expect("a correct runtime loads after a refused one");
+        let vectors = backend.embed_batch_raw(&["the fox"]).unwrap();
+        assert_eq!(vectors[0].len(), 4);
     }
 
     /// End to end through `EmbeddingRuntime::load`, which validates and checksums the
