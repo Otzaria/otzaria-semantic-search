@@ -146,7 +146,7 @@ deliberately — do not relax the assertion.
 | `onnx_package_checksum.py` | The ONNX package checksum (`otzaria-onnx-package-v1`), computed independently of the crate. Standard library only. CI runs it on the real package. |
 | `test_onnx_package_checksum.py` | Reproduces the crate's golden digest from the same bytes, and pins which files are in a package and which references are refused. CI runs it. |
 | `onnx_golden_cases.json` | The ONNX goldens' inputs. Most take their text from `golden_corpus.json` by id. Plain data. |
-| `generate_onnx_golden_vectors.py` | The Python reference for the ONNX backend. Writes `tests/data/onnx_golden_vectors.json`. |
+| `generate_onnx_golden_vectors.py` | The Python reference for the ONNX backend. Writes one golden file per graph: `tests/data/onnx_golden_vectors_int8.json` for the int8 graph (the default identity) and `tests/data/onnx_golden_vectors.json` for the fp32 graph (its reference). |
 | `make_onnx_fixture.py` | Writes the tiny ONNX packages in `tests/data/onnx_fixture/` that the ordinary ONNX tests run — five graphs of about 8 KB, a BERT-style and a production-shaped (Unigram) tokenizer, and `expected.json`, the Python references' ids and vectors. Byte-stable for the package versions in its docstring (`onnx`, `tokenizers`, `onnxruntime`, `numpy`); `--check` compares with the committed files and writes nothing. |
 
 ### The package checksum
@@ -172,16 +172,19 @@ model it saved with external data.
 ### The model
 
 ```
+seforim-embed-round2-int8.onnx    42,489,219 bytes  sha256 659226865abd3a1bc833565ae6b2e2f48abdd7136285824a12966d4d3294cbf8
 seforim-embed-round2-fp32.onnx   168,177,986 bytes  sha256 1fc2aa8f9e1a85a38c8667b4901205d2cc1f17d1e2e5acc8c676514b2d687948
 tokenizer.json                     2,191,362 bytes  sha256 0664287976ecb078bdfd8f5e5515dc87d8cb7f985a79a481aa1cdf7a7321c0e9
 ```
 
 From `ArieLLL123/judaic-semantic-round2-onnx-zayit` at
-`1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca` on HuggingFace, gated behind a manual approval
-(the project's private mirror, which CI uses, is `otzaria/judaic-semantic-round2-onnx-zayit`).
-Keep the two files together in one directory — the tokenizer is found beside the graph —
-anywhere outside the repository, and pass the graph as `--model` or through
-`OTZARIA_TEST_ONNX_MODEL`. Licence and attribution:
+`1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca` on HuggingFace, gated behind a manual approval;
+the project's private mirror, which CI uses, is `otzaria/judaic-semantic-round2-onnx-zayit`
+(99b8a61, the same bytes in all eight files). The int8 graph is the default identity and the
+fp32 graph the reference it was quantized from: two models, each with its own golden file.
+Keep a graph and the tokenizer together in one directory — the tokenizer is found beside
+the graph — anywhere outside the repository, and pass the graph as `--model` or through
+`OTZARIA_TEST_ONNX_MODEL`; the Rust gate picks the golden file by the graph's SHA-256. Licence and attribution:
 [`config/models/meivin-round2-onnx/README.md`](../config/models/meivin-round2-onnx/README.md).
 
 ### Python environment
@@ -209,19 +212,22 @@ gate would see a difference.
 ### Regenerating the goldens
 
 ```sh
-"$SCRATCH/venv-onnx/bin/python" tools/generate_onnx_golden_vectors.py \
-  --model /path/to/seforim-embed-round2-fp32.onnx --date "$(date +%F)"
-"$SCRATCH/venv-onnx/bin/python" tools/generate_onnx_golden_vectors.py \
-  --model /path/to/seforim-embed-round2-fp32.onnx --check
+for graph in int8 fp32; do
+  "$SCRATCH/venv-onnx/bin/python" tools/generate_onnx_golden_vectors.py \
+    --model /path/to/seforim-embed-round2-$graph.onnx --date "$(date +%F)"
+  "$SCRATCH/venv-onnx/bin/python" tools/generate_onnx_golden_vectors.py \
+    --model /path/to/seforim-embed-round2-$graph.onnx --check
+done
 ```
 
 | Flag | Effect |
 |---|---|
-| `--model PATH` | The fp32 graph; defaults to `$OTZARIA_TEST_ONNX_MODEL`. Any other file name is refused: the int8 graph beside it is a different model. |
+| `--model PATH` | One of the package's graphs; defaults to `$OTZARIA_TEST_ONNX_MODEL`. Its file name picks its golden file (`GRAPHS` in the script); any other file name is refused, since each graph is its own model. |
+| `--out PATH` | The golden file; defaults to the graph's own. |
 | `--date YYYY-MM-DD` | `header.generated_date`, exactly as for the GGUF goldens: `--check` inherits it from the file. |
 | `--check` | Recompute and compare byte for byte. Writes nothing. |
 | `--regenerate` | Required to overwrite goldens whose `graph_sha256` or `tokenizer_sha256` is not the files'. The interlock is the GGUF generator's, and so are its reasons. |
-| `--diagnostics` | Also measure what can move a vector: repeat runs, fresh sessions, thread counts, optimization levels, KleidiAI, the int8 graph. |
+| `--diagnostics` | Also measure what can move a vector: repeat runs, fresh sessions, thread counts, optimization levels, KleidiAI, the other graph. |
 | `--boundary-prefix ID ROLE N` | Print the `prefix_chars` at which a corpus text's input is exactly N ids. How the boundary cases are calibrated. |
 | `--threads N`, `--optimization LEVEL` | The session's intra-op threads (default 4) and graph optimization level. Keep `ORT_ENABLE_ALL`: it is the backend's. |
 
@@ -232,12 +238,22 @@ graph's first output stored raw. The same inputs on the same machine produce a
 byte-identical file.
 
 Measured with `--diagnostics` on 2026-09-30 (Apple M4, onnxruntime 1.28.0, all 41 cases):
-repeat runs, fresh sessions and 1, 2, 4 or 8 threads are bit-identical;
-`ORT_ENABLE_EXTENDED` equals `ORT_ENABLE_ALL` bit for bit, while `ORT_DISABLE_ALL` and
-`ORT_ENABLE_BASIC` move components by up to 2.1e-7 and KleidiAI off by 2.7e-7 (cosine 1
-to twelve places); the int8 graph agrees at cosine 0.99911 at worst. Against these goldens
-the Rust gate (`onnx_backend::golden`) matched every id and reached cosine 1.0000000000 on
-every case, with Microsoft's 1.28.0 build on the same machine.
+
+| | fp32 graph | int8 graph |
+|---|---|---|
+| repeat runs, fresh sessions, 1/2/4/8 threads | bit-identical | bit-identical |
+| `ORT_ENABLE_EXTENDED` against `ORT_ENABLE_ALL` | bit-identical | bit-identical |
+| `ORT_DISABLE_ALL`, `ORT_ENABLE_BASIC` | max \|Δ\| 2.1e-7 | max \|Δ\| 1.06e-2, cosine 0.99908 |
+| KleidiAI off | max \|Δ\| 2.7e-7 | max \|Δ\| 1.07e-2, cosine 0.99896 |
+| the other graph | cosine 0.99911 at worst | the same |
+
+So the fp32 graph's vectors are a function of its inputs to within a few 1e-7 on any
+kernel, while the int8 graph's depend on which int8 kernels run: two correct CPUs can part
+at cosine ~0.999, the order at which int8 and fp32 themselves part. The Rust gate
+(`onnx_backend::golden`) holds fp32 to cosine 0.99999 everywhere and int8 to 0.99999 on
+the goldens' machine class, 0.995 elsewhere; it chooses the golden file by the graph's
+hash. Against both files the gate matched every id and reproduced all 41 vectors bit for
+bit, with Microsoft's 1.28.0 build on the same machine.
 
 ### Extending the cases
 

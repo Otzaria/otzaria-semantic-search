@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Regenerate tests/data/onnx_golden_vectors.json from the real ONNX model package.
+"""Regenerate the ONNX golden vectors from the real ONNX model package.
 
 The Python reference for the ONNX backend's parity gate (`semantic::onnx_backend::golden`
 in src/semantic/onnx_backend.rs). It runs the model's own `tokenizer.json` through the
-`tokenizers` package and the fp32 graph through `onnxruntime`: the same tokenizer core
-(0.23.2) and the same ONNX Runtime release (1.28.0) the backend is pinned to, reached
-through their Python bindings instead of through this crate. What the backend has to
-reproduce is therefore the model's own wiring, not a second copy of ours.
+`tokenizers` package and one of the package's two graphs through `onnxruntime`: the same
+tokenizer core (0.23.2) and the same ONNX Runtime release (1.28.0) the backend is pinned
+to, reached through their Python bindings instead of through this crate. What the backend
+has to reproduce is therefore the model's own wiring, not a second copy of ours.
+
+Each graph has its own golden file (GRAPHS below): the int8 graph, which is the default
+identity (config/models/meivin-round2-onnx/), into tests/data/onnx_golden_vectors_int8.json,
+and the fp32 graph it was quantized from (config/models/meivin-round2-onnx-fp32/) into
+tests/data/onnx_golden_vectors.json. They are different models -- their vectors agree at
+cosine 0.999, not 1 -- so neither file may describe the other's graph.
 
 Read tools/README.md before running.
 
@@ -60,7 +66,6 @@ from typing import Any
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CASES = os.path.join(REPO_ROOT, "tools", "onnx_golden_cases.json")
 DEFAULT_CORPUS = os.path.join(REPO_ROOT, "tools", "golden_corpus.json")
-DEFAULT_OUT = os.path.join(REPO_ROOT, "tests", "data", "onnx_golden_vectors.json")
 
 MODEL_ENV = "OTZARIA_TEST_ONNX_MODEL"
 RUNTIME_ENV = "OTZARIA_ONNX_RUNTIME"
@@ -69,8 +74,22 @@ RUNTIME_ENV = "OTZARIA_ONNX_RUNTIME"
 # bytes wherever they come from, which graph_sha256 / tokenizer_sha256 establish.
 MODEL_REPO = "ArieLLL123/judaic-semantic-round2-onnx-zayit"
 MODEL_REVISION = "1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca"
-GRAPH_FILE = "seforim-embed-round2-fp32.onnx"
 TOKENIZER_FILE = "tokenizer.json"
+
+# Each graph the goldens know, and the golden file it is checked against. The Rust gate
+# picks the file by the graph's SHA-256, so a graph appears here or it has no gate.
+GRAPHS = OrderedDict(
+    [
+        (
+            "seforim-embed-round2-int8.onnx",
+            os.path.join(REPO_ROOT, "tests", "data", "onnx_golden_vectors_int8.json"),
+        ),
+        (
+            "seforim-embed-round2-fp32.onnx",
+            os.path.join(REPO_ROOT, "tests", "data", "onnx_golden_vectors.json"),
+        ),
+    ]
+)
 
 # The backend's pins (Cargo.toml: tokenizers =0.23.2, and the reference ONNX Runtime).
 # A reference on other versions is a different reference, so they are checked, not
@@ -540,12 +559,15 @@ def run_diagnostics(ref: Reference, records: list[OrderedDict]) -> None:
     batch = ref.inputs["input_ids"].shape[0]
     print(f"declared input shape: {ref.inputs['input_ids'].shape} (batch {batch!r})", file=sys.stderr)
 
-    int8 = os.path.join(os.path.dirname(ref.session._model_path), "seforim-embed-round2-int8.onnx")
-    if os.path.exists(int8):
+    here = os.path.basename(ref.session._model_path)
+    for other in GRAPHS:
+        path = os.path.join(os.path.dirname(ref.session._model_path), other)
+        if other == here or not os.path.exists(path):
+            continue
         options = ref.ort.SessionOptions()
         options.intra_op_num_threads = ref.threads
-        session = ref.ort.InferenceSession(int8, sess_options=options, providers=["CPUExecutionProvider"])
-        spread("the int8 graph (not the goldens' model)", lambda r, s=session: ref.run(r["token_ids"], s))
+        session = ref.ort.InferenceSession(path, sess_options=options, providers=["CPUExecutionProvider"])
+        spread(f"{other} (not the goldens' model)", lambda r, s=session: ref.run(r["token_ids"], s))
 
     norms = [l2_norm(f32_unb64(r["vector_f32_le_base64"])) for r in records]
     print(f"vector L2 norms: min {min(norms):.9f} max {max(norms):.9f}", file=sys.stderr)
@@ -632,12 +654,17 @@ def main() -> int:
     ap.add_argument(
         "--model",
         default=os.environ.get(MODEL_ENV),
-        help=f"The fp32 graph ({GRAPH_FILE}), with tokenizer.json beside it. Defaults to "
-        f"${MODEL_ENV}.",
+        help=f"One of the package's graphs ({', '.join(GRAPHS)}), with tokenizer.json beside "
+        f"it. Defaults to ${MODEL_ENV}.",
     )
     ap.add_argument("--cases", default=DEFAULT_CASES)
     ap.add_argument("--corpus", default=DEFAULT_CORPUS)
-    ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="The golden file. Defaults to the one GRAPHS assigns the graph: each graph has "
+        "its own.",
+    )
     ap.add_argument(
         "--date",
         default=None,
@@ -669,16 +696,19 @@ def main() -> int:
 
     if not args.model:
         raise SystemExit(
-            f"No model: pass --model or set {MODEL_ENV} to the fp32 graph ({GRAPH_FILE}). "
-            "It is gated and never committed; see tools/README.md."
+            f"No model: pass --model or set {MODEL_ENV} to one of the package's graphs "
+            f"({', '.join(GRAPHS)}). They are gated and never committed; see tools/README.md."
         )
     if not os.path.isfile(args.model):
         raise SystemExit(f"Model not found: {args.model}")
-    if os.path.basename(args.model) != GRAPH_FILE:
+    graph_name = os.path.basename(args.model)
+    if graph_name not in GRAPHS:
         raise SystemExit(
-            f"{args.model} is not {GRAPH_FILE}. The goldens and model.json describe the fp32 "
-            "graph; the int8 graph is a different model."
+            f"{args.model} is none of the graphs the goldens know ({', '.join(GRAPHS)}). "
+            "Each graph is its own model, with its own golden file; add it to GRAPHS first."
         )
+    if args.out is None:
+        args.out = GRAPHS[graph_name]
 
     with open(args.corpus, encoding="utf-8") as fh:
         corpus = json.load(fh)

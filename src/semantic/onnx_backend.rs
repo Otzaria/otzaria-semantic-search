@@ -2345,19 +2345,23 @@ mod tests {
 }
 
 /// Verification against the real model's golden vectors. **This is the parity gate** for
-/// the production graph, not a placeholder for one.
+/// the production graphs, not a placeholder for one.
 ///
-/// The goldens (`tests/data/onnx_golden_vectors.json`, written by
-/// `tools/generate_onnx_golden_vectors.py`) are the Python reference's answers: the ids
-/// from the `tokenizers` package and the vector from the `onnxruntime` package, for
-/// inputs spelled exactly as the tokenizer receives them, role prefix included. They need
-/// the gated 168 MB fp32 graph, so each test is `#[ignore]`d *and* skips loudly when
-/// `OTZARIA_TEST_ONNX_MODEL` is unset — which keeps the ordinary matrix green on
-/// machines with no model. Run them with:
+/// The goldens (written by `tools/generate_onnx_golden_vectors.py`) are the Python
+/// reference's answers: the ids from the `tokenizers` package and the vector from the
+/// `onnxruntime` package, for inputs spelled exactly as the tokenizer receives them, role
+/// prefix included. There is one golden file per graph of the package — `GOLDEN_FILES` —
+/// and the test takes the one whose `graph_sha256` is the graph's, so
+/// `OTZARIA_TEST_ONNX_MODEL` may name either: the int8 graph, the default identity, or the
+/// fp32 graph it was quantized from. A graph none of them describes fails, loudly.
+///
+/// The graphs are gated and never committed, so each test is `#[ignore]`d *and* skips
+/// loudly when `OTZARIA_TEST_ONNX_MODEL` is unset — which keeps the ordinary matrix green
+/// on machines with no model. Run them with:
 ///
 /// ```sh
 /// OTZARIA_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
-/// OTZARIA_TEST_ONNX_MODEL=/path/to/seforim-embed-round2-fp32.onnx \
+/// OTZARIA_TEST_ONNX_MODEL=/path/to/seforim-embed-round2-int8.onnx \
 ///   cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
 /// ```
 ///
@@ -2367,21 +2371,147 @@ mod golden {
     use super::*;
     use crate::semantic::model_package::onnx_tokenizer_path;
 
-    /// Names the fp32 graph, `seforim-embed-round2-fp32.onnx`.
+    /// Names either graph of the package: `seforim-embed-round2-int8.onnx` or
+    /// `seforim-embed-round2-fp32.onnx`.
     const MODEL_ENV: &str = "OTZARIA_TEST_ONNX_MODEL";
 
+    /// How a graph computes, which is what decides how far a vector may drift between two
+    /// correct machines.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Arithmetic {
+        Fp32,
+        /// Dynamic INT8 quantization (`DynamicQuantizeLinear`, `MatMulInteger`).
+        DynamicInt8,
+    }
+
+    /// Every golden file under `tests/data/`, and the arithmetic of the graph it describes.
+    /// A graph is found in them by its SHA-256, never by its name.
+    const GOLDEN_FILES: [(&str, Arithmetic); 2] = [
+        ("onnx_golden_vectors_int8.json", Arithmetic::DynamicInt8),
+        ("onnx_golden_vectors.json", Arithmetic::Fp32),
+    ];
+
     /// The agreement required between this backend and the Python reference, per case,
-    /// once the token ids have been proven **exactly** equal.
+    /// once the token ids have been proven **exactly** equal — for fp32 anywhere, and for
+    /// int8 on the kind of machine the goldens were produced on.
     ///
-    /// Not 1.0, because the two sides need not run the same ONNX Runtime build or even the
-    /// same instruction set: kernel choice alone (KleidiAI on or off, fused or unfused
-    /// operators) measured maxabs 2.9e-6 on identical inputs, a cosine deficit around
-    /// 1e-11. 0.99999 leaves that noise six orders of magnitude of room and still fails
-    /// every wiring error the ids cannot see — an `attention_mask` or `token_type_ids`
-    /// fed wrong, the wrong output taken, a half-precision execution provider, or the
-    /// int8 graph standing in for the fp32 one (0.9986 on the author's own parity check).
-    /// Truncation and prefix errors never reach this check: they change the ids.
+    /// fp32 is not held to 1.0 because the two sides need not run the same ONNX Runtime
+    /// build or even the same instruction set: kernel choice alone (KleidiAI on or off,
+    /// fused or unfused operators) measured maxabs 2.9e-6 on identical inputs, a cosine
+    /// deficit around 1e-11. 0.99999 leaves that noise six orders of magnitude of room and
+    /// still fails every wiring error the ids cannot see — an `attention_mask` or
+    /// `token_type_ids` fed wrong, the wrong output taken, a half-precision execution
+    /// provider. Truncation and prefix errors never reach this check: they change the ids.
+    ///
+    /// int8 on the goldens' own machine class runs the same int8 kernels as the reference,
+    /// through the same ONNX Runtime release, and measured bit-identical — 41 of 41 — so
+    /// the same bound applies there too.
     const MIN_COSINE: f64 = 0.999_99;
+
+    /// The bound for int8 on another CPU family than the goldens'. Its vectors are not
+    /// reproducible across int8 kernels: on the reference machine itself, turning KleidiAI
+    /// off moved components by 1.07e-2 (cosine 0.99896) and an unfused graph by 1.06e-2
+    /// (0.99908), and x86 runs MLAS's own int8 kernels. Two correct int8 approximations,
+    /// each within cosine 0.99911 of the fp32 graph on these cases, can lie up to twice
+    /// that angle apart — cosine 0.9964 — so the bound sits below that, at 0.995, and still
+    /// far above what a wiring error produces (a wrong output or mask gives a vector that
+    /// is not this text's at all). A different graph cannot slip through it: the golden
+    /// file is chosen by the graph's SHA-256.
+    const MIN_COSINE_INT8_ACROSS_MACHINES: f64 = 0.995;
+
+    /// One golden file, as chosen for a graph.
+    struct Goldens {
+        file: &'static str,
+        arithmetic: Arithmetic,
+        data: serde_json::Value,
+    }
+
+    impl Goldens {
+        fn header(&self) -> &serde_json::Value {
+            &self.data["header"]
+        }
+
+        /// The cosine every vector must reach here, and why.
+        fn min_cosine(&self) -> (f64, &'static str) {
+            match (self.arithmetic, same_machine_as(self.header())) {
+                (Arithmetic::Fp32, _) => (MIN_COSINE, "fp32: kernels move a component ~1e-6"),
+                (Arithmetic::DynamicInt8, true) => (
+                    MIN_COSINE,
+                    "int8 on the goldens' machine class: the same int8 kernels",
+                ),
+                (Arithmetic::DynamicInt8, false) => (
+                    MIN_COSINE_INT8_ACROSS_MACHINES,
+                    "int8 on another CPU family: other int8 kernels",
+                ),
+            }
+        }
+    }
+
+    /// Whether this process runs on the kind of machine the goldens were produced on: int8
+    /// kernels are chosen per CPU family.
+    fn same_machine_as(header: &serde_json::Value) -> bool {
+        header["reference"]["machine"]
+            .as_str()
+            .and_then(rust_platform_of)
+            == Some((std::env::consts::OS, std::env::consts::ARCH))
+    }
+
+    /// The generator's `f"{platform.system()} {platform.machine()}"` as Rust spells the
+    /// same platform (`std::env::consts::{OS, ARCH}`), or `None` for one it does not know.
+    fn rust_platform_of(machine: &str) -> Option<(&'static str, &'static str)> {
+        let mut parts = machine.split_whitespace();
+        let os = match parts.next()? {
+            "Darwin" => "macos",
+            "Linux" => "linux",
+            "Windows" => "windows",
+            _ => return None,
+        };
+        let arch = match parts.next()? {
+            "arm64" | "aarch64" => "aarch64",
+            "x86_64" | "AMD64" => "x86_64",
+            _ => return None,
+        };
+        parts.next().is_none().then_some((os, arch))
+    }
+
+    /// Selection by hash has a failure mode of its own: a graph none of the files knows is
+    /// a failure naming the graphs they do know — never a skip, and never another graph's
+    /// goldens. Runs without a model: the fixture graph is known to no golden file.
+    #[test]
+    #[should_panic(expected = "is a graph no golden file describes")]
+    fn a_graph_no_golden_file_describes_fails_loudly() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/onnx_fixture/dynamic.onnx");
+        let _ = goldens_for(&fixture);
+    }
+
+    /// The machine the tolerance depends on is read the way the generator writes it.
+    #[test]
+    fn the_goldens_machine_is_read_as_the_generator_writes_it() {
+        assert_eq!(rust_platform_of("Darwin arm64"), Some(("macos", "aarch64")));
+        assert_eq!(rust_platform_of("Linux x86_64"), Some(("linux", "x86_64")));
+        assert_eq!(
+            rust_platform_of("Linux aarch64"),
+            Some(("linux", "aarch64"))
+        );
+        assert_eq!(
+            rust_platform_of("Windows AMD64"),
+            Some(("windows", "x86_64"))
+        );
+        for unknown in ["", "Darwin", "FreeBSD amd64", "Darwin arm64 extra"] {
+            assert_eq!(rust_platform_of(unknown), None, "{unknown:?}");
+        }
+        // Both committed golden files record a machine this mapping knows.
+        for (file, _) in GOLDEN_FILES {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data")
+                .join(file);
+            let data: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let machine = data["header"]["reference"]["machine"].as_str().unwrap();
+            assert!(rust_platform_of(machine).is_some(), "{file}: {machine}");
+        }
+    }
 
     /// The graph, or `None` with a loud explanation. Skipping rather than failing because
     /// CI has no model, and a test that fails there teaches everyone to ignore it.
@@ -2390,9 +2520,9 @@ mod golden {
             Ok(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
             _ => {
                 println!(
-                    "SKIPPED: {MODEL_ENV} is not set. This test needs the 168 MB \
-                     seforim-embed-round2-fp32.onnx (with tokenizer.json beside it), which is \
-                     gated and never committed."
+                    "SKIPPED: {MODEL_ENV} is not set. This test needs one of the model's graphs \
+                     — seforim-embed-round2-int8.onnx (42 MB) or -fp32.onnx (168 MB) — with \
+                     tokenizer.json beside it; they are gated and never committed."
                 );
                 return None;
             }
@@ -2413,18 +2543,47 @@ mod golden {
         }
     }
 
-    /// Missing goldens with a model present fail rather than skip: asking for this gate
-    /// and getting a green tick without one would be the worst outcome.
-    fn goldens() -> serde_json::Value {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/onnx_golden_vectors.json");
-        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "cannot read {}: {e}. Generate it with tools/generate_onnx_golden_vectors.py",
-                path.display()
-            )
-        });
-        serde_json::from_str(&raw).expect("onnx_golden_vectors.json is not valid JSON")
+    /// The golden file that describes `graph`, chosen by the graph's SHA-256.
+    ///
+    /// Fails rather than skips, for a missing golden file and for a graph no golden file
+    /// describes alike: asking for this gate and getting a green tick without one would be
+    /// the worst outcome.
+    fn goldens_for(graph: &Path) -> Goldens {
+        let graph_sha = sha256_of(graph);
+        let mut known = Vec::new();
+        for (file, arithmetic) in GOLDEN_FILES {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data")
+                .join(file);
+            let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "cannot read {}: {e}. Generate it with tools/generate_onnx_golden_vectors.py",
+                    path.display()
+                )
+            });
+            let data: serde_json::Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{file} is not valid JSON: {e}"));
+            let header = &data["header"];
+            let described = header["graph_sha256"].as_str().unwrap_or_default();
+            if described == graph_sha {
+                return Goldens {
+                    file,
+                    arithmetic,
+                    data,
+                };
+            }
+            known.push(format!(
+                "{file}: {} {described}",
+                header["graph_file"].as_str().unwrap_or("?")
+            ));
+        }
+        panic!(
+            "{} (SHA-256 {graph_sha}) is a graph no golden file describes, so there is nothing \
+             to check it against. The goldens know:\n  {}\nPoint {MODEL_ENV} at one of those, \
+             or generate goldens for this graph with tools/generate_onnx_golden_vectors.py",
+            graph.display(),
+            known.join("\n  ")
+        )
     }
 
     fn sha256_of(path: &Path) -> String {
@@ -2448,18 +2607,10 @@ mod golden {
             .collect()
     }
 
-    /// Confirm the files behind `OTZARIA_TEST_ONNX_MODEL` are the ones the goldens were
-    /// produced from, since the alternative is a wall of vector failures for a model that
-    /// was simply the wrong one — the int8 graph beside the fp32 one, for instance.
+    /// Confirm the rest of the package behind `OTZARIA_TEST_ONNX_MODEL` is the one the
+    /// goldens were produced from — the graph already chose them by its hash — since the
+    /// alternative is a wall of id failures for a tokenizer that was simply another one.
     fn assert_is_the_golden_package(graph: &Path, header: &serde_json::Value) {
-        let graph_sha = sha256_of(graph);
-        assert_eq!(
-            graph_sha,
-            header["graph_sha256"].as_str().expect("graph_sha256"),
-            "{} is not the graph the goldens were produced from ({})",
-            graph.display(),
-            header["graph_file"]
-        );
         let tokenizer = onnx_tokenizer_path(graph);
         assert_eq!(
             sha256_of(&tokenizer),
@@ -2560,12 +2711,13 @@ mod golden {
     /// special-token matching are all decided before the graph runs, and none of them is
     /// reliably visible in a cosine.
     #[test]
-    #[ignore = "needs the 168 MB fp32 graph; set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    #[ignore = "needs a Meivin graph (int8 or fp32); set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
     fn token_ids_match_the_reference_exactly_and_vectors_agree() {
         let Some(graph) = model_path() else { return };
-        let data = goldens();
-        let header = &data["header"];
+        let goldens = goldens_for(&graph);
+        let (data, header) = (&goldens.data, goldens.header());
         assert_is_the_golden_package(&graph, header);
+        let (min_cosine, why) = goldens.min_cosine();
 
         let max_tokens = header["max_tokens"].as_u64().expect("max_tokens") as usize;
         let dim = header["dim"].as_u64().expect("dim") as usize;
@@ -2574,9 +2726,15 @@ mod golden {
         assert_eq!(backend.max_tokens(), max_tokens);
         println!("\n{backend:?}");
         println!(
-            "reference: onnxruntime {}, tokenizers {}",
-            header["onnxruntime_version"], header["tokenizers_version"]
+            "goldens: {} ({:?}, from {} on {}); reference: onnxruntime {}, tokenizers {}",
+            goldens.file,
+            goldens.arithmetic,
+            header["graph_file"],
+            header["reference"]["machine"],
+            header["onnxruntime_version"],
+            header["tokenizers_version"]
         );
+        println!("required cosine >= {min_cosine} ({why})");
 
         let cases = data["cases"].as_array().expect("cases");
         assert!(!cases.is_empty(), "the goldens hold no cases");
@@ -2657,15 +2815,15 @@ mod golden {
             id_mismatches.join("\n  ")
         );
         println!(
-            "worst cosine {:.10} ({}), required >= {MIN_COSINE}; {identical} of {} vectors \
+            "worst cosine {:.10} ({}), required >= {min_cosine}; {identical} of {} vectors \
              bit-identical to the reference",
             worst.0,
             worst.1,
             cases.len()
         );
         assert!(
-            worst.0 >= MIN_COSINE,
-            "worst cosine {:.10} on {} is below {MIN_COSINE}",
+            worst.0 >= min_cosine,
+            "worst cosine {:.10} on {} is below {min_cosine} ({why})",
             worst.0,
             worst.1
         );
@@ -2675,10 +2833,10 @@ mod golden {
     /// for bit, and in input order — `EmbeddingRuntime` pairs vectors with chunks by
     /// position and could not see a transposition.
     #[test]
-    #[ignore = "needs the 168 MB fp32 graph; set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    #[ignore = "needs a Meivin graph (int8 or fp32); set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
     fn batched_vectors_equal_single_ones_in_input_order() {
         let Some(graph) = model_path() else { return };
-        let data = goldens();
+        let data = goldens_for(&graph).data;
         let max_tokens = data["header"]["max_tokens"].as_u64().expect("max_tokens") as usize;
         let owned = inputs(&data);
         let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -2696,10 +2854,10 @@ mod golden {
     /// sessions — the shape `hybrid::coordinator` produces — agreeing with the serial
     /// answer bit for bit. Timings are printed, never asserted.
     #[test]
-    #[ignore = "needs the 168 MB fp32 graph; set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    #[ignore = "needs a Meivin graph (int8 or fp32); set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
     fn concurrent_callers_through_a_shared_reference_agree_with_serial_ones() {
         let Some(graph) = model_path() else { return };
-        let data = goldens();
+        let data = goldens_for(&graph).data;
         let max_tokens = data["header"]["max_tokens"].as_u64().expect("max_tokens") as usize;
         let owned = inputs(&data);
         let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
