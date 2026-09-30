@@ -33,15 +33,17 @@ mock-embedding = []
 llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 
 # Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer. Non-default
-# for the reason `llama-backend` is: it links a large native runtime into every
-# downstream build.
-#
-# Empty for now: the ONNX Runtime and tokenizer dependencies arrive with the backend
-# implementation, and until then `OnnxBackend::open` refuses every model with
-# `BackendUnavailable`. Which backend serves a model is decided by the model file's
+# for the reason `llama-backend` is: it puts a large native runtime behind every
+# downstream build. Which backend serves a model is decided by the model file's
 # format — `.onnx` is ONNX, every other path GGUF — not by which features are on; see
 # `semantic::backend`.
-onnx-backend = []
+#
+# Nothing is linked: ONNX Runtime is a shared library loaded when the first ONNX model
+# is (see the `ort` declaration below), so this feature adds no build-time download and
+# no native code to the binary. Its crates are declared for desktop targets only; on
+# every other target the feature is on with no backend behind it, as `llama-backend`
+# is on 32-bit ARM.
+onnx-backend = ["dep:ort", "dep:tokenizers"]
 
 # CUDA offload, for the build machine that produces the library's vectors — never
 # for the application, which ships no CUDA runtime.
@@ -124,4 +126,67 @@ optional = true
 [target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-sys-2]
 version = "=0.1.153"
 default-features = false
+optional = true
+
+# Optional, behind `onnx-backend`. See `src/semantic/onnx_backend.rs` and
+# `docs/ONNX_BACKEND.md`.
+#
+# Pinned exactly, for two reasons — read them before bumping:
+#
+# 1. The API is still moving between release candidates: rc.10 made `Session::run`
+#    take `&mut self` (why the backend keeps a pool of sessions), rc.12 introduced the
+#    `api-*` features and rc.13 gated execution providers at compile time. A
+#    resolver-chosen rc.14 is a different API.
+# 2. It is part of what produces the stored vectors — the session options it applies
+#    and the ONNX Runtime API level it requests — and the manifest records the backend
+#    as index identity, so the version cannot move implicitly.
+#
+# `default-features = false, features = ["std", "load-dynamic"]`: the runtime is a
+# shared library loaded at run time — from `OTZARIA_ONNX_RUNTIME`, else the platform's
+# file name beside the graph — and never linked. The default, `download-binaries`,
+# links pyke's static builds, and each of those disqualifies itself:
+#
+# * Windows x64: compiled with `/arch:AVX2` into `search_engine.dll`, where AVX2 code
+#   can run at DLL load, so a pre-Haswell CPU loses the whole application — lexical
+#   search included — rather than semantic search alone;
+# * Linux: they need glibc >= 2.38, newer than the CI container (bookworm, 2.36) and
+#   than Ubuntu 22.04, Debian 12 and RHEL 9;
+# * Apple: they raise the application's floor to macOS 13.4 / iOS 15.1 and link
+#   CoreML into it;
+# * the build: they are fetched from cdn.pyke.io while cargo runs, which this build
+#   network cannot reach.
+#
+# Loaded instead, a missing or unusable runtime is `BackendUnavailable` for semantic
+# search and nothing else. No `api-*` feature: the default API level, 17, is all the
+# backend uses, so any runtime from ONNX Runtime 1.17 on loads; the reference is
+# Microsoft's official 1.28.0 release, which dispatches CPU features at run time.
+#
+# Declared for desktop targets only — macOS, Linux (glibc) and Windows (MSVC), each on
+# aarch64 and x86_64 — the platforms Microsoft publishes that runtime for. iOS and
+# Android have no runtime to load in v1: an iOS app cannot load code it did not ship
+# signed, and shipping a runtime on either is future work. Elsewhere the feature is on
+# with no backend behind it and an ONNX model gets `BackendUnavailable`, as a GGUF
+# model does on 32-bit ARM. `semantic/mod.rs`, `semantic::backend` and
+# `tests/onnx_backend.rs` carry the same condition, and a test in the last holds all
+# the spellings together.
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.ort]
+version = "=2.0.0-rc.13"
+default-features = false
+features = ["std", "load-dynamic"]
+optional = true
+
+# Pinned exactly for the reason `ort` is, with the tokenizer's own twist: token ids are
+# the primary correctness gate — the goldens compare them exactly — and this crate is
+# what turns `tokenizer.json` into them.
+#
+# `default-features = false` drops `onig` (C, built through `cc`), `esaxx_fast` (C++)
+# and `progressbar`. Exactly one regex engine has to be enabled or the crate refuses to
+# compile, hence `fancy-regex`, which is pure Rust. A BERT normalizer and pre-tokenizer
+# use no regex at all, so for this model family the engine cannot change an id; the
+# token-id parity checks against the Python reference are what would say otherwise.
+# The same targets as `ort`, since nothing else uses it.
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.tokenizers]
+version = "=0.23.2"
+default-features = false
+features = ["fancy-regex"]
 optional = true

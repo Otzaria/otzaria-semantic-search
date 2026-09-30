@@ -381,7 +381,26 @@ fn llama_cpp_backend(_config: &EmbeddingConfig) -> Constructed {
 ///
 /// The package's tokenizer is `tokenizer.json` beside the graph — see
 /// [`onnx_tokenizer_path`](crate::semantic::model_package::onnx_tokenizer_path).
-#[cfg(all(feature = "onnx-backend", not(test)))]
+#[cfg(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    ),
+    not(test)
+))]
 fn onnx_backend(config: &EmbeddingConfig) -> Constructed {
     use crate::semantic::model_package::onnx_tokenizer_path;
     use crate::semantic::onnx_backend::{OnnxBackend, OnnxBackendConfig};
@@ -401,7 +420,26 @@ fn onnx_backend(config: &EmbeddingConfig) -> Constructed {
 }
 
 /// `None`, not `Some(Err(_))`: without the feature there is no such implementation.
-#[cfg(not(all(feature = "onnx-backend", not(test))))]
+#[cfg(not(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    ),
+    not(test)
+)))]
 fn onnx_backend(_config: &EmbeddingConfig) -> Constructed {
     None
 }

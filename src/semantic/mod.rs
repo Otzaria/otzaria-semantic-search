@@ -47,7 +47,29 @@ pub mod official_index;
 // `backend::onnx_backend` is gated on the same condition, so a target restriction
 // added here must be added there too. A plain comment for the reason given above
 // `llama_backend`.
-#[cfg(feature = "onnx-backend")]
+//
+// The target half is the desktop set a loadable ONNX Runtime exists for, and mirrors
+// the dependency declarations in `Cargo.toml`; `tests/onnx_backend.rs` fails if the
+// spellings drift apart.
+#[cfg(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+))]
 pub mod onnx_backend;
 pub mod recipe;
 pub mod store;
