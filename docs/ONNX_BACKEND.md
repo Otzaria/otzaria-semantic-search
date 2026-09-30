@@ -362,6 +362,14 @@ one at a time, and concurrent callers vs serial.
 default session options (`ORT_ENABLE_ALL`), fp32: ids identical, and every vector
 **bit-identical** (max |Δ| 0) — with the 1.28.0 wheel, and with 1.30.0 as well.
 
+**The golden gate** (`onnx_backend::golden`, against `tests/data/onnx_golden_vectors.json`
+from `onnx/golden` @ `7e49323` — Python `onnxruntime` 1.28.0 and `tokenizers` 0.23.2 on
+Darwin arm64, `ORT_ENABLE_ALL`, one text per run): 41 cases — 26 passages, 11 queries, 4
+raw, including niqqud, cantillation, bidi marks, literal specials and the 256/257-token
+boundaries — every input's bytes, every id and the package checksum equal, and **41 of 41
+vectors bit-identical** (cosine 1.0000000000, max |Δ| 0); batched equal to single, and
+four concurrent callers over two sessions equal to serial.
+
 **fp32 vs int8**, same 600 inputs: cosine min 0.999067, median 0.999473, max 0.999742 —
 in line with the author's own floor of 0.99863 (int8 against PyTorch, four samples), and a
 reason the two graphs are different identities (`model_quantization`).
@@ -374,7 +382,7 @@ reason the two graphs are different identities (`model_quantization`).
 |---|---|---|
 | `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, the stand-in's stub tokenizer | nothing |
 | `onnx_backend::tests` | the fixture against the Python references; truncation; order; batch = single; concurrency; threads and sessions change nothing; static batch; `token_type_ids` as zeros; rank-3, extra-input, over-cap and non-ONNX refusals; one runtime per process | `OTZARIA_ONNX_RUNTIME` |
-| `onnx_backend::golden` | the production graph against `tests/data/onnx_golden_vectors.json`: sha256 of graph and tokenizer, ids exactly, cosine ≥ 0.99999, batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
+| `onnx_backend::golden` | the production graph against `tests/data/onnx_golden_vectors.json`: sha256 of graph and tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine ≥ 0.99999 (and how many are bit-identical), batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
 | `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
 
 The tests that run a graph skip loudly without `OTZARIA_ONNX_RUNTIME`, as the model-gated
@@ -384,7 +392,7 @@ Runtime 1.28.0 for the runner** (`lib/libonnxruntime.so` from
 `onnxruntime-osx-arm64-1.28.0.tgz`, `lib/onnxruntime.dll` from
 `onnxruntime-win-x64-1.28.0.zip`).
 
-The golden tests, once the goldens exist:
+The golden tests:
 
 ```sh
 OTZARIA_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
@@ -411,9 +419,8 @@ references' ids for both and vectors for the first.
 
 ## 9. Open issues
 
-- **The golden run** waits for `tests/data/onnx_golden_vectors.json` (branch
-  `onnx/golden`). The measurements it would confirm are in §7.2: ids equal over 57,348
-  inputs, vectors bit-identical to Python over 600.
+- **The golden file lives on `onnx/golden`**; the gate passes against it (§7.2) and needs
+  that branch merged beside this one to run from the integration branch.
 - **The cap, 256 vs 128** (§5), for retrieval-quality measurement to settle.
 - **Linux and Windows** were checked to compile, not run; CI's runtime job is what runs
   them.

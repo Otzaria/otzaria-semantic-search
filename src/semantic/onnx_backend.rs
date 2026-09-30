@@ -2287,6 +2287,17 @@ mod golden {
             "{} is not the tokenizer the goldens were produced with",
             tokenizer.display()
         );
+        // And the package as the index identity names it (design D4): the same two files,
+        // through the validator `EmbeddingRuntime::load` runs.
+        if let Some(expected) = header["package_checksum"].as_str() {
+            let validated = crate::semantic::model_package::validate_model(graph)
+                .unwrap_or_else(|e| panic!("the golden package does not validate: {e}"));
+            assert_eq!(
+                validated.checksum(),
+                expected,
+                "the package checksum differs from the goldens' header"
+            );
+        }
     }
 
     /// Standard, padded base64. Hand-rolled to keep a decoder out of the dependency tree.
@@ -2389,9 +2400,10 @@ mod golden {
         assert!(!cases.is_empty(), "the goldens hold no cases");
         let mut id_mismatches = Vec::new();
         let mut worst = (1.0f64, String::new());
+        let mut identical = 0usize;
         println!(
-            "\n{:<36} {:<8} {:>5} {:>14}",
-            "case", "role", "ids", "cosine"
+            "\n{:<38} {:<8} {:>5} {:>14} {:>10}",
+            "case", "role", "ids", "cosine", "max|Δ|"
         );
         for case in cases {
             let name = case["name"].as_str().expect("name");
@@ -2409,6 +2421,19 @@ mod golden {
                 .iter()
                 .map(|id| id.as_u64().expect("an id") as u32)
                 .collect();
+
+            // Proves the exact bytes were read, invisible characters included.
+            if let Some(digest) = case["input_utf8_sha256"].as_str() {
+                use sha2::Digest;
+                let actual: String = sha2::Sha256::digest(input.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                assert_eq!(
+                    actual, digest,
+                    "{name}: the input read is not the golden input"
+                );
+            }
 
             let produced = backend.tokenize(input).expect("tokenize");
             if produced != golden_ids {
@@ -2429,7 +2454,16 @@ mod golden {
             let reference =
                 golden_vector(case["vector_f32_le_base64"].as_str().expect("vector"), dim);
             let cos = cosine(&vector, &reference);
-            println!("{name:<36} {role:<8} {:>5} {cos:>14.10}", produced.len());
+            let max_abs = vector
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            identical += usize::from(vector == reference);
+            println!(
+                "{name:<38} {role:<8} {:>5} {cos:>14.10} {max_abs:>10.3e}",
+                produced.len()
+            );
             if cos < worst.0 {
                 worst = (cos, name.to_string());
             }
@@ -2441,8 +2475,11 @@ mod golden {
             id_mismatches.join("\n  ")
         );
         println!(
-            "worst cosine {:.10} ({}), required >= {MIN_COSINE}",
-            worst.0, worst.1
+            "worst cosine {:.10} ({}), required >= {MIN_COSINE}; {identical} of {} vectors \
+             bit-identical to the reference",
+            worst.0,
+            worst.1,
+            cases.len()
         );
         assert!(
             worst.0 >= MIN_COSINE,
