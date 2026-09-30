@@ -448,8 +448,8 @@ jobs:
               exit 1
             fi
           }
-          check seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json
-          check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx/model.json
+          check seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json config/models/meivin-round2-onnx/model.json
+          check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx-fp32/model.json
 
       # `--ignored` is what selects them; the name selects the ONNX gate alone. The gate
       # picks each graph's goldens by its hash.

@@ -7,12 +7,14 @@ one pair, never a mix of two.
 | Directory | Model | Status |
 |---|---|---|
 | `config/` | `EMD123/Otzaria-Embedding-V1-Flash-0.6B`, GGUF `Q4_K_M`, llama.cpp, 1024 dimensions | **the frozen production identity** — what the library's vectors were built under |
-| `config/models/meivin-round2-onnx/` | Meivin Round 2, ONNX fp32 through ONNX Runtime, 256 dimensions | the identity of an artifact built with the ONNX model; see its README |
+| `config/models/meivin-round2-onnx/` | Meivin Round 2, the ONNX **int8** graph through ONNX Runtime, 256 dimensions | **the ONNX model's identity**: the graph an application ships and the library is built with; see its README for why int8 |
+| `config/models/meivin-round2-onnx-fp32/` | Meivin Round 2, the ONNX fp32 graph | the reference graph the int8 one was quantized from — a different model, for reference artifacts and parity checks only |
 
-The two differ in every field that describes the model, in `embedding_text_version` (1
-against 2, the role prefixes) and so in `chunking_identity`. Every one of those is an identity field an
-installation compares, so an artifact built under one pair can never pass for one built
-under the other.
+The production pair and the ONNX pairs differ in every field that describes the model, in
+`embedding_text_version` (1 against 2, the role prefixes) and so in `chunking_identity`.
+The two ONNX pairs differ from each other in `model_checksum` and `model_quantization`
+alone. Every one of those is an identity field an installation compares, so an artifact
+built under one pair can never pass for one built under another.
 
 ## Why they are files
 
