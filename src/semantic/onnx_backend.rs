@@ -88,12 +88,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Default intra-op threads per session: a cap, not a target — phones are big.LITTLE.
-/// Four is the llama backend's measured cap, taken over until this backend has its own
-/// measurement.
+///
+/// Four is where the returns stop on the production graph: a 256-token input took
+/// 27.9 ms at one thread, 20.1 at two, 16.4 at four and 16.2–16.6 at six to ten (Apple
+/// M4, four performance cores). The thread count measured bit-identical from one to
+/// eight, so it cannot change a stored vector.
 const DEFAULT_THREADS_CAP: usize = 4;
 
-/// Default number of sessions, i.e. concurrent `embed_batch_raw` calls: one, because
-/// the smallest target is a phone and every session holds its own activations.
+/// Default number of sessions, i.e. concurrent inferences: one, because the smallest
+/// target is a phone and each session holds its own copy of the weights — about 200 MiB
+/// more peak footprint for the fp32 production graph (387 → 589 MiB). One is not a
+/// cliff: runs are leased one text at a time, so a query waits for one inference
+/// behind an indexing batch (measured at most 14.7 ms), not for the batch.
 const DEFAULT_SESSIONS: usize = 1;
 
 /// Environment variable naming the ONNX Runtime shared library to load. Read by
