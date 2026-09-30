@@ -70,8 +70,8 @@ model data.
   a trailing space, as the model card and the author's parity checks do (the author's
   `manifest.json` records the bare tokens). For a text that begins with anything visible
   the two spellings give identical ids; for one that begins with whitespace, the spaced
-  form adds one `▁` id. Passages are trimmed by the chunker; queries are not — see
-  `tools/README.md`.
+  form adds one `▁` id. So neither side hands the model one: passages are trimmed by the
+  chunker, and text recipe 2 trims a query before prefixing it — see `tools/README.md`.
 
 ## Licence and attribution
 

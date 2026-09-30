@@ -80,7 +80,9 @@ pub enum EmbeddingTextRecipe {
     /// The prefix goes on **last**: after the neighbour context, the character cap and
     /// the text normalization. The passage is therefore version 1's text *exactly*, the
     /// cap is spent on content alone, and no normalization can alter the prefix. The
-    /// token cap is another matter — it counts the prefix, because the model does.
+    /// token cap is another matter — it counts the prefix, because the model does. A
+    /// query is trimmed before its prefix, as a line is before the chunker caps it
+    /// ([`Self::query_text`]).
     ///
     /// Without the prefix on either side a query lands elsewhere in the space than the
     /// passages it should find, and nothing about either vector says so. That is why the
@@ -114,11 +116,17 @@ impl EmbeddingTextRecipe {
     /// The text a query carries to the model, from the query as the text normalization
     /// left it. The identity for version 1. Call [`query_input`], which applies the
     /// normalization first, rather than this.
+    ///
+    /// Version 2 trims the query ([`str::trim`], Unicode whitespace) before the prefix,
+    /// as the chunker trims every stored line before its cap: whitespace at either end is
+    /// not content, and a Metaspace tokenizer — the production model's — would give a
+    /// space after `[QUERY] ` a `▁` token of its own. Version 1 is left byte for byte as
+    /// it was.
     pub fn query_text(self, normalized_query: &str) -> Cow<'_, str> {
         match self {
             Self::LineOrNeighbourContext => Cow::Borrowed(normalized_query),
             Self::RolePrefixedLineOrNeighbourContext => {
-                Cow::Owned(format!("{QUERY_PREFIX}{normalized_query}"))
+                Cow::Owned(format!("{QUERY_PREFIX}{}", normalized_query.trim()))
             }
         }
     }
@@ -415,6 +423,49 @@ mod tests {
         assert_eq!(query, format!("[QUERY] {line}"));
         assert_eq!(query.matches("[QUERY]").count(), 1);
         assert!(!query.contains("[PASSAGE]"));
+    }
+
+    /// Under version 2 a query loses its leading and trailing whitespace before the
+    /// prefix, as a stored line does before the chunker caps it. Kept, it reaches the
+    /// model: a Metaspace tokenizer turns a space after `[QUERY] ` — or a no-break space,
+    /// which NFKC makes one — into a lone `▁` token of its own, and a trailing one into
+    /// another. Version 1 keeps the query byte for byte, as it always has.
+    #[test]
+    fn version_two_trims_the_query_before_the_prefix_and_version_one_does_not() {
+        let v2 = EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext;
+        let v1 = EmbeddingTextRecipe::LineOrNeighbourContext;
+        let normalization = TextNormalizationRecipe::AsSuppliedByCorpus;
+        let query = "מצות תפילין";
+
+        for padded in [
+            " מצות תפילין",
+            "מצות תפילין ",
+            "\t מצות תפילין\n",
+            "\u{00A0}מצות תפילין\u{3000}",
+        ] {
+            assert_eq!(
+                v2.query_text(padded),
+                format!("[QUERY] {query}"),
+                "{padded:?}"
+            );
+            assert_eq!(
+                query_input(v2, normalization, padded).unwrap(),
+                format!("[QUERY] {query}"),
+                "{padded:?}"
+            );
+
+            assert!(
+                matches!(v1.query_text(padded), Cow::Borrowed(t) if t == padded),
+                "{padded:?}"
+            );
+            assert_eq!(query_input(v1, normalization, padded).unwrap(), padded);
+        }
+
+        // Whitespace inside the query is content, and stays.
+        assert_eq!(
+            v2.query_text("מצות  תפילין"),
+            "[QUERY] מצות  תפילין".to_string()
+        );
     }
 
     /// An empty query has nothing to embed, whatever the recipe — and under version 2 a

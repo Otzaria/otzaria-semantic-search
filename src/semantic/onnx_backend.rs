@@ -1580,6 +1580,44 @@ mod tests {
         }
     }
 
+    /// What text recipe 2 hands this tokenizer for a query typed with whitespace around it
+    /// must tokenize exactly as the bare query does. The production-shaped tokenizer is
+    /// the one that can tell: its Metaspace pre-tokenizer turns a doubled space after
+    /// `[QUERY]` — and a trailing one — into a lone `▁` id, which the fixture's WordPiece
+    /// tokenizer would silently drop.
+    #[test]
+    fn a_query_padded_with_whitespace_reaches_the_tokenizer_as_the_bare_query_does() {
+        use crate::semantic::recipe::{query_input, EmbeddingTextRecipe, TextNormalizationRecipe};
+
+        let (tokenizer, _) = load_tokenizer(
+            &fixture("dynamic.onnx"),
+            &fixture("tokenizer_unigram.json"),
+            64,
+        )
+        .unwrap();
+        let ids = |text: &str| tokenizer.encode(text, true).unwrap().get_ids().to_vec();
+        let lone_metaspace = tokenizer
+            .token_to_id("▁")
+            .expect("the fixture has a bare ▁");
+        let embedded = |query: &str| {
+            query_input(
+                EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext,
+                TextNormalizationRecipe::AsSuppliedByCorpus,
+                query,
+            )
+            .unwrap()
+        };
+
+        let bare = ids(&embedded("מצות תפילין"));
+        assert!(!bare.contains(&lone_metaspace), "{bare:?}");
+        for padded in [" מצות תפילין", "מצות תפילין ", "\u{00A0}מצות תפילין\t"]
+        {
+            assert_eq!(ids(&embedded(padded)), bare, "{padded:?}");
+        }
+        // The tokenizer fact the trim is for: the same query, prefixed untrimmed.
+        assert!(ids("[QUERY]  מצות תפילין").contains(&lone_metaspace));
+    }
+
     /// The stand-in's stub package reaches this backend first in a mock + ONNX build, so
     /// its tokenizer — WordLevel, no post-processor, hence no special tokens — must load
     /// with this crate's `tokenizers`, and the refusal come from the graph.

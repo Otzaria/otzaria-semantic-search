@@ -247,7 +247,7 @@ otzaria-semantic-search/
 * [`src/semantic/recipe.rs`](../src/semantic/recipe.rs)
   - `EmbeddingTextRecipe` — אילו טקסט מגיע למודל, משני הצדדים. גרסה 1: השורה או השורה
     בהקשר; גרסה 2 (`RolePrefixedLineOrNeighbourContext`): `"[PASSAGE] "` + בדיוק הטקסט של
-    גרסה 1 לכל מסמך, ו-`"[QUERY] "` + השאילתה המנורמלת לכל שאילתה. `passage_text()` מופעל
+    גרסה 1 לכל מסמך, ו-`"[QUERY] "` + השאילתה המנורמלת, בלי רווחים בקצותיה, לכל שאילתה. `passage_text()` מופעל
     ב-chunker **אחרי** הקיטום והנרמול, ולכן התחילית אינה נספרת בתקרת התווים ואינה מנורמלת.
   - `query_input()` — הפונקציה היחידה שדרכה כל מסלול מטמיע שאילתה (המנוע וה-
     `OfficialSemanticIndex`; הקואורדינטור מגיע למודל רק דרכם): נרמול, ואז התחילית. שאילתה

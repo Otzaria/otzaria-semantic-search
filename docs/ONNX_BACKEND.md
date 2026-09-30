@@ -226,7 +226,9 @@ On the production tokenizer, every added token is `special: true, normalized: fa
 `[שאילתה]`=7, `[קטע]`=8, which the recipe does not use but which a book's text would
 match all the same. The file itself ships with padding `BatchLongest` (pad id 0) and
 truncation at 512; both are overridden. `"[QUERY] …"` and `"[QUERY]…"` give the same ids —
-the Metaspace pre-tokenizer prepends `▁` either way. Its normalizer, in order: NFKC; strip
+the Metaspace pre-tokenizer prepends `▁` either way — but a second space after the prefix,
+or one at the end, is a lone `▁` id of its own; so text recipe 2 trims a query before
+prefixing it, as the chunker trims a stored line. Its normalizer, in order: NFKC; strip
 U+0591–U+05BD and U+05BF–U+05C7 (cantillation and points, not the maqaf); strip the
 zero-width and bidi controls U+200B–U+200F, U+202A–U+202E, U+2060–U+2069, U+FEFF; fold
 geresh and single curly quotes to `'`, gershayim and double curly quotes to `"`, maqaf and

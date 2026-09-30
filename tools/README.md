@@ -258,8 +258,12 @@ backend has to agree:
   They differ when it begins with whitespace — a space, or a character NFKC makes one, such
   as a no-break space — when it is empty, or when it begins with another special token:
   the spaced form then carries one more `▁` id (10). The recipe uses the spaced form, as
-  the model card and the model author's own export checks do. The chunker trims every
-  passage; a query is not trimmed, and `query_leading_whitespace` pins what the model then
-  sees. The generator reports the comparison for every case on each run: 36 of the 37
-  role-prefixed cases tokenize alike either way — those beginning with a digit, a quote, a
-  parenthesis and a Latin letter among them — and `query_leading_whitespace` does not.
+  the model card and the model author's own export checks do, and hands the tokenizer
+  neither shape: the chunker trims every passage, and text recipe 2 trims every query
+  before prefixing it (`EmbeddingTextRecipe::query_text`). `query_leading_whitespace` is
+  spelled as the tokenizer receives it, so it still pins the tokenizer's side of this —
+  what an untrimmed query would cost — though no search produces it any more; its
+  `notes`, recorded in the goldens, predate the trim. The generator reports the comparison
+  for every case on each run: 36 of the 37 role-prefixed cases tokenize alike either way —
+  those beginning with a digit, a quote, a parenthesis and a Latin letter among them — and
+  `query_leading_whitespace` does not.
