@@ -136,13 +136,17 @@ impl LocalModel {
         })
     }
 
-    /// The typed pooling strategy, refusing both a spelling [`Pooling`] cannot parse and
-    /// one no backend implements — the caller's configuration error either way.
+    /// The typed pooling strategy, refusing a spelling [`Pooling`] cannot parse and one
+    /// no backend for the model's format implements — the caller's configuration error
+    /// either way.
     fn pooling_strategy(&self) -> Result<Pooling, SemanticSearchError> {
         let pooling = Pooling::parse(&self.pooling)
             .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
-        crate::semantic::backend::ensure_pooling_is_implemented(pooling)
-            .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
+        crate::semantic::backend::ensure_pooling_is_implemented_for(
+            pooling,
+            crate::semantic::model_package::ModelFormat::of(&self.model_path),
+        )
+        .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
         Ok(pooling)
     }
 }

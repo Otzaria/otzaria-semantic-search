@@ -125,6 +125,25 @@ pub enum EmbeddingError {
         implemented: String,
     },
 
+    /// A pooling some backend performs, but none that serves this model's format.
+    ///
+    /// Distinct from [`Self::PoolingNotImplemented`] because the fix is: `in-graph` is
+    /// exactly right for an ONNX graph that pools inside itself and meaningless for a
+    /// GGUF, so the value is not wrong — the pairing is, and either half may be the one
+    /// to change. Refused while it is still a configuration, for the reason that variant
+    /// is: a manifest written with it would outlive the mistake.
+    #[error(
+        "Pooling '{pooling}' is not available for {format} models (for {format}: \
+         {implemented}); it is implemented for {implemented_elsewhere}. Configure the \
+         pooling this model's format uses, or a model of the format that uses this one"
+    )]
+    PoolingNotForFormat {
+        pooling: String,
+        format: String,
+        implemented: String,
+        implemented_elsewhere: String,
+    },
+
     /// The loaded backend pools differently from the configuration it was loaded
     /// for.
     ///

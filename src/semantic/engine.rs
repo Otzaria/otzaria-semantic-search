@@ -10,7 +10,7 @@
 //! the coordinator falls back to BM25) until [`SemanticEngine::reset_index`].
 
 use crate::errors::{ManifestError, SemanticSearchError};
-use crate::semantic::backend::{ensure_pooling_is_implemented, Pooling};
+use crate::semantic::backend::{ensure_pooling_is_implemented_for, Pooling};
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
@@ -37,7 +37,9 @@ pub struct SemanticConfig {
     /// persists it verbatim, so [`SemanticConfig::validate`] refuses both a spelling
     /// [`Pooling`] cannot parse and a strategy no backend implements.
     pub pooling: String,
-    /// Token cap requested per embedded text, EOS included.
+    /// Token cap requested per embedded text: the total sequence length, the special
+    /// tokens the model adds included (llama.cpp's EOS; a BERT tokenizer's `[CLS]` and
+    /// `[SEP]`).
     ///
     /// Enforced by the backend, which may clamp it to the model's trained context;
     /// the *requested* value is what the manifest records as part of the index's
@@ -121,12 +123,12 @@ impl SemanticConfig {
         ChunkingAlgorithm::from_version(self.chunking.chunking_version)?;
         EmbeddingTextRecipe::from_version(self.chunking.embedding_text_version)?;
         TextNormalizationRecipe::from_version(self.chunking.normalization_version)?;
-        // 2, not 1: the cap counts the EOS the backend appends, so 1 leaves no room for
-        // content and every text embeds as a bare `[eos]`.
+        // 2, not 1: the cap counts the special tokens the backend adds around the text,
+        // so 1 leaves no room for content and every text embeds as a bare special token.
         if self.embedding_max_tokens < 2 {
             return Err(SemanticSearchError::Config(format!(
-                "embedding_max_tokens is {}; the cap includes the EOS token, so at least 2 \
-                 are needed for any content to reach the model",
+                "embedding_max_tokens is {}; the cap counts the special tokens the model adds \
+                 around the text, so at least 2 are needed for any content to reach the model",
                 self.embedding_max_tokens
             )));
         }
@@ -135,14 +137,18 @@ impl SemanticConfig {
 
     /// The configured pooling as the typed strategy the runtime needs.
     ///
-    /// Refuses both a spelling [`Pooling`] cannot parse (`"last_token"`) and a
-    /// strategy that parses but no backend implements (`"mean"`); both are the
-    /// caller's [`SemanticSearchError::Config`], not a runtime failure.
+    /// Refuses a spelling [`Pooling`] cannot parse (`"last_token"`), a strategy that
+    /// parses but no backend implements (`"mean"`), and one no backend for the model's
+    /// format implements (`"in-graph"` beside a GGUF); each is the caller's
+    /// [`SemanticSearchError::Config`], not a runtime failure.
     pub fn pooling_strategy(&self) -> Result<Pooling, SemanticSearchError> {
         let pooling = Pooling::parse(&self.pooling)
             .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
-        ensure_pooling_is_implemented(pooling)
-            .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
+        ensure_pooling_is_implemented_for(
+            pooling,
+            crate::semantic::model_package::ModelFormat::of(&self.model_path),
+        )
+        .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
         Ok(pooling)
     }
 }
@@ -1035,6 +1041,41 @@ mod tests {
             engine.index_book(&three_line_book()).unwrap(),
             IndexOutcome::Indexed { chunks: 3 }
         );
+    }
+
+    /// The same trap as `"mean"`, reopened by a pooling only one format has: `"in-graph"`
+    /// is implemented, but not for the GGUF this configuration names, and a manifest
+    /// written with it would outlive the correction.
+    #[test]
+    fn a_pooling_the_models_format_cannot_serve_is_refused_before_the_manifest_is_written() {
+        let dir = TempDir::new("pooling_wrong_format");
+        let mut config = config_at(&dir);
+        config.pooling = "in-graph".to_string();
+
+        match SemanticEngine::open(config.clone()) {
+            Err(SemanticSearchError::Config(msg)) => {
+                assert!(
+                    msg.contains("in-graph") && msg.contains("GGUF") && msg.contains("last-token"),
+                    "the error must name the pooling, the format and what it does use: {msg}"
+                );
+            }
+            Err(other) => panic!("expected a config error, got {other}"),
+            Ok(_) => panic!("a pooling the model's format cannot serve must be refused"),
+        }
+        assert!(
+            !SemanticManifest::file_path(&config.root_dir).exists(),
+            "a refused configuration must not have persisted an index identity"
+        );
+
+        // And the mirror image, for an ONNX model.
+        let mut onnx = config_at(&dir);
+        onnx.model_path = dir.path().join("model.onnx");
+        assert!(
+            onnx.pooling_strategy().is_err(),
+            "an ONNX graph pools in-graph"
+        );
+        onnx.pooling = "in-graph".to_string();
+        assert_eq!(onnx.pooling_strategy().unwrap(), Pooling::InGraph);
     }
 
     /// The cap decides how much of a long line the model ever saw, so it is part of

@@ -7,9 +7,9 @@
 
 use crate::errors::EmbeddingError;
 use crate::semantic::backend::{
-    ensure_pooling_is_implemented, select_backend, EmbeddingBackend, Pooling,
+    ensure_pooling_is_implemented_for, select_backend, EmbeddingBackend, Pooling,
 };
-use crate::semantic::model_package::validate_model;
+use crate::semantic::model_package::{validate_model, ModelFormat};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -62,11 +62,12 @@ pub struct EmbeddingConfig {
     /// the model file, and a silent disagreement fills the index with wrong-width
     /// vectors.
     pub embedding_dim: u32,
-    /// Token cap *requested* for a single input. This layer never enforces it —
-    /// it has no tokenizer; it is a contract the backend implements, spelled out
-    /// at [`EmbeddingBackend::max_tokens`]. Here it only travels: the backend
-    /// reports it back and the manifest records it, so a change is detected as an
-    /// incompatibility instead of silently changing what gets embedded.
+    /// Token cap *requested* for a single input — the total sequence length, special
+    /// tokens included. This layer never enforces it — it has no tokenizer; it is a
+    /// contract the backend implements, spelled out at
+    /// [`EmbeddingBackend::max_tokens`]. Here it only travels: the backend reports it
+    /// back and the manifest records it, so a change is detected as an incompatibility
+    /// instead of silently changing what gets embedded.
     pub max_tokens: usize,
     /// Number of texts handed to the backend per inference call.
     pub batch_size: usize,
@@ -94,9 +95,9 @@ impl EmbeddingConfig {
     /// `batch_size` is deliberately absent: zero there is recoverable and means
     /// "one text per call" ([`EmbeddingRuntime::batch_size`] clamps it), whereas a
     /// zero dimensionality or token cap makes every embedding degenerate. The
-    /// pooling check asks whether any backend *performs* the strategy, and belongs
-    /// here because the value is persisted as the index's identity — see
-    /// [`ensure_pooling_is_implemented`].
+    /// pooling check asks whether a backend for the model's format *performs* the
+    /// strategy, and belongs here because the value is persisted as the index's
+    /// identity — see [`ensure_pooling_is_implemented_for`].
     pub fn validate(&self) -> Result<(), EmbeddingError> {
         if self.embedding_dim == 0 {
             return Err(EmbeddingError::LoadFailed {
@@ -105,19 +106,23 @@ impl EmbeddingConfig {
                     .to_string(),
             });
         }
-        // 2, not 1: the cap counts the appended EOS, so a cap of 1 leaves no budget
-        // for content and embeds every text as a bare `[eos]` — a plausible-looking
-        // vector carrying nothing of the input.
+        // 2, not 1: the cap is the total sequence length, and every backend spends at
+        // least one token of it on a special token — llama.cpp's appended EOS, a BERT
+        // tokenizer's [CLS] and [SEP]. A cap of 1 leaves no budget for content and
+        // embeds every text as a bare special token: a plausible-looking vector
+        // carrying nothing of the input. A backend whose specials take more refuses
+        // the cap at load, where it knows how many it adds.
         if self.max_tokens < 2 {
             return Err(EmbeddingError::LoadFailed {
                 reason: format!(
-                    "max_tokens is {}; the cap includes the EOS token, so at least 2 are \
-                     needed for any content to reach the model",
+                    "max_tokens is {}; the cap counts the special tokens the model adds \
+                     around the text, so at least 2 are needed for any content to reach the \
+                     model",
                     self.max_tokens
                 ),
             });
         }
-        ensure_pooling_is_implemented(self.pooling)?;
+        ensure_pooling_is_implemented_for(self.pooling, ModelFormat::of(&self.model_path))?;
         Ok(())
     }
 }
@@ -2108,6 +2113,29 @@ mod tests {
             let mut rt = EmbeddingRuntime::new(config);
             // `LoadFailed`, not `ModelNotFound`, proves the file was never touched.
             assert!(matches!(rt.load(), Err(EmbeddingError::LoadFailed { .. })));
+        }
+    }
+
+    /// The pairing is refused before the file is opened, like a pooling nothing
+    /// performs: the model paths here do not exist, so `ModelNotFound` would prove the
+    /// check ran too late.
+    #[test]
+    fn load_refuses_a_pooling_the_models_format_does_not_serve_before_reading_it() {
+        let dir = TempDir::new("pooling_wrong_format");
+        for (model, pooling) in [
+            ("absent.gguf", Pooling::InGraph),
+            ("absent.onnx", Pooling::LastToken),
+        ] {
+            let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+                model_path: dir.path().join(model),
+                pooling,
+                ..Default::default()
+            });
+            assert!(
+                matches!(rt.load(), Err(EmbeddingError::PoolingNotForFormat { .. })),
+                "{model} with {pooling}"
+            );
+            assert!(!rt.is_loaded());
         }
     }
 
