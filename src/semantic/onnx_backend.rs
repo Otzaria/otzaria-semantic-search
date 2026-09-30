@@ -1949,3 +1949,359 @@ mod tests {
         }
     }
 }
+
+/// Verification against the real model's golden vectors. **This is the parity gate** for
+/// the production graph, not a placeholder for one.
+///
+/// The goldens (`tests/data/onnx_golden_vectors.json`, written by
+/// `tools/generate_onnx_golden_vectors.py`) are the Python reference's answers: the ids
+/// from the `tokenizers` package and the vector from the `onnxruntime` package, for
+/// inputs spelled exactly as the tokenizer receives them, role prefix included. They need
+/// the gated 168 MB fp32 graph, so each test is `#[ignore]`d *and* skips loudly when
+/// `OTZARIA_TEST_ONNX_MODEL` is unset — which keeps the ordinary matrix green on
+/// machines with no model. Run them with:
+///
+/// ```sh
+/// OTZARIA_ONNX_RUNTIME=/path/to/libonnxruntime.dylib \
+/// OTZARIA_TEST_ONNX_MODEL=/path/to/seforim-embed-round2-fp32.onnx \
+///   cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+/// ```
+///
+/// The tokenizer is the package's, `tokenizer.json` beside the graph.
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use crate::semantic::model_package::onnx_tokenizer_path;
+
+    /// Names the fp32 graph, `seforim-embed-round2-fp32.onnx`.
+    const MODEL_ENV: &str = "OTZARIA_TEST_ONNX_MODEL";
+
+    /// The agreement required between this backend and the Python reference, per case,
+    /// once the token ids have been proven **exactly** equal.
+    ///
+    /// Not 1.0, because the two sides need not run the same ONNX Runtime build or even the
+    /// same instruction set: kernel choice alone (KleidiAI on or off, fused or unfused
+    /// operators) measured maxabs 2.9e-6 on identical inputs, a cosine deficit around
+    /// 1e-11. 0.99999 leaves that noise six orders of magnitude of room and still fails
+    /// every wiring error the ids cannot see — an `attention_mask` or `token_type_ids`
+    /// fed wrong, the wrong output taken, a half-precision execution provider, or the
+    /// int8 graph standing in for the fp32 one (0.9986 on the author's own parity check).
+    /// Truncation and prefix errors never reach this check: they change the ids.
+    const MIN_COSINE: f64 = 0.999_99;
+
+    /// The graph, or `None` with a loud explanation. Skipping rather than failing because
+    /// CI has no model, and a test that fails there teaches everyone to ignore it.
+    fn model_path() -> Option<PathBuf> {
+        let path = match std::env::var(MODEL_ENV) {
+            Ok(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
+            _ => {
+                println!(
+                    "SKIPPED: {MODEL_ENV} is not set. This test needs the 168 MB \
+                     seforim-embed-round2-fp32.onnx (with tokenizer.json beside it), which is \
+                     gated and never committed."
+                );
+                return None;
+            }
+        };
+        if !path.is_file() {
+            println!("SKIPPED: {MODEL_ENV} points at {path:?}, which does not exist");
+            return None;
+        }
+        match std::env::var_os(RUNTIME_ENV) {
+            Some(runtime) if !runtime.is_empty() => Some(path),
+            _ => {
+                println!(
+                    "SKIPPED: {RUNTIME_ENV} is not set; running the graph needs an ONNX Runtime \
+                     shared library"
+                );
+                None
+            }
+        }
+    }
+
+    /// Missing goldens with a model present fail rather than skip: asking for this gate
+    /// and getting a green tick without one would be the worst outcome.
+    fn goldens() -> serde_json::Value {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/onnx_golden_vectors.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. Generate it with tools/generate_onnx_golden_vectors.py",
+                path.display()
+            )
+        });
+        serde_json::from_str(&raw).expect("onnx_golden_vectors.json is not valid JSON")
+    }
+
+    fn sha256_of(path: &Path) -> String {
+        use sha2::Digest;
+
+        let mut hasher = sha2::Sha256::new();
+        let mut file = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("cannot open {}: {e}", path.display()));
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer).expect("read");
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Confirm the files behind `OTZARIA_TEST_ONNX_MODEL` are the ones the goldens were
+    /// produced from, since the alternative is a wall of vector failures for a model that
+    /// was simply the wrong one — the int8 graph beside the fp32 one, for instance.
+    fn assert_is_the_golden_package(graph: &Path, header: &serde_json::Value) {
+        let graph_sha = sha256_of(graph);
+        assert_eq!(
+            graph_sha,
+            header["graph_sha256"].as_str().expect("graph_sha256"),
+            "{} is not the graph the goldens were produced from ({})",
+            graph.display(),
+            header["graph_file"]
+        );
+        let tokenizer = onnx_tokenizer_path(graph);
+        assert_eq!(
+            sha256_of(&tokenizer),
+            header["tokenizer_sha256"]
+                .as_str()
+                .expect("tokenizer_sha256"),
+            "{} is not the tokenizer the goldens were produced with",
+            tokenizer.display()
+        );
+    }
+
+    /// Standard, padded base64. Hand-rolled to keep a decoder out of the dependency tree.
+    fn base64_decode(input: &str) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::with_capacity(input.len() / 4 * 3);
+        let (mut accumulator, mut bits) = (0u32, 0u32);
+        for byte in input.bytes() {
+            if byte == b'=' || byte.is_ascii_whitespace() {
+                continue;
+            }
+            let value = ALPHABET
+                .iter()
+                .position(|c| *c == byte)
+                .unwrap_or_else(|| panic!("{byte:?} is not a base64 character"));
+            accumulator = (accumulator << 6) | value as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((accumulator >> bits) & 0xFF) as u8);
+            }
+        }
+        out
+    }
+
+    fn golden_vector(encoded: &str, dim: usize) -> Vec<f32> {
+        let bytes = base64_decode(encoded);
+        assert_eq!(bytes.len(), dim * 4, "a golden vector is {dim} f32 values");
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// Cosine in f64, so the accumulation cannot be what fails a 0.99999 threshold.
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
+        let norm = |v: &[f32]| {
+            v.iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>()
+                .sqrt()
+        };
+        dot / (norm(a) * norm(b))
+    }
+
+    fn open_golden(graph: &Path, max_tokens: usize, sessions: usize) -> OnnxBackend {
+        OnnxBackend::open(
+            graph,
+            &onnx_tokenizer_path(graph),
+            max_tokens,
+            Pooling::InGraph,
+            &OnnxBackendConfig {
+                sessions,
+                ..OnnxBackendConfig::default()
+            },
+        )
+        .expect("the golden model must load")
+    }
+
+    fn inputs(data: &serde_json::Value) -> Vec<String> {
+        data["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .map(|case| case["input"].as_str().expect("input").to_string())
+            .collect()
+    }
+
+    /// **The primary gate.** Exact token-id equality, then the vectors.
+    ///
+    /// Only `input` is read as input, so feeding the golden ids back cannot make the
+    /// assertion a tautology. The ids carry the weight: truncation, the role prefix and
+    /// special-token matching are all decided before the graph runs, and none of them is
+    /// reliably visible in a cosine.
+    #[test]
+    #[ignore = "needs the 168 MB fp32 graph; set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    fn token_ids_match_the_reference_exactly_and_vectors_agree() {
+        let Some(graph) = model_path() else { return };
+        let data = goldens();
+        let header = &data["header"];
+        assert_is_the_golden_package(&graph, header);
+
+        let max_tokens = header["max_tokens"].as_u64().expect("max_tokens") as usize;
+        let dim = header["dim"].as_u64().expect("dim") as usize;
+        let backend = open_golden(&graph, max_tokens, 1);
+        assert_eq!(backend.dim() as usize, dim);
+        assert_eq!(backend.max_tokens(), max_tokens);
+        println!("\n{backend:?}");
+        println!(
+            "reference: onnxruntime {}, tokenizers {}",
+            header["onnxruntime_version"], header["tokenizers_version"]
+        );
+
+        let cases = data["cases"].as_array().expect("cases");
+        assert!(!cases.is_empty(), "the goldens hold no cases");
+        let mut id_mismatches = Vec::new();
+        let mut worst = (1.0f64, String::new());
+        println!(
+            "\n{:<36} {:<8} {:>5} {:>14}",
+            "case", "role", "ids", "cosine"
+        );
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let role = case["role"].as_str().expect("role");
+            let input = case["input"].as_str().expect("input");
+            match role {
+                "passage" => assert!(input.starts_with("[PASSAGE] "), "{name}: {role}"),
+                "query" => assert!(input.starts_with("[QUERY] "), "{name}: {role}"),
+                "raw" => {}
+                other => panic!("{name}: unknown role {other:?}"),
+            }
+            let golden_ids: Vec<u32> = case["token_ids"]
+                .as_array()
+                .expect("token_ids")
+                .iter()
+                .map(|id| id.as_u64().expect("an id") as u32)
+                .collect();
+
+            let produced = backend.tokenize(input).expect("tokenize");
+            if produced != golden_ids {
+                let first = produced
+                    .iter()
+                    .zip(&golden_ids)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(produced.len().min(golden_ids.len()));
+                id_mismatches.push(format!(
+                    "{name}: {} ids vs {} golden, first difference at {first}",
+                    produced.len(),
+                    golden_ids.len()
+                ));
+                continue;
+            }
+
+            let vector = backend.embed_batch_raw(&[input]).expect("embed").remove(0);
+            let reference =
+                golden_vector(case["vector_f32_le_base64"].as_str().expect("vector"), dim);
+            let cos = cosine(&vector, &reference);
+            println!("{name:<36} {role:<8} {:>5} {cos:>14.10}", produced.len());
+            if cos < worst.0 {
+                worst = (cos, name.to_string());
+            }
+        }
+
+        assert!(
+            id_mismatches.is_empty(),
+            "TOKEN ID MISMATCHES — the primary correctness gate:\n  {}",
+            id_mismatches.join("\n  ")
+        );
+        println!(
+            "worst cosine {:.10} ({}), required >= {MIN_COSINE}",
+            worst.0, worst.1
+        );
+        assert!(
+            worst.0 >= MIN_COSINE,
+            "worst cosine {:.10} on {} is below {MIN_COSINE}",
+            worst.0,
+            worst.1
+        );
+    }
+
+    /// A batch is one run per text, so batched and single answers must be *equal*, bit
+    /// for bit, and in input order — `EmbeddingRuntime` pairs vectors with chunks by
+    /// position and could not see a transposition.
+    #[test]
+    #[ignore = "needs the 168 MB fp32 graph; set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    fn batched_vectors_equal_single_ones_in_input_order() {
+        let Some(graph) = model_path() else { return };
+        let data = goldens();
+        let max_tokens = data["header"]["max_tokens"].as_u64().expect("max_tokens") as usize;
+        let owned = inputs(&data);
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+        let backend = open_golden(&graph, max_tokens, 1);
+        let batched = backend.embed_batch_raw(&texts).expect("batched");
+        assert_eq!(batched.len(), texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            let single = backend.embed_batch_raw(&[text]).expect("single").remove(0);
+            assert_eq!(batched[index], single, "case {index}: batched != single");
+        }
+    }
+
+    /// Several threads inside `embed_batch_raw` at once, through `&self`, over two
+    /// sessions — the shape `hybrid::coordinator` produces — agreeing with the serial
+    /// answer bit for bit. Timings are printed, never asserted.
+    #[test]
+    #[ignore = "needs the 168 MB fp32 graph; set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    fn concurrent_callers_through_a_shared_reference_agree_with_serial_ones() {
+        let Some(graph) = model_path() else { return };
+        let data = goldens();
+        let max_tokens = data["header"]["max_tokens"].as_u64().expect("max_tokens") as usize;
+        let owned = inputs(&data);
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+        let backend = open_golden(&graph, max_tokens, 2);
+        let started = std::time::Instant::now();
+        let serial = backend.embed_batch_raw(&texts).expect("serial");
+        let serial_time = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let concurrent = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let backend = &backend;
+                    let texts = &texts;
+                    scope.spawn(move || backend.embed_batch_raw(texts).expect("concurrent"))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker"))
+                .collect::<Vec<_>>()
+        });
+        println!(
+            "{} texts: serial {serial_time:?}; 4 threads x the same batch over 2 sessions {:?}",
+            texts.len(),
+            started.elapsed()
+        );
+        for (thread, result) in concurrent.iter().enumerate() {
+            assert_eq!(
+                result, &serial,
+                "thread {thread} disagrees with the serial answer"
+            );
+        }
+    }
+}
