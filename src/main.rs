@@ -5,8 +5,9 @@
 //! `validate` commands that produce an official artifact.
 //!
 //! `pack` and `validate` need no embedding backend — they never turn text into a vector —
-//! so they work in a default build, which is the one a release pipeline has. `build` does
-//! turn text into vectors, and so needs one compiled in.
+//! so they work in a default build, which is the one a release pipeline has. So does
+//! `model-checksum`, which reads a model without running it. `build` does turn text into
+//! vectors, and so needs one compiled in.
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::distribution::builder::{build, BuildRequest, PlannedCorpus};
@@ -27,6 +28,7 @@ use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
 use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
+use otzaria_semantic_search::semantic::model_package::{validate_model, ValidatedModel};
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
 use otzaria_semantic_search::semantic::versioning::ModelIdentity;
 use otzaria_semantic_search::semantic::zevc_store::VECTORS_FILENAME;
@@ -58,6 +60,8 @@ Commands:
                                       artifact.
   pack [options]                      Build an official artifact from ready-made vectors.
   validate [options]                  Verify an artifact against a corpus and a model.
+  model-checksum --model-file <path>  Validate a model and print the model_checksum an
+                                      identity has to declare for it.
 
 Options for 'search':
   --dir <path>       Directory holding semantic database (default: "./semantic_db")
@@ -71,7 +75,8 @@ Options for 'build':
   --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
   --corpus-lines <path>      JSONL, one corpus line per document
   --model <path>             JSON ModelIdentity describing how the vectors are produced
-  --model-file <path>        The GGUF the vectors are produced with
+  --model-file <path>        The model the vectors are produced with: a GGUF file, or an
+                             ONNX graph with its package beside it (see 'model-checksum')
   --chunking <path>          JSON ChunkerConfig — the recipe itself (see below)
   --out <dir>                Output directory; must not exist, or be empty
   --batch <N>                Texts per inference call (default: 32)
@@ -91,7 +96,8 @@ Options for 'export-plan':
 Options for 'embed-shard':
   --plan <path>              plan.jsonl, as 'export-plan' wrote it
   --model <path>             The identity the plan was exported under
-  --model-file <path>        The GGUF; held to every field the identity declares
+  --model-file <path>        The model, GGUF or ONNX; held to every field the identity
+                             declares
   --skip <N>                 Records to skip (default: 0)
   --take <N>                 Records to embed (default: all that remain)
   --batch <N>                Texts per inference call (default: 32)
@@ -171,22 +177,33 @@ Options for 'validate':
   --model <path>             As above
   --chunking <path>          Optional; as for 'pack'
 
+Options for 'model-checksum':
+  --model-file <path>        A .gguf file, or an .onnx graph. Any other extension is read
+                             as GGUF.
+
+For GGUF the checksum is the file's SHA-256. An ONNX model is a package: the graph, the
+tokenizer.json beside it and every external-data file the graph names, and the checksum is
+the SHA-256 of a manifest listing each of them with its size and SHA-256 — printed here
+exactly as it is hashed. Nothing else in the directory is part of it: not a README, not a
+second graph, not an ONNX Runtime library.
+
 A record is {{"line_id":N,"source_line_sha256":"...","embedding_text_sha256":"..."}}.
 Both digests are lowercase hex SHA-256.
 
   source_line_sha256     of the corpus line's text. Checked against the corpus: this is
                          what catches a vector file that drifted out of step with its id
                          list, which nothing else here would notice.
-  embedding_text_sha256  of the text that was actually embedded, after any title prefix,
+  embedding_text_sha256  of the text that was actually embedded, after any role prefix,
                          neighbour context or truncation. Recorded as the record's
                          chunk_hash; not checked against anything, because the corpus
                          holds the line and not the recipe's output.
 
 A chunker configuration is
 {{"min_meaningful_chars":20,"context_window_lines":2,"max_chunk_chars":512,
-  "min_embeddable_chars":5,"chunking_version":1}}, and its hash must be the
-chunking_identity the model declares — an artifact records the hash, and a hash cannot
-be turned back into the recipe.
+  "min_embeddable_chars":5,"chunking_version":1,"embedding_text_version":1,
+  "normalization_version":1}}, and its hash must be the chunking_identity the model
+declares — an artifact records the hash, and a hash cannot be turned back into the recipe.
+Every field is required.
 
 The coverage contract: with --chunking, the lines that must get a vector are the ones the
 recipe embeds, derived from the corpus. Without it, they are every line in the corpus
@@ -203,6 +220,7 @@ Examples:
   otzaria-semantic-search pack --vectors v.f32 --records v.jsonl \
       --corpus-identity corpus.json --corpus-lines corpus.jsonl \
       --model model.json --out ./artifact
+  otzaria-semantic-search model-checksum --model-file models/meivin/model-fp32.onnx
 "#,
         env!("CARGO_PKG_VERSION")
     );
@@ -219,7 +237,7 @@ fn main() {
     match command.as_str() {
         "version" | "-v" | "--version" => {
             println!("otzaria-semantic-search CLI {}", env!("CARGO_PKG_VERSION"));
-            println!("Engine: Hybrid Tantivy + Local Vector Engine (GGUF MRL support)");
+            println!("Engine: Hybrid Tantivy + Local Vector Engine (GGUF and ONNX models)");
             println!("Crate Targets: rlib, cdylib, staticlib, binary CLI");
         }
         "status" => {
@@ -389,6 +407,7 @@ fn main() {
         "ledger" => run_ledger(&args),
         "pack" => run_pack(&args),
         "validate" => run_validate(&args),
+        "model-checksum" => run_model_checksum(&args),
         "help" | "-h" | "--help" => {
             print_usage();
         }
@@ -396,6 +415,59 @@ fn main() {
             eprintln!("Unknown command: '{other}'");
             print_usage();
             process::exit(1);
+        }
+    }
+}
+
+/// Validate a model the way `build` and the runtime will, and print what an identity has
+/// to declare for it.
+///
+/// Opens no backend, so it works in a default build: the checksum is a fact about the
+/// files, and writing `model.json` for a new model should not need the model to run.
+fn run_model_checksum(args: &[String]) {
+    let model_file = PathBuf::from(require_arg(args, "--model-file"));
+    let validated = validate_model(&model_file)
+        .unwrap_or_else(|error| exit_with("The model cannot be used", error));
+
+    println!("=== Model checksum ===");
+    println!("Model:           {}", model_file.display());
+    println!("Format:          {}", validated.format());
+    println!("model_checksum:  {}", validated.checksum());
+
+    match &validated {
+        ValidatedModel::Gguf { .. } => {
+            if let Ok(metadata) = std::fs::metadata(&model_file) {
+                println!("Size:            {} bytes", metadata.len());
+            }
+            println!("\nFor GGUF the checksum is the SHA-256 of the file itself.");
+        }
+        ValidatedModel::Onnx(package) => {
+            let facts = package.graph_facts();
+            println!("Package root:    {}", package.root().display());
+            println!(
+                "Graph:           IR {}, {} opset import(s), {} input(s), {} output(s), {} \
+                 external tensor reference(s)",
+                facts.ir_version,
+                facts.opset_imports,
+                facts.graph_inputs,
+                facts.graph_outputs,
+                facts.external_tensors
+            );
+            println!("\nPackage files ({}):", package.files().len());
+            let width = package
+                .files()
+                .iter()
+                .map(|file| file.relpath.chars().count())
+                .max()
+                .unwrap_or(0);
+            for file in package.files() {
+                println!(
+                    "  {:<width$}  {:>12} bytes  sha256 {}",
+                    file.relpath, file.size, file.sha256
+                );
+            }
+            println!("\nThe checksum is the SHA-256 of exactly this text:");
+            print!("{}", package.manifest_text());
         }
     }
 }
