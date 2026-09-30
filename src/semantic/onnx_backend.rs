@@ -102,6 +102,14 @@ const DEFAULT_THREADS_CAP: usize = 4;
 /// behind an indexing batch (measured at most 14.7 ms), not for the batch.
 const DEFAULT_SESSIONS: usize = 1;
 
+/// The largest `max_tokens` this backend accepts: past the context of any sentence
+/// encoder (512 positions for the production graph; the long-context ones stop at 8192 or
+/// 32768), and so a bound on the load-time probe rather than a claim about a graph —
+/// whether one runs a cap is what the probe proves. Without it the probe is as long as
+/// whatever the configuration says: a `u32` of a few billion asked the allocator for
+/// hundreds of gigabytes, which aborts the process instead of failing the load.
+const MAX_TOKENS_CEILING: usize = 1 << 16;
+
 /// Environment variable naming the ONNX Runtime shared library to load. Read by
 /// [`OnnxBackend::open`], not by [`OnnxBackendConfig`]: it chooses the code that runs,
 /// not a size.
@@ -841,7 +849,8 @@ impl OnnxBackend {
     /// finished `[batch, dim]` sentence vector.
     ///
     /// Everything is checked here rather than on the first search, cheapest first: the
-    /// pooling and the tuning; that both files exist; that the tokenizer parses and
+    /// pooling, the tuning and a cap no encoder has (`MAX_TOKENS_CEILING`, since the probe
+    /// below is as long as the cap); that both files exist; that the tokenizer parses and
     /// leaves `max_tokens` room for content; the runtime library (see the module docs);
     /// the graph's inputs and first output; and finally a probe of exactly `max_tokens`
     /// tokens through **every** session, which must come back finite, `dim` long and
@@ -852,8 +861,9 @@ impl OnnxBackend {
     ///
     /// * [`EmbeddingError::PoolingMismatch`] for a pooling other than `in-graph`;
     /// * [`EmbeddingError::ModelNotFound`] / [`EmbeddingError::TokenizerNotFound`];
-    /// * [`EmbeddingError::LoadFailed`] for a zero thread or session count, a cap that
-    ///   leaves no room for content, or a session that will not allocate;
+    /// * [`EmbeddingError::LoadFailed`] for a zero thread or session count, a cap past
+    ///   any encoder's context or one that leaves no room for content, or a session that
+    ///   will not allocate;
     /// * [`EmbeddingError::BackendUnavailable`] when no ONNX Runtime can be loaded — none
     ///   found, too old, not a runtime, or a different one already loaded;
     /// * [`EmbeddingError::InvalidModelFile`] for a tokenizer or graph this backend
@@ -887,6 +897,16 @@ impl OnnxBackend {
                     ),
                 });
             }
+        }
+        if max_tokens > MAX_TOKENS_CEILING {
+            return Err(EmbeddingError::LoadFailed {
+                reason: format!(
+                    "max_tokens is {max_tokens}, past the context of any sentence encoder; \
+                     this backend accepts at most {MAX_TOKENS_CEILING}, and the graph's own \
+                     positions decide at load whether even that runs. The Meivin Round 2 \
+                     identity declares 256"
+                ),
+            });
         }
         if !graph.is_file() {
             return Err(EmbeddingError::ModelNotFound {
@@ -1537,6 +1557,38 @@ mod tests {
         let (_, specials) = load_tokenizer(&fixture("dynamic.onnx"), &fixture("tokenizer.json"), 3)
             .expect("3 fits");
         assert_eq!(specials, 2);
+    }
+
+    /// The load-time probe is `max_tokens` tokens long, so its cost is the cap's. A cap
+    /// past any encoder's context — a mistyped setting, a `u32` from the application —
+    /// overflowed the probe's arithmetic or asked the allocator for hundreds of gigabytes,
+    /// which aborts the whole process instead of failing the load. Refused first, with no
+    /// runtime needed.
+    #[test]
+    fn a_cap_past_any_encoders_context_is_refused_before_anything_is_loaded() {
+        for cap in [
+            MAX_TOKENS_CEILING + 1,
+            u32::MAX as usize,
+            usize::MAX / 2,
+            usize::MAX,
+        ] {
+            match open_fixture("dynamic.onnx", cap, &tuning(1, 1)) {
+                Err(EmbeddingError::LoadFailed { reason }) => assert!(
+                    reason.contains(&format!("max_tokens is {cap}"))
+                        && reason.contains(&MAX_TOKENS_CEILING.to_string()),
+                    "{reason}"
+                ),
+                other => panic!("a cap of {cap} must be refused, got {:?}", other.err()),
+            }
+        }
+        // The ceiling itself is only a bound on the probe, not a claim that a graph runs
+        // it: `a_cap_the_graph_cannot_run_fails_at_load` is what refuses 49 for this one.
+        assert!(load_tokenizer(
+            &fixture("dynamic.onnx"),
+            &fixture("tokenizer.json"),
+            MAX_TOKENS_CEILING
+        )
+        .is_ok());
     }
 
     /// Named as the package's fault: the graph is the model file, the reason says which

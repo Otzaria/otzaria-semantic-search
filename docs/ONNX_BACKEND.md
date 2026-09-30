@@ -173,6 +173,7 @@ be served fails at load and never in the middle of an index:
 |---|---|
 | pooling other than `in-graph` | `PoolingMismatch` |
 | `intra_threads` or `sessions` of 0 in a literal config | `LoadFailed`, naming the field |
+| `max_tokens` above 65,536 — past any encoder's context; the probe below is that long | `LoadFailed` |
 | graph / `tokenizer.json` absent | `ModelNotFound` / `TokenizerNotFound` |
 | tokenizer not parseable | `InvalidModelFile` (the graph named, the tokenizer in the reason) |
 | `max_tokens` ≤ the special tokens the tokenizer adds | `LoadFailed` — also what keeps the tokenizer's own unchecked subtraction from wrapping |
@@ -382,7 +383,7 @@ reason the two graphs are different identities (`model_quantization`).
 
 | where | what | needs |
 |---|---|---|
-| `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, the stand-in's stub tokenizer | nothing |
+| `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query reaching it exactly as the bare one does, the stand-in's stub tokenizer | nothing |
 | `onnx_backend::tests` | the fixture against the Python references; truncation; order; batch = single; concurrency; threads and sessions change nothing; static batch; `token_type_ids` as zeros; rank-3, extra-input, over-cap and non-ONNX refusals; one runtime per process | `OTZARIA_ONNX_RUNTIME` |
 | `onnx_backend::golden` | the production graph against `tests/data/onnx_golden_vectors.json`: sha256 of graph and tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine ≥ 0.99999 (and how many are bit-identical), batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
 | `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
