@@ -421,7 +421,9 @@ fn backends_performing(pooling: Pooling, format: Option<ModelFormat>) -> String 
 ///
 /// [`EmbeddingError::BackendUnavailable`] when nothing serving the model's format is
 /// compiled in — every default build, the guarantee
-/// `tests/production_backend_gate.rs` holds — naming the feature that would serve it.
+/// `tests/production_backend_gate.rs` holds — naming the feature that would serve it,
+/// or, for an ONNX model with that feature already on, saying that this target has no
+/// ONNX backend (`no_backend_reason`).
 /// Otherwise whatever the first compiled-in candidate for the format, or
 /// [`EmbeddingConfig::validate`], failed with.
 pub fn select_backend(
@@ -435,17 +437,46 @@ pub fn select_backend(
     candidates_for(Some(format))
         .find_map(|candidate| (candidate.construct)(config))
         .unwrap_or_else(|| {
-            // For GGUF this is, byte for byte, the message from before formats existed.
             Err(EmbeddingError::BackendUnavailable {
-                reason: format!(
-                    "this build has no inference backend compiled in (enable the \
-                     `{}` feature for real {format} inference); model file {} \
-                     validated but cannot be executed",
-                    format.backend_feature(),
-                    config.model_path.display()
+                reason: no_backend_reason(
+                    format,
+                    cfg!(feature = "onnx-backend"),
+                    &config.model_path,
                 ),
             })
         })
+}
+
+/// Why nothing in this build serves a `format` model — the reason
+/// [`select_backend`] gives when no candidate for the format answers.
+///
+/// For GGUF, byte for byte the message from before formats existed, whatever the
+/// features: it names `llama-backend`. For ONNX it names `onnx-backend` too, unless that
+/// feature is on (`onnx_feature_enabled`, the caller's `cfg!`). Then no row answered
+/// because this target has no ONNX backend at all — its crates are declared for desktop
+/// targets only — and telling the reader to enable a feature that is already on would
+/// send them round a loop: the plugin's production feature set enables it on phones too.
+fn no_backend_reason(
+    format: ModelFormat,
+    onnx_feature_enabled: bool,
+    model_path: &std::path::Path,
+) -> String {
+    if format == ModelFormat::Onnx && onnx_feature_enabled {
+        return format!(
+            "this target has no ONNX backend in this version: `onnx-backend` is enabled, \
+             but ONNX Runtime is loaded on desktop targets only (macOS, Linux with glibc, \
+             Windows with MSVC; aarch64 and x86_64); model file {} validated but cannot be \
+             executed here",
+            model_path.display()
+        );
+    }
+    format!(
+        "this build has no inference backend compiled in (enable the \
+         `{}` feature for real {format} inference); model file {} \
+         validated but cannot be executed",
+        format.backend_feature(),
+        model_path.display()
+    )
 }
 
 /// Real GGUF inference, in a build that compiled it in.
@@ -953,6 +984,43 @@ mod tests {
                 "{format} has no real backend in the table: {rows:?}"
             );
         }
+    }
+
+    /// What a build with nothing for the model's format says. GGUF's message is byte for
+    /// byte what it has always been, whatever the features. ONNX's names the feature when
+    /// it is off; when it is on — which outside the desktop gate means a target with no
+    /// ONNX backend, a phone — it says that, rather than asking for a feature already on.
+    /// Built directly, because no target this suite runs on reaches that arm.
+    #[test]
+    fn a_build_with_no_backend_for_the_format_says_which_and_why() {
+        let gguf = std::path::Path::new("models/model.gguf");
+        for onnx_feature_enabled in [false, true] {
+            assert_eq!(
+                no_backend_reason(ModelFormat::Gguf, onnx_feature_enabled, gguf),
+                "this build has no inference backend compiled in (enable the `llama-backend` \
+                 feature for real GGUF inference); model file models/model.gguf validated but \
+                 cannot be executed"
+            );
+        }
+
+        let onnx = std::path::Path::new("models/model.onnx");
+        assert_eq!(
+            no_backend_reason(ModelFormat::Onnx, false, onnx),
+            "this build has no inference backend compiled in (enable the `onnx-backend` \
+             feature for real ONNX inference); model file models/model.onnx validated but \
+             cannot be executed"
+        );
+        let target = no_backend_reason(ModelFormat::Onnx, true, onnx);
+        assert!(
+            target.contains("this target has no ONNX backend in this version")
+                && target.contains("desktop")
+                && target.contains("models/model.onnx"),
+            "{target}"
+        );
+        assert!(
+            !target.contains("enable the"),
+            "the feature is on; asking for it sends the reader round a loop: {target}"
+        );
     }
 
     /// The no-backend arm cannot be checked here — `#[cfg(test)]` enables the

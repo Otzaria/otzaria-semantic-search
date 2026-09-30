@@ -84,7 +84,9 @@ neither network nor minimum-OS changes.
 
 **Targets.** The crates are declared for desktop targets only — the platforms Microsoft
 publishes a runtime for. Everywhere else the feature is on with no backend behind it and
-an ONNX model gets `BackendUnavailable`, exactly as a GGUF model does on 32-bit ARM. The
+an ONNX model gets `BackendUnavailable`, as a GGUF model does on 32-bit ARM — with a
+reason that says this target has no ONNX backend in this version (desktop only), rather
+than asking for the feature, which the plugin's `semantic` set enables on phones too. The
 condition is spelled in `Cargo.toml` (three declarations), `semantic/mod.rs`, the
 constructor pair in `semantic::backend` and `tests/onnx_backend.rs`;
 `the_target_condition_is_spelled_identically_everywhere` fails if any of the seven drifts
