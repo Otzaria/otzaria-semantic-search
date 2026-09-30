@@ -194,11 +194,15 @@ default-features = false
 features = ["fancy-regex"]
 optional = true
 
-# Reached directly for the one thing `ort` reads and does not expose: the runtime's
-# version string (`OrtGetApiBase()->GetVersionString()`), which the load log names —
-# `ort::info()` carries a commit id, not a version. Opened only after `ort` has loaded the
-# same file, so it bumps a reference count and runs no initializer twice. Unpinned: it
-# decides no vector, and a range lets cargo unify it with `ort`'s own.
+# Reached directly to open the runtime *before* `ort` does: `ort` 2.0.0-rc.13 cannot
+# recover from refusing a library (a failed load still completes its `OnceLock`, and the
+# next call panics), so the backend loads the file itself, checks that it exports
+# `OrtGetApiBase` and reports a version `ort` accepts, and only then calls
+# `ort::init_from` — which opens the same file again, bumping a reference count. The same
+# open reads `GetVersionString`, which `ort` checks and does not expose; the load log
+# names it. The handle is kept for the life of the process. See
+# `onnx_backend::ensure_runtime`. Unpinned: it decides no vector, and a range lets cargo
+# unify it with `ort`'s own.
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.libloading]
 version = "0.9"
 optional = true

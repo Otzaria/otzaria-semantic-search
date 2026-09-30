@@ -389,11 +389,12 @@ reason the two graphs are different identities (`model_quantization`).
 | `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
 
 The tests that run a graph skip loudly without `OTZARIA_ONNX_RUNTIME`, as the model-gated
-tests do without a model. **CI should set `OTZARIA_ONNX_RUNTIME` to Microsoft's ONNX
-Runtime 1.28.0 for the runner** (`lib/libonnxruntime.so` from
-`onnxruntime-linux-x64-1.28.0.tgz`, `lib/libonnxruntime.dylib` from
-`onnxruntime-osx-arm64-1.28.0.tgz`, `lib/onnxruntime.dll` from
-`onnxruntime-win-x64-1.28.0.zip`).
+tests do without a model. **CI's `onnx-backend` job sets it to Microsoft's ONNX Runtime
+1.28.0 for each runner**, fetched by asset name and a pinned SHA-256, with only the
+library extracted: `lib/libonnxruntime.so.1.28.0` from `onnxruntime-linux-x64-1.28.0.tgz`,
+`lib/libonnxruntime.1.28.0.dylib` from `onnxruntime-osx-arm64-1.28.0.tgz`, and
+`lib/onnxruntime.dll`, with `onnxruntime_providers_shared.dll` beside it, from
+`onnxruntime-win-x64-1.28.0.zip`.
 
 The golden tests:
 
@@ -422,11 +423,9 @@ references' ids for both and vectors for the first.
 
 ## 9. Open issues
 
-- **The golden file lives on `onnx/golden`**; the gate passes against it (§7.2) and needs
-  that branch merged beside this one to run from the integration branch.
 - **The cap, 256 vs 128** (§5), for retrieval-quality measurement to settle.
-- **Linux and Windows** were checked to compile, not run; CI's runtime job is what runs
-  them.
+- **Linux and Windows** were checked to compile, not run; CI's `onnx-backend` job is what
+  runs them, and it has not run yet.
 - **Report the `ort` rc.13 `OnceLock` bug upstream** (§3); the pre-check stays needed until
   a fixed release is pinned.
 - **Mobile.** No runtime ships for iOS or Android in v1; the gating keeps both building.

@@ -941,8 +941,6 @@ mod tests {
         );
     }
 
-    /// A missing model is not a broken artifact, and the host has to be able to tell them
-    /// apart — one is fixed by fetching the model, the other by fetching the index.
     /// An artifact built under text recipe 2 is queried the way its passages were built:
     /// normalized, then marked as a query — once.
     #[test]
@@ -985,6 +983,8 @@ mod tests {
         assert!(v1.embed_query("").is_err());
     }
 
+    /// A missing model is not a broken artifact, and the host has to be able to tell them
+    /// apart — one is fixed by fetching the model, the other by fetching the index.
     #[test]
     fn a_missing_model_is_reported_as_an_embedding_error() {
         let dir = TempDir::new("no_model");
