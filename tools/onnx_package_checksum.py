@@ -61,6 +61,8 @@ TOKENIZER_FILE = "tokenizer.json"
 # The crate's limits (model_package.rs), kept identical: a package one implementation
 # accepts and the other refuses would have a checksum only one of them can confirm.
 MAX_TOKENIZER_BYTES = 256 << 20
+# Past any real tokenizer.json, and serde_json's own recursion limit; see _read_tokenizer.
+MAX_TOKENIZER_JSON_DEPTH = 128
 SNIFF_BYTES = 64
 MAX_MESSAGE_DEPTH = 64
 MAX_MESSAGES = 1 << 24
@@ -992,6 +994,32 @@ def _refuse_json_constant(name):
     raise ValueError(f"{name} is not JSON")
 
 
+def json_nesting_depth(data: bytes) -> int:
+    """How deeply `data`'s arrays and objects nest: every `[` or `{` outside a string opens
+    a level, the top-level object being level 1. A linear scan over the bytes, not a parse,
+    and exactly the crate's `json_nesting_depth`: inside a string a backslash takes the
+    next byte with it, whatever it is."""
+    depth = deepest = 0
+    in_string = escaped = False
+    for byte in data:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # quote
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):  # [ {
+            depth += 1
+            deepest = max(deepest, depth)
+        elif byte in (0x5D, 0x7D):  # ] }
+            depth = max(depth - 1, 0)
+    return deepest
+
+
 def _read_tokenizer(path: Path, refuse, unreadable) -> PackageFile:
     """Read tokenizer.json whole, hash it, and require a JSON object -- which is also
     what catches a truncated download of it, since JSON that stops early does not parse."""
@@ -1005,20 +1033,41 @@ def _read_tokenizer(path: Path, refuse, unreadable) -> PackageFile:
             f"its tokenizer {path} is larger than {MAX_TOKENIZER_BYTES} bytes, which no "
             "tokenizer is"
         )
-    try:
-        # Strict UTF-8 and strict JSON, as serde_json reads it: no byte-order mark, no
-        # NaN or Infinity.
-        parsed = json.loads(data.decode("utf-8"), parse_constant=_refuse_json_constant)
-    except ValueError as e:
-        raise refuse(
-            f"its tokenizer {path} is not a JSON object ({e}); if it was downloaded, "
+    def not_json(why):
+        return refuse(
+            f"its tokenizer {path} is not a JSON object ({why}); if it was downloaded, "
             "download it again"
-        ) from None
-    if not isinstance(parsed, dict):
-        raise refuse(
-            f"its tokenizer {path} is not a JSON object (it is a JSON {type(parsed).__name__}); "
-            "if it was downloaded, download it again"
         )
+
+    try:
+        # The whole file as strict UTF-8, as the crate checks it before parsing.
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise not_json(e) from None
+    # Bounded before json.loads, as in the crate: json recurses, and past a depth its
+    # interpreter decides it raises RecursionError, while the crate's parser accepts any
+    # depth. The same bound in both is what makes them agree.
+    depth = json_nesting_depth(data)
+    if depth > MAX_TOKENIZER_JSON_DEPTH:
+        raise refuse(
+            f"its tokenizer {path} nests {depth} levels deep, and at most "
+            f"{MAX_TOKENIZER_JSON_DEPTH} are accepted; no tokenizer nests that deep"
+        )
+    try:
+        # Strict JSON, as serde_json reads it: no byte-order mark, no NaN or Infinity.
+        parsed = json.loads(text, parse_constant=_refuse_json_constant)
+    except ValueError as e:
+        raise not_json(e) from None
+    if not isinstance(parsed, dict):
+        raise not_json(f"it is a JSON {type(parsed).__name__}")
+    # The crate reads each top-level key into a Rust String, which cannot hold a lone
+    # surrogate: `{"\ud800": 1}` is refused there, and json alone would accept it. A key
+    # deeper down, or a value, is not read as text by the crate, and is accepted by both.
+    for key in parsed:
+        try:
+            key.encode("utf-8")
+        except UnicodeEncodeError:
+            raise not_json(f"the key {key!r} holds a lone surrogate") from None
     return PackageFile(TOKENIZER_FILE, path, len(data), hashlib.sha256(data).hexdigest())
 
 

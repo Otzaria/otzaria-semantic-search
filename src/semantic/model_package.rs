@@ -272,6 +272,12 @@ pub fn onnx_package_checksum(files: &[PackageFile]) -> String {
 /// whole to be checked.
 const MAX_TOKENIZER_BYTES: u64 = 256 << 20;
 
+/// How deeply a `tokenizer.json` may nest its arrays and objects: far past any real one
+/// (about five levels), and `serde_json`'s own recursion limit. Checked by a scan before
+/// the file is parsed, identically in `tools/onnx_package_checksum.py`, so that neither
+/// parser's recursion decides which packages are accepted — see `read_tokenizer`.
+const MAX_TOKENIZER_JSON_DEPTH: usize = 128;
+
 /// How many bytes of the graph's start are examined to name a *kind* of non-ONNX file —
 /// a Git LFS pointer, an error page — rather than only refusing it.
 const SNIFF_BYTES: usize = 64;
@@ -1620,21 +1626,72 @@ fn read_tokenizer(path: &Path) -> Result<PackageFile, GraphFailure> {
             path.display()
         )));
     }
-    // Values ignored, not built: whether the tokenizer is one the backend can load is the
-    // backend's question. This one is whether the file is whole.
-    serde_json::from_slice::<BTreeMap<String, serde::de::IgnoredAny>>(&bytes).map_err(|e| {
+    let not_json = |why: String| {
         GraphFailure::Invalid(format!(
-            "its tokenizer {} is not a JSON object ({e}); if it was downloaded, download it \
+            "its tokenizer {} is not a JSON object ({why}); if it was downloaded, download it \
              again",
             path.display()
         ))
-    })?;
+    };
+    // The whole file as UTF-8, before the parse: the parse below skips every value it
+    // does not read without looking at its bytes, so a file the backend cannot even read
+    // as text would pass it — and `tools/onnx_package_checksum.py`, which decodes first,
+    // refuses that file. The two implementations must refuse the same packages.
+    let text = std::str::from_utf8(&bytes).map_err(|e| not_json(e.to_string()))?;
+    // For the same reason, bounded before either parser runs: this one skips a nested
+    // value iteratively and would accept any depth, Python's recurses and fails at one
+    // its interpreter decides. A real tokenizer nests about five levels.
+    let depth = json_nesting_depth(&bytes);
+    if depth > MAX_TOKENIZER_JSON_DEPTH {
+        return Err(GraphFailure::Invalid(format!(
+            "its tokenizer {} nests {depth} levels deep, and at most \
+             {MAX_TOKENIZER_JSON_DEPTH} are accepted; no tokenizer nests that deep",
+            path.display()
+        )));
+    }
+    // Values ignored, not built: whether the tokenizer is one the backend can load is the
+    // backend's question. This one is whether the file is whole. A top-level key is read
+    // as a `String`, which is what refuses one holding a lone surrogate escape.
+    serde_json::from_str::<BTreeMap<String, serde::de::IgnoredAny>>(text)
+        .map_err(|e| not_json(e.to_string()))?;
     Ok(PackageFile {
         relpath: ONNX_TOKENIZER_FILE.to_string(),
         path: path.to_path_buf(),
         size: bytes.len() as u64,
         sha256: hex_encode(&Sha256::digest(&bytes)),
     })
+}
+
+/// How deeply `json`'s arrays and objects nest: every `[` or `{` outside a string opens a
+/// level, the top-level object being level 1. A linear scan over the bytes, not a parse —
+/// whether the text is JSON at all is the parser's to say, afterwards — and exactly the
+/// scan `tools/onnx_package_checksum.py` makes: inside a string a backslash takes the next
+/// byte with it, whatever it is.
+fn json_nesting_depth(json: &[u8]) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in json {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 #[cfg(test)]
@@ -2830,6 +2887,74 @@ mod tests {
             assert!(
                 reason.contains("tokenizer") && reason.contains("JSON object"),
                 "{contents:?}: {reason}"
+            );
+        }
+    }
+
+    /// Where the parse below `read_tokenizer` and Python's `json` could part, the crate
+    /// refuses and accepts what `tools/onnx_package_checksum.py` does — its test suite
+    /// holds the same cases. The parse skips every value it does not read, bytes unseen,
+    /// and skips a nested value iteratively; Python decodes the whole file first and
+    /// recurses. So the text must be UTF-8 throughout, and nest no deeper than the bound
+    /// both check before either parser runs.
+    #[test]
+    fn a_tokenizer_is_refused_and_accepted_as_the_python_implementation_does() {
+        let dir = TempDir::new("tokenizer_parity");
+        let graph = mock::write_stub_onnx_package(dir.path());
+        let nested = |levels: usize| {
+            let mut json = "{\"a\":".to_string();
+            json.push_str(&"[".repeat(levels - 1));
+            json.push_str(&"]".repeat(levels - 1));
+            json.push('}');
+            json.into_bytes()
+        };
+
+        for (case, contents) in [
+            (
+                "invalid UTF-8 in a nested value",
+                b"{\"a\":{\"b\":\"\xff\xfe\"}}".to_vec(),
+            ),
+            ("invalid UTF-8 in a value", b"{\"a\":\"\xc3\x28\"}".to_vec()),
+            ("invalid UTF-8 in a key", b"{\"\xff\":1}".to_vec()),
+            ("a lone surrogate in a key", br#"{"\ud800":1}"#.to_vec()),
+            (
+                "a lone trailing surrogate in a key",
+                br#"{"\udc00":1}"#.to_vec(),
+            ),
+            (
+                "one level past the bound",
+                nested(MAX_TOKENIZER_JSON_DEPTH + 1),
+            ),
+            ("far past the bound", nested(100_000)),
+        ] {
+            std::fs::write(dir.path().join("tokenizer.json"), &contents).unwrap();
+            let reason = refusal(&graph);
+            assert!(reason.contains("tokenizer"), "{case}: {reason}");
+        }
+
+        for (case, contents) in [
+            ("exactly the bound", nested(MAX_TOKENIZER_JSON_DEPTH)),
+            (
+                "brackets inside a string",
+                br#"{"a":"[[[[{{{{\"]]]]"}"#.to_vec(),
+            ),
+            (
+                "a lone surrogate inside a value",
+                br#"{"a":"\ud800"}"#.to_vec(),
+            ),
+            (
+                "a lone surrogate in a nested key",
+                br#"{"a":{"\ud800":1}}"#.to_vec(),
+            ),
+            (
+                "a surrogate pair in a key",
+                br#"{"\ud83d\ude00":1}"#.to_vec(),
+            ),
+        ] {
+            std::fs::write(dir.path().join("tokenizer.json"), &contents).unwrap();
+            assert!(
+                validate_onnx_package(&graph).is_ok(),
+                "{case} must be accepted, as Python accepts it"
             );
         }
     }

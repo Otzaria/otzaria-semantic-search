@@ -356,6 +356,64 @@ def test_a_tokenizer_that_is_not_a_whole_json_object_is_refused(tmp_path, conten
     assert "not a JSON object" in refusal(graph_path)
 
 
+def nested(levels: int) -> bytes:
+    """A JSON object whose deepest container sits at `levels` (the object is level 1)."""
+    return b'{"a":' + b"[" * (levels - 1) + b"]" * (levels - 1) + b"}"
+
+
+# Where Python's json and the crate's serde_json could part: the crate's test
+# `a_tokenizer_is_refused_and_accepted_as_the_python_implementation_does` holds the same
+# cases, and both implementations must land on the same side of each.
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b'{"a":{"b":"\xff\xfe"}}',
+        b'{"a":"\xc3\x28"}',
+        b'{"\xff":1}',
+        b'{"\\ud800":1}',
+        b'{"\\udc00":1}',
+        nested(checksum.MAX_TOKENIZER_JSON_DEPTH + 1),
+        nested(100_000),
+    ],
+    ids=[
+        "invalid UTF-8 in a nested value",
+        "invalid UTF-8 in a value",
+        "invalid UTF-8 in a key",
+        "a lone surrogate in a key",
+        "a lone trailing surrogate in a key",
+        "one level past the bound",
+        "far past the bound",
+    ],
+)
+def test_a_tokenizer_the_crate_refuses_is_refused(tmp_path, contents):
+    graph_path = write_golden(tmp_path)
+    (tmp_path / "tokenizer.json").write_bytes(contents)
+    assert "tokenizer" in refusal(graph_path)
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        nested(checksum.MAX_TOKENIZER_JSON_DEPTH),
+        b'{"a":"[[[[{{{{\\"]]]]"}',
+        b'{"a":"\\ud800"}',
+        b'{"a":{"\\ud800":1}}',
+        b'{"\\ud83d\\ude00":1}',
+    ],
+    ids=[
+        "exactly the bound",
+        "brackets inside a string",
+        "a lone surrogate inside a value",
+        "a lone surrogate in a nested key",
+        "a surrogate pair in a key",
+    ],
+)
+def test_a_tokenizer_the_crate_accepts_is_accepted(tmp_path, contents):
+    graph_path = write_golden(tmp_path)
+    (tmp_path / "tokenizer.json").write_bytes(contents)
+    checksum.validate_onnx_package(graph_path)
+
+
 # ── external data ──
 
 
