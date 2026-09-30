@@ -189,7 +189,7 @@ be served fails at load and never in the middle of an index:
 |---|---|
 | pooling other than `in-graph` | `PoolingMismatch` |
 | `intra_threads` or `sessions` of 0 in a literal config | `LoadFailed`, naming the field |
-| `max_tokens` above 65,536 — past any encoder's context; the probe below is that long | `LoadFailed` |
+| `max_tokens` above 65,536 — past any encoder's context; the probe below is that long. Refused before this too, by `EmbeddingConfig::validate` and the engine's configuration — before a manifest records it — while a GGUF cap stays llama.cpp's to clamp | `LoadFailed` (`Config` in the engine) |
 | graph / `tokenizer.json` absent | `ModelNotFound` / `TokenizerNotFound` |
 | tokenizer not parseable | `InvalidModelFile` (the graph named, the tokenizer in the reason) |
 | `max_tokens` ≤ the special tokens the tokenizer adds | `LoadFailed` — also what keeps the tokenizer's own unchecked subtraction from wrapping |

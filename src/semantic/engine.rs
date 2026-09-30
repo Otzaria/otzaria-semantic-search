@@ -10,7 +10,9 @@
 //! the coordinator falls back to BM25) until [`SemanticEngine::reset_index`].
 
 use crate::errors::{ManifestError, SemanticSearchError};
-use crate::semantic::backend::{ensure_pooling_is_implemented_for, Pooling};
+use crate::semantic::backend::{
+    ensure_pooling_is_implemented_for, max_tokens_past_the_format, Pooling,
+};
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::manifest::{
@@ -131,6 +133,14 @@ impl SemanticConfig {
                  around the text, so at least 2 are needed for any content to reach the model",
                 self.embedding_max_tokens
             )));
+        }
+        // And an ONNX cap past any encoder's context, before the manifest records it.
+        if let Some(reason) = max_tokens_past_the_format(
+            "embedding_max_tokens",
+            self.embedding_max_tokens,
+            crate::semantic::model_package::ModelFormat::of(&self.model_path),
+        ) {
+            return Err(SemanticSearchError::Config(reason));
         }
         Ok(())
     }
@@ -854,6 +864,7 @@ fn manifest_config(
 mod tests {
     use super::*;
     use crate::errors::{ArtifactError, EmbeddingError};
+    use crate::semantic::backend::ONNX_MAX_TOKENS_CEILING;
     use crate::semantic::embedding::mock;
     use crate::semantic::types::BookLine;
 
@@ -1118,6 +1129,47 @@ mod tests {
         );
         onnx.pooling = "in-graph".to_string();
         assert_eq!(onnx.pooling_strategy().unwrap(), Pooling::InGraph);
+    }
+
+    /// An ONNX token cap past any encoder's context — `u32::MAX` is what a negative
+    /// setting arrives as — is refused like a pooling the format cannot serve: while it is
+    /// a configuration, before the manifest records it as the index's identity. A GGUF
+    /// cap has no such bound here: llama.cpp clamps it to the model's trained context and
+    /// reports what it used, as it always has.
+    #[test]
+    fn an_onnx_cap_past_any_encoders_context_is_refused_before_the_manifest_is_written() {
+        let dir = TempDir::new("onnx_cap_ceiling");
+        let mut config = config_at(&dir);
+        config.model_path =
+            crate::semantic::embedding::mock::write_stub_onnx_package(&dir.path().join("package"));
+        config.pooling = "in-graph".to_string();
+
+        for cap in [ONNX_MAX_TOKENS_CEILING + 1, u32::MAX as usize] {
+            config.embedding_max_tokens = cap;
+            match SemanticEngine::open(config.clone()) {
+                Err(SemanticSearchError::Config(msg)) => assert!(
+                    msg.contains(&format!("embedding_max_tokens is {cap}"))
+                        && msg.contains(&ONNX_MAX_TOKENS_CEILING.to_string()),
+                    "the error must name the cap and the ceiling: {msg}"
+                ),
+                Err(other) => panic!("expected a config error, got {other}"),
+                Ok(_) => panic!("a cap of {cap} must be refused for an ONNX model"),
+            }
+            assert!(
+                !SemanticManifest::file_path(&config.root_dir).exists(),
+                "a refused configuration must not have persisted an index identity"
+            );
+        }
+
+        config.embedding_max_tokens = ONNX_MAX_TOKENS_CEILING;
+        assert!(config.validate().is_ok(), "the ceiling itself is accepted");
+
+        let mut gguf = config_at(&dir);
+        gguf.embedding_max_tokens = u32::MAX as usize;
+        assert!(
+            gguf.validate().is_ok(),
+            "a GGUF cap is llama.cpp's to clamp"
+        );
     }
 
     /// The cap decides how much of a long line the model ever saw, so it is part of

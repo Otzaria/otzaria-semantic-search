@@ -342,6 +342,42 @@ pub fn ensure_pooling_is_implemented_for(
     })
 }
 
+/// The largest token cap an ONNX model may be configured with: past the context of any
+/// sentence encoder (512 positions for Meivin Round 2; the long-context ones stop at 8192
+/// or 32768).
+///
+/// A bound on configurations, not a claim about a graph — whether a graph runs a cap
+/// below it is what the ONNX backend's load-time probe proves — and one that probe needs:
+/// it is as long as the cap, so an unbounded cap (a `u32` of a few billion, which is what
+/// a negative application setting arrives as) asked the allocator for hundreds of
+/// gigabytes and aborted the process instead of failing the load. GGUF has no bound
+/// here: llama.cpp clamps the cap to the model's trained context and reports what it
+/// used.
+pub const ONNX_MAX_TOKENS_CEILING: usize = 1 << 16;
+
+/// Why a token cap of `max_tokens`, configured as `field`, is more than any backend for
+/// `format` serves — or `None`. Refused while it is still a configuration, for the reason
+/// [`ensure_pooling_is_implemented_for`] refuses a pooling: the cap is recorded as the
+/// index's identity before any backend is asked. [`EmbeddingConfig::validate`], the
+/// engine's configuration and the ONNX backend each refuse it in their own error type.
+pub(crate) fn max_tokens_past_the_format(
+    field: &str,
+    max_tokens: usize,
+    format: ModelFormat,
+) -> Option<String> {
+    match format {
+        ModelFormat::Gguf => None,
+        ModelFormat::Onnx => (max_tokens > ONNX_MAX_TOKENS_CEILING).then(|| {
+            format!(
+                "{field} is {max_tokens}, past the context of any ONNX sentence encoder: at most \
+                 {ONNX_MAX_TOKENS_CEILING} is accepted. Set it to the model's own cap — the \
+                 Meivin Round 2 identity declares 256 — and the load-time probe then proves the \
+                 graph runs it"
+            )
+        }),
+    }
+}
+
 /// Attributed per backend, because "implemented: last-token" reads as a limit of
 /// the build while "last-token (mock-hash-v1)" names the implementation.
 fn describe_implemented_poolings(format: Option<ModelFormat>) -> String {
@@ -1019,6 +1055,15 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "an ONNX token cap past any encoder's context",
+                EmbeddingConfig {
+                    model_path: "absent/model.onnx".into(),
+                    pooling: Pooling::InGraph,
+                    max_tokens: ONNX_MAX_TOKENS_CEILING + 1,
+                    ..Default::default()
+                },
+            ),
         ];
 
         for (name, config) in cases {
@@ -1028,6 +1073,31 @@ mod tests {
                 "{name} must be refused, but a backend was built for it"
             );
         }
+    }
+
+    /// The ceiling binds ONNX alone: a GGUF cap is llama.cpp's to clamp, at any size.
+    #[test]
+    fn the_token_cap_ceiling_binds_onnx_and_leaves_gguf_as_it_was() {
+        for cap in [2, 512, ONNX_MAX_TOKENS_CEILING + 1, usize::MAX] {
+            assert_eq!(
+                max_tokens_past_the_format("max_tokens", cap, ModelFormat::Gguf),
+                None
+            );
+        }
+        for cap in [2, 256, ONNX_MAX_TOKENS_CEILING] {
+            assert_eq!(
+                max_tokens_past_the_format("max_tokens", cap, ModelFormat::Onnx),
+                None
+            );
+        }
+        let refused = max_tokens_past_the_format("max_tokens", usize::MAX, ModelFormat::Onnx)
+            .expect("refused");
+        assert!(
+            refused.starts_with(&format!("max_tokens is {}", usize::MAX))
+                && refused.contains(&ONNX_MAX_TOKENS_CEILING.to_string())
+                && refused.contains("Set it to the model's own cap"),
+            "the reason names the cap, the ceiling and the fix: {refused}"
+        );
     }
 
     #[test]

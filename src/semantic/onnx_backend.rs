@@ -74,9 +74,9 @@
 //! inside a book is an accident, here the prefix *is* one.
 
 use crate::errors::EmbeddingError;
-use crate::semantic::backend::{EmbeddingBackend, Pooling};
+use crate::semantic::backend::{max_tokens_past_the_format, EmbeddingBackend, Pooling};
 use crate::semantic::embedding::EmbeddingConfig;
-use crate::semantic::model_package::onnx_package_root;
+use crate::semantic::model_package::{onnx_package_root, ModelFormat};
 
 use ort::logging::LogLevel;
 use ort::session::builder::GraphOptimizationLevel;
@@ -103,14 +103,6 @@ const DEFAULT_THREADS_CAP: usize = 4;
 /// cliff: runs are leased one text at a time, so a query waits for one inference
 /// behind an indexing batch (measured at most 14.7 ms), not for the batch.
 const DEFAULT_SESSIONS: usize = 1;
-
-/// The largest `max_tokens` this backend accepts: past the context of any sentence
-/// encoder (512 positions for the production graph; the long-context ones stop at 8192 or
-/// 32768), and so a bound on the load-time probe rather than a claim about a graph —
-/// whether one runs a cap is what the probe proves. Without it the probe is as long as
-/// whatever the configuration says: a `u32` of a few billion asked the allocator for
-/// hundreds of gigabytes, which aborts the process instead of failing the load.
-const MAX_TOKENS_CEILING: usize = 1 << 16;
 
 /// Environment variable naming the ONNX Runtime shared library to load. Read by
 /// [`OnnxBackend::open`], not by [`OnnxBackendConfig`]: it chooses the code that runs,
@@ -851,13 +843,15 @@ impl OnnxBackend {
     /// finished `[batch, dim]` sentence vector.
     ///
     /// Everything is checked here rather than on the first search, cheapest first: the
-    /// pooling, the tuning and a cap no encoder has (`MAX_TOKENS_CEILING`, since the probe
-    /// below is as long as the cap); that both files exist; that the tokenizer parses and
-    /// leaves `max_tokens` room for content; the runtime library (see the module docs);
-    /// the graph's inputs and first output; and finally a probe of exactly `max_tokens`
-    /// tokens through **every** session, which must come back finite, `dim` long and
-    /// identical across sessions — so a cap the graph cannot run, or a session that will
-    /// not allocate, fails here and not in the middle of an index.
+    /// pooling, the tuning and a cap no encoder has — above
+    /// [`ONNX_MAX_TOKENS_CEILING`](crate::semantic::backend::ONNX_MAX_TOKENS_CEILING),
+    /// since the probe below is as long as the cap; that both files exist; that the
+    /// tokenizer parses and leaves `max_tokens` room for content; the runtime library
+    /// (see the module docs); the graph's inputs and first output; and finally a probe of
+    /// exactly `max_tokens` tokens through **every** session, which must come back
+    /// finite, `dim` long and identical across sessions — so a cap the graph cannot run,
+    /// or a session that will not allocate, fails here and not in the middle of an
+    /// index.
     ///
     /// # Errors
     ///
@@ -900,15 +894,12 @@ impl OnnxBackend {
                 });
             }
         }
-        if max_tokens > MAX_TOKENS_CEILING {
-            return Err(EmbeddingError::LoadFailed {
-                reason: format!(
-                    "max_tokens is {max_tokens}, past the context of any sentence encoder; \
-                     this backend accepts at most {MAX_TOKENS_CEILING}, and the graph's own \
-                     positions decide at load whether even that runs. The Meivin Round 2 \
-                     identity declares 256"
-                ),
-            });
+        // Checked here too, for a caller that never went through `EmbeddingConfig::validate`:
+        // the probe below is as long as the cap (`ONNX_MAX_TOKENS_CEILING` says why).
+        if let Some(reason) =
+            max_tokens_past_the_format("max_tokens", max_tokens, ModelFormat::Onnx)
+        {
+            return Err(EmbeddingError::LoadFailed { reason });
         }
         if !graph.is_file() {
             return Err(EmbeddingError::ModelNotFound {
@@ -1328,6 +1319,7 @@ impl EmbeddingBackend for OnnxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::backend::ONNX_MAX_TOKENS_CEILING;
     use std::sync::Mutex;
 
     /// Every test that reads or writes the tuning variables holds this, because the test
@@ -1569,7 +1561,7 @@ mod tests {
     #[test]
     fn a_cap_past_any_encoders_context_is_refused_before_anything_is_loaded() {
         for cap in [
-            MAX_TOKENS_CEILING + 1,
+            ONNX_MAX_TOKENS_CEILING + 1,
             u32::MAX as usize,
             usize::MAX / 2,
             usize::MAX,
@@ -1577,7 +1569,7 @@ mod tests {
             match open_fixture("dynamic.onnx", cap, &tuning(1, 1)) {
                 Err(EmbeddingError::LoadFailed { reason }) => assert!(
                     reason.contains(&format!("max_tokens is {cap}"))
-                        && reason.contains(&MAX_TOKENS_CEILING.to_string()),
+                        && reason.contains(&ONNX_MAX_TOKENS_CEILING.to_string()),
                     "{reason}"
                 ),
                 other => panic!("a cap of {cap} must be refused, got {:?}", other.err()),
@@ -1588,7 +1580,7 @@ mod tests {
         assert!(load_tokenizer(
             &fixture("dynamic.onnx"),
             &fixture("tokenizer.json"),
-            MAX_TOKENS_CEILING
+            ONNX_MAX_TOKENS_CEILING
         )
         .is_ok());
     }

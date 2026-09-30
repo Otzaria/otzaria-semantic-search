@@ -7,7 +7,8 @@
 
 use crate::errors::EmbeddingError;
 use crate::semantic::backend::{
-    ensure_pooling_is_implemented_for, select_backend, EmbeddingBackend, Pooling,
+    ensure_pooling_is_implemented_for, max_tokens_past_the_format, select_backend,
+    EmbeddingBackend, Pooling,
 };
 use crate::semantic::model_package::{validate_model, ModelFormat};
 use std::io::Read;
@@ -97,7 +98,9 @@ impl EmbeddingConfig {
     /// zero dimensionality or token cap makes every embedding degenerate. The
     /// pooling check asks whether a backend for the model's format *performs* the
     /// strategy, and belongs here because the value is persisted as the index's
-    /// identity — see [`ensure_pooling_is_implemented_for`].
+    /// identity — see [`ensure_pooling_is_implemented_for`]. So is the token cap, and an
+    /// ONNX one is held to [`ONNX_MAX_TOKENS_CEILING`](crate::semantic::backend::ONNX_MAX_TOKENS_CEILING)
+    /// here for the same reason.
     pub fn validate(&self) -> Result<(), EmbeddingError> {
         if self.embedding_dim == 0 {
             return Err(EmbeddingError::LoadFailed {
@@ -122,7 +125,11 @@ impl EmbeddingConfig {
                 ),
             });
         }
-        ensure_pooling_is_implemented_for(self.pooling, ModelFormat::of(&self.model_path))?;
+        let format = ModelFormat::of(&self.model_path);
+        if let Some(reason) = max_tokens_past_the_format("max_tokens", self.max_tokens, format) {
+            return Err(EmbeddingError::LoadFailed { reason });
+        }
+        ensure_pooling_is_implemented_for(self.pooling, format)?;
         Ok(())
     }
 }
@@ -2114,6 +2121,49 @@ mod tests {
             // `LoadFailed`, not `ModelNotFound`, proves the file was never touched.
             assert!(matches!(rt.load(), Err(EmbeddingError::LoadFailed { .. })));
         }
+    }
+
+    /// An ONNX cap past any encoder's context is a configuration nothing can serve, and
+    /// is refused as one — before the file is opened, as the paths here do not exist —
+    /// naming the ceiling. A GGUF cap is not bounded here: llama.cpp clamps it to the
+    /// model's trained context, which only the model knows.
+    #[test]
+    fn validate_bounds_an_onnx_cap_and_leaves_a_gguf_one_to_the_backend() {
+        let dir = TempDir::new("cap_ceiling");
+        let onnx = |max_tokens: usize| EmbeddingConfig {
+            model_path: dir.path().join("absent.onnx"),
+            pooling: Pooling::InGraph,
+            max_tokens,
+            ..Default::default()
+        };
+        for cap in [
+            crate::semantic::backend::ONNX_MAX_TOKENS_CEILING + 1,
+            u32::MAX as usize,
+            usize::MAX,
+        ] {
+            match onnx(cap).validate() {
+                Err(EmbeddingError::LoadFailed { reason }) => assert!(
+                    reason.contains(&format!("max_tokens is {cap}"))
+                        && reason.contains(
+                            &crate::semantic::backend::ONNX_MAX_TOKENS_CEILING.to_string()
+                        ),
+                    "{reason}"
+                ),
+                other => panic!("a cap of {cap} must be refused, got {other:?}"),
+            }
+            let mut rt = EmbeddingRuntime::new(onnx(cap));
+            assert!(matches!(rt.load(), Err(EmbeddingError::LoadFailed { .. })));
+        }
+        assert!(onnx(crate::semantic::backend::ONNX_MAX_TOKENS_CEILING)
+            .validate()
+            .is_ok());
+
+        let gguf = EmbeddingConfig {
+            model_path: dir.path().join("absent.gguf"),
+            max_tokens: u32::MAX as usize,
+            ..Default::default()
+        };
+        assert!(gguf.validate().is_ok(), "unchanged for GGUF");
     }
 
     /// The pairing is refused before the file is opened, like a pooling nothing
