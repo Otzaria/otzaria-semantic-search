@@ -337,12 +337,15 @@ jobs:
           OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
         run: cargo test --test artifact_builder --features llama-backend -- --ignored --nocapture
 
-  # The ONNX backend's parity gate: tests/data/onnx_golden_vectors.json holds the Python
-  # reference's answers (`tools/generate_onnx_golden_vectors.py`) for the production
-  # graph, and `semantic::onnx_backend::golden` requires the same token ids exactly, then
-  # every vector within cosine 0.99999. Truncation at the 256-token cap, the role tokens
-  # and special-token matching are all decided before the graph runs, and the ids are
-  # where an error in any of them shows.
+  # The ONNX backend's parity gates, one per graph of the Meivin Round 2 package: the int8
+  # graph, which is the default identity, and the fp32 graph it was quantized from. Each has
+  # its golden file — tests/data/onnx_golden_vectors_int8.json and onnx_golden_vectors.json,
+  # the Python reference's answers (`tools/generate_onnx_golden_vectors.py`) — and
+  # `semantic::onnx_backend::golden`, which picks the file by the graph's SHA-256, requires
+  # the same token ids exactly, then every vector within the graph's cosine bound (see
+  # `MIN_COSINE` there: int8 vectors depend on the CPU's int8 kernels, fp32 ones do not).
+  # Truncation at the 256-token cap, the role tokens and special-token matching are all
+  # decided before the graph runs, and the ids are where an error in any of them shows.
   #
   # The same policy as `golden-vectors`, for the same reasons: the model is gated, so the
   # job runs off the OTZARIA_HF_TOKEN secret on every push and same-repo PR, fails rather
@@ -350,10 +353,12 @@ jobs:
   # forks, which get no secrets.
   #
   # The files come from the project's private mirror,
-  # `otzaria/judaic-semantic-round2-onnx-zayit`, never from the gated original
+  # `otzaria/judaic-semantic-round2-onnx-zayit` (99b8a61, byte-identical to the source in
+  # all eight files), never from the gated original
   # (`ArieLLL123/judaic-semantic-round2-onnx-zayit`), whose access is one person's manual
-  # approval. So this job needs that mirror to exist, holding the same bytes — the SHA-256
-  # check below is what says so — and an OTZARIA_HF_TOKEN that can read it.
+  # approval. The mirror is private: the Hugging Face account behind the OTZARIA_HF_TOKEN
+  # secret needs read access to it, or every download below answers 401 and the job fails.
+  # The SHA-256 checks are what say the bytes are the goldens' ones.
   golden-onnx:
     name: Golden Vectors (ONNX model)
     if: >-
@@ -372,12 +377,12 @@ jobs:
         with:
           key: onnx-backend
 
-      # The package — the fp32 graph and the tokenizer.json beside it — downloaded fresh
-      # every run and deliberately NOT cached, as in `golden-vectors`: an Actions cache
-      # on `main` is readable by a run from a fork's pull request, and caching these
-      # would publish a gated model to anyone who opens one. The token reaches curl
-      # through a config on stdin, never argv; `--retry` because HuggingFace rate-limits
-      # with a 429 that is not a refusal.
+      # Both graphs — 42 MB and 168 MB — and the tokenizer.json they share, downloaded fresh
+      # every run and deliberately NOT cached, as in `golden-vectors`: an Actions cache on
+      # `main` is readable by a run from a fork's pull request, and caching these would
+      # publish a gated model to anyone who opens one. The token reaches curl through a
+      # config on stdin, never argv; `--retry` because HuggingFace rate-limits with a 429
+      # that is not a refusal.
       - name: Fetch the model package
         id: model
         env:
@@ -388,23 +393,26 @@ jobs:
             exit 1
           fi
           mkdir -p onnx-model
-          for file in seforim-embed-round2-fp32.onnx tokenizer.json; do
+          for file in seforim-embed-round2-int8.onnx seforim-embed-round2-fp32.onnx tokenizer.json; do
             printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
               curl -fSL --retry 5 --retry-all-errors --output "onnx-model/$file" -K - \
                 "https://huggingface.co/otzaria/judaic-semantic-round2-onnx-zayit/resolve/main/$file"
           done
           # A mismatch must read as "wrong model" rather than as confusing id and vector diffs.
           verify() {
-            expected=$(python3 -c "import json,sys; print(json.load(open('tests/data/onnx_golden_vectors.json'))['header'][sys.argv[1]])" "$2")
+            expected=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header'][sys.argv[2]])" "tests/data/$2" "$3")
             actual=$(sha256sum "onnx-model/$1" | cut -d' ' -f1)
             if [ "$expected" != "$actual" ]; then
-              echo "::error::$1: SHA-256 mismatch. The goldens expect $expected, got $actual."
+              echo "::error::$1: SHA-256 mismatch. $2 expects $expected, got $actual."
               exit 1
             fi
           }
-          verify seforim-embed-round2-fp32.onnx graph_sha256
-          verify tokenizer.json tokenizer_sha256
-          echo "path=$(pwd)/onnx-model/seforim-embed-round2-fp32.onnx" >> "$GITHUB_OUTPUT"
+          verify seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json graph_sha256
+          verify seforim-embed-round2-fp32.onnx onnx_golden_vectors.json graph_sha256
+          verify tokenizer.json onnx_golden_vectors_int8.json tokenizer_sha256
+          verify tokenizer.json onnx_golden_vectors.json tokenizer_sha256
+          echo "int8=$(pwd)/onnx-model/seforim-embed-round2-int8.onnx" >> "$GITHUB_OUTPUT"
+          echo "fp32=$(pwd)/onnx-model/seforim-embed-round2-fp32.onnx" >> "$GITHUB_OUTPUT"
 
       # The linux-x64 row of the `onnx-backend` matrix; bump the two together.
       - name: Fetch ONNX Runtime 1.28.0
@@ -416,30 +424,41 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
           echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
 
-      # The package checksum is what an artifact built from this model declares as
+      # The package checksum is what an artifact built from a graph declares as
       # `model_checksum`, and it has two implementations: the crate's and
-      # tools/onnx_package_checksum.py. Both must reach the value
-      # config/models/meivin-round2-onnx/model.json declares and the goldens record, from
-      # the real 168 MB package — the unit tests only reach it from a 241-byte one.
-      - name: The package checksum, by both implementations
-        env:
-          GRAPH: ${{ steps.model.outputs.path }}
+      # tools/onnx_package_checksum.py. For each graph both must reach the value its golden
+      # file records — from the real package; the unit tests only reach it from a 241-byte
+      # one — and, where an identity declares that graph, the value the identity declares.
+      - name: The package checksums, by both implementations
         run: |
-          declared=$(python3 -c "import json; print(json.load(open('config/models/meivin-round2-onnx/model.json'))['model_checksum'])")
-          recorded=$(python3 -c "import json; print(json.load(open('tests/data/onnx_golden_vectors.json'))['header']['package_checksum'])")
-          if [ "$declared" != "$recorded" ]; then
-            echo "::error::model.json declares $declared, the goldens record $recorded."
-            exit 1
-          fi
-          python3 tools/onnx_package_checksum.py --expect "$declared" "$GRAPH"
-          computed=$(cargo run --quiet --features onnx-backend -- model-checksum --model-file "$GRAPH" | awk '$1 == "model_checksum:" { print $2 }')
-          if [ "$computed" != "$declared" ]; then
-            echo "::error::The crate computes model_checksum '$computed'; model.json declares $declared."
-            exit 1
-          fi
+          check() {
+            graph="onnx-model/$1"
+            recorded=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header']['package_checksum'])" "tests/data/$2")
+            if [ -n "${3:-}" ]; then
+              declared=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['model_checksum'])" "$3")
+              if [ "$declared" != "$recorded" ]; then
+                echo "::error::$3 declares $declared, and $2 records $recorded."
+                exit 1
+              fi
+            fi
+            python3 tools/onnx_package_checksum.py --expect "$recorded" "$graph"
+            computed=$(cargo run --quiet --features onnx-backend -- model-checksum --model-file "$graph" | awk '$1 == "model_checksum:" { print $2 }')
+            if [ "$computed" != "$recorded" ]; then
+              echo "::error::The crate computes model_checksum '$computed' for $1; $2 records $recorded."
+              exit 1
+            fi
+          }
+          check seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json
+          check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx/model.json
 
-      # `--ignored` is what selects them; the name selects the ONNX gate alone.
-      - name: Golden parity (token ids exact, then cosine)
+      # `--ignored` is what selects them; the name selects the ONNX gate alone. The gate
+      # picks each graph's goldens by its hash.
+      - name: Golden parity, int8 (the default identity)
         env:
-          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.path }}
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+
+      - name: Golden parity, fp32 (the reference graph)
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.fp32 }}
         run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
