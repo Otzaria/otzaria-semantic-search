@@ -20,6 +20,11 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
+# The ONNX model's graphs (config/models/meivin-round2-onnx/), wherever they are put,
+# and the directory CI's golden-onnx job downloads the package into.
+seforim-embed-round2-fp32.onnx
+seforim-embed-round2-int8.onnx
+/onnx-model/
 semantic_db/
 
 # Byte-code left behind by the golden-vector tooling in tools/. Running

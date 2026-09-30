@@ -1,0 +1,269 @@
+{
+ "cases_version": 1,
+ "description": "Input cases for tools/generate_onnx_golden_vectors.py. Each becomes one record in tests/data/onnx_golden_vectors.json. Most texts are taken from tools/golden_corpus.json by id, so the two golden files exercise the same lines; the rest are here because only a BERT-style tokenizer with role tokens makes them interesting. Plain data: add a case without touching code, then regenerate.",
+ "field_docs": {
+  "name": "Stable, unique, ASCII identifier. Never rename an existing name -- a Rust test may name it.",
+  "role": "'passage', 'query' or 'raw'. The model input is '[PASSAGE] ' + text, '[QUERY] ' + text, or the text alone -- exactly what embedding text version 2 hands the backend for a stored passage and for a query, and a raw control with no role token at all.",
+  "corpus_id": "Take the text from tools/golden_corpus.json, by id, verbatim. Exactly one of 'corpus_id' or 'text' is required.",
+  "text": "The text itself, verbatim, without the role prefix. Invisible or ambiguous characters are written as \\uXXXX escapes so a diff can show them.",
+  "prefix_chars": "Optional, with corpus_id: only the first N characters (code points) of the corpus text. How the token-boundary cases are cut from one long line.",
+  "expect_total_tokens": "Optional: the number of ids the golden must hold, after truncation. Pins a boundary; if a regeneration fails here, the tokenizer or the text changed. Recalibrate deliberately (--boundary-prefix), never relax.",
+  "expect_untruncated_tokens": "Optional: the number of ids the input tokenizes to with truncation off -- what proves a truncation case is truncated, and by how much.",
+  "notes": "What the case is for. Copied into the golden record."
+ },
+ "cases": [
+  {
+   "name": "passage_heb_prose_mishneh_torah",
+   "role": "passage",
+   "corpus_id": "heb_prose_mishneh_torah",
+   "notes": "Ordinary unpointed halachic prose: the common case, as a stored passage."
+  },
+  {
+   "name": "passage_heb_prose_aggada",
+   "role": "passage",
+   "corpus_id": "heb_prose_aggada",
+   "notes": "Ordinary unpointed aggadic prose."
+  },
+  {
+   "name": "passage_aramaic_talmud_sugya",
+   "role": "passage",
+   "corpus_id": "aramaic_talmud_sugya",
+   "notes": "Talmudic Aramaic: a different language in the same script."
+  },
+  {
+   "name": "passage_otzaria_line_with_reference",
+   "role": "passage",
+   "corpus_id": "otzaria_line_with_reference",
+   "notes": "Title, reference and line, as an Otzaria line reads with its location written out."
+  },
+  {
+   "name": "passage_punct_hebrew_abbrev",
+   "role": "passage",
+   "corpus_id": "punct_hebrew_abbrev",
+   "notes": "Geresh, gershayim, maqaf and sof pasuq in abbreviations."
+  },
+  {
+   "name": "passage_punct_rashi_abbrev_dense",
+   "role": "passage",
+   "corpus_id": "punct_rashi_abbrev_dense",
+   "notes": "Commentary apparatus that is almost entirely abbreviations: the worst case for subword segmentation."
+  },
+  {
+   "name": "passage_mixed_hebrew_english",
+   "role": "passage",
+   "corpus_id": "mixed_hebrew_english",
+   "notes": "Hebrew and Latin script in one line, with digits and '='. This normalizer does not lowercase -- 'Qwen3' reaches the model as written -- and it turns the em dash into '-'."
+  },
+  {
+   "name": "passage_digits_and_gematria",
+   "role": "passage",
+   "corpus_id": "digits_and_gematria",
+   "notes": "Hebrew alphabetic numerals beside Western digits, joined by a maqaf."
+  },
+  {
+   "name": "passage_final_letters",
+   "role": "passage",
+   "corpus_id": "final_letters",
+   "notes": "Final letter forms, which a normalizer must not fold into their medial forms."
+  },
+  {
+   "name": "passage_invisible_bidi_marks",
+   "role": "passage",
+   "corpus_id": "invisible_bidi_marks",
+   "notes": "RLM, LRM, NBSP, ZWNJ, ZWJ and a soft hyphen. The normalizer removes the bidi and joiner marks, NFKC turns the NBSP into a space, and the soft hyphen survives: all invisible, so only the ids can show that the backend did the same."
+  },
+  {
+   "name": "passage_whitespace_shapes",
+   "role": "passage",
+   "corpus_id": "whitespace_shapes",
+   "notes": "Tabs, newlines and runs of spaces inside the text."
+  },
+  {
+   "name": "passage_near_identical_a",
+   "role": "passage",
+   "corpus_id": "near_identical_a",
+   "notes": "With passage_near_identical_b: two lines that differ by one word."
+  },
+  {
+   "name": "passage_near_identical_b",
+   "role": "passage",
+   "corpus_id": "near_identical_b",
+   "notes": "With passage_near_identical_a."
+  },
+  {
+   "name": "passage_unrelated_a",
+   "role": "passage",
+   "corpus_id": "unrelated_a",
+   "notes": "With passage_unrelated_b: same language, different domains."
+  },
+  {
+   "name": "passage_unrelated_b",
+   "role": "passage",
+   "corpus_id": "unrelated_b",
+   "notes": "With passage_unrelated_a."
+  },
+  {
+   "name": "passage_medium_paragraph",
+   "role": "passage",
+   "corpus_id": "medium_paragraph",
+   "notes": "A responsa-length paragraph, inside the cap."
+  },
+  {
+   "name": "passage_foreign_special_markup",
+   "role": "passage",
+   "corpus_id": "special_token_markup_in_paragraph",
+   "notes": "Another model family's special-token markup (<|endoftext|>) in a paragraph. This tokenizer has no such token, so it is ordinary text here; the ids show it is not mistaken for one."
+  },
+  {
+   "name": "passage_editorial_brackets",
+   "role": "passage",
+   "text": "אמר רבי יוחנן [משום רבי שמעון בן יוחאי] (ברכות ז, ב): גדולה שמושה של תורה יותר מלמודה, שנאמר (מלכים ב ג, יא) פה אלישע בן שפט [אשר יצק מים על ידי אליהו].",
+   "notes": "Otzaria-style editorial apparatus: a bracketed insertion and parenthesised source references inside a quotation."
+  },
+  {
+   "name": "passage_editorial_gloss_nested",
+   "role": "passage",
+   "text": "ומברך על נטילת ידים (הגה: ויש אומרים שאין לברך עד שינגב [ועיין לעיל סימן ד, סעיף א], וכן נוהגין) (ב\"י בשם הרא\"ש).",
+   "notes": "A parenthesised gloss holding a bracketed cross-reference, then a parenthesised source abbreviation: nested apparatus, as commentaries print it."
+  },
+  {
+   "name": "passage_literal_passage_marker",
+   "role": "passage",
+   "text": "בכתב היד נמצא הסימן [PASSAGE] באמצע השורה, ואחריו המשך הדברים.",
+   "notes": "The role marker itself inside the content. The tokenizer matches added special tokens anywhere in its input (encode_special_tokens is off), so the literal becomes the [PASSAGE] token a second time -- the reference does not escape or strip it, and the backend must not either: the ids pin that both sides treat it identically."
+  },
+  {
+   "name": "passage_literal_bert_specials",
+   "role": "passage",
+   "text": "טבלה: [CLS] עמודה ראשונה [SEP] עמודה שנייה [MASK] ובסוף [UNK]",
+   "notes": "BERT's own special-token spellings inside the content. Matched as the special tokens they spell, like the role marker; a text that contains them is embedded with them, as the reference does."
+  },
+  {
+   "name": "passage_literal_hebrew_markers",
+   "role": "passage",
+   "text": "הערת המהדיר [קטע] בתוך השורה, ואחריה [שאילתה] נוספת.",
+   "notes": "tokenizer.json also declares [שאילתה] and [קטע] as special tokens (ids 7 and 8), Hebrew spellings of the two roles; the recipe never produces them, but a line that contains them is matched to them, like [PASSAGE]."
+  },
+  {
+   "name": "passage_normalizer_classes",
+   "role": "passage",
+   "text": "אמר לו \u2018כך מקובלני\u2019 והשיב \u201cואני כך\u201d \u2013 בסימן \uff13\u2212\uff11, כנזכר ב`ספר` \u202bלעיל\u202c ו\u2066להלן\u2069 מילה\u2060בתוך\ufeffמילה\u200bאחת, \ufb2aבת ו\ufb4fהים \ufb20ל הכל \u05c6 נון הפוכה.",
+   "notes": "One character from each class the normalizer rewrites that the corpus lines do not already hold: curly single and double quotes and a backtick (to ' and \"), an en dash and a minus sign (to -), bidi embedding and isolate controls, a word joiner, a zero-width space and a BOM (removed), a nun hafukha (U+05C6, removed with the pointing), fullwidth digits and Hebrew presentation forms (NFKC: the precomposed shin with its dot, whose dot the pointing rule then removes, the alef-lamed ligature, the alternative ayin). The rewrites are regular expressions, and the backend's tokenizer is built with a different regex engine (fancy-regex) from the Python reference's (onig): these ids are where the two would part."
+  },
+  {
+   "name": "passage_over_256_truncated",
+   "role": "passage",
+   "corpus_id": "over_512_full",
+   "expect_total_tokens": 256,
+   "notes": "A line far longer than the cap: truncated on the right to 256 ids in total, content first, so [CLS], the role token and the final [SEP] all survive."
+  },
+  {
+   "name": "passage_boundary_exactly_256",
+   "role": "passage",
+   "corpus_id": "over_512_full",
+   "prefix_chars": 985,
+   "expect_total_tokens": 256,
+   "expect_untruncated_tokens": 256,
+   "notes": "Exactly 256 ids with nothing cut: the first 985 characters of over_512_full end on a whole word. An implementation that reserves one id too many, or counts the cap as content only, truncates this and changes its ids."
+  },
+  {
+   "name": "passage_boundary_257_truncated_by_one",
+   "role": "passage",
+   "corpus_id": "over_512_full",
+   "prefix_chars": 986,
+   "expect_total_tokens": 256,
+   "expect_untruncated_tokens": 257,
+   "notes": "One character more -- the comma after that word -- is 257 ids, so exactly one content id is cut: the comma goes, and [SEP] stays last."
+  },
+  {
+   "name": "raw_nikud_bereshit",
+   "role": "raw",
+   "corpus_id": "nikud_bereshit",
+   "notes": "Nikud as combining marks, with no role token. The normalizer removes the pointing, so the ids are those of the unpointed text."
+  },
+  {
+   "name": "raw_teamim_shema",
+   "role": "raw",
+   "corpus_id": "teamim_shema",
+   "notes": "Cantillation marks, paseq and sof pasuq, with no role token. All are removed -- the paseq leaves two spaces behind, hence a lone '\u2581' id -- and sof pasuq goes with the pointing, before the rule that would have turned it into ':' sees it."
+  },
+  {
+   "name": "raw_nikud_qamats_qatan",
+   "role": "raw",
+   "corpus_id": "nikud_qamats_qatan",
+   "notes": "Rare pointing code points, qamats qatan (U+05C7, the end of the removed range) among them, with no role token."
+  },
+  {
+   "name": "raw_heb_prose_mishneh_torah",
+   "role": "raw",
+   "corpus_id": "heb_prose_mishneh_torah",
+   "notes": "The same text as passage_heb_prose_mishneh_torah and query_heb_prose_mishneh_torah, with no role token: the three differ only in the role."
+  },
+  {
+   "name": "query_heb_prose_mishneh_torah",
+   "role": "query",
+   "corpus_id": "heb_prose_mishneh_torah",
+   "notes": "A stored line's text asked as a query: its ids differ from the passage's in the role token alone."
+  },
+  {
+   "name": "query_two_words",
+   "role": "query",
+   "text": "מצות תפילין",
+   "notes": "A typical short search: two words."
+  },
+  {
+   "name": "query_leading_whitespace",
+   "role": "query",
+   "text": " מצות תפילין",
+   "notes": "A query whose text begins with a space. The recipe prefixes '[QUERY] ' without trimming the query, so the model sees two spaces, and the Metaspace pre-tokenizer turns the extra one into a lone '\u2581' id after [QUERY] -- which '[QUERY]' + text, or a trimmed query, would not have. Passages cannot show this: the chunker trims them."
+  },
+  {
+   "name": "query_single_word",
+   "role": "query",
+   "text": "תשובה",
+   "notes": "One word."
+  },
+  {
+   "name": "query_question",
+   "role": "query",
+   "text": "מה הדין אם שכח לומר יעלה ויבוא בברכת המזון?",
+   "notes": "A whole question, as people type one."
+  },
+  {
+   "name": "query_aramaic",
+   "role": "query",
+   "text": "מאי חנוכה",
+   "notes": "An Aramaic query."
+  },
+  {
+   "name": "query_mixed_script_digits",
+   "role": "query",
+   "text": "Rambam הלכות תשובה פרק 3",
+   "notes": "Latin, Hebrew and a digit in one query, beginning with a Latin letter; the same ids with or without the space after '[QUERY]'."
+  },
+  {
+   "name": "query_starts_with_digit",
+   "role": "query",
+   "text": "613 מצוות",
+   "notes": "Begins with a digit. Like every text that begins with something visible, it tokenizes to the same ids with or without the space after '[QUERY]'."
+  },
+  {
+   "name": "query_starts_with_quote",
+   "role": "query",
+   "text": "\"כל ישראל ערבים זה בזה\"",
+   "notes": "Begins with a quotation mark; the same ids with or without the space after '[QUERY]'."
+  },
+  {
+   "name": "query_starts_with_punctuation",
+   "role": "query",
+   "text": "(ברכות ז, ב) גדולה שמושה של תורה",
+   "notes": "Begins with a parenthesis, as a pasted reference does; the same ids with or without the space after '[QUERY]'."
+  },
+  {
+   "name": "query_lowercase_marker",
+   "role": "query",
+   "text": "מה פירוש [query] בלשון המחשב",
+   "notes": "The role marker in lower case inside the content. [QUERY] is declared with normalized: false, so only its exact spelling matches: '[query]' is tokenized as text."
+  }
+ ]
+}
