@@ -172,10 +172,17 @@ impl Chunker {
             // the model is given. Hashing the pre-normalization text would put a digest of
             // something nothing was built from into every record — the same fault
             // `chunk_hash` describing the corpus line instead of the embedded text would be.
-            let embedded_text = self.normalization.apply(&truncated_text).into_owned();
-            if embedded_text.trim().is_empty() {
+            let normalized = self.normalization.apply(&truncated_text);
+            // Judged before any role prefix: a prefix is not content, and a line with none
+            // must not embed as the prefix alone.
+            if normalized.trim().is_empty() {
                 continue;
             }
+            // The recipe's last word, after the cap and the normalization, so the content
+            // is exactly what version 1 embeds — and so is hashed with the prefix, because
+            // the digest describes the string the model is given. See
+            // `EmbeddingTextRecipe::passage_text`.
+            let embedded_text = self.text_recipe.passage_text(&normalized).into_owned();
             let chunk_hash = compute_chunk_hash(&embedded_text);
             let semantic_id =
                 compute_semantic_id(&book.source_book_key, line.line_id, chunking_identity);
@@ -202,12 +209,14 @@ impl Chunker {
         chunks
     }
 
-    /// What the model is given for one line.
+    /// The content the model is given for one line, before the cap, the normalization and
+    /// the recipe's role prefix.
     ///
     /// The `match` is the point: whether a title prefix or a reference prefix helps is
-    /// S1's measurement, and the answer becomes a second
-    /// [`EmbeddingTextRecipe`] with an arm here. Until one exists, `embedding_text_version`
-    /// can only be 1 — which is what stops an artifact declaring a recipe nobody wrote.
+    /// S1's measurement, and the answer becomes another [`EmbeddingTextRecipe`] with an
+    /// arm here. Only a variant with an arm can be accepted as `embedding_text_version` —
+    /// which is what stops an artifact declaring a recipe nobody wrote. Version 2 shares
+    /// version 1's arm on purpose: its passage is version 1's text, prefixed afterwards.
     fn embedding_text_for(
         &self,
         book: &BookForIndexing,
@@ -215,7 +224,8 @@ impl Chunker {
         char_count: usize,
     ) -> String {
         match self.text_recipe {
-            EmbeddingTextRecipe::LineOrNeighbourContext => {
+            EmbeddingTextRecipe::LineOrNeighbourContext
+            | EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext => {
                 if char_count < self.config.min_meaningful_chars {
                     self.build_context_text(book, index)
                 } else {
@@ -510,6 +520,112 @@ mod tests {
         assert_eq!(chunk.content_hash, book.content_fingerprint);
         assert_eq!(chunk.source_book_key, book.source_book_key);
         assert_eq!(chunk.source_doc_key, "book1.txt:1");
+    }
+
+    /// A book that exercises every branch of version 1: a line standing alone, a short
+    /// line borrowing its neighbours, a line too short to embed, and a line cut by the
+    /// character cap.
+    fn every_branch_book() -> BookForIndexing {
+        dummy_book(vec![
+            (1, "a line that stands alone"),
+            (1, "short one"),
+            (1, "no"),
+            (2, "abcdefghijklmnopqrstuvwxyz0123456789"),
+        ])
+    }
+
+    /// Version 1 is byte-identical to the recipe as it was before a second version
+    /// existed. The expected texts are written out, and their digests were computed
+    /// outside this crate (Python's hashlib), so neither can drift with the code.
+    #[test]
+    fn version_one_embeds_exactly_what_it_always_has() {
+        let chunker = chunker(ChunkerConfig {
+            max_chunk_chars: 30,
+            ..ChunkerConfig::default()
+        });
+        let chunks = chunker.chunk_book(&every_branch_book());
+        let produced: Vec<(u64, &str, &str)> = chunks
+            .iter()
+            .map(|c| (c.line_id, c.embedding_text.as_str(), c.chunk_hash.as_str()))
+            .collect();
+        assert_eq!(
+            produced,
+            vec![
+                (
+                    1,
+                    "a line that stands alone",
+                    "d5e703cd670772730f9f85bd4e17353c"
+                ),
+                // Borrowed from both neighbours in its section, then capped at 30.
+                (
+                    2,
+                    "a line that stands alone short",
+                    "2b7b0d10688b8fdebefd9b9d5b132a17"
+                ),
+                (
+                    4,
+                    "abcdefghijklmnopqrstuvwxyz0123",
+                    "0bf245c7abbd87326a228aa4178257fb"
+                ),
+            ]
+        );
+    }
+
+    /// Version 2 is version 1's text with `[PASSAGE] ` in front, once, on every chunk —
+    /// the same lines, the cap spent on content, the digest over what the model is given.
+    #[test]
+    fn version_two_prefixes_every_passage_once_and_changes_nothing_else() {
+        let v1 = chunker(ChunkerConfig {
+            max_chunk_chars: 30,
+            ..ChunkerConfig::default()
+        });
+        let v2 = chunker(ChunkerConfig {
+            max_chunk_chars: 30,
+            embedding_text_version: EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext
+                .version(),
+            ..ChunkerConfig::default()
+        });
+        let book = every_branch_book();
+        let (before, after) = (v1.chunk_book(&book), v2.chunk_book(&book));
+
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the prefix decides no line's fate"
+        );
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(new.line_id, old.line_id);
+            assert_eq!(
+                new.embedding_text,
+                format!("[PASSAGE] {}", old.embedding_text),
+                "line {}",
+                old.line_id
+            );
+            assert_eq!(new.embedding_text.matches("[PASSAGE]").count(), 1);
+            assert_eq!(new.chunk_hash, compute_chunk_hash(&new.embedding_text));
+            assert_ne!(new.chunk_hash, old.chunk_hash);
+            assert_eq!(
+                new.anchor_text, old.anchor_text,
+                "the anchor is the line itself"
+            );
+            // The identity folds the version in, so the two never share an id.
+            assert_ne!(new.semantic_id, old.semantic_id);
+        }
+    }
+
+    /// A line whose text already reads like a prefix is content: it is embedded with the
+    /// role prefix in front of it, not instead of it.
+    #[test]
+    fn a_line_that_looks_like_a_prefix_is_still_content() {
+        let v2 = chunker(ChunkerConfig {
+            embedding_text_version: 2,
+            ..ChunkerConfig::default()
+        });
+        let chunks = v2.chunk_book(&dummy_book(vec![(1, "[PASSAGE] a line about passages")]));
+        assert_eq!(
+            chunks[0].embedding_text,
+            "[PASSAGE] [PASSAGE] a line about passages"
+        );
     }
 
     #[test]

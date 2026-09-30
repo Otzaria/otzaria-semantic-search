@@ -662,9 +662,11 @@ impl SemanticEngine {
         };
 
         // Through the same text recipe the chunker applied to everything it stored: both
-        // sides of a comparison have to reach the model the same way.
-        let (_, _, normalization) = self.chunker.recipe();
-        Ok(runtime.embed_one(&normalization.apply(query))?)
+        // sides of a comparison have to reach the model the same way — normalized alike,
+        // and each marked with its own role when the recipe has roles.
+        let (_, text_recipe, normalization) = self.chunker.recipe();
+        let text = crate::semantic::recipe::query_input(text_recipe, normalization, query)?;
+        Ok(runtime.embed_one(&text)?)
     }
 
     /// Search with a vector already produced by this engine's embedding runtime.
@@ -1041,6 +1043,46 @@ mod tests {
             engine.index_book(&three_line_book()).unwrap(),
             IndexOutcome::Indexed { chunks: 3 }
         );
+    }
+
+    /// The query side of text recipe 2: every query is embedded marked as one, once, and
+    /// version 1 embeds it as it is.
+    #[test]
+    fn a_query_is_embedded_through_the_text_recipe_of_the_index() {
+        let dir = TempDir::new("query_recipe");
+        let query = "מצות תפילין";
+
+        let reference = {
+            let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
+                model_path: config_at(&dir).model_path,
+                embedding_dim: 64,
+                ..Default::default()
+            });
+            runtime.load().unwrap();
+            runtime
+        };
+
+        let mut v1 = SemanticEngine::open(config_at(&dir)).unwrap();
+        v1.load_model().unwrap();
+        assert_eq!(
+            v1.embed_query(query).unwrap(),
+            reference.embed_one(query).unwrap()
+        );
+
+        let other = TempDir::new("query_recipe_v2");
+        let mut config = config_at(&other);
+        config.chunking.embedding_text_version = 2;
+        let mut v2 = SemanticEngine::open(config).unwrap();
+        v2.load_model().unwrap();
+        let produced = v2.embed_query(query).unwrap();
+        assert_eq!(
+            produced,
+            reference.embed_one(&format!("[QUERY] {query}")).unwrap()
+        );
+        assert_ne!(produced, reference.embed_one(query).unwrap());
+
+        // Nothing to embed is refused, rather than embedded as the bare prefix.
+        assert!(v2.embed_query("  ").is_err());
     }
 
     /// The same trap as `"mean"`, reopened by a pooling only one format has: `"in-graph"`

@@ -203,7 +203,8 @@ A chunker configuration is
   "min_embeddable_chars":5,"chunking_version":1,"embedding_text_version":1,
   "normalization_version":1}}, and its hash must be the chunking_identity the model
 declares — an artifact records the hash, and a hash cannot be turned back into the recipe.
-Every field is required.
+Every field is required. embedding_text_version 2 puts "[PASSAGE] " before every passage
+and "[QUERY] " before every query, for a model trained with those role prefixes.
 
 The coverage contract: with --chunking, the lines that must get a vector are the ones the
 recipe embeds, derived from the corpus. Without it, they are every line in the corpus

@@ -177,9 +177,12 @@ pub struct OfficialSemanticIndex {
     verified: VerifiedPackage,
     store: Box<dyn VectorSearchBackend>,
     runtime: EmbeddingRuntime,
-    /// The text recipe the artifact's vectors were built under, applied to every query.
-    /// Both sides of a comparison have to go through the same one.
+    /// The text normalization the artifact's vectors were built under, applied to every
+    /// query. Both sides of a comparison have to go through the same one.
     normalization: TextNormalizationRecipe,
+    /// The text recipe likewise: under version 2 it marks every query as one, as the
+    /// stored passages were marked as passages.
+    text_recipe: EmbeddingTextRecipe,
     recovery: InstallRecovery,
     /// Counted once, at open, because the payload cannot change under a read-only store —
     /// and because counting means listing every book key, which is not something
@@ -222,10 +225,11 @@ impl OfficialSemanticIndex {
         // The artifact's own copy is refused by `validate_complete` during verification;
         // this refuses the *installation's*, which is what stops a configuration and an
         // artifact from agreeing on a recipe neither can run.
-        EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
-        // Held, not just checked: the query has to reach the model through the same text
-        // recipe the stored vectors were built under, or the two live in different places
-        // and nothing about either vector says so.
+        //
+        // Both are held, not just checked: the query has to reach the model through the
+        // same text recipe the stored vectors were built under, or the two live in
+        // different places and nothing about either vector says so.
+        let text_recipe = EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
         let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
 
         let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
@@ -262,6 +266,7 @@ impl OfficialSemanticIndex {
             store: Box::new(store),
             runtime,
             normalization,
+            text_recipe,
             recovery,
             book_count,
         };
@@ -295,9 +300,12 @@ impl OfficialSemanticIndex {
     /// Embed a query separately, so the coordinator can cache the vector.
     pub(crate) fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
         // The same recipe the stored vectors were built under. A query embedded from raw
-        // text against vectors built from normalized text scores nonsense with full
-        // confidence, and no check downstream can see it.
-        Ok(self.runtime.embed_one(&self.normalization.apply(query))?)
+        // text against vectors built from normalized text — or without the role prefix
+        // its passages were built with — scores nonsense with full confidence, and no
+        // check downstream can see it.
+        let text =
+            crate::semantic::recipe::query_input(self.text_recipe, self.normalization, query)?;
+        Ok(self.runtime.embed_one(&text)?)
     }
 
     /// Search with a vector this index's runtime already produced.
@@ -935,6 +943,48 @@ mod tests {
 
     /// A missing model is not a broken artifact, and the host has to be able to tell them
     /// apart — one is fixed by fetching the model, the other by fetching the index.
+    /// An artifact built under text recipe 2 is queried the way its passages were built:
+    /// normalized, then marked as a query — once.
+    #[test]
+    fn a_version_two_artifact_embeds_every_query_with_its_role_prefix() {
+        let dir = TempDir::new("query_prefix");
+        let model_path = dir.path().join("model.gguf");
+        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let target = dir.path().join("v2");
+        build_artifact(&target, &model_path, |manifest| {
+            manifest.identity.model.embedding_text_version = 2;
+        });
+
+        let index = OfficialSemanticIndex::open(OfficialIndexConfig {
+            model: LocalModel {
+                embedding_text_version: 2,
+                ..local_model(&model_path)
+            },
+            ..config_for(&target, &model_path)
+        })
+        .unwrap();
+
+        let query = LINES[2].2;
+        let embedded = |text: &str| {
+            let mut vector = mock::hash_embedding(text, DIM);
+            crate::semantic::embedding::normalize_validated(&mut vector, DIM).unwrap();
+            vector
+        };
+        let produced = index.embed_query(query).unwrap();
+        assert_eq!(produced, embedded(&format!("[QUERY] {query}")));
+        assert_ne!(produced, embedded(query));
+        assert_ne!(produced, embedded(&format!("[QUERY] [QUERY] {query}")));
+
+        // And version 1 is the query itself.
+        let (v1_model, v1_target, _) = installed(&dir);
+        let v1 = OfficialSemanticIndex::open(config_for(&v1_target, &v1_model)).unwrap();
+        assert_eq!(v1.embed_query(query).unwrap(), embedded(query));
+
+        // An empty query has nothing to embed under either.
+        assert!(index.embed_query("   ").is_err());
+        assert!(v1.embed_query("").is_err());
+    }
+
     #[test]
     fn a_missing_model_is_reported_as_an_embedding_error() {
         let dir = TempDir::new("no_model");

@@ -647,6 +647,88 @@ mod tests {
         );
     }
 
+    /// Text recipe 2 is applied where every recipe is, in the plan: the worker is handed
+    /// the passage already marked, and its digest covers the mark. The corpus line's
+    /// digest does not — it describes the line, which the prefix does not change — and
+    /// the build packs and validates exactly as under version 1.
+    #[test]
+    fn a_version_two_plan_carries_the_passage_prefixed_text_and_its_digest() {
+        let dir = TempDir::new("plan_v2");
+        let corpus = corpus(&dir);
+        let model_path = dir.0.join("model.gguf");
+        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let checksum = validate_and_checksum_gguf(&model_path).unwrap();
+
+        let plan_under = |chunking: &ChunkerConfig, model: &ModelIdentity| {
+            let mut sink = Vec::new();
+            export_plan(&corpus, chunking, model, &mut sink).unwrap();
+            read_plan(std::io::Cursor::new(sink), 0, usize::MAX)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let v1_chunking = ChunkerConfig::default();
+        let v2_chunking = ChunkerConfig {
+            embedding_text_version: 2,
+            ..ChunkerConfig::default()
+        };
+        let v2_model = ModelIdentity {
+            embedding_text_version: 2,
+            ..model_for(&checksum, &v2_chunking)
+        };
+        let v1 = plan_under(&v1_chunking, &model_for(&checksum, &v1_chunking));
+        let v2 = plan_under(&v2_chunking, &v2_model);
+
+        assert_eq!(v1.len(), v2.len(), "the prefix decides no line's fate");
+        for (old, new) in v1.iter().zip(&v2) {
+            assert_eq!(new.line_id, old.line_id);
+            assert_eq!(
+                new.embedding_text,
+                format!("[PASSAGE] {}", old.embedding_text)
+            );
+            assert_eq!(new.embedding_text.matches("[PASSAGE]").count(), 1);
+            assert_eq!(
+                new.embedding_text_sha256,
+                sha256_hex(new.embedding_text.as_bytes())
+            );
+            assert_eq!(
+                new.source_line_sha256, old.source_line_sha256,
+                "the corpus line is the same line"
+            );
+        }
+
+        // A worker embeds it unchanged — its digest check passes on the prefixed text —
+        // and the merge packs and verifies it against the corpus.
+        let runtime = runtime_for(&model_path);
+        let (mut vectors, mut records) = (Vec::new(), Vec::new());
+        let report = embed_shard(
+            v2.clone().into_iter().map(Ok),
+            ("plan".to_string(), 0, v2.len()),
+            &v2_model,
+            &runtime,
+            2,
+            &mut vectors,
+            &mut records,
+        )
+        .unwrap();
+        assert_eq!(report.records, v2.len());
+
+        let built = build(
+            BuildRequest {
+                output_path: dir.0.join("v2-artifact"),
+                model_path: model_path.clone(),
+                model: v2_model.clone(),
+                chunking: v2_chunking.clone(),
+                created_at: "2026-08-09T00:00:00Z".to_string(),
+                collection_name: "chunks".to_string(),
+                batch_size: 2,
+                allow_non_semantic_backend: true,
+            },
+            &corpus,
+        )
+        .unwrap();
+        assert_eq!(built.vector_count as usize, v2.len());
+    }
+
     /// A shard that never ran is a hole, and `pack` is what has to see it.
     ///
     /// Deliberately checked here rather than trusted from S4a: the whole reason a shard
