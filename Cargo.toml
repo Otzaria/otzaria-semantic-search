@@ -32,9 +32,9 @@ mock-embedding = []
 # on with no backend behind it; `semantic::backend` gates on the same condition.
 llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 
-# Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer. Non-default
-# for the reason `llama-backend` is: it links a large native runtime into every
-# downstream build.
+# Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer. Non-default,
+# like `llama-backend`: real inference is opt-in, and a default build must be unable to
+# produce embeddings at all (`tests/production_backend_gate.rs`).
 #
 # Empty for now: the ONNX Runtime and tokenizer dependencies arrive with the backend
 # implementation, and until then `OnnxBackend::open` refuses every model with

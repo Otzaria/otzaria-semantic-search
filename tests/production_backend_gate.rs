@@ -83,8 +83,8 @@ fn the_manifest_enables_no_embedding_backend_by_default() {
              (default = {default_set}).\n\
              A release build must not be able to produce embeddings: `mock-embedding` would \
              let it serve hash vectors as if they were semantic, `llama-backend` would make \
-             every downstream build compile llama.cpp, and `onnx-backend` would put an \
-             inference runtime into every downstream build. All three are opt-in by design, \
+             every downstream build compile llama.cpp, and `onnx-backend` would give every \
+             downstream build an ONNX inference backend. All three are opt-in by design, \
              and the behavioural halves of this file only run when they are off — so \
              enabling one by default would leave a half compiling to zero tests. If this \
              change is deliberate, delete this file and the guarantee with it, deliberately."

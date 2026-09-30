@@ -570,6 +570,7 @@ fn walk_graph_file(graph: &Path) -> Result<WalkedGraph, GraphFailure> {
         reader: HashingReader::new(file),
         file_len,
         messages: 0,
+        regions: 0,
         summary: GraphSummary::default(),
     };
     walk.model().map_err(|error| match error {
@@ -811,14 +812,19 @@ impl WalkError {
 /// A forward-only protobuf walk over the graph file, hashing every byte it passes.
 ///
 /// Every read is bounded by the end of the message it belongs to, and every message by
-/// the one holding it. A length that runs past the end of the *file* is a truncated
-/// download; one that runs past the end of its *message* but not of the file is a
-/// malformed one. Only that distinction needs the file length, which is why it is known
-/// up front.
+/// the one holding it. Only the outermost message is bounded by the end of the *file*,
+/// so only there does a read that runs past its bound prove a truncated download. A
+/// nested message's own length was checked against the file before it was entered, so
+/// a field that runs past *it* is a malformed file — even when that message happens to
+/// end exactly where the file does, and even when the field would run past the file
+/// too.
 struct GraphWalk {
     reader: HashingReader,
     file_len: u64,
     messages: u64,
+    /// How many length-bounded messages the walk is inside; 1 is the file's own
+    /// `ModelProto`.
+    regions: u32,
     summary: GraphSummary,
 }
 
@@ -840,8 +846,8 @@ impl GraphWalk {
         }
     }
 
-    /// Refuse a read of `bytes` that would pass `end` — as truncation if it passes the
-    /// end of the file too.
+    /// Refuse a read of `bytes` that would pass `end`: as truncation in the outermost
+    /// message, whose bound is the end of the file, and as malformation anywhere else.
     fn within(&self, bytes: u64, end: u64, wanted: &'static str) -> Result<(), WalkError> {
         let at = self.pos();
         let Some(needs) = at.checked_add(bytes) else {
@@ -849,15 +855,15 @@ impl GraphWalk {
                 "{wanted} at byte {at} declares {bytes} bytes, which no file can hold"
             )));
         };
-        if needs > self.file_len {
+        if needs <= end {
+            return Ok(());
+        }
+        if self.regions <= 1 {
             return Err(WalkError::Truncated { at, wanted, needs });
         }
-        if needs > end {
-            return Err(WalkError::Malformed(format!(
-                "{wanted} at byte {at} runs past the end of the message holding it (byte {end})"
-            )));
-        }
-        Ok(())
+        Err(WalkError::Malformed(format!(
+            "{wanted} at byte {at} runs past the end of the message holding it (byte {end})"
+        )))
     }
 
     fn byte(&mut self, end: u64, wanted: &'static str) -> Result<u8, WalkError> {
@@ -1004,6 +1010,8 @@ impl GraphWalk {
         F: FnMut(&mut Self, u32, Wire, u64) -> Result<bool, WalkError>,
     {
         self.enter(depth)?;
+        // Left raised on an error: the walk is abandoned then, not resumed.
+        self.regions += 1;
         while self.pos() < end {
             let at = self.pos();
             let (field, wire) = self.tag(end)?;
@@ -1025,6 +1033,7 @@ impl GraphWalk {
                 self.skip_value(field, wire, end, depth)?;
             }
         }
+        self.regions -= 1;
         Ok(())
     }
 
@@ -1466,6 +1475,9 @@ fn package_relpath(location: &str) -> Result<String, String> {
     }
     if location.starts_with('/') {
         return Err("an absolute path".to_string());
+    }
+    if location.ends_with('/') {
+        return Err("a trailing '/', which names a directory".to_string());
     }
     let mut components = Vec::new();
     for component in location.split('/') {
@@ -2343,6 +2355,30 @@ mod tests {
         assert!(!reason.contains("incomplete"), "{reason}");
     }
 
+    /// Only the outermost message is bounded by the end of the file. A graph whose own
+    /// length fits the file exactly, holding a field that claims more, is malformed —
+    /// downloading it again would change nothing.
+    #[test]
+    fn an_overrun_inside_a_message_that_ends_at_the_end_of_the_file_is_malformed() {
+        let dir = TempDir::new("overrun_at_eof");
+        let mut graph = onnx::graph("g", &onnx::encoder_inputs(), &[], &[]);
+        proto::key(&mut graph, 12, proto::LEN);
+        proto::varint(&mut graph, 5000); // an output claiming far more than is left
+        graph.extend_from_slice(b"xy");
+        let mut model = Vec::new();
+        proto::uint(&mut model, 1, 8);
+        proto::bytes(&mut model, 8, &onnx::opset("", 17));
+        proto::bytes(&mut model, 7, &graph); // last: it ends exactly at the end of the file
+
+        let path = package_with(&dir, &model);
+        let reason = refusal(&path);
+        assert!(
+            reason.contains("runs past the end of the message"),
+            "{reason}"
+        );
+        assert!(!reason.contains("incomplete"), "{reason}");
+    }
+
     #[test]
     fn nesting_past_the_bound_is_refused() {
         let dir = TempDir::new("depth");
@@ -2476,7 +2512,8 @@ mod tests {
             ("w.bin\nsecond line", "control character"),
             ("", "empty location"),
             (".", "no file name"),
-            ("./", "no file name"),
+            ("./", "trailing '/'"),
+            ("weights/", "trailing '/'"),
         ] {
             let graph = package_with(
                 &inner,

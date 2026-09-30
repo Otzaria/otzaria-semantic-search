@@ -28,9 +28,9 @@
 //! `.onnx` is ONNX and every other path is GGUF
 //! ([`ModelFormat::of`](crate::semantic::model_package::ModelFormat::of)), and only the
 //! candidates serving that format are walked. The stand-in is gated so a release build
-//! cannot serve fake vectors; real inference is gated because it links a large native
-//! runtime. With a real backend and the stand-in both enabled the real one wins, since
-//! `CANDIDATES` is ordered by preference.
+//! cannot serve fake vectors; real inference is gated because it brings a large native
+//! runtime into the build. With a real backend and the stand-in both enabled the real
+//! one wins, since `CANDIDATES` is ordered by preference.
 
 use crate::errors::EmbeddingError;
 use crate::semantic::embedding::EmbeddingConfig;
@@ -396,9 +396,7 @@ pub fn select_backend(
 
     // `Some(Err(_))` stops the walk just as `Some(Ok(_))` does — see
     // `BackendCandidate::construct`.
-    CANDIDATES
-        .iter()
-        .filter(|candidate| candidate.formats.contains(&format))
+    candidates_for(Some(format))
         .find_map(|candidate| (candidate.construct)(config))
         .unwrap_or_else(|| {
             // For GGUF this is, byte for byte, the message from before formats existed.
