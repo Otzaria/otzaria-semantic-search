@@ -133,6 +133,31 @@ const RUNTIME_FILE_NAME: &str = "onnxruntime.dll";
 /// (`onnxruntime.SessionOptions`) defaults to.
 const GRAPH_OPTIMIZATION: GraphOptimizationLevel = GraphOptimizationLevel::All;
 
+/// ONNX Runtime's session entry for exact int8 matrix products on x86
+/// (`kOrtSessionOptionsAvx2PrecisionMode`), set to `"1"` on every session.
+///
+/// A dynamically quantized graph multiplies uint8 activations by int8 weights, and on x86
+/// ONNX Runtime's kernels for that sum each pair of neighbouring products with `PMADDUBSW`,
+/// in **saturating 16-bit** arithmetic: 255 × 127 × 2 = 64,770 is clamped to 32,767. Only
+/// VNNI (or AMX) sums them in 32 bits, so the clamp is live on AVX2 and AVX-512 CPUs without
+/// it, and — in Microsoft's Windows build — on SSE4.1 CPUs without AVX2. The production int8
+/// graph's weights span the full ±127 and it saturates: on CI's x86-64 runner every one of
+/// the 41 golden vectors moved, to cosine 0.9809 at worst, and emulating the clamp on the M4
+/// reproduced its numbers case by case, to within 6e-4. With the entry set, the runtime
+/// rewrites each int8 weight tensor as uint8 (`Avx2WeightS8ToU8Transformer`: `w + 128`, the
+/// zero point moved with it — the same products exactly) so that its U8U8 kernels run,
+/// which sum them without a 16-bit clamp: exactly.
+///
+/// The runtime applies it only where it finds its own U8S8 kernels unsafe
+/// (`MlasPlatformU8S8Overflow`, x86 builds only); on ARM, and for an fp32 graph, it changes
+/// nothing — the M4's optimized graph is byte-identical with and without it. Set
+/// unconditionally, on the build machine and in the application alike, because it decides
+/// what an int8 vector is on x86: a library embedded on one x86 CPU and queried on another
+/// must have computed the same products. The cost is speed alone: ONNX Runtime documents
+/// the U8U8 kernels as slower, and a VNNI CPU, whose int8 products were exact already, gives
+/// up its VNNI kernels for the same result. `docs/ONNX_BACKEND.md` §0.1 has the mechanism.
+const X64_QUANT_PRECISION: &str = "session.x64quantprecision";
+
 /// The three inputs this backend knows how to feed.
 const INPUT_IDS: &str = "input_ids";
 const ATTENTION_MASK: &str = "attention_mask";
@@ -646,6 +671,7 @@ fn inspect_graph(session: &Session, graph: &Path) -> Result<Wiring, EmbeddingErr
 fn build_session(graph: &Path, intra_threads: usize) -> ort::Result<Session> {
     Session::builder()?
         .with_optimization_level(GRAPH_OPTIMIZATION)?
+        .with_config_entry(X64_QUANT_PRECISION, "1")?
         .with_intra_threads(intra_threads)?
         // Spinning keeps idle intra-op threads busy between runs: throughput on a
         // benchmark, battery on a phone, and no effect on a vector.
@@ -840,9 +866,10 @@ impl OnnxBackend {
     /// every stored vector.
     ///
     /// Also part of the wiring, and so covered by the same version: one text per run,
-    /// and graph optimization `All` (`GRAPH_OPTIMIZATION`). Deliberately **not** the
-    /// runtime's version or the thread count, as `LlamaCppBackend::ID` leaves out the
-    /// llama.cpp build: `docs/ONNX_BACKEND.md` measures what they move.
+    /// graph optimization `All` (`GRAPH_OPTIMIZATION`), and exact int8 products on x86
+    /// (`X64_QUANT_PRECISION`). Deliberately **not** the runtime's version or the thread
+    /// count, as `LlamaCppBackend::ID` leaves out the llama.cpp build:
+    /// `docs/ONNX_BACKEND.md` measures what they move.
     pub const ID: &'static str = "onnxruntime-sentence-v1";
 
     /// Load the graph at `graph` with the tokenizer at `tokenizer`, truncating every
@@ -1001,8 +1028,8 @@ impl OnnxBackend {
             "Embedding backend '{}' ready: {} — dim {} ({}), max_tokens {max_tokens} \
              ({special_tokens} special), batch dimension {} (one text per run), inputs \
              {INPUT_IDS} + {ATTENTION_MASK}{}, output '{}', {} session(s) x {} intra-op \
-             thread(s), graph optimization {GRAPH_OPTIMIZATION:?}; ONNX Runtime {runtime} from \
-             {}; loaded in {} ms",
+             thread(s), graph optimization {GRAPH_OPTIMIZATION:?}, {X64_QUANT_PRECISION} = 1; \
+             ONNX Runtime {runtime} from {}; loaded in {} ms",
             Self::ID,
             backend.graph.display(),
             backend.dim,
@@ -2421,7 +2448,9 @@ mod golden {
     /// The bound for int8 on another CPU family than the goldens'. Its vectors are not
     /// reproducible across int8 kernels: on the reference machine itself, turning KleidiAI
     /// off moved components by 1.07e-2 (cosine 0.99896) and an unfused graph by 1.06e-2
-    /// (0.99908), and x86 runs MLAS's own int8 kernels. Two correct int8 approximations,
+    /// (0.99908), and x86 runs MLAS's own int8 kernels — exact ones only because the backend
+    /// sets `X64_QUANT_PRECISION`; without it CI's x86-64 runner clamped its products and
+    /// fell to cosine 0.9809 here. Two correct int8 approximations,
     /// each within cosine 0.99911 of the fp32 graph on these cases, can lie up to twice
     /// that angle apart — cosine 0.9964 — so the bound sits below that, at 0.995, and still
     /// far above what a wiring error produces (a wrong output or mask gives a vector that
