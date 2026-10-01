@@ -27,6 +27,7 @@
 //! replaces it — see `docs/DEVELOPMENT.md`. Nothing here is an ANN index, and this
 //! module is not the `zvec` library.
 
+use crate::cancellation::{CancellationToken, SCAN_CHECK_INTERVAL};
 use crate::distribution::package::VerifiedPackage;
 use crate::errors::VectorStoreError;
 // One threshold for the whole crate, so no two layers can disagree about which vector
@@ -460,11 +461,12 @@ impl VectorSearchBackend for ReadOnlyZevcStore {
         self.records.len().min(u32::MAX as usize) as u32
     }
 
-    fn search(
+    fn search_cancellable(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
         search_records(
             &self.records,
@@ -472,6 +474,7 @@ impl VectorSearchBackend for ReadOnlyZevcStore {
             query_vector,
             top_k,
             filters,
+            cancel,
         )
     }
 
@@ -947,11 +950,12 @@ impl VectorSearchBackend for ZevcStore {
             .min(u32::MAX as usize) as u32
     }
 
-    fn search(
+    fn search_cancellable(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
         let state = self
             .state
@@ -963,6 +967,7 @@ impl VectorSearchBackend for ZevcStore {
             query_vector,
             top_k,
             filters,
+            cancel,
         )
     }
 
@@ -1122,12 +1127,17 @@ impl VectorStoreBackend for ZevcStore {
 /// Both sides are normalized, so the dot product *is* the cosine. An incomparable query
 /// yields nothing rather than `NaN`-scoring the whole store, and ties break on
 /// `semantic_id` because `HashMap` order is randomized per run.
+///
+/// `cancel` is looked at before the first record and every [`SCAN_CHECK_INTERVAL`]
+/// records after it; once it is set, the scan stops with [`VectorStoreError::Cancelled`]
+/// and its partial top-k is dropped.
 fn search_records(
     records: &HashMap<String, StoredVectorRecord>,
     embedding_dim: u32,
     query_vector: &[f32],
     top_k: usize,
     filters: Option<&SearchFilters>,
+    cancel: &CancellationToken,
 ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
     if query_vector.len() as u32 != embedding_dim {
         return Err(VectorStoreError::DimensionMismatch {
@@ -1147,7 +1157,10 @@ fn search_records(
     let filters = filters.and_then(SearchFilters::compile);
     let mut heap: BinaryHeap<ScoredEntry> = BinaryHeap::with_capacity(top_k + 1);
 
-    for record in records.values() {
+    for (scanned, record) in records.values().enumerate() {
+        if scanned % SCAN_CHECK_INTERVAL == 0 {
+            cancel.scan_checkpoint(scanned)?;
+        }
         if let Some(compiled) = filters.as_ref() {
             if !compiled.matches(&record.metadata) {
                 continue;
@@ -1749,6 +1762,115 @@ mod tests {
                 assert!(reason.contains("no search could return it"), "{reason}")
             }
             other => panic!("expected a direction rejection, got {other:?}"),
+        }
+    }
+
+    // ── cancellation ──
+
+    /// Records for the scan both openers share, several scan intervals of them.
+    fn records(count: usize) -> HashMap<String, StoredVectorRecord> {
+        (0..count)
+            .map(|i| {
+                let mut vector = vec![1.0, (i % 89) as f32 / 89.0, 0.5, 0.25];
+                normalize_for_scoring(&mut vector).unwrap();
+                let id = format!("id{i:06}");
+                (
+                    id.clone(),
+                    StoredVectorRecord {
+                        metadata: sample_metadata(&id, "book_a"),
+                        vector,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The scan the official index runs, cancelled from another thread mid-way: it stops
+    /// at the checkpoint the cancel landed on, not at the end of the payload.
+    #[test]
+    fn a_cancel_mid_scan_stops_the_shared_scan_at_its_next_checkpoint() {
+        use crate::cancellation::probe;
+
+        let records = records(5 * SCAN_CHECK_INTERVAL + 3);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let cancel = CancellationToken::new();
+
+        let (result, checkpoints) = probe::cancelling_at(&cancel, 2 * SCAN_CHECK_INTERVAL, || {
+            search_records(&records, 4, &query, 3, None, &cancel)
+        });
+        assert!(
+            matches!(result, Err(VectorStoreError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            checkpoints,
+            [0, SCAN_CHECK_INTERVAL, 2 * SCAN_CHECK_INTERVAL]
+        );
+
+        // Uncancelled, the same scan reaches every checkpoint and answers.
+        let (hits, checkpoints) = probe::checkpoints_of(|| {
+            search_records(&records, 4, &query, 3, None, &CancellationToken::new()).unwrap()
+        });
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            checkpoints,
+            (0..=5)
+                .map(|interval| interval * SCAN_CHECK_INTERVAL)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Both openers go through that scan: a token cancelled before the search reaches
+    /// either of them stops it before its first record.
+    #[test]
+    fn both_openers_honour_a_cancelled_token() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_openers");
+        let dim = write_snapshot(&dir);
+        let writable = ZevcStore::open_or_create(ZevcStoreConfig {
+            db_path: dir.path().to_path_buf(),
+            embedding_dim: dim,
+            collection_name: "chunks".to_string(),
+            auto_persist: false,
+        })
+        .unwrap();
+        let snapshot = read_snapshot(
+            dir.path(),
+            &SnapshotExpectation {
+                embedding_dim: dim,
+                format_version: STORE_FORMAT_VERSION,
+                collection_name: None,
+                declared_sha256: Some(declared(&dir)),
+            },
+        )
+        .unwrap()
+        .expect("the snapshot is there");
+        let read_only = ReadOnlyZevcStore {
+            records: snapshot.records,
+            book_index: snapshot.book_index,
+            embedding_dim: dim,
+            collection_name: snapshot.collection_name,
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let query = [0.0, 0.0, 1.0, 0.0];
+        for store in [&writable as &dyn VectorSearchBackend, &read_only] {
+            let (result, checkpoints) =
+                probe::checkpoints_of(|| store.search_cancellable(&query, 2, None, &cancel));
+            assert!(
+                matches!(result, Err(VectorStoreError::Cancelled)),
+                "{result:?}"
+            );
+            assert_eq!(checkpoints, [0]);
+            // A token nobody cancels is the plain search.
+            assert_eq!(
+                store.search(&query, 2, None).unwrap()[0]
+                    .metadata
+                    .semantic_id,
+                "b1"
+            );
         }
     }
 }

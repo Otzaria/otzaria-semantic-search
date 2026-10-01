@@ -36,6 +36,7 @@
 //! and for the future builder. It is not the application path.
 
 pub mod api;
+pub mod cancellation;
 pub mod config;
 pub mod distribution;
 pub mod errors;

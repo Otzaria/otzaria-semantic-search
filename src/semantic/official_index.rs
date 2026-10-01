@@ -48,6 +48,7 @@
 //! Mapping those onto user-facing states (`ready`, `corrupt`, `incompatible`,
 //! `model_missing`) is the host application's job — S5 and S6.
 
+use crate::cancellation::CancellationToken;
 use crate::distribution::importer::{recover_interrupted_install, InstallRecovery};
 use crate::distribution::package::{
     ArtifactExpectation, IndexPackage, VerificationDepth, VerifiedPackage,
@@ -302,8 +303,23 @@ impl OfficialSemanticIndex {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        self.search_cancellable(query, top_k, filters, &CancellationToken::new())
+    }
+
+    /// As [`Self::search`], or [`SemanticSearchError::Cancelled`] once `cancel` is
+    /// cancelled: looked at before the query is embedded, after it is, and throughout the
+    /// scan of the payload. See [`crate::cancellation`].
+    pub fn search_cancellable(
+        &self,
+        query: &str,
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        cancel.checkpoint()?;
         let query_vector = self.embed_query(query)?;
-        self.search_vector(&query_vector, top_k, filters)
+        cancel.checkpoint()?;
+        self.search_vector(&query_vector, top_k, filters, cancel)
     }
 
     /// Embed a query separately, so the coordinator can cache the vector.
@@ -323,8 +339,11 @@ impl OfficialSemanticIndex {
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
-        Ok(self.store.search(query_vector, top_k, filters)?)
+        Ok(self
+            .store
+            .search_cancellable(query_vector, top_k, filters, cancel)?)
     }
 
     /// Operational status, in the same shape the self-built path reports.
@@ -1010,6 +1029,49 @@ mod tests {
         .unwrap();
         assert_eq!(index.identity(), &built_identity(&model_path));
         assert_eq!(index.artifact_digest(), digest);
+    }
+
+    /// The application's path, cancelled: before the query is embedded the payload is never
+    /// scanned, and once the scan has begun it stops there — the same error either way, and
+    /// the index answers the next query as if nothing had happened.
+    #[test]
+    fn a_cancelled_query_stops_before_the_scan_or_inside_it() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancelled_query");
+        let (model_path, target, _) = installed(&dir);
+        let index = OfficialSemanticIndex::open(config_for(&target, &model_path)).unwrap();
+        let (line_id, _, text) = LINES[1];
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (result, checkpoints) =
+            probe::checkpoints_of(|| index.search_cancellable(text, 3, None, &cancelled));
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(checkpoints.is_empty(), "the scan must never have started");
+
+        // Cancelled from another thread as the scan starts, after the query was embedded.
+        let cancel = CancellationToken::new();
+        let (result, checkpoints) = probe::cancelling_at(&cancel, 0, || {
+            index.search_cancellable(text, 3, None, &cancel)
+        });
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(checkpoints, [0]);
+
+        let hits = index
+            .search_cancellable(text, 3, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(hits[0].metadata.line_id, line_id);
+        assert_eq!(
+            index.search(text, 3, None).unwrap()[0].metadata.line_id,
+            line_id
+        );
     }
 
     /// A missing model is not a broken artifact, and the host has to be able to tell them

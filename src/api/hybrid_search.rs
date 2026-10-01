@@ -17,6 +17,11 @@
 //! — see `docs/PRODUCT_CONTRACT.md` §4. Model download management is the host
 //! application's job (§5).
 //!
+//! A *search*, on the other hand, can be abandoned:
+//! [`OtzariaHybridEngine::search_cancellable`]. That is not the indexing cancel/resume
+//! ruled out above — it is what lets a search per keystroke drop the queries the next
+//! keystroke made obsolete. See [`crate::cancellation`].
+//!
 //! On a coordinator built over an installed official artifact
 //! ([`HybridCoordinator::with_official_index`]) every one of those operations refuses
 //! by name, with
@@ -25,6 +30,7 @@
 //! what the *application* may call is search and status. Dropping them from the surface
 //! the app links against belongs to the FFI layer, in S5.
 
+use crate::cancellation::CancellationToken;
 use crate::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
 use crate::semantic::types::{
     BookForIndexing, ContentFingerprint, HybridSearchResult, IndexDiff, IndexingSummary,
@@ -72,7 +78,33 @@ impl OtzariaHybridEngine {
     /// A semantic failure never fails the call: the result reports the mode that
     /// actually ran and why, so the caller can surface a degraded state instead
     /// of an error. See [`HybridSearchResult`].
+    ///
+    /// Cannot be cancelled; [`Self::search_cancellable`] can.
     pub fn search(&self, request: SearchRequest) -> Result<HybridSearchResult, String> {
+        self.search_cancellable(request, &CancellationToken::new())
+            .map_err(|e| e.to_string())
+    }
+
+    /// As [`Self::search`], abandoned once `cancel` is cancelled.
+    ///
+    /// For a search per keystroke: keep a clone of the token, and cancel it when the next
+    /// keystroke's search starts. The superseded search then stops at its next checkpoint
+    /// — within a fraction of a millisecond of scanning, or once the query embedding in
+    /// progress finishes — with
+    /// [`SemanticSearchError::Cancelled`](crate::errors::SemanticSearchError::Cancelled),
+    /// having cached nothing and logged nothing. See [`crate::cancellation`].
+    ///
+    /// The error is the engine's own, not its message as in [`Self::search`], because the
+    /// one outcome a caller must tell apart has to be matched, not parsed: `Cancelled` is
+    /// the caller's own doing, to be dropped silently, while every other error is exactly
+    /// what [`Self::search`] would have reported as text. Hydrating semantic-only results
+    /// happens after this returns, in the caller, so a caller that cancels from another
+    /// thread should look at the token again before it hydrates.
+    pub fn search_cancellable(
+        &self,
+        request: SearchRequest,
+        cancel: &CancellationToken,
+    ) -> Result<HybridSearchResult, crate::errors::SemanticSearchError> {
         let params = HybridSearchParams {
             limit: request.limit.unwrap_or(20) as usize,
             offset: request.offset.unwrap_or(0) as usize,
@@ -83,9 +115,12 @@ impl OtzariaHybridEngine {
             feature_flags: request.feature_flags,
         };
 
-        self.coordinator
-            .search(&request.query, request.lexical_candidates, &params)
-            .map_err(|e| e.to_string())
+        self.coordinator.search_cancellable(
+            &request.query,
+            request.lexical_candidates,
+            &params,
+            cancel,
+        )
     }
 
     /// Query the current status of the semantic sidecar.

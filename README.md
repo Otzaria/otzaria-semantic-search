@@ -148,6 +148,7 @@ otzaria-semantic-search/
     ├── lib.rs                          ➜ Library root, module exports & product contract
     ├── main.rs                         ➜ Development CLI (audit / smoke) + the build commands: pack / validate
     ├── errors.rs                       ➜ Strongly-typed error hierarchy (thiserror)
+    ├── cancellation.rs                 ➜ CancellationToken: abandoning a query nobody waits for
     ├── api/
     │   ├── mod.rs                      ➜ API module declaration
     │   └── hybrid_search.rs            ➜ Flutter / FFI bridge entry point (OtzariaHybridEngine)
@@ -196,6 +197,7 @@ otzaria-semantic-search/
 |--------|-----------|---------------------------|---------|
 | **API Boundary** | [`src/api/hybrid_search.rs`](src/api/hybrid_search.rs) | `OtzariaHybridEngine`, `SearchRequest` | High-level thread-safe API wrapper for Flutter / FFI bridge |
 | **Error Handling** | [`src/errors.rs`](src/errors.rs) | `SemanticSearchError`, `EmbeddingError`, `VectorStoreError` | Strongly-typed error hierarchy using `thiserror` |
+| **Query Cancellation** | [`src/cancellation.rs`](src/cancellation.rs) | `CancellationToken`, `SCAN_CHECK_INTERVAL` | A search per keystroke abandons the queries the next keystroke made obsolete: checked before embedding, after it, every 1,024 records of the scan, and around fusion. `SemanticSearchError::Cancelled`, never a lexical fallback, and nothing cached or counted |
 | **Hybrid Coordinator** | [`src/hybrid/coordinator.rs`](src/hybrid/coordinator.rs) | `HybridCoordinator`, `HybridSearchParams` | Main search entry point orchestrating lexical & semantic paths |
 | **Score Fusion** | [`src/hybrid/fusion.rs`](src/hybrid/fusion.rs) | `normalize_bm25_scores`, `fuse_weighted`, `fuse_rrf` | BM25 saturation ($x/(k+x)$) & cosine score mapping with clamp bounds |
 | **Query Ranking** | [`src/hybrid/ranking.rs`](src/hybrid/ranking.rs) | `analyze_query`, `compute_alpha`, `QueryFeatures` | Dynamic $\alpha$ computation (short/exact $\to 0.7\text{--}0.9$, conceptual $\to 0.2\text{--}0.4$) |

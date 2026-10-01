@@ -18,6 +18,7 @@
 //! [`VectorSearchBackend`](crate::semantic::store_backend::VectorSearchBackend) is the
 //! seam either answer slots into.
 
+use crate::cancellation::{CancellationToken, SCAN_CHECK_INTERVAL};
 use crate::errors::VectorStoreError;
 // One threshold for the whole crate, so no two layers can disagree about it.
 use crate::semantic::embedding::MIN_VECTOR_NORM;
@@ -255,6 +256,19 @@ impl VectorStore {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
+        self.search_cancellable(query_vector, top_k, filters, &CancellationToken::new())
+    }
+
+    /// As [`Self::search`], stopping with [`VectorStoreError::Cancelled`] at the first
+    /// checkpoint after `cancel` is cancelled: one before the first record, then one every
+    /// [`SCAN_CHECK_INTERVAL`] records.
+    pub fn search_cancellable(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
         if query_vector.len() as u32 != self.config.embedding_dim {
             return Err(VectorStoreError::DimensionMismatch {
                 store_dim: self.config.embedding_dim,
@@ -282,7 +296,10 @@ impl VectorStore {
         let state = self.read_state();
 
         let mut heap: BinaryHeap<ScoredEntry> = BinaryHeap::with_capacity(top_k + 1);
-        for record in state.records.values() {
+        for (scanned, record) in state.records.values().enumerate() {
+            if scanned % SCAN_CHECK_INTERVAL == 0 {
+                cancel.scan_checkpoint(scanned)?;
+            }
             if let Some(compiled) = filters.as_ref() {
                 if !compiled.matches(&record.metadata) {
                     continue;
@@ -427,13 +444,14 @@ impl crate::semantic::store_backend::VectorSearchBackend for VectorStore {
         VectorStore::vector_count(self).min(u32::MAX as usize) as u32
     }
 
-    fn search(
+    fn search_cancellable(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
-        VectorStore::search(self, query_vector, top_k, filters)
+        VectorStore::search_cancellable(self, query_vector, top_k, filters, cancel)
     }
 
     fn book_keys(&self) -> Vec<String> {
@@ -1143,5 +1161,113 @@ mod tests {
             );
         }
         assert_eq!(store.vector_count(), 4 * 19);
+    }
+
+    // ── cancellation ──
+
+    /// A store several scan intervals long, so a scan has checkpoints to stop at.
+    fn store_of(dir: &TempDir, records: usize) -> VectorStore {
+        let store = store(dir, 4);
+        let batch: Vec<(VectorMetadata, Vec<f32>)> = (0..records)
+            .map(|i| {
+                (
+                    sample_metadata(&format!("id{i:06}"), "book1.txt"),
+                    vec![1.0, (i % 97) as f32 / 97.0, 0.25, 0.5],
+                )
+            })
+            .collect();
+        store.insert_batch(&batch).unwrap();
+        store
+    }
+
+    fn ids_and_scores(hits: &[SemanticCandidate]) -> Vec<(String, u32)> {
+        hits.iter()
+            .map(|hit| {
+                (
+                    hit.metadata.semantic_id.clone(),
+                    hit.similarity_score.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_the_scan_before_its_first_record() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_before_scan");
+        let store = store_of(&dir, 3 * SCAN_CHECK_INTERVAL);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let (result, checkpoints) = probe::checkpoints_of(|| {
+            store.search_cancellable(&[1.0, 0.0, 0.0, 0.0], 5, None, &cancel)
+        });
+        assert!(
+            matches!(result, Err(VectorStoreError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(checkpoints, [0], "not one record may be scored");
+    }
+
+    /// Cancelled from another thread three intervals into the scan, the scan stops right
+    /// there instead of finishing the other seven.
+    #[test]
+    fn a_cancel_from_another_thread_stops_the_scan_at_its_next_checkpoint() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_mid_scan");
+        let store = store_of(&dir, 10 * SCAN_CHECK_INTERVAL + 7);
+        let cancel = CancellationToken::new();
+
+        let (result, checkpoints) = probe::cancelling_at(&cancel, 3 * SCAN_CHECK_INTERVAL, || {
+            store.search_cancellable(&[1.0, 0.0, 0.0, 0.0], 5, None, &cancel)
+        });
+        assert!(
+            matches!(result, Err(VectorStoreError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            checkpoints,
+            [0, 1, 2, 3].map(|interval| interval * SCAN_CHECK_INTERVAL),
+            "the scan must stop at the checkpoint the cancel landed on"
+        );
+
+        // A new token is a new search: the store answers it in full.
+        let hits = store
+            .search_cancellable(&[1.0, 0.0, 0.0, 0.0], 5, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(hits.len(), 5);
+    }
+
+    #[test]
+    fn a_token_nobody_cancels_changes_neither_the_scan_nor_the_answer() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_never");
+        let store = store_of(&dir, 2 * SCAN_CHECK_INTERVAL + 1);
+        let query = [0.3, 0.9, 0.1, 0.0];
+
+        let (hits, checkpoints) = probe::checkpoints_of(|| {
+            store
+                .search_cancellable(&query, 7, None, &CancellationToken::new())
+                .unwrap()
+        });
+        assert_eq!(
+            checkpoints,
+            [0, SCAN_CHECK_INTERVAL, 2 * SCAN_CHECK_INTERVAL],
+            "a full scan reaches every checkpoint"
+        );
+        assert_eq!(
+            ids_and_scores(&hits),
+            ids_and_scores(&store.search(&query, 7, None).unwrap())
+        );
+
+        // And through the trait, as the engine holds it.
+        let backend: &dyn crate::semantic::store_backend::VectorSearchBackend = &store;
+        assert_eq!(
+            ids_and_scores(&backend.search(&query, 7, None).unwrap()),
+            ids_and_scores(&hits)
+        );
     }
 }

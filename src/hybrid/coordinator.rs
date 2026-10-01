@@ -21,6 +21,7 @@
 //! [`HybridSearchResult::fallback_reason`], which is what lets the caller decide
 //! whether to retry in another mode.
 
+use crate::cancellation::CancellationToken;
 use crate::config::feature_flags::FeatureFlags;
 use crate::config::profiles::{FusionStrategy, RankingProfile, SearchProfile};
 use crate::errors::SemanticSearchError;
@@ -146,10 +147,11 @@ impl SemanticSide {
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
         match self {
-            Self::SelfBuilt(engine) => engine.search_vector(query_vector, top_k, filters),
-            Self::Official(index) => index.search_vector(query_vector, top_k, filters),
+            Self::SelfBuilt(engine) => engine.search_vector(query_vector, top_k, filters, cancel),
+            Self::Official(index) => index.search_vector(query_vector, top_k, filters, cancel),
         }
     }
 
@@ -239,12 +241,38 @@ impl HybridCoordinator {
     }
 
     /// Primary search entry point. Coordinates BM25 and semantic candidates.
+    ///
+    /// [`Self::search_cancellable`] with a token nobody cancels, so never
+    /// [`SemanticSearchError::Cancelled`].
     pub fn search(
         &self,
         query: &str,
         lexical_candidates: Vec<LexicalCandidate>,
         params: &HybridSearchParams,
     ) -> Result<HybridSearchResult, SemanticSearchError> {
+        self.search_cancellable(query, lexical_candidates, params, &CancellationToken::new())
+    }
+
+    /// As [`Self::search`], or [`SemanticSearchError::Cancelled`] once `cancel` is
+    /// cancelled.
+    ///
+    /// The token is looked at before anything else — before either cache is consulted —
+    /// after the query is embedded, throughout the vector scan, before fusion, and after
+    /// it; [`crate::cancellation`] says why each one is there.
+    ///
+    /// A cancelled search returns `Cancelled` from every mode. It is never degraded to the
+    /// lexical results the way a failed semantic path is, because nobody wants the answer
+    /// any more, and it leaves this coordinator exactly as it found it: the result is not
+    /// cached, the query's embedding is not cached either (both caches are written only
+    /// after the last checkpoint), and the search is not counted in the telemetry.
+    pub fn search_cancellable(
+        &self,
+        query: &str,
+        lexical_candidates: Vec<LexicalCandidate>,
+        params: &HybridSearchParams,
+        cancel: &CancellationToken,
+    ) -> Result<HybridSearchResult, SemanticSearchError> {
+        cancel.checkpoint()?;
         let start_time = std::time::Instant::now();
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
         let flags = params.feature_flags.clone().unwrap_or_default();
@@ -335,6 +363,10 @@ impl HybridCoordinator {
 
         let skip_semantic_for_exact = requested == SearchMode::Hybrid && requested_alpha >= 1.0;
 
+        // A vector this query had to embed, kept out of the embedding cache until the last
+        // checkpoint has passed: a cancelled search writes to neither cache.
+        let mut fresh_embedding = None;
+
         let semantic = if requested == SearchMode::LexicalOnly || skip_semantic_for_exact {
             // Not consulted — this is the caller's choice (or an optimization),
             // not a degradation.
@@ -357,22 +389,30 @@ impl HybridCoordinator {
                                 Some(embedding_start.elapsed().as_millis() as u64);
                             if ranking_profile.embedding_cache_enabled {
                                 if let Ok(vector) = &result {
-                                    self.embedding_cache
-                                        .insert(&normalized_query, vector.clone());
+                                    fresh_embedding = Some(vector.clone());
                                 }
                             }
                             result
                         }
                     };
+                    // Embedding is the one stage nothing can interrupt, so look again
+                    // before paying for the scan.
+                    cancel.checkpoint()?;
 
                     match query_vector.and_then(|vector| {
                         side.search_vector(
                             &vector,
                             self.semantic_top_k(params, &ranking_profile),
                             params.filters.as_ref(),
+                            cancel,
                         )
                     }) {
                         Ok(candidates) => SemanticOutcome::ok(candidates),
+                        // Abandoned, not failed: nothing to degrade to, because nobody is
+                        // waiting for the lexical results either.
+                        Err(SemanticSearchError::Cancelled) => {
+                            return Err(SemanticSearchError::Cancelled)
+                        }
                         Err(error) => {
                             log::warn!(
                                 "Semantic search path failed: {error}. Serving the lexical results."
@@ -383,6 +423,9 @@ impl HybridCoordinator {
                 }
             }
         };
+        // Fusion is cheap next to the scan behind it, but its result would only be thrown
+        // away.
+        cancel.checkpoint()?;
 
         let mode = match requested {
             SearchMode::LexicalOnly => SearchMode::LexicalOnly,
@@ -506,8 +549,17 @@ impl HybridCoordinator {
                 .then_some(telemetry_record.clone()),
         };
 
+        // The last look, with the result in hand and nothing recorded yet. A search
+        // cancelled while it fused is not counted, not cached, and not handed back to be
+        // hydrated — hydration costs the caller a lookup per result.
+        cancel.checkpoint()?;
+
         if ranking_profile.telemetry_enabled {
             self.telemetry.record_search(&telemetry_record);
+        }
+
+        if let Some(vector) = fresh_embedding {
+            self.embedding_cache.insert(&normalized_query, vector);
         }
 
         // §1.1 + §3.4: Only cache queries with enough substance to be reused.
@@ -2067,5 +2119,171 @@ mod tests {
         assert_eq!(status.indexed_book_count, 1);
         assert_eq!(status.embedding_backend.as_deref(), Some("mock-hash-v1"));
         assert!(!status.vectors_persisted);
+    }
+
+    // ── cancellation ──
+
+    /// What a caller can compare two results by: the ranked ids, where each came from, and
+    /// the exact fused score.
+    fn ranked(result: &HybridSearchResult) -> Vec<(u64, ResultSource, u32)> {
+        result
+            .results
+            .iter()
+            .map(|item| (item.id, item.source, item.fused_score.to_bits()))
+            .collect()
+    }
+
+    /// A search per keystroke abandons most of its queries before they start. One already
+    /// cancelled costs nothing, in every mode: neither cache is consulted or written, the
+    /// query is not embedded, nothing is scanned and nothing is counted.
+    #[test]
+    fn a_search_cancelled_before_it_starts_costs_nothing_and_leaves_nothing() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_before_start");
+        let coordinator = indexed_coordinator(&dir);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        for mode in [
+            SearchMode::Hybrid,
+            SearchMode::SemanticOnly,
+            SearchMode::LexicalOnly,
+        ] {
+            let params = HybridSearchParams {
+                force_mode: Some(mode),
+                ..Default::default()
+            };
+            let (result, checkpoints) = probe::checkpoints_of(|| {
+                coordinator.search_cancellable(
+                    LINE_TWO,
+                    vec![lexical(2, LINE_TWO, 9.0)],
+                    &params,
+                    &cancel,
+                )
+            });
+            assert!(
+                matches!(result, Err(SemanticSearchError::Cancelled)),
+                "{mode}: {result:?}"
+            );
+            assert!(checkpoints.is_empty(), "{mode}: nothing may be scanned");
+        }
+
+        let embeddings = coordinator.embedding_cache_stats();
+        assert_eq!(
+            (embeddings.hits, embeddings.misses, embeddings.size),
+            (0, 0, 0),
+            "the embedding cache is looked at only just before embedding"
+        );
+        assert_eq!(coordinator.get_telemetry_snapshot().total_searches, 0);
+
+        // Nor was a result cached: the same search, uncancelled, is computed afresh.
+        let fresh = coordinator
+            .search(
+                LINE_TWO,
+                vec![lexical(2, LINE_TWO, 9.0)],
+                &HybridSearchParams::default(),
+            )
+            .unwrap();
+        assert!(!fresh.telemetry.unwrap().cache_hit);
+    }
+
+    /// Cancelled from another thread once the scan has begun — the query embedded already
+    /// — the search stops inside the scan. It is not served as a lexical fallback, and the
+    /// embedding it paid for is not cached: a cancelled search writes nothing.
+    #[test]
+    fn a_search_cancelled_during_the_scan_is_neither_degraded_nor_cached() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_mid_scan");
+        let coordinator = indexed_coordinator(&dir);
+        let modes = [SearchMode::Hybrid, SearchMode::SemanticOnly];
+        let params = |mode| HybridSearchParams {
+            force_mode: Some(mode),
+            ..Default::default()
+        };
+
+        for mode in modes {
+            let cancel = CancellationToken::new();
+            let (result, checkpoints) = probe::cancelling_at(&cancel, 0, || {
+                coordinator.search_cancellable(
+                    LINE_TWO,
+                    vec![lexical(2, LINE_TWO, 9.0)],
+                    &params(mode),
+                    &cancel,
+                )
+            });
+            assert!(
+                matches!(result, Err(SemanticSearchError::Cancelled)),
+                "{mode}: {result:?}"
+            );
+            assert_eq!(checkpoints, [0], "{mode}: the scan had started");
+        }
+        assert_eq!(
+            coordinator.embedding_cache_stats().size,
+            0,
+            "a cancelled search must not cache the embedding it computed"
+        );
+        assert_eq!(coordinator.get_telemetry_snapshot().total_searches, 0);
+
+        // Nothing was poisoned or half-written: the same searches now complete, and agree
+        // with a coordinator that never saw the cancelled ones.
+        let reference_dir = TempDir::new("cancel_mid_scan_reference");
+        let reference = indexed_coordinator(&reference_dir);
+        for mode in modes {
+            let after = coordinator
+                .search(LINE_TWO, vec![lexical(2, LINE_TWO, 9.0)], &params(mode))
+                .unwrap();
+            let expected = reference
+                .search(LINE_TWO, vec![lexical(2, LINE_TWO, 9.0)], &params(mode))
+                .unwrap();
+            assert_eq!(after.search_mode, mode);
+            assert!(!after.telemetry.as_ref().unwrap().cache_hit);
+            assert_eq!(ranked(&after), ranked(&expected), "{mode}");
+        }
+        assert_eq!(
+            coordinator.embedding_cache_stats().size,
+            1,
+            "an uncancelled search caches its embedding as it always did"
+        );
+    }
+
+    /// A token nobody cancels is no token: the answer, the caches and the counts are those
+    /// of [`HybridCoordinator::search`].
+    #[test]
+    fn a_token_nobody_cancels_changes_nothing() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancel_never");
+        let coordinator = indexed_coordinator(&dir);
+        let reference_dir = TempDir::new("cancel_never_reference");
+        let reference = indexed_coordinator(&reference_dir);
+        let candidates = vec![lexical(1, LINE_ONE, 10.0), lexical(2, LINE_TWO, 8.0)];
+
+        let (with_token, checkpoints) = probe::checkpoints_of(|| {
+            coordinator
+                .search_cancellable(
+                    LINE_ONE,
+                    candidates.clone(),
+                    &HybridSearchParams::default(),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+        });
+        let without = reference
+            .search(LINE_ONE, candidates, &HybridSearchParams::default())
+            .unwrap();
+
+        assert_eq!(checkpoints, [0], "the three-vector store is one interval");
+        assert_eq!(with_token.search_mode, without.search_mode);
+        assert_eq!(ranked(&with_token), ranked(&without));
+        assert_eq!(
+            coordinator.embedding_cache_stats().size,
+            reference.embedding_cache_stats().size
+        );
+        assert_eq!(
+            coordinator.get_telemetry_snapshot().total_searches,
+            reference.get_telemetry_snapshot().total_searches
+        );
     }
 }

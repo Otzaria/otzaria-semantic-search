@@ -17,6 +17,8 @@
 #![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
+use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::errors::SemanticSearchError;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::embedding::mock;
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
@@ -988,4 +990,52 @@ fn paging_covers_every_result_exactly_once() {
     let first_ids: Vec<u64> = first.results.iter().map(|r| r.id).collect();
     let again_ids: Vec<u64> = page(0).results.iter().map(|r| r.id).collect();
     assert_eq!(first_ids, again_ids);
+}
+
+// ───────────────────────── cancellation ─────────────────────────
+
+/// What the host does with every keystroke: hand the search a token and, when the next
+/// keystroke arrives, cancel it. The abandoned search must come back as something the host
+/// can match on — not a message to parse, and not a degraded result it would display.
+#[test]
+fn a_search_cancelled_through_the_api_is_told_apart_from_a_failure() {
+    let dir = TempDir::new("cancelled");
+    let api = indexed_api(config_at(&dir));
+    let request = SearchRequest {
+        query: LINE_ONE.to_string(),
+        lexical_candidates: vec![lexical_hit(1, LINE_ONE, 15.5)],
+        ..Default::default()
+    };
+
+    // Cancelled from another thread, as the host will, before this search reached a
+    // checkpoint.
+    let cancel = CancellationToken::new();
+    let remote = cancel.clone();
+    std::thread::spawn(move || remote.cancel()).join().unwrap();
+    match api.search_cancellable(request.clone(), &cancel) {
+        Err(SemanticSearchError::Cancelled) => {}
+        other => panic!("a cancelled search must say so, got {other:?}"),
+    }
+    assert_eq!(api.get_telemetry_snapshot().total_searches, 0);
+
+    // A token nobody cancels is the plain search, and the plain search is unchanged.
+    let with_token = api
+        .search_cancellable(request.clone(), &CancellationToken::new())
+        .unwrap();
+    let plain = api.search(request).unwrap();
+    assert_eq!(with_token.search_mode, SearchMode::Hybrid);
+    assert_eq!(plain.search_mode, SearchMode::Hybrid);
+    let ids = |result: &otzaria_semantic_search::semantic::types::HybridSearchResult| {
+        result
+            .results
+            .iter()
+            .map(|item| (item.id, item.fused_score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&with_token), ids(&plain));
+    assert!(
+        !with_token.telemetry.unwrap().cache_hit,
+        "the cancelled search must not have cached a result"
+    );
+    assert!(plain.telemetry.unwrap().cache_hit);
 }

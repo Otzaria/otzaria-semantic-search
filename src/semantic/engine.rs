@@ -9,6 +9,7 @@
 //! semantic path is refused with [`SemanticSearchError::IncompatibleIndex`] (so
 //! the coordinator falls back to BM25) until [`SemanticEngine::reset_index`].
 
+use crate::cancellation::CancellationToken;
 use crate::errors::{ManifestError, SemanticSearchError};
 use crate::semantic::backend::{
     ensure_pooling_is_implemented_for, max_tokens_past_the_format, Pooling,
@@ -665,8 +666,23 @@ impl SemanticEngine {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        self.search_cancellable(query, top_k, filters, &CancellationToken::new())
+    }
+
+    /// As [`Self::search`], or [`SemanticSearchError::Cancelled`] once `cancel` is
+    /// cancelled: looked at before the query is embedded, after it is, and throughout the
+    /// store's scan. See [`crate::cancellation`].
+    pub fn search_cancellable(
+        &self,
+        query: &str,
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        cancel.checkpoint()?;
         let query_vec = self.embed_query(query)?;
-        self.search_vector(&query_vec, top_k, filters)
+        cancel.checkpoint()?;
+        self.search_vector(&query_vec, top_k, filters, cancel)
     }
 
     /// Embed a query separately so the coordinator can safely cache the vector.
@@ -693,9 +709,12 @@ impl SemanticEngine {
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
         self.ensure_index_usable()?;
-        Ok(self.store.search(query_vector, top_k, filters)?)
+        Ok(self
+            .store
+            .search_cancellable(query_vector, top_k, filters, cancel)?)
     }
 
     /// Compare the library's per-book fingerprints against the semantic index.
@@ -1813,6 +1832,52 @@ mod tests {
                 EmbeddingError::InferenceFailed { .. }
             ))
         ));
+    }
+
+    /// The self-built path honours a token as the official one does: refused before the
+    /// store is scanned when the token is already set, stopped inside the scan when it is
+    /// set there.
+    #[test]
+    fn a_cancelled_search_stops_before_the_scan_or_inside_it() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancelled_search");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+        let book = three_line_book();
+        engine.index_book(&book).unwrap();
+        let query = &book.lines[2].text;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (result, checkpoints) =
+            probe::checkpoints_of(|| engine.search_cancellable(query, 3, None, &cancelled));
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(
+            checkpoints.is_empty(),
+            "the store must never have been scanned"
+        );
+
+        let cancel = CancellationToken::new();
+        let (result, checkpoints) = probe::cancelling_at(&cancel, 0, || {
+            engine.search_cancellable(query, 3, None, &cancel)
+        });
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(checkpoints, [0]);
+
+        let hits = engine
+            .search_cancellable(query, 3, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(hits[0].metadata.line_id, 3);
+        assert!(
+            engine.status().available,
+            "a cancel leaves the engine usable"
+        );
     }
 
     // ── model loading ──

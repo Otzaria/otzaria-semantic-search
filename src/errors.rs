@@ -13,8 +13,10 @@ pub enum SemanticSearchError {
     #[error("Embedding runtime error: {0}")]
     EmbeddingRuntime(#[from] EmbeddingError),
 
+    /// `#[source]` and not `#[from]`: the conversion is written out below this enum, so
+    /// that a cancelled scan becomes [`Self::Cancelled`] instead of this.
     #[error("Vector store error: {0}")]
-    VectorStore(#[from] VectorStoreError),
+    VectorStore(#[source] VectorStoreError),
 
     #[error("Manifest error: {0}")]
     Manifest(#[from] ManifestError),
@@ -50,11 +52,34 @@ pub enum SemanticSearchError {
     )]
     ReadOnlyIndex { operation: &'static str },
 
+    /// The caller cancelled the search through its
+    /// [`CancellationToken`](crate::cancellation::CancellationToken) before it finished.
+    ///
+    /// Not a failure, and not to be shown as one: the caller asked for it, because a newer
+    /// query superseded this one. The search logged nothing and left nothing behind — no
+    /// cached result, no cached embedding, no telemetry — so dropping it is all a caller
+    /// has to do. See [`crate::cancellation`].
+    #[error("The search was cancelled before it finished")]
+    Cancelled,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+/// By hand rather than `#[from]`, because of one variant: a scan abandoned through its
+/// token is [`SemanticSearchError::Cancelled`] whichever layer noticed it. Wrapped as a
+/// store error it would read as a fault of the store, and a caller matching on
+/// `Cancelled` — the one outcome it must tell apart from a failure — would miss it.
+impl From<VectorStoreError> for SemanticSearchError {
+    fn from(error: VectorStoreError) -> Self {
+        match error {
+            VectorStoreError::Cancelled => Self::Cancelled,
+            other => Self::VectorStore(other),
+        }
+    }
 }
 
 /// Errors from the embedding model runtime.
@@ -216,6 +241,11 @@ pub enum VectorStoreError {
 
     #[error("Store is corrupted: {reason}")]
     Corrupted { reason: String },
+
+    /// The scan stopped at a checkpoint because its token was cancelled. Not a fault of
+    /// the store: it reaches the caller as [`SemanticSearchError::Cancelled`].
+    #[error("Search cancelled before the scan finished")]
+    Cancelled,
 }
 
 /// Errors from the manifest/versioning system.

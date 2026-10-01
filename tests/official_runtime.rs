@@ -20,10 +20,12 @@
 #![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
+use otzaria_semantic_search::cancellation::CancellationToken;
 use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
 use otzaria_semantic_search::distribution::package::{
     ArtifactExpectation, IndexPackage, PackageManifest, PayloadDescriptor,
 };
+use otzaria_semantic_search::errors::SemanticSearchError;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::MockHashBackend;
 use otzaria_semantic_search::semantic::embedding::{
@@ -321,6 +323,48 @@ fn a_query_over_an_installed_artifact_returns_the_line_id_it_was_built_from() {
     assert_eq!(fused.id, line_id);
     assert!(fused.lexical_score.is_some());
     assert!(fused.semantic_score.is_some());
+}
+
+/// The path the application takes on every keystroke: a search over the installed artifact,
+/// abandoned because the next keystroke superseded it. It must come back as `Cancelled` in
+/// both modes that scan the artifact — not as a lexical fallback the host would display —
+/// and the artifact must serve the next query as if nothing had happened.
+#[test]
+fn a_cancelled_query_over_an_installed_artifact_is_dropped_and_the_next_one_served() {
+    let dir = TempDir::new("cancelled");
+    let (model_path, target) = install(&dir);
+    let api = OtzariaHybridEngine::new(HybridCoordinator::with_official_index(open_official(
+        &target,
+        &model_path,
+    )));
+    let (line_id, _, text) = LINES[0];
+
+    for mode in [SearchMode::SemanticOnly, SearchMode::Hybrid] {
+        let request = SearchRequest {
+            query: text.to_string(),
+            lexical_candidates: vec![lexical(line_id, text, 18.0)],
+            force_mode: Some(mode),
+            ..Default::default()
+        };
+
+        let superseded = CancellationToken::new();
+        let next_keystroke = superseded.clone();
+        std::thread::spawn(move || next_keystroke.cancel())
+            .join()
+            .unwrap();
+        match api.search_cancellable(request.clone(), &superseded) {
+            Err(SemanticSearchError::Cancelled) => {}
+            other => panic!("{mode}: a superseded search must be cancelled, got {other:?}"),
+        }
+
+        let served = api
+            .search_cancellable(request, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(served.search_mode, mode);
+        assert!(served.fallback_reason.is_none());
+        assert_eq!(served.results[0].id, line_id);
+    }
+    assert_eq!(api.get_telemetry_snapshot().total_searches, 2);
 }
 
 /// An artifact is not something this device may write to, and the seam has to say so

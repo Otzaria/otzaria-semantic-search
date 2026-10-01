@@ -42,6 +42,7 @@ otzaria-semantic-search/
     ├── lib.rs                              # נקודת הכניסה לספריה + חוזה המוצר
     ├── main.rs                             # CLI פיתוח (audit / smoke)
     ├── errors.rs                           # מערכת השגיאות המרכזית (thiserror)
+    ├── cancellation.rs                     # CancellationToken: ביטול שאילתה שאיש אינו ממתין לה
     ├── api/
     │   ├── mod.rs                          # ייצוא רכיבי ה-API
     │   └── hybrid_search.rs                # ממשק API נקי עבור Flutter / FFI
@@ -94,8 +95,8 @@ otzaria-semantic-search/
 ### 1. נקודת הכניסה ומערכת השגיאות
 
 * [`src/lib.rs`](../src/lib.rs)
-  - מייצא את המודולים: `api`, `benchmark`, `config`, `distribution`, `errors`,
-    `hybrid`, `semantic`, `telemetry`.
+  - מייצא את המודולים: `api`, `benchmark`, `cancellation`, `config`, `distribution`,
+    `errors`, `hybrid`, `semantic`, `telemetry`.
   - נושא את ארבע החלטות ההיקף כ-doc comment ברמת ה-crate, כדי שמי שקורא רק את הקוד
     יראה אותן גם בלי המסמכים.
 * [`src/errors.rs`](../src/errors.rs)
@@ -112,6 +113,22 @@ otzaria-semantic-search/
     שנקטעה ולא הצליחה להשתחזר. כל וריאנט הוא סירוב, לא התדרדרות — וההבחנה ביניהם קיימת
     כדי שהאפליקציה תוכל להציג „לא מתאים” לעומת „פגום”, שהם שני תיקונים שונים.
   - `ChunkingError` — שגיאות חלוקת ספר לקטעים.
+  - `SemanticSearchError::Cancelled` — החיפוש בוטל דרך ה-`CancellationToken` שלו. **לא**
+    כשל: המארח ביקש זאת, כי שאילתה חדשה החליפה את הישנה. `VectorStoreError::Cancelled`
+    של סריקה שנעצרה מומר אליו בכל שכבה (`From` כתוב ידנית, לא `#[from]`), כדי שמי שבודק
+    `Cancelled` לא יפספס ביטול שנעטף כשגיאת store.
+* [`src/cancellation.rs`](../src/cancellation.rs)
+  - `CancellationToken` — `Arc<AtomicBool>`: `Clone` זול, `Send + Sync`, `cancel()` חד-כיווני
+    ו-`is_cancelled()`. חיפוש לכל הקשה: כל שאילתה מלבד האחרונה מתיישנת לפני שהיא מסתיימת,
+    וסריקה מלאה של ארטיפקט בגודל הספרייה אורכת סדר גודל של שנייה.
+  - נקודות הבדיקה: לפני הכול (לפני שני ה-caches ולפני ה-embedding), אחרי ה-embedding,
+    בתוך כל סריקת וקטורים כל `SCAN_CHECK_INTERVAL` (1,024) רשומות, לפני ה-fusion ואחריו.
+    1,024 נבחר במדידה: בדיקה היא טעינה אטומית אחת (~ננו-שנייה), רשומה עולה ~180 ns
+    ב-256 ממדים ו-~370 ns ב-1,024, ובבנצ'מרק הסריקות נמדדו זהות עם הבדיקות ובלעדיהן.
+    ביטול נקלט תוך 0.2–0.4 ms של סריקה.
+  - חיפוש שבוטל אינו נרשם ב-log, אינו מתדרדר לתוצאות לקסיקליות ואינו משאיר דבר: לא
+    תוצאה ב-cache, לא embedding ב-cache (שניהם נכתבים רק אחרי נקודת הבדיקה האחרונה) ולא
+    רשומת telemetry.
 
 ---
 
@@ -120,6 +137,9 @@ otzaria-semantic-search/
 * [`src/api/hybrid_search.rs`](../src/api/hybrid_search.rs)
   - `OtzariaHybridEngine` — Wrapper ראשי הניתן לחשיפה ל-Flutter באמצעות `flutter_rust_bridge`.
   - `SearchRequest` — Struct המאגד את פרמטרי השאילתא והפילטרים למניעת `too_many_arguments`.
+  - `search_cancellable()` — כמו `search()`, עם `CancellationToken`. מחזיר את
+    `SemanticSearchError` עצמו ולא את הודעתו, כי את `Cancelled` צריך להבחין בהתאמה ולא
+    בפענוח מחרוזת. `search()` נשאר כשהיה — טוקן שאיש אינו מבטל.
   - `get_semantic_status()` — שאילתת סטטוס זמינות המודל והאינדקס.
   - `get_semantic_index_diff()` — בדיקת פערים בין Tantivy ל-Semantic Store. הצורה
     המועדפת: הקורא מחליט מה החתימה של ספר, וזו הדרך היחידה שבה PDF יכול להגיע
@@ -140,7 +160,8 @@ otzaria-semantic-search/
   > נכון להיום זהו ה-API שהבדיקות והבנייה משתמשות בו, ולכן הוא מתועד ולא מוסתר —
   > וכשהמנוע נבנה מעל ארטיפקט מותקן, כל אחת מהן **נדחית בשם** ואינה מדווחת הצלחה ריקה.
   > *מה שלא יהיה כאן לעולם:* progress stream ו-cancel/resume של אינדוקס — אין
-  > אינדוקס באפליקציה.
+  > אינדוקס באפליקציה. ביטול *שאילתה* (`search_cancellable`) הוא עניין אחר: הוא מה שמאפשר
+  > חיפוש לכל הקשה.
 
 ---
 
@@ -160,6 +181,8 @@ otzaria-semantic-search/
     ה-`alpha` נקבע לפי המצב שרץ בפועל (1.0 / 0.0 / דינמי), כדי שציון ממנוע אחד
     לא יוקטן במשקל של המנוע החסר.
   - כל התדרדרות נראית: `search_mode` הוא המצב שרץ, `fallback_reason` הוא הסיבה.
+  - `search_cancellable()` — מחזיר `Cancelled` מכל מצב, ולעולם אינו מתדרדר ל-BM25:
+    לתוצאות הלקסיקליות אין מי שממתין. `search()` הוא אותה קריאה עם טוקן שאיש אינו מבטל.
   - חלון המועמדים הסמנטיים חסום ב-`MAX_SEMANTIC_CANDIDATES` (מדווח ב-log כשנחתך).
   - `index_books()` — נועל את ה-engine **פר-ספר** כדי שחיפושים לא ייחסמו לכל אורך
     האינדוקס, ושומר את ה-manifest פעם אחת בסוף: כל שמירה מסריאלזת את כל הרשומות,
