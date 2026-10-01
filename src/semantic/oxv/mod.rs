@@ -22,12 +22,18 @@
 //! | [`codec`] | how a unit vector becomes a slot's bytes: `f32`, and int8 with per-dimension scales |
 //! | [`writer`] | tables first, then the vectors streamed in slot order |
 //! | [`reader`] | map a segment, check what is cheap to check, read records in place |
+//! | `kernel` | the exact integer dot product, scalar, AVX2 and NEON |
+//! | [`scan`] | every live slot scored, on several threads, under a book filter, the best `k` kept |
 
 pub mod codec;
 pub mod format;
+pub(crate) mod kernel;
 pub mod reader;
+pub mod scan;
 pub mod writer;
 
+#[cfg(test)]
+mod scan_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
