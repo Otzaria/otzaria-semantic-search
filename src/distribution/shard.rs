@@ -3,14 +3,14 @@
 //! [`build`](super::builder::build) does the whole job in one process: read the corpus,
 //! apply the recipe, embed, pack. That is the right shape when one machine has both the
 //! corpus and the arithmetic, and the wrong one for the library, where the corpus lives on
-//! a build machine and the only affordable inference is on rented GPUs that see it for a
-//! few hours and are then destroyed.
+//! a build machine and the inference is spread over rented machines that see it for a few
+//! hours and are then destroyed.
 //!
 //! So the same work is cut in two, at the one seam that does not weaken anything:
 //!
 //! ```text
 //! export_plan    corpus + recipe -> plan.jsonl          build machine, no model
-//! embed_shard    a slice of plan  -> vectors + records  GPU worker, no corpus
+//! embed_shard    a slice of plan  -> vectors + records  worker, no corpus
 //! pack           all the vectors  -> artifact           build machine, full verification
 //! ```
 //!
@@ -26,21 +26,14 @@
 //! the plan be written in ascending id order, which would demand it be sorted, which would
 //! demand the whole thing in memory — 5.9 million passages of text — to buy nothing.
 //!
-//! **A shard boundary should fall on a multiple of the batch size**, and the reason is
-//! arithmetic rather than tidiness. llama.cpp's output depends on how a batch is composed,
-//! so two runs that group the same texts differently produce vectors that differ in the
-//! last bits. Measured on 2 396 real lines with the real GGUF: three shards of 800/800/796
-//! at batch 32 gave a `vectors.f32` **byte-identical** to embedding the whole plan in one
-//! window (`6530649db051…`), because 800 is a multiple of 32 and every batch was therefore
-//! the same batch.
-//!
-//! The same measurement is why an artifact merged from shards is *not* byte-identical to
-//! one [`build`](super::builder::build) produced from the same corpus: `PlannedEmbeddings`
-//! refills from one book at a time, so its batches never span books and every book ends in
-//! a short one. Neither grouping is more correct — the divergence is the same order as the
-//! CPU-versus-Metal disagreement `docs/P2_REFERENCE_VECTORS.md` §5 measures and the
-//! manifest already governs — but only one of them can be the artifact, and for the library
-//! it is this one. It is also the faster one: 7 285 books is 7 285 partial batches.
+//! **Where a shard boundary falls changes no vector.** The ONNX backend runs one text per
+//! session run, so a vector depends on its text alone — measured bit-identical batched and
+//! one at a time, at 1 to 8 threads and 1 or 2 sessions (`docs/ONNX_BACKEND.md` §5, §7). A
+//! window may start at any record and hold any number of them, and the vectors of a plan
+//! embedded in shards are the ones a single window, or [`build`](super::builder::build),
+//! would have produced from the same corpus — provided every shard runs the same graph on
+//! the same kind of CPU, since an int8 vector depends on the CPU's int8 kernels
+//! (`docs/ONNX_BACKEND.md` §0).
 //!
 //! **What each side can check, it checks.** The worker cannot recompute
 //! `source_line_sha256`; it has no corpus, and that digest is the packer's business at
@@ -59,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, Write};
 
-/// One line's work, as the build machine hands it to a machine with a GPU.
+/// One line's work, as the build machine hands it to the machine that embeds it.
 ///
 /// `embedding_text` is the string the backend will be given, complete: prefixed,
 /// context-borrowed and truncated already. Nothing downstream may re-derive it.
@@ -433,7 +426,8 @@ mod tests {
     use crate::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};
     use crate::distribution::packer::{pack, read_vector_inputs, PackRequest};
     use crate::semantic::backend::Pooling;
-    use crate::semantic::embedding::{mock, validate_and_checksum_gguf, EmbeddingConfig};
+    use crate::semantic::embedding::{mock, EmbeddingConfig};
+    use crate::semantic::model_package::validate_model;
     use crate::semantic::versioning::CorpusIdentity;
     use std::path::PathBuf;
 
@@ -538,10 +532,10 @@ mod tests {
         ModelIdentity {
             model_id: "otzaria-embedding-v1".to_string(),
             model_checksum: checksum.to_string(),
-            model_quantization: "Q4_K_M".to_string(),
+            model_quantization: "int8".to_string(),
             embedding_backend: "mock-hash-v1".to_string(),
             embedding_dim: DIM,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             max_tokens: 512,
             embedding_text_version: 1,
             normalization_version: 1,
@@ -555,7 +549,7 @@ mod tests {
             embedding_dim: DIM,
             max_tokens: 512,
             batch_size: 2,
-            pooling: Pooling::LastToken,
+            pooling: Pooling::InGraph,
         });
         runtime.load().unwrap();
         runtime
@@ -573,9 +567,8 @@ mod tests {
         let dir = TempDir::new("equivalence");
         let corpus = corpus(&dir);
         let chunking = ChunkerConfig::default();
-        let model_path = dir.0.join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-        let model = model_for(&validate_and_checksum_gguf(&model_path).unwrap(), &chunking);
+        let model_path = mock::write_stub_onnx_package(&dir.0.join("model"));
+        let model = model_for(validate_model(&model_path).unwrap().checksum(), &chunking);
 
         let whole = build(
             BuildRequest {
@@ -655,9 +648,8 @@ mod tests {
     fn a_version_two_plan_carries_the_passage_prefixed_text_and_its_digest() {
         let dir = TempDir::new("plan_v2");
         let corpus = corpus(&dir);
-        let model_path = dir.0.join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-        let checksum = validate_and_checksum_gguf(&model_path).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.0.join("model"));
+        let checksum = validate_model(&model_path).unwrap().checksum().to_string();
 
         let plan_under = |chunking: &ChunkerConfig, model: &ModelIdentity| {
             let mut sink = Vec::new();
@@ -736,9 +728,8 @@ mod tests {
     fn a_version_two_plan_carries_a_capped_passage_without_its_trailing_space() {
         let dir = TempDir::new("plan_v2_trim");
         let corpus = corpus(&dir);
-        let model_path = dir.0.join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-        let checksum = validate_and_checksum_gguf(&model_path).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.0.join("model"));
+        let checksum = validate_model(&model_path).unwrap().checksum().to_string();
         // "בראשית ברא …" capped at 7 characters is "בראשית ", space included.
         let chunking = |embedding_text_version| ChunkerConfig {
             max_chunk_chars: 7,
@@ -794,9 +785,8 @@ mod tests {
         let dir = TempDir::new("hole");
         let corpus = corpus(&dir);
         let chunking = ChunkerConfig::default();
-        let model_path = dir.0.join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-        let model = model_for(&validate_and_checksum_gguf(&model_path).unwrap(), &chunking);
+        let model_path = mock::write_stub_onnx_package(&dir.0.join("model"));
+        let model = model_for(validate_model(&model_path).unwrap().checksum(), &chunking);
 
         let plan_path = dir.0.join("plan.jsonl");
         let mut sink = std::fs::File::create(&plan_path).unwrap();
@@ -844,8 +834,7 @@ mod tests {
     #[test]
     fn a_plan_whose_text_no_longer_matches_its_digest_is_refused_before_it_is_embedded() {
         let dir = TempDir::new("tampered");
-        let model_path = dir.0.join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.0.join("model"));
         let runtime = runtime_for(&model_path);
 
         let honest = PlannedChunk {

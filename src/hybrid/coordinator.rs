@@ -1267,8 +1267,7 @@ mod tests {
 
     /// A coordinator over an empty but working semantic engine.
     fn semantic_coordinator(dir: &TempDir) -> HybridCoordinator {
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
         let root = dir.path().join("semantic");
 
         let engine = SemanticEngine::open(SemanticConfig {
@@ -1294,7 +1293,7 @@ mod tests {
         let engine = SemanticEngine::open(SemanticConfig {
             root_dir: root.clone(),
             // Deliberately absent: load_model will fail.
-            model_path: dir.path().join("absent.gguf"),
+            model_path: dir.path().join("absent.onnx"),
             embedding_dim: 64,
             store: VectorStoreConfig {
                 db_path: root.join("vectors"),
@@ -1822,8 +1821,7 @@ mod tests {
         use std::sync::Arc;
 
         let dir = TempDir::new("interleave");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
         let root = dir.path().join("semantic");
 
         let engine = SemanticEngine::open(SemanticConfig {

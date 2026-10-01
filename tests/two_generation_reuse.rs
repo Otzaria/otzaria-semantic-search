@@ -18,11 +18,11 @@
 //! reason the ledger is keyed on the embedding text instead — see
 //! `distribution::reuse`. A corpus of independent lines would pass either design.
 //!
-//! Two generations have to be embedded here, so a backend is required, and the stub GGUF
-//! this uses is one real inference rightly refuses — hence `mock-embedding` without
-//! `llama-backend`, the same gate the other end-to-end tests carry.
+//! Two generations have to be embedded here, so a backend is required, and the stub ONNX
+//! package this uses is one real inference rightly refuses — hence `mock-embedding`
+//! without `onnx-backend`, the same gate the other end-to-end tests carry.
 
-#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+#![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
 use otzaria_semantic_search::distribution::builder::PlannedCorpus;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};
@@ -35,9 +35,8 @@ use otzaria_semantic_search::distribution::reuse::{
 use otzaria_semantic_search::distribution::shard::{embed_shard, export_plan, read_plan};
 use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
-use otzaria_semantic_search::semantic::embedding::{
-    mock, validate_and_checksum_gguf, EmbeddingConfig, EmbeddingRuntime,
-};
+use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingConfig, EmbeddingRuntime};
+use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
 use std::path::{Path, PathBuf};
 
@@ -142,10 +141,10 @@ fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
     ModelIdentity {
         model_id: "otzaria-embedding-v1".to_string(),
         model_checksum: checksum.to_string(),
-        model_quantization: "Q4_K_M".to_string(),
+        model_quantization: "int8".to_string(),
         embedding_backend: "mock-hash-v1".to_string(),
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
@@ -159,7 +158,7 @@ fn runtime(model_path: &Path) -> EmbeddingRuntime {
         embedding_dim: DIM,
         max_tokens: 512,
         batch_size: 2,
-        pooling: Pooling::LastToken,
+        pooling: Pooling::InGraph,
     });
     runtime.load().unwrap();
     runtime
@@ -310,9 +309,8 @@ fn digest_of(artifact: &Path) -> String {
 fn a_release_assembled_from_reuse_is_the_release_a_full_rebuild_would_produce() {
     let dir = TempDir::new("chain");
     let chunking = ChunkerConfig::default();
-    let model_path = dir.at("model.gguf");
-    mock::write_stub_gguf(&model_path, 3).unwrap();
-    let model = model_for(&validate_and_checksum_gguf(&model_path).unwrap(), &chunking);
+    let model_path = mock::write_stub_onnx_package(&dir.at("model"));
+    let model = model_for(validate_model(&model_path).unwrap().checksum(), &chunking);
 
     // Generation one.
     let v1 = write_corpus(

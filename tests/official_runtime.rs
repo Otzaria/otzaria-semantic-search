@@ -14,10 +14,10 @@
 //!
 //! Driving a query end to end needs an embedding backend, and needs the deterministic
 //! stand-in to be the one actually selected — the fixture's model is a weightless stub
-//! that real inference rightly refuses — hence `mock-embedding` without `llama-backend`,
+//! that real inference rightly refuses — hence `mock-embedding` without `onnx-backend`,
 //! as in `tests/hybrid_integration_test.rs`.
 
-#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+#![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::cancellation::CancellationToken;
@@ -28,9 +28,8 @@ use otzaria_semantic_search::distribution::package::{
 use otzaria_semantic_search::errors::SemanticSearchError;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::MockHashBackend;
-use otzaria_semantic_search::semantic::embedding::{
-    mock, validate_and_checksum_gguf, EmbeddingDeployment,
-};
+use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
+use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::official_index::{
     readable_store_identity, LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
 };
@@ -111,10 +110,10 @@ fn corpus() -> CorpusIdentity {
 fn local_model(model_path: &Path) -> LocalModel {
     LocalModel {
         model_path: model_path.to_path_buf(),
-        model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
-        model_quantization: "Q4_K_M".to_string(),
+        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+        model_quantization: "int8".to_string(),
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
@@ -129,7 +128,7 @@ fn identity(model_path: &Path) -> IndexVersion {
         model: ModelIdentity {
             model_id: model.model_id,
             // What the builder had, computed here from the file the runtime will load.
-            model_checksum: validate_and_checksum_gguf(model_path).unwrap(),
+            model_checksum: validate_model(model_path).unwrap().checksum().to_string(),
             model_quantization: model.model_quantization,
             embedding_backend: MockHashBackend::ID.to_string(),
             embedding_dim: model.embedding_dim,
@@ -164,8 +163,7 @@ fn metadata(line_id: u64, book: &str) -> VectorMetadata {
 /// Install an artifact into `dir`, and return the model it was built with and the
 /// directory the runtime opens.
 fn install(dir: &TempDir) -> (PathBuf, PathBuf) {
-    let model_path = dir.path().join("model.gguf");
-    mock::write_stub_gguf(&model_path, 3).unwrap();
+    let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
     let source = dir.path().join("build-output");
     let store = ZevcStore::open_or_create(ZevcStoreConfig {

@@ -28,7 +28,7 @@ use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
 use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
-use otzaria_semantic_search::semantic::model_package::{validate_model, ValidatedModel};
+use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
 use otzaria_semantic_search::semantic::versioning::ModelIdentity;
 use otzaria_semantic_search::semantic::zevc_store::VECTORS_FILENAME;
@@ -75,8 +75,8 @@ Options for 'build':
   --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
   --corpus-lines <path>      JSONL, one corpus line per document
   --model <path>             JSON ModelIdentity describing how the vectors are produced
-  --model-file <path>        The model the vectors are produced with: a GGUF file, or an
-                             ONNX graph with its package beside it (see 'model-checksum')
+  --model-file <path>        The model the vectors are produced with: an ONNX graph, with
+                             its package beside it (see 'model-checksum')
   --chunking <path>          JSON ChunkerConfig — the recipe itself (see below)
   --out <dir>                Output directory; must not exist, or be empty
   --batch <N>                Texts per inference call (default: 32)
@@ -96,8 +96,7 @@ Options for 'export-plan':
 Options for 'embed-shard':
   --plan <path>              plan.jsonl, as 'export-plan' wrote it
   --model <path>             The identity the plan was exported under
-  --model-file <path>        The model, GGUF or ONNX; held to every field the identity
-                             declares
+  --model-file <path>        The ONNX graph; held to every field the identity declares
   --skip <N>                 Records to skip (default: 0)
   --take <N>                 Records to embed (default: all that remain)
   --batch <N>                Texts per inference call (default: 32)
@@ -109,7 +108,7 @@ Options for 'embed-shard':
 Options for 'plan-split':
   --plan <path>              plan.jsonl for the release being built
   --ledger <path>            ledger.jsonl of the release to reuse from. Omit it for a
-                             full baseline: every line then goes to the GPU.
+                             full baseline: every line is then embedded.
   --out <dir>                Receives reuse.jsonl and embed.jsonl
 
 Options for 'assemble':
@@ -178,14 +177,13 @@ Options for 'validate':
   --chunking <path>          Optional; as for 'pack'
 
 Options for 'model-checksum':
-  --model-file <path>        A .gguf file, or an .onnx graph. Any other extension is read
-                             as GGUF.
+  --model-file <path>        An .onnx graph, its tokenizer.json beside it. No other kind of
+                             model is read: a path that does not end in .onnx is refused.
 
-For GGUF the checksum is the file's SHA-256. An ONNX model is a package: the graph, the
-tokenizer.json beside it and every external-data file the graph names, and the checksum is
-the SHA-256 of a manifest listing each of them with its size and SHA-256 — printed here
-exactly as it is hashed. Nothing else in the directory is part of it: not a README, not a
-second graph, not an ONNX Runtime library.
+An ONNX model is a package: the graph, the tokenizer.json beside it and every external-data
+file the graph names, and the checksum is the SHA-256 of a manifest listing each of them
+with its size and SHA-256 — printed here exactly as it is hashed. Nothing else in the
+directory is part of it: not a README, not a second graph, not an ONNX Runtime library.
 
 A record is {{"line_id":N,"source_line_sha256":"...","embedding_text_sha256":"..."}}.
 Both digests are lowercase hex SHA-256.
@@ -217,7 +215,7 @@ Examples:
   otzaria-semantic-search search "מצות תפילין" --mode semantic --limit 5
   otzaria-semantic-search index-text "otzaria/demo.txt" "ספר הדגמה" "כל העוסק בתורה בלילה שכינה כנגדו"
   otzaria-semantic-search build --corpus-identity corpus.json --corpus-lines corpus.jsonl \
-      --model model.json --model-file model.gguf --chunking chunking.json --out ./artifact
+      --model model.json --model-file model.onnx --chunking chunking.json --out ./artifact
   otzaria-semantic-search pack --vectors v.f32 --records v.jsonl \
       --corpus-identity corpus.json --corpus-lines corpus.jsonl \
       --model model.json --out ./artifact
@@ -238,7 +236,7 @@ fn main() {
     match command.as_str() {
         "version" | "-v" | "--version" => {
             println!("otzaria-semantic-search CLI {}", env!("CARGO_PKG_VERSION"));
-            println!("Engine: Hybrid Tantivy + Local Vector Engine (GGUF and ONNX models)");
+            println!("Engine: Hybrid Tantivy + Local Vector Engine (ONNX models)");
             println!("Crate Targets: rlib, cdylib, staticlib, binary CLI");
         }
         "status" => {
@@ -428,50 +426,40 @@ fn main() {
 /// files, and writing `model.json` for a new model should not need the model to run.
 fn run_model_checksum(args: &[String]) {
     let model_file = PathBuf::from(require_arg(args, "--model-file"));
-    let validated = validate_model(&model_file)
+    let package = validate_model(&model_file)
         .unwrap_or_else(|error| exit_with("The model cannot be used", error));
 
     println!("=== Model checksum ===");
     println!("Model:           {}", model_file.display());
-    println!("Format:          {}", validated.format());
-    println!("model_checksum:  {}", validated.checksum());
+    println!("Format:          ONNX");
+    println!("model_checksum:  {}", package.checksum());
 
-    match &validated {
-        ValidatedModel::Gguf { .. } => {
-            if let Ok(metadata) = std::fs::metadata(&model_file) {
-                println!("Size:            {} bytes", metadata.len());
-            }
-            println!("\nFor GGUF the checksum is the SHA-256 of the file itself.");
-        }
-        ValidatedModel::Onnx(package) => {
-            let facts = package.graph_facts();
-            println!("Package root:    {}", package.root().display());
-            println!(
-                "Graph:           IR {}, {} opset import(s), {} input(s), {} output(s), {} \
-                 external tensor reference(s)",
-                facts.ir_version,
-                facts.opset_imports,
-                facts.graph_inputs,
-                facts.graph_outputs,
-                facts.external_tensors
-            );
-            println!("\nPackage files ({}):", package.files().len());
-            let width = package
-                .files()
-                .iter()
-                .map(|file| file.relpath.chars().count())
-                .max()
-                .unwrap_or(0);
-            for file in package.files() {
-                println!(
-                    "  {:<width$}  {:>12} bytes  sha256 {}",
-                    file.relpath, file.size, file.sha256
-                );
-            }
-            println!("\nThe checksum is the SHA-256 of exactly this text:");
-            print!("{}", package.manifest_text());
-        }
+    let facts = package.graph_facts();
+    println!("Package root:    {}", package.root().display());
+    println!(
+        "Graph:           IR {}, {} opset import(s), {} input(s), {} output(s), {} \
+         external tensor reference(s)",
+        facts.ir_version,
+        facts.opset_imports,
+        facts.graph_inputs,
+        facts.graph_outputs,
+        facts.external_tensors
+    );
+    println!("\nPackage files ({}):", package.files().len());
+    let width = package
+        .files()
+        .iter()
+        .map(|file| file.relpath.chars().count())
+        .max()
+        .unwrap_or(0);
+    for file in package.files() {
+        println!(
+            "  {:<width$}  {:>12} bytes  sha256 {}",
+            file.relpath, file.size, file.sha256
+        );
     }
+    println!("\nThe checksum is the SHA-256 of exactly this text:");
+    print!("{}", package.manifest_text());
 }
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
@@ -553,7 +541,7 @@ fn plan_corpus<'a>(
 /// Apply the recipe on the machine that holds the corpus, and write the work out.
 ///
 /// No model is opened and none is needed: this is the half of a build that is arithmetic
-/// on strings. What it writes is what a worker with a GPU and no corpus can act on.
+/// on strings. What it writes is what a worker with the model and no corpus can act on.
 fn run_export_plan(args: &[String]) {
     let out = PathBuf::from(require_arg(args, "--out"));
     let model = read_model(&require_arg(args, "--model"));
@@ -673,7 +661,7 @@ fn run_embed_shard(args: &[String]) {
     // A finished shard is three files, and this refuses to write over one. Unlike the merge,
     // *re-running* is normal here — a session that timed out gets retried on another account
     // — so a directory holding leftovers is fair game and only a complete shard is protected.
-    // Overwriting one silently discarded an hour of GPU time and reported success.
+    // Overwriting one silently discarded an hour of embedding and reported success.
     let manifest_path = out.join("shard-manifest.json");
     if [
         &out.join("vectors.f32"),
@@ -746,7 +734,7 @@ fn run_embed_shard(args: &[String]) {
 /// Split a plan against the previous release's ledger.
 ///
 /// The half of an update that decides what does not have to be embedded again. Reads no
-/// model and touches no GPU: it is a digest lookup per line.
+/// model and runs no inference: it is a digest lookup per line.
 fn run_plan_split(args: &[String]) {
     let out = PathBuf::from(require_arg(args, "--out"));
     let plan = require_arg(args, "--plan");
@@ -839,8 +827,8 @@ fn run_assemble(args: &[String]) {
     // The same verified bundle `plan-split` used. Reuse cannot be handed a bare file.
     let base = verified_base(args);
 
-    // Every `vectors.f32` under the root, at any depth: a shard produced by a
-    // multi-GPU session is a directory of directories, and flattening it here means the
+    // Every `vectors.f32` under the root, at any depth: a shard produced by a session that
+    // ran several windows is a directory of directories, and flattening it here means the
     // caller does not have to.
     let mut shards = Vec::new();
     collect_shards(&shard_root, &mut shards);

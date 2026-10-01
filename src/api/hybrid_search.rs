@@ -1,7 +1,7 @@
 //! Clean high-level API for Flutter / flutter_rust_bridge.
 //!
 //! Provides domain-level operations for hybrid search and semantic index
-//! lifecycle management. Flutter never sees GGUF, chunking, the vector backend,
+//! lifecycle management. Flutter never sees the model, chunking, the vector backend,
 //! the manifest or the fusion implementation.
 //!
 //! # Scope

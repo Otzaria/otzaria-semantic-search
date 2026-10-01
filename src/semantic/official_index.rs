@@ -94,7 +94,7 @@ pub fn readable_store_identity() -> StoreIdentity {
 pub struct LocalModel {
     pub model_path: PathBuf,
     pub model_id: String,
-    /// Quantization of the weights, e.g. `"Q4_K_M"`. Redundant against the checksum by
+    /// Quantization of the weights, e.g. `"int8"`. Redundant against the checksum by
     /// design: it is what makes a rejection readable.
     pub model_quantization: String,
     pub embedding_dim: u32,
@@ -138,16 +138,12 @@ impl LocalModel {
     }
 
     /// The typed pooling strategy, refusing a spelling [`Pooling`] cannot parse and one
-    /// no backend for the model's format implements — the caller's configuration error
-    /// either way.
+    /// no backend implements — the caller's configuration error either way.
     fn pooling_strategy(&self) -> Result<Pooling, SemanticSearchError> {
         let pooling = Pooling::parse(&self.pooling)
             .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
-        crate::semantic::backend::ensure_pooling_is_implemented_for(
-            pooling,
-            crate::semantic::model_package::ModelFormat::of(&self.model_path),
-        )
-        .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
+        crate::semantic::backend::ensure_pooling_is_implemented(pooling)
+            .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
         Ok(pooling)
     }
 }
@@ -489,7 +485,8 @@ mod tests {
     use crate::distribution::importer::{previous_path, ImportConfig, IndexImporter};
     use crate::distribution::package::{IndexPackage, PackageManifest, PayloadDescriptor};
     use crate::errors::{EmbeddingError, VectorStoreError};
-    use crate::semantic::embedding::{mock, validate_and_checksum_gguf};
+    use crate::semantic::embedding::mock;
+    use crate::semantic::model_package::validate_model;
     use crate::semantic::store_backend::VectorStoreBackend;
     use crate::semantic::types::VectorMetadata;
     use crate::semantic::versioning::IdentityField;
@@ -566,11 +563,11 @@ mod tests {
     fn local_model(model_path: &Path) -> LocalModel {
         LocalModel {
             model_path: model_path.to_path_buf(),
-            model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
-            model_quantization: "Q4_K_M".to_string(),
+            model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+            model_quantization: "int8".to_string(),
             embedding_dim: DIM,
-            pooling: "last-token".to_string(),
-            max_tokens: 512,
+            pooling: "in-graph".to_string(),
+            max_tokens: 256,
             embedding_text_version: 1,
             normalization_version: 1,
             chunking_identity: 0x0BAD_C0DE,
@@ -585,7 +582,7 @@ mod tests {
             corpus: corpus(),
             model: ModelIdentity {
                 model_id: model.model_id,
-                model_checksum: validate_and_checksum_gguf(model_path).unwrap(),
+                model_checksum: validate_model(model_path).unwrap().checksum().to_string(),
                 model_quantization: model.model_quantization,
                 embedding_backend: crate::semantic::backend::MockHashBackend::ID.to_string(),
                 embedding_dim: model.embedding_dim,
@@ -680,8 +677,7 @@ mod tests {
 
     /// A model, an artifact built for it, and that artifact installed into `target`.
     fn installed(dir: &TempDir) -> (PathBuf, PathBuf, String) {
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
         let source = dir.path().join("build-output");
         let target = dir.path().join("semantic_index");
@@ -781,8 +777,7 @@ mod tests {
     #[test]
     fn counts_the_payload_does_not_hold_are_refused_at_open() {
         let dir = TempDir::new("counts");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
         for (label, adjust) in [
             (
@@ -874,8 +869,7 @@ mod tests {
     #[test]
     fn a_package_that_does_not_declare_this_backends_payloads_is_refused() {
         let dir = TempDir::new("payload_set");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
         let source = dir.path().join("build-output");
         build_artifact(&source, &model_path, |_| {});
@@ -912,8 +906,7 @@ mod tests {
     #[test]
     fn an_artifact_built_for_another_corpus_or_another_model_is_refused_by_field_name() {
         let dir = TempDir::new("mismatch");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
         // Same library name, one book inserted in the middle: every `line_id` after it
         // now names a different line, and nothing in the vectors says so.
@@ -923,12 +916,12 @@ mod tests {
         });
 
         // Same `model_id`, different weights behind it.
-        let other_model = dir.path().join("other-model.gguf");
-        mock::write_stub_gguf(&other_model, 2).unwrap();
+        let other_model = mock::write_stub_onnx_package(&dir.path().join("other-model"));
+        std::fs::write(&other_model, mock::onnx::stub_graph_named("other weights")).unwrap();
         let foreign_model = dir.path().join("foreign-model");
         build_artifact(&foreign_model, &model_path, |manifest| {
             manifest.identity.model.model_checksum =
-                validate_and_checksum_gguf(&other_model).unwrap()
+                validate_model(&other_model).unwrap().checksum().to_string()
         });
 
         for (source, field) in [
@@ -975,8 +968,7 @@ mod tests {
     #[test]
     fn a_version_two_artifact_embeds_every_query_with_its_role_prefix() {
         let dir = TempDir::new("query_prefix");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
         let target = dir.path().join("v2");
         build_artifact(&target, &model_path, |manifest| {
             manifest.identity.model.embedding_text_version = 2;
@@ -1081,12 +1073,12 @@ mod tests {
         let dir = TempDir::new("no_model");
         let (_, target, _) = installed(&dir);
 
-        let absent = dir.path().join("not-installed.gguf");
+        let absent = dir.path().join("not-installed.onnx");
         match OfficialSemanticIndex::open(config_for(&target, &absent))
             .map(|index| index.vector_count())
         {
             Err(SemanticSearchError::EmbeddingRuntime(EmbeddingError::ModelNotFound { path })) => {
-                assert!(path.contains("not-installed.gguf"), "{path}")
+                assert!(path.contains("not-installed.onnx"), "{path}")
             }
             other => panic!("expected a model error, got {other:?}"),
         }

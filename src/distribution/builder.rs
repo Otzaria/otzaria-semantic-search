@@ -35,8 +35,8 @@
 //! cosine and is deliberately not versioned. See [`recipe`](crate::semantic::recipe).
 //!
 //! What is left declared and unverifiable: `model_id` and `model_quantization`. Nothing in
-//! a GGUF file states either, and inventing a check that reads them from the same place
-//! that wrote them would prove nothing.
+//! an ONNX package states either in a form anything here could check, and inventing a
+//! check that reads them from the same place that wrote them would prove nothing.
 //!
 //! **One window stays open, and is not closed here.** The checksum is computed, and then
 //! the backend opens the same path again; a model file swapped between those two reads
@@ -91,8 +91,8 @@ use std::path::PathBuf;
 pub struct BuildRequest {
     /// Directory the artifact is written into. Must not exist, or be an empty directory.
     pub output_path: PathBuf,
-    /// The GGUF file the vectors are produced with. Its checksum has to be the one
-    /// `model.model_checksum` declares.
+    /// The ONNX graph the vectors are produced with, its package beside it. The package
+    /// checksum has to be the one `model.model_checksum` declares.
     pub model_path: PathBuf,
     /// What the artifact will declare about how its vectors were made. The half a model
     /// file can answer for is checked against it; see the module documentation for the
@@ -623,7 +623,8 @@ mod tests {
     use crate::distribution::corpus::{CorpusLineRecord, JsonlCorpus};
     use crate::distribution::package::{ArtifactExpectation, IndexPackage};
     use crate::semantic::chunker::compute_chunk_hash;
-    use crate::semantic::embedding::{mock, validate_and_checksum_gguf};
+    use crate::semantic::embedding::mock;
+    use crate::semantic::model_package::validate_model;
     use crate::semantic::versioning::IndexVersion;
     use crate::semantic::zevc_store::ReadOnlyZevcStore;
     use std::collections::HashMap;
@@ -740,10 +741,10 @@ mod tests {
         ModelIdentity {
             model_id: "otzaria-embedding-v1".to_string(),
             model_checksum: checksum.to_string(),
-            model_quantization: "Q4_K_M".to_string(),
+            model_quantization: "int8".to_string(),
             embedding_backend: "mock-hash-v1".to_string(),
             embedding_dim: DIM,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             max_tokens: 512,
             embedding_text_version: 1,
             normalization_version: 1,
@@ -751,16 +752,21 @@ mod tests {
         }
     }
 
-    /// A stub GGUF and the checksum a build must declare for it.
+    /// Where [`write_model`] puts the stub graph.
+    fn model_path_in(dir: &TempDir) -> PathBuf {
+        dir.path().join("model").join("model.onnx")
+    }
+
+    /// A stub ONNX package and the checksum a build must declare for it.
     fn write_model(dir: &TempDir) -> (PathBuf, String) {
-        let path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&path, 3).unwrap();
-        let checksum = validate_and_checksum_gguf(&path).unwrap();
+        let path = mock::write_stub_onnx_package(&dir.path().join("model"));
+        assert_eq!(path, model_path_in(dir));
+        let checksum = validate_model(&path).unwrap().checksum().to_string();
         (path, checksum)
     }
 
     fn build_request(dir: &TempDir, model: ModelIdentity, chunking: ChunkerConfig) -> BuildRequest {
-        let (model_path, _) = (dir.path().join("model.gguf"), ());
+        let model_path = model_path_in(dir);
         BuildRequest {
             output_path: dir.path().join("artifact"),
             model_path,
@@ -1008,7 +1014,7 @@ mod tests {
     /// backend** — which is a fact about the stand-in rather than a gap in the check. The
     /// deterministic backend is constructed *from* the configuration and echoes its width
     /// and token cap straight back, so declaring the wrong one configures the backend to
-    /// agree; and it always reports `last-token`, so the only other pooling this crate can
+    /// agree; and it always reports `in-graph`, so the only other pooling this crate can
     /// spell is refused earlier, for having no implementation at all. Real inference reads
     /// all three out of the weights, which is where those comparisons acquire teeth. The
     /// checksum and the backend id are not echoed by anything, and are exercised.
@@ -1039,7 +1045,7 @@ mod tests {
             (
                 "embedding_backend",
                 ModelIdentity {
-                    embedding_backend: "llama-cpp-2-0.1.153".to_string(),
+                    embedding_backend: "onnxruntime-sentence-v1".to_string(),
                     ..truthful.clone()
                 },
             ),

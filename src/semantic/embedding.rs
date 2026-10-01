@@ -1,45 +1,18 @@
 //! Embedding model runtime: the shell *around* inference, never inference
-//! itself — model-file validation and checksumming, the batch API, and the single
-//! place a vector's dimension, finiteness and norm are checked before it can
-//! enter the index. What an implementation must provide, and which one a build
-//! gets, live in [`backend`](crate::semantic::backend); what an ONNX model *is* on
-//! disk, in [`model_package`](crate::semantic::model_package).
+//! itself — the configuration's checks, the batch API, and the single place a
+//! vector's dimension, finiteness and norm are checked before it can enter the
+//! index. What an implementation must provide, and which one a build gets, live in
+//! [`backend`](crate::semantic::backend); what an ONNX model *is* on disk, and how it
+//! is validated and checksummed, in [`model_package`](crate::semantic::model_package).
 
 use crate::errors::EmbeddingError;
 use crate::semantic::backend::{
-    ensure_pooling_is_implemented_for, max_tokens_past_the_format, select_backend_for,
+    ensure_pooling_is_implemented, max_tokens_past_any_encoder, select_backend_for,
     EmbeddingBackend, Pooling,
 };
-use crate::semantic::model_package::{validate_model, ModelFormat};
+use crate::semantic::model_package::{ensure_onnx_model_path, validate_model};
 use std::io::Read;
-use std::path::{Path, PathBuf};
-
-/// GGUF container magic, little-endian `b"GGUF"`.
-const GGUF_MAGIC: [u8; 4] = *b"GGUF";
-
-/// GGUF container versions this crate is willing to open.
-///
-/// v1 is refused rather than misparsed: it stored `tensor_count` and
-/// `metadata_kv_count` as `u32`, widened to `u64` in v2, so reading a v1 header
-/// with the v2 layout would silently misread it. Supporting v1 would mean a real
-/// per-version parser.
-const GGUF_SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
-
-/// Size of the GGUF header: magic (4) + version (4) + `tensor_count` (8) +
-/// `metadata_kv_count` (8).
-const GGUF_HEADER_BYTES: usize = 24;
-
-/// Sanity ceiling for the header's declared counts. A real model has hundreds of
-/// tensors; a wildly larger count means the bytes are not a GGUF header.
-const GGUF_MAX_DECLARED_COUNT: u64 = 1 << 24;
-
-/// Ceiling on the descriptor region, which in a real model is a few megabytes
-/// dominated by the tokenizer vocabulary. A supported GGUF exceeding it is
-/// rejected rather than accepted unvalidated.
-const GGUF_MAX_DESCRIPTOR_REGION_BYTES: u64 = 64 << 20;
-
-/// Default tensor-data alignment when the file declares no `general.alignment`.
-const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+use std::path::PathBuf;
 
 /// Read buffer for hashing, large enough that hashing is bound by the hash rather
 /// than by syscalls.
@@ -77,14 +50,17 @@ pub struct EmbeddingConfig {
     pub pooling: Pooling,
 }
 
+/// The production model: the Meivin Round 2 int8 graph, as its identity
+/// (`config/models/meivin-round2-onnx/model.json`) declares it, at a path relative to the
+/// working directory. `defaults_are_the_production_identity` holds the two together.
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("models/otzaria-embedding-v1-flash-q4.gguf"),
-            embedding_dim: 1024,
-            max_tokens: 512,
+            model_path: PathBuf::from("models/meivin-round2-onnx/seforim-embed-round2-int8.onnx"),
+            embedding_dim: 256,
+            max_tokens: 256,
             batch_size: 32,
-            pooling: Pooling::LastToken,
+            pooling: Pooling::InGraph,
         }
     }
 }
@@ -95,11 +71,14 @@ impl EmbeddingConfig {
     ///
     /// `batch_size` is deliberately absent: zero there is recoverable and means
     /// "one text per call" ([`EmbeddingRuntime::batch_size`] clamps it), whereas a
-    /// zero dimensionality or token cap makes every embedding degenerate. The
-    /// pooling check asks whether a backend for the model's format *performs* the
-    /// strategy, and belongs here because the value is persisted as the index's
-    /// identity — see [`ensure_pooling_is_implemented_for`]. So is the token cap, and an
-    /// ONNX one is held to [`ONNX_MAX_TOKENS_CEILING`](crate::semantic::backend::ONNX_MAX_TOKENS_CEILING)
+    /// zero dimensionality or token cap makes every embedding degenerate. A model path
+    /// that names no ONNX graph — a GGUF, say — is refused here, as
+    /// [`EmbeddingError::InvalidModelFile`] (see
+    /// [`ensure_onnx_model_path`]), since no backend reads anything else. The pooling
+    /// check asks whether a backend *performs* the strategy, and belongs here because the
+    /// value is persisted as the index's identity — see [`ensure_pooling_is_implemented`].
+    /// So is the token cap, which is held to
+    /// [`ONNX_MAX_TOKENS_CEILING`](crate::semantic::backend::ONNX_MAX_TOKENS_CEILING)
     /// here for the same reason.
     pub fn validate(&self) -> Result<(), EmbeddingError> {
         if self.embedding_dim == 0 {
@@ -110,11 +89,11 @@ impl EmbeddingConfig {
             });
         }
         // 2, not 1: the cap is the total sequence length, and every backend spends at
-        // least one token of it on a special token — llama.cpp's appended EOS, a BERT
-        // tokenizer's [CLS] and [SEP]. A cap of 1 leaves no budget for content and
-        // embeds every text as a bare special token: a plausible-looking vector
-        // carrying nothing of the input. A backend whose specials take more refuses
-        // the cap at load, where it knows how many it adds.
+        // least one token of it on a special token — a BERT tokenizer's [CLS] and
+        // [SEP]. A cap of 1 leaves no budget for content and embeds every text as a bare
+        // special token: a plausible-looking vector carrying nothing of the input. A
+        // backend whose specials take more refuses the cap at load, where it knows how
+        // many it adds.
         if self.max_tokens < 2 {
             return Err(EmbeddingError::LoadFailed {
                 reason: format!(
@@ -125,11 +104,11 @@ impl EmbeddingConfig {
                 ),
             });
         }
-        let format = ModelFormat::of(&self.model_path);
-        if let Some(reason) = max_tokens_past_the_format("max_tokens", self.max_tokens, format) {
+        ensure_onnx_model_path(&self.model_path)?;
+        if let Some(reason) = max_tokens_past_any_encoder("max_tokens", self.max_tokens) {
             return Err(EmbeddingError::LoadFailed { reason });
         }
-        ensure_pooling_is_implemented_for(self.pooling, format)?;
+        ensure_pooling_is_implemented(self.pooling)?;
         Ok(())
     }
 }
@@ -166,10 +145,8 @@ pub struct EmbeddingDeployment {
     /// relative path is resolved against the current directory, so pass an absolute one.
     ///
     /// A process holds one runtime: once one has loaded, a different path is refused rather
-    /// than ignored, because ONNX Runtime cannot be unloaded or replaced. Ignored for a GGUF
-    /// model — the llama backend links llama.cpp into the build and has no runtime to find —
-    /// and by the stand-in, which runs nothing. `docs/ONNX_BACKEND.md` §3 has the whole
-    /// lookup.
+    /// than ignored, because ONNX Runtime cannot be unloaded or replaced. Ignored by the
+    /// stand-in, which runs nothing. `docs/ONNX_BACKEND.md` §3 has the whole lookup.
     pub onnx_runtime: Option<PathBuf>,
 }
 
@@ -222,8 +199,8 @@ impl EmbeddingRuntime {
             });
         }
 
-        // By the format the path names: a GGUF file, or an ONNX graph with the package
-        // around it. The same rule picks the backend below.
+        // The ONNX graph, with the package around it: every file of it whole, and the
+        // checksum that names them all.
         let validated = validate_model(&self.config.model_path)?;
         let backend = select_backend_for(&self.config, &self.deployment)?;
         self.adopt(backend, Some(validated.checksum().to_string()))
@@ -321,18 +298,14 @@ impl EmbeddingRuntime {
             .is_some_and(|backend| backend.is_semantic())
     }
 
-    /// The loaded model's `model_checksum`, or `None` before a successful load:
+    /// The loaded model's `model_checksum`, or `None` before a successful load: the
+    /// package checksum, the SHA-256 of a canonical manifest listing the graph, every
+    /// external-data file it names and `tokenizer.json`, each with its size and SHA-256 —
+    /// see [`model_package`](crate::semantic::model_package). Nothing else in the
+    /// directory is covered, because nothing else reaches a vector.
     ///
-    /// * **GGUF** — the SHA-256 of the file, from
-    ///   [`validate_and_checksum_gguf`];
-    /// * **ONNX** — the package checksum: the SHA-256 of a canonical manifest listing
-    ///   the graph, every external-data file it names and `tokenizer.json`, each with
-    ///   its size and SHA-256 — see
-    ///   [`model_package`](crate::semantic::model_package). Nothing else in the
-    ///   directory is covered, because nothing else reaches a vector.
-    ///
-    /// Either way lowercase hex, 64 digits, and a statement that the bytes behind the
-    /// model path are the ones an index was built with — not a download verification.
+    /// Lowercase hex, 64 digits, and a statement that the bytes behind the model path are
+    /// the ones an index was built with — not a download verification.
     pub fn model_checksum(&self) -> Option<&str> {
         self.model_checksum.as_deref()
     }
@@ -402,9 +375,9 @@ impl EmbeddingRuntime {
     }
 
     /// The token cap in force: the loaded backend's effective one, or the requested
-    /// one before a model is loaded. The two can differ, since a backend clamps the
-    /// request to its model's context length. This layer never truncates — the cap
-    /// is the backend's contract, see [`EmbeddingBackend::max_tokens`].
+    /// one before a model is loaded. A backend reports the cap it applies, which is what
+    /// counts once one is loaded. This layer never truncates — the cap is the backend's
+    /// contract, see [`EmbeddingBackend::max_tokens`].
     pub fn max_tokens(&self) -> usize {
         self.backend
             .as_ref()
@@ -488,388 +461,6 @@ pub fn l2_normalize(vec: &mut [f32]) -> f32 {
     norm
 }
 
-/// Validate a GGUF container and return the file's SHA-256, in one pass over the
-/// file.
-///
-/// Checks the header first (a non-GGUF file is rejected after 24 bytes), parses the
-/// descriptor region, then requires the file to hold what its descriptors describe.
-///
-/// That size check is deliberately a **lower** bound — one bit per element, below
-/// every ggml type. Exact lengths would need the block size of every quantization,
-/// and one wrong entry would reject a *valid* model, the worse failure: it makes
-/// the feature unavailable instead of failing late with a clear error. So a
-/// download cut off inside the final tensor can still pass; a placeholder, a
-/// header-only stub, or a download that stopped earlier cannot.
-///
-/// **Not download verification** — a checksum from the file cannot attest to the
-/// file. It detects that the bytes behind a model path *changed* between sessions.
-pub fn validate_and_checksum_gguf(path: &Path) -> Result<String, EmbeddingError> {
-    let invalid = |reason: String| EmbeddingError::InvalidModelFile {
-        path: path.display().to_string(),
-        reason,
-    };
-    let unreadable = |e: std::io::Error| EmbeddingError::LoadFailed {
-        reason: format!("cannot read model file {}: {e}", path.display()),
-    };
-
-    let file = std::fs::File::open(path).map_err(|e| EmbeddingError::LoadFailed {
-        reason: format!("cannot open model file {}: {e}", path.display()),
-    })?;
-    let mut reader = HashingReader::new(file);
-
-    // ── 1. the header, on its own ──
-    let mut header = [0u8; GGUF_HEADER_BYTES];
-    if let Err(e) = reader.read_exact_hashed(&mut header) {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            return Err(invalid(format!(
-                "file is {} bytes; a GGUF header needs {GGUF_HEADER_BYTES}",
-                reader.consumed()
-            )));
-        }
-        return Err(unreadable(e));
-    }
-
-    if header[..4] != GGUF_MAGIC {
-        return Err(invalid(format!(
-            "expected magic {:?}, found {:?}",
-            String::from_utf8_lossy(&GGUF_MAGIC),
-            String::from_utf8_lossy(&header[..4])
-        )));
-    }
-
-    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    if !GGUF_SUPPORTED_VERSIONS.contains(&version) {
-        return Err(invalid(format!(
-            "unsupported GGUF version {version} (supported: {}..={})",
-            GGUF_SUPPORTED_VERSIONS.start(),
-            GGUF_SUPPORTED_VERSIONS.end()
-        )));
-    }
-
-    let field = |offset: usize| -> u64 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&header[offset..offset + 8]);
-        u64::from_le_bytes(bytes)
-    };
-    let header = GgufHeader {
-        tensor_count: field(8),
-        metadata_kv_count: field(16),
-    };
-    if header.tensor_count > GGUF_MAX_DECLARED_COUNT
-        || header.metadata_kv_count > GGUF_MAX_DECLARED_COUNT
-    {
-        return Err(invalid(format!(
-            "implausible header counts (tensors: {}, metadata: {}); the file is \
-             probably not GGUF or is corrupt",
-            header.tensor_count, header.metadata_kv_count
-        )));
-    }
-    if header.tensor_count == 0 {
-        return Err(invalid(
-            "the GGUF declares no tensors; it is a container header, not an embedding model"
-                .to_string(),
-        ));
-    }
-
-    // ── 2. the descriptors, hashed as they are parsed ──
-    let layout = read_gguf_layout(&mut reader, &header);
-    let parsed = match layout {
-        LayoutOutcome::Parsed(parsed) => parsed,
-        LayoutOutcome::Truncated { at, wanted } => {
-            return Err(invalid(format!(
-                "the file ends inside its own descriptors — {wanted} at byte {at}; the \
-                 download is incomplete"
-            )));
-        }
-        LayoutOutcome::Unparsed(reason) => {
-            return Err(invalid(format!(
-                "the GGUF descriptor table is invalid or unsupported: {reason}"
-            )));
-        }
-    };
-
-    // ── 3. the rest of the file, hashed ──
-    let (checksum, total_bytes) = reader.finish().map_err(unreadable)?;
-
-    let required = parsed.data_start.saturating_add(parsed.min_data_bytes);
-    if total_bytes < required {
-        return Err(invalid(format!(
-            "file is {total_bytes} bytes, but its {} tensor descriptor(s) place \
-             data up to at least byte {required} (tensor data starts at \
-             {}) — the download is incomplete",
-            header.tensor_count, parsed.data_start
-        )));
-    }
-
-    Ok(checksum)
-}
-
-/// The counts a GGUF header declares.
-struct GgufHeader {
-    tensor_count: u64,
-    metadata_kv_count: u64,
-}
-
-/// Where the descriptors say the tensor data lives.
-struct GgufLayout {
-    /// First byte of the tensor data blob, after alignment padding.
-    data_start: u64,
-    /// Highest `offset + size lower bound`, relative to [`Self::data_start`].
-    min_data_bytes: u64,
-}
-
-/// Result of parsing the descriptor region.
-enum LayoutOutcome {
-    Parsed(GgufLayout),
-    /// The file ended mid-descriptor: provably incomplete.
-    Truncated {
-        at: u64,
-        wanted: &'static str,
-    },
-    /// Invalid under the supported schema, or past this validator's resource
-    /// limits. Either way the model is not safe to accept.
-    Unparsed(String),
-}
-
-/// Parse the metadata and tensor descriptors, hashing every byte and reading
-/// strictly forward so the caller's single pass is preserved.
-fn read_gguf_layout(reader: &mut HashingReader, header: &GgufHeader) -> LayoutOutcome {
-    const MAX_METADATA_KEY_BYTES: u64 = u16::MAX as u64;
-    const MAX_TENSOR_NAME_BYTES: u64 = 64;
-    /// GGUF tensors have at most four dimensions.
-    const MAX_TENSOR_DIMS: u32 = 4;
-    const ALIGNMENT_KEY: &[u8] = b"general.alignment";
-
-    macro_rules! read {
-        ($call:expr, $what:literal) => {
-            match $call {
-                Ok(value) => value,
-                Err(ReadError::Eof { at }) => return LayoutOutcome::Truncated { at, wanted: $what },
-                Err(ReadError::Io(e)) => {
-                    return LayoutOutcome::Unparsed(format!("read failed: {e}"))
-                }
-            }
-        };
-    }
-
-    let mut alignment = GGUF_DEFAULT_ALIGNMENT;
-
-    for index in 0..header.metadata_kv_count {
-        if reader.consumed() > GGUF_MAX_DESCRIPTOR_REGION_BYTES {
-            return LayoutOutcome::Unparsed(format!(
-                "metadata exceeds {GGUF_MAX_DESCRIPTOR_REGION_BYTES} bytes at entry {index}"
-            ));
-        }
-
-        let key_len = read!(reader.read_u64(), "a metadata key length");
-        if key_len > MAX_METADATA_KEY_BYTES {
-            return LayoutOutcome::Unparsed(format!("metadata key {index} claims {key_len} bytes"));
-        }
-        // Kept rather than skipped because the alignment is read from one of them.
-        let key = read!(reader.read_bytes(key_len), "a metadata key");
-        let value_type = read!(reader.read_u32(), "a metadata value type");
-
-        if key == ALIGNMENT_KEY {
-            if value_type != GgufValueType::UInt32 as u32 {
-                return LayoutOutcome::Unparsed("general.alignment is not a uint32".to_string());
-            }
-            let declared = read!(reader.read_u32(), "the declared alignment") as u64;
-            // The GGUF contract requires a multiple of eight, not a power of two.
-            if declared < 8 || !declared.is_multiple_of(8) {
-                return LayoutOutcome::Unparsed(format!(
-                    "general.alignment is {declared}, expected a multiple of 8"
-                ));
-            }
-            alignment = declared;
-            continue;
-        }
-
-        match skip_gguf_value(reader, value_type, 0) {
-            SkipOutcome::Done => {}
-            SkipOutcome::Truncated { at, wanted } => {
-                return LayoutOutcome::Truncated { at, wanted }
-            }
-            SkipOutcome::Unparsed(reason) => return LayoutOutcome::Unparsed(reason),
-        }
-    }
-
-    let mut min_data_bytes = 0u64;
-    for index in 0..header.tensor_count {
-        if reader.consumed() > GGUF_MAX_DESCRIPTOR_REGION_BYTES {
-            return LayoutOutcome::Unparsed(format!(
-                "tensor descriptors exceed {GGUF_MAX_DESCRIPTOR_REGION_BYTES} bytes at \
-                 tensor {index}"
-            ));
-        }
-
-        let name_len = read!(reader.read_u64(), "a tensor name length");
-        if name_len > MAX_TENSOR_NAME_BYTES {
-            return LayoutOutcome::Unparsed(format!("tensor {index} name claims {name_len} bytes"));
-        }
-        read!(reader.skip(name_len), "a tensor name");
-
-        let dim_count = read!(reader.read_u32(), "a tensor dimension count");
-        if dim_count == 0 || dim_count > MAX_TENSOR_DIMS {
-            return LayoutOutcome::Unparsed(format!(
-                "tensor {index} claims {dim_count} dimensions"
-            ));
-        }
-        let mut elements = 1u64;
-        for _ in 0..dim_count {
-            let extent = read!(reader.read_u64(), "a tensor dimension");
-            elements = elements.saturating_mul(extent.max(1));
-        }
-        let _ggml_type = read!(reader.read_u32(), "a tensor type");
-        let offset = read!(reader.read_u64(), "a tensor data offset");
-        if offset % alignment != 0 {
-            return LayoutOutcome::Unparsed(format!(
-                "tensor {index} offset {offset} is not aligned to {alignment} bytes"
-            ));
-        }
-
-        // One bit per element: every ggml type stores more, so this cannot
-        // over-reject whatever type table a future model uses.
-        let floor = elements.div_ceil(8).max(1);
-        min_data_bytes = min_data_bytes.max(offset.saturating_add(floor));
-    }
-
-    let descriptors_end = reader.consumed();
-    let data_start = descriptors_end.next_multiple_of(alignment);
-
-    LayoutOutcome::Parsed(GgufLayout {
-        data_start,
-        min_data_bytes,
-    })
-}
-
-/// GGUF metadata value types, in spec order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-enum GgufValueType {
-    UInt8 = 0,
-    Int8 = 1,
-    UInt16 = 2,
-    Int16 = 3,
-    UInt32 = 4,
-    Int32 = 5,
-    Float32 = 6,
-    Bool = 7,
-    String = 8,
-    Array = 9,
-    UInt64 = 10,
-    Int64 = 11,
-    Float64 = 12,
-}
-
-impl GgufValueType {
-    fn from_raw(raw: u32) -> Option<Self> {
-        Some(match raw {
-            0 => Self::UInt8,
-            1 => Self::Int8,
-            2 => Self::UInt16,
-            3 => Self::Int16,
-            4 => Self::UInt32,
-            5 => Self::Int32,
-            6 => Self::Float32,
-            7 => Self::Bool,
-            8 => Self::String,
-            9 => Self::Array,
-            10 => Self::UInt64,
-            11 => Self::Int64,
-            12 => Self::Float64,
-            _ => return None,
-        })
-    }
-
-    /// Fixed encoded width, or `None` for the variable-length types.
-    fn fixed_width(self) -> Option<u64> {
-        Some(match self {
-            Self::UInt8 | Self::Int8 | Self::Bool => 1,
-            Self::UInt16 | Self::Int16 => 2,
-            Self::UInt32 | Self::Int32 | Self::Float32 => 4,
-            Self::UInt64 | Self::Int64 | Self::Float64 => 8,
-            Self::String | Self::Array => return None,
-        })
-    }
-}
-
-/// Result of skipping one metadata value.
-enum SkipOutcome {
-    Done,
-    Truncated { at: u64, wanted: &'static str },
-    Unparsed(String),
-}
-
-/// Skip one metadata value. `depth` guards the array-of-arrays case: the spec
-/// permits nesting, and a corrupt file could describe it without end.
-fn skip_gguf_value(reader: &mut HashingReader, raw_type: u32, depth: u32) -> SkipOutcome {
-    const MAX_NESTING: u32 = 4;
-    const MAX_ARRAY_LEN: u64 = 1 << 28;
-    const MAX_STRING_BYTES: u64 = 1 << 26;
-
-    if depth > MAX_NESTING {
-        return SkipOutcome::Unparsed(format!("metadata arrays nested deeper than {MAX_NESTING}"));
-    }
-
-    let Some(value_type) = GgufValueType::from_raw(raw_type) else {
-        // An unknown type makes every later byte unlocatable.
-        return SkipOutcome::Unparsed(format!("unknown metadata value type {raw_type}"));
-    };
-
-    macro_rules! read {
-        ($call:expr, $what:literal) => {
-            match $call {
-                Ok(value) => value,
-                Err(ReadError::Eof { at }) => return SkipOutcome::Truncated { at, wanted: $what },
-                Err(ReadError::Io(e)) => return SkipOutcome::Unparsed(format!("read failed: {e}")),
-            }
-        };
-    }
-
-    if let Some(width) = value_type.fixed_width() {
-        read!(reader.skip(width), "a metadata value");
-        return SkipOutcome::Done;
-    }
-
-    match value_type {
-        GgufValueType::String => {
-            let len = read!(reader.read_u64(), "a metadata string length");
-            if len > MAX_STRING_BYTES {
-                return SkipOutcome::Unparsed(format!("metadata string claims {len} bytes"));
-            }
-            read!(reader.skip(len), "a metadata string");
-            SkipOutcome::Done
-        }
-        GgufValueType::Array => {
-            let element_type = read!(reader.read_u32(), "a metadata array element type");
-            let count = read!(reader.read_u64(), "a metadata array length");
-            if count > MAX_ARRAY_LEN {
-                return SkipOutcome::Unparsed(format!("metadata array claims {count} elements"));
-            }
-
-            // One arithmetic skip rather than `count` round trips: a tokenizer's
-            // token-type array has ~150k entries.
-            if let Some(width) = GgufValueType::from_raw(element_type).and_then(|t| t.fixed_width())
-            {
-                read!(
-                    reader.skip(count.saturating_mul(width)),
-                    "a metadata array body"
-                );
-                return SkipOutcome::Done;
-            }
-
-            for _ in 0..count {
-                match skip_gguf_value(reader, element_type, depth + 1) {
-                    SkipOutcome::Done => {}
-                    other => return other,
-                }
-            }
-            SkipOutcome::Done
-        }
-        _ => unreachable!("every other type has a fixed width"),
-    }
-}
-
 /// EOF inside a structure the file itself declared is proof of truncation; an I/O
 /// error is a fact about the disk. Only the first condemns the model.
 pub(crate) enum ReadError {
@@ -878,8 +469,8 @@ pub(crate) enum ReadError {
 }
 
 /// Buffered forward reader that hashes everything it passes over, so validating
-/// and checksumming a multi-hundred-megabyte model reads it once. Shared with the
-/// ONNX package walk in [`model_package`](crate::semantic::model_package).
+/// and checksumming a model of hundreds of megabytes reads it once — the ONNX
+/// package walk in [`model_package`](crate::semantic::model_package).
 pub(crate) struct HashingReader {
     inner: std::io::BufReader<std::fs::File>,
     hasher: sha2::Sha256,
@@ -917,25 +508,6 @@ impl HashingReader {
             }
             Err(e) => Err(ReadError::Io(e)),
         }
-    }
-
-    fn read_u32(&mut self) -> Result<u32, ReadError> {
-        let mut bytes = [0u8; 4];
-        self.fill(&mut bytes)?;
-        Ok(u32::from_le_bytes(bytes))
-    }
-
-    fn read_u64(&mut self) -> Result<u64, ReadError> {
-        let mut bytes = [0u8; 8];
-        self.fill(&mut bytes)?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    /// For short fields only — the caller bounds `len` first.
-    fn read_bytes(&mut self, len: u64) -> Result<Vec<u8>, ReadError> {
-        let mut bytes = vec![0u8; len as usize];
-        self.fill(&mut bytes)?;
-        Ok(bytes)
     }
 
     /// Skip `len` bytes, hashing them.
@@ -1003,29 +575,6 @@ pub mod mock {
         }
 
         vec
-    }
-
-    /// Write a minimal structurally valid GGUF with one scalar F32 tensor: a
-    /// container fixture, not a usable model, so tests exercise descriptor,
-    /// alignment and payload validation rather than a magic-byte placeholder.
-    pub fn write_stub_gguf(path: &std::path::Path, version: u32) -> std::io::Result<()> {
-        let mut bytes = Vec::with_capacity(68);
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&version.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // metadata_kv_count
-
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // name length
-        bytes.push(b'x');
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // one dimension
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // one element
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // F32
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // aligned data offset
-        while bytes.len() % super::GGUF_DEFAULT_ALIGNMENT as usize != 0 {
-            bytes.push(0);
-        }
-        bytes.extend_from_slice(&0f32.to_le_bytes());
-        std::fs::write(path, bytes)
     }
 
     /// Just enough of the protobuf wire format to hand-encode ONNX fixtures.
@@ -1207,10 +756,16 @@ pub mod mock {
         /// output `sentence_embedding` (`float[1, 8]`). No nodes, so no runtime would
         /// run it; the validator's structural checks all pass.
         pub fn stub_graph() -> Vec<u8> {
+            stub_graph_named("otzaria-stub-encoder")
+        }
+
+        /// [`stub_graph`] under another graph name: just as valid, in other bytes — what
+        /// a second model, or the same model's file replaced, is to a checksum.
+        pub fn stub_graph_named(name: &str) -> Vec<u8> {
             let output = value_info("sentence_embedding", FLOAT, &[Dim::Fixed(1), Dim::Fixed(8)]);
             model(
                 8,
-                &graph("otzaria-stub-encoder", &encoder_inputs(), &[output], &[]),
+                &graph(name, &encoder_inputs(), &[output], &[]),
                 &[opset("", 17)],
             )
         }
@@ -1240,6 +795,7 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -1268,8 +824,7 @@ mod tests {
     }
 
     fn loaded_runtime(dir: &TempDir, dim: u32) -> EmbeddingRuntime {
-        let model = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model, 3).unwrap();
+        let model = mock::write_stub_onnx_package(dir.path());
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model,
             embedding_dim: dim,
@@ -1300,7 +855,7 @@ mod tests {
     fn load_rejects_missing_model() {
         let dir = TempDir::new("missing");
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: dir.path().join("nope.gguf"),
+            model_path: dir.path().join("nope.onnx"),
             ..Default::default()
         });
         assert!(matches!(
@@ -1311,16 +866,15 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_placeholder_that_is_not_gguf() {
+    fn load_rejects_a_placeholder_that_is_not_a_graph() {
         let dir = TempDir::new("placeholder");
-        let model = dir.path().join("fake.gguf");
-        std::fs::write(&model, b"GGUF_MOCK").unwrap();
+        let model = mock::write_stub_onnx_package(dir.path());
+        std::fs::write(&model, b"ONNX_MOCK").unwrap();
 
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model,
             ..Default::default()
         });
-        // b"GGUF_MOCK" has the right magic but version bytes "_MOC".
         assert!(matches!(
             rt.load(),
             Err(EmbeddingError::InvalidModelFile { .. })
@@ -1329,317 +883,10 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_wrong_magic_and_truncated_files() {
-        let dir = TempDir::new("magic");
-
-        let wrong = dir.path().join("wrong.gguf");
-        std::fs::write(&wrong, b"NOTGGUF_and_more_bytes_to_fill_the_header").unwrap();
-        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: wrong,
-            ..Default::default()
-        });
-        assert!(matches!(
-            rt.load(),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-
-        let short = dir.path().join("short.gguf");
-        std::fs::write(&short, b"GGUF").unwrap();
-        let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: short,
-            ..Default::default()
-        });
-        assert!(matches!(
-            rt.load(),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    #[test]
-    fn load_rejects_a_header_that_stops_after_the_version() {
-        let dir = TempDir::new("partial_header");
-        let model = dir.path().join("partial.gguf");
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        assert_eq!(bytes.len(), 8);
-        std::fs::write(&model, &bytes).unwrap();
-
-        match validate_and_checksum_gguf(&model) {
-            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
-                assert!(reason.contains("header"), "unhelpful reason: {reason}");
-            }
-            other => panic!("an 8-byte file must be rejected, got {other:?}"),
-        }
-
-        // Truncated part-way through the counts, too.
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&[0u8; 4]);
-        assert_eq!(bytes.len(), GGUF_HEADER_BYTES - 4);
-        std::fs::write(&model, &bytes).unwrap();
-        assert!(matches!(
-            validate_and_checksum_gguf(&model),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    #[test]
-    fn load_rejects_implausible_header_counts() {
-        let dir = TempDir::new("implausible");
-        let model = dir.path().join("garbage.gguf");
-
-        for (tensors, metadata) in [(u64::MAX, 0u64), (0, u64::MAX), (1 << 40, 1 << 40)] {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(b"GGUF");
-            bytes.extend_from_slice(&3u32.to_le_bytes());
-            bytes.extend_from_slice(&tensors.to_le_bytes());
-            bytes.extend_from_slice(&metadata.to_le_bytes());
-            std::fs::write(&model, &bytes).unwrap();
-
-            assert!(
-                matches!(
-                    validate_and_checksum_gguf(&model),
-                    Err(EmbeddingError::InvalidModelFile { .. })
-                ),
-                "tensors={tensors} metadata={metadata} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn an_empty_container_is_not_an_embedding_model() {
-        let dir = TempDir::new("empty_container");
-        let model = dir.path().join("empty.gguf");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        std::fs::write(&model, bytes).unwrap();
-
-        assert!(matches!(
-            validate_and_checksum_gguf(&model),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    #[test]
-    fn load_rejects_unsupported_gguf_versions() {
-        let dir = TempDir::new("version");
-        let model = dir.path().join("other-version.gguf");
-
-        // v1 is refused rather than misparsed — see GGUF_SUPPORTED_VERSIONS.
-        for version in [0, 1, GGUF_SUPPORTED_VERSIONS.end() + 1] {
-            mock::write_stub_gguf(&model, version).unwrap();
-            let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
-                model_path: model.clone(),
-                ..Default::default()
-            });
-            assert!(
-                matches!(rt.load(), Err(EmbeddingError::InvalidModelFile { .. })),
-                "version {version} must be refused"
-            );
-        }
-
-        for version in GGUF_SUPPORTED_VERSIONS {
-            mock::write_stub_gguf(&model, version).unwrap();
-            assert!(
-                validate_and_checksum_gguf(&model).is_ok(),
-                "version {version} must be accepted"
-            );
-        }
-    }
-
-    /// A download cut short keeps its header, so only the declared counts can
-    /// detect it: a file below their size floor is provably incomplete.
-    #[test]
-    fn load_rejects_a_truncated_download_whose_header_survived() {
-        let dir = TempDir::new("truncated_download");
-        let model = dir.path().join("interrupted.gguf");
-
-        let header = |tensors: u64, metadata: u64| {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(b"GGUF");
-            bytes.extend_from_slice(&3u32.to_le_bytes());
-            bytes.extend_from_slice(&tensors.to_le_bytes());
-            bytes.extend_from_slice(&metadata.to_le_bytes());
-            bytes
-        };
-
-        // A realistic header, with almost none of the body.
-        let mut interrupted = header(291, 24);
-        interrupted.extend_from_slice(&[0u8; 128]);
-        std::fs::write(&model, &interrupted).unwrap();
-
-        match validate_and_checksum_gguf(&model) {
-            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
-                assert!(reason.contains("incomplete"), "unhelpful reason: {reason}");
-            }
-            other => panic!("a truncated download must be rejected, got {other:?}"),
-        }
-
-        // Padding to a guessed size floor is not enough: descriptors must parse.
-        let mut padded_garbage = header(291, 24);
-        padded_garbage.resize(16_000, 0u8);
-        std::fs::write(&model, &padded_garbage).unwrap();
-        assert!(matches!(
-            validate_and_checksum_gguf(&model),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    /// A structurally valid GGUF: header, three metadata entries covering the
-    /// variable-length types, one tensor descriptor, padding, then `data_bytes` of
-    /// tensor data — a file whose own descriptors let the validator prove whether
-    /// its payload is present.
-    fn gguf_with_one_tensor(dims: &[u64], data_bytes: usize) -> Vec<u8> {
-        gguf_with_one_tensor_layout(dims, data_bytes, 32, 0)
-    }
-
-    fn gguf_with_one_tensor_layout(
-        dims: &[u64],
-        data_bytes: usize,
-        alignment: u32,
-        tensor_offset: u64,
-    ) -> Vec<u8> {
-        fn push_string(bytes: &mut Vec<u8>, value: &str) {
-            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(value.as_bytes());
-        }
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
-        bytes.extend_from_slice(&3u64.to_le_bytes()); // metadata_kv_count
-
-        // A plain string value.
-        push_string(&mut bytes, "general.architecture");
-        bytes.extend_from_slice(&8u32.to_le_bytes()); // String
-        push_string(&mut bytes, "bert");
-
-        // An array of strings — the shape a tokenizer vocabulary takes.
-        push_string(&mut bytes, "tokenizer.ggml.tokens");
-        bytes.extend_from_slice(&9u32.to_le_bytes()); // Array
-        bytes.extend_from_slice(&8u32.to_le_bytes()); // of String
-        bytes.extend_from_slice(&2u64.to_le_bytes()); // two of them
-        push_string(&mut bytes, "אלף");
-        push_string(&mut bytes, "בית");
-
-        // The alignment the padding below uses.
-        push_string(&mut bytes, "general.alignment");
-        bytes.extend_from_slice(&4u32.to_le_bytes()); // UInt32
-        bytes.extend_from_slice(&alignment.to_le_bytes());
-
-        // One tensor at the requested offset in the data blob.
-        push_string(&mut bytes, "blk.0.attn_q.weight");
-        bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
-        for extent in dims {
-            bytes.extend_from_slice(&extent.to_le_bytes());
-        }
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // ggml type
-        bytes.extend_from_slice(&tensor_offset.to_le_bytes());
-
-        while bytes.len() % alignment as usize != 0 {
-            bytes.push(0);
-        }
-        bytes.resize(bytes.len() + tensor_offset as usize + data_bytes, 0);
-        bytes
-    }
-
-    /// The case a header-derived floor cannot see: all the descriptors present, the
-    /// weights they describe absent.
-    #[test]
-    fn a_download_cut_off_inside_the_weights_is_rejected() {
-        let dir = TempDir::new("truncated_weights");
-        let model = dir.path().join("cut_short.gguf");
-
-        // 1024×1024 elements need at least 131072 bytes at one bit each.
-        std::fs::write(&model, gguf_with_one_tensor(&[1024, 1024], 1_024)).unwrap();
-        match validate_and_checksum_gguf(&model) {
-            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
-                assert!(reason.contains("incomplete"), "unhelpful reason: {reason}");
-            }
-            other => panic!("a download cut off inside the weights must be rejected: {other:?}"),
-        }
-
-        // With the data present it is accepted, so the bound is not rejecting
-        // everything.
-        std::fs::write(&model, gguf_with_one_tensor(&[1024, 1024], 131_072)).unwrap();
-        assert!(
-            validate_and_checksum_gguf(&model).is_ok(),
-            "a file that holds what its descriptors describe must be accepted"
-        );
-    }
-
-    /// The bound must stay below every real quantization or it rejects valid
-    /// models, so it is pinned to exactly one bit per element.
-    #[test]
-    fn the_size_bound_is_exactly_one_bit_per_element() {
-        let dir = TempDir::new("bound_boundary");
-        let model = dir.path().join("boundary.gguf");
-        let elements = 8_192u64;
-        let floor = elements as usize / 8;
-
-        std::fs::write(&model, gguf_with_one_tensor(&[elements], floor)).unwrap();
-        assert!(validate_and_checksum_gguf(&model).is_ok());
-
-        std::fs::write(&model, gguf_with_one_tensor(&[elements], floor - 1)).unwrap();
-        assert!(matches!(
-            validate_and_checksum_gguf(&model),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    /// An unknown type means the descriptor table cannot be validated at all.
-    #[test]
-    fn an_unknown_metadata_type_is_rejected() {
-        let dir = TempDir::new("future_metadata");
-        let model = dir.path().join("future.gguf");
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"GGUF");
-        bytes.extend_from_slice(&3u32.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // one tensor
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // one metadata entry
-        bytes.extend_from_slice(&4u64.to_le_bytes());
-        bytes.extend_from_slice(b"what");
-        bytes.extend_from_slice(&9999u32.to_le_bytes()); // a type from the future
-        bytes.resize(256, 0);
-        std::fs::write(&model, &bytes).unwrap();
-
-        assert!(matches!(
-            validate_and_checksum_gguf(&model),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    #[test]
-    fn alignment_may_be_any_multiple_of_eight() {
-        let dir = TempDir::new("non_power_of_two_alignment");
-        let model = dir.path().join("alignment24.gguf");
-        std::fs::write(&model, gguf_with_one_tensor_layout(&[8], 1, 24, 0)).unwrap();
-        assert!(validate_and_checksum_gguf(&model).is_ok());
-    }
-
-    #[test]
-    fn tensor_offsets_must_honor_the_declared_alignment() {
-        let dir = TempDir::new("misaligned_tensor_offset");
-        let model = dir.path().join("misaligned.gguf");
-        std::fs::write(&model, gguf_with_one_tensor_layout(&[8], 1, 24, 8)).unwrap();
-        assert!(matches!(
-            validate_and_checksum_gguf(&model),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
-    }
-
-    #[test]
     fn load_computes_model_checksum_and_detects_a_changed_file() {
         let dir = TempDir::new("checksum");
-        let model = dir.path().join("model.gguf");
+        let model = mock::write_stub_onnx_package(dir.path());
 
-        mock::write_stub_gguf(&model, 3).unwrap();
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model.clone(),
             ..Default::default()
@@ -1656,10 +903,12 @@ mod tests {
         again.load().unwrap();
         assert_eq!(again.model_checksum().unwrap(), first);
 
-        // Different bytes behind the same path → different checksum.
-        let mut bytes = std::fs::read(&model).unwrap();
-        bytes.extend_from_slice(b"extra tensor payload");
-        std::fs::write(&model, &bytes).unwrap();
+        // Different bytes behind the same path → different checksum: here the
+        // tokenizer's, which decides the ids the graph sees as surely as the graph does.
+        let tokenizer = dir.path().join("tokenizer.json");
+        let changed_tokenizer = mock::STUB_TOKENIZER_JSON.replace("[UNK]\":0", "[UNK]\":9");
+        assert_ne!(changed_tokenizer, mock::STUB_TOKENIZER_JSON);
+        std::fs::write(&tokenizer, changed_tokenizer).unwrap();
         let mut changed = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model,
             ..Default::default()
@@ -1668,26 +917,41 @@ mod tests {
         assert_ne!(changed.model_checksum().unwrap(), first);
     }
 
+    /// Every file of the package is hashed whole, past the read buffer too: two packages
+    /// identical but for one byte beyond the first `HASH_BUFFER_BYTES + 1` of an
+    /// external-data file must not share a checksum.
     #[test]
-    fn checksum_is_computed_over_the_whole_file_across_buffer_boundaries() {
+    fn checksum_is_computed_over_whole_files_across_buffer_boundaries() {
+        use mock::onnx::{self, Dim};
+
         let dir = TempDir::new("big");
-        let a = dir.path().join("a.gguf");
-        let b = dir.path().join("b.gguf");
+        let package = |name: &str, tail: &[u8]| -> PathBuf {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut weights = vec![7u8; HASH_BUFFER_BYTES + 1];
+            weights.extend_from_slice(tail);
+            std::fs::write(root.join("weights.bin"), weights).unwrap();
+            let output = onnx::value_info(
+                "sentence_embedding",
+                onnx::FLOAT,
+                &[Dim::Fixed(1), Dim::Fixed(8)],
+            );
+            let tensor = onnx::external_tensor("w", &[8], "weights.bin", None, None);
+            let graph = onnx::model(
+                8,
+                &onnx::graph("big", &onnx::encoder_inputs(), &[output], &[tensor]),
+                &[onnx::opset("", 17)],
+            );
+            std::fs::write(root.join("model.onnx"), graph).unwrap();
+            std::fs::write(root.join("tokenizer.json"), mock::STUB_TOKENIZER_JSON).unwrap();
+            root.join("model.onnx")
+        };
 
-        // Identical for the first HASH_BUFFER_BYTES + 1 bytes, so only whole-file
-        // hashing can distinguish the extra trailing byte.
-        mock::write_stub_gguf(&a, 3).unwrap();
-        let mut base = std::fs::read(&a).unwrap();
-        base.resize(HASH_BUFFER_BYTES + 1, 7u8);
-
-        let mut with_tail = base.clone();
-        with_tail.push(9u8);
-        std::fs::write(&a, &base).unwrap();
-        std::fs::write(&b, &with_tail).unwrap();
-
+        let base = validate_model(&package("base", b"")).unwrap();
+        let with_tail = validate_model(&package("with_tail", b"\x09")).unwrap();
         assert_ne!(
-            validate_and_checksum_gguf(&a).unwrap(),
-            validate_and_checksum_gguf(&b).unwrap(),
+            base.checksum(),
+            with_tail.checksum(),
             "a trailing byte past the read buffer must change the checksum"
         );
     }
@@ -1745,13 +1009,17 @@ mod tests {
         assert!(rt.model_checksum().is_none());
     }
 
-    /// A GGUF behind an `.onnx` name is read as ONNX, because the path decides, and is
-    /// refused by what it is.
+    /// A GGUF container behind an `.onnx` name is read as a graph, because the path
+    /// decides, and is refused by what it is.
     #[test]
-    fn a_gguf_named_like_an_onnx_graph_is_refused_as_onnx() {
+    fn a_gguf_named_like_an_onnx_graph_is_refused_by_what_it_is() {
         let dir = TempDir::new("gguf_as_onnx");
         let graph = mock::write_stub_onnx_package(dir.path());
-        mock::write_stub_gguf(&graph, 3).unwrap();
+        std::fs::write(
+            &graph,
+            b"GGUF\x03\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
 
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: graph,
@@ -1768,6 +1036,66 @@ mod tests {
             }
             other => panic!("expected InvalidModelFile, got {other:?}"),
         }
+    }
+
+    /// A model path that names no ONNX graph is refused as an invalid model before the
+    /// file is opened — whether or not it is there, which `ModelNotFound` for the absent
+    /// one would disprove — and nothing is installed.
+    #[test]
+    fn load_refuses_a_model_path_that_names_no_onnx_graph_before_reading_it() {
+        let dir = TempDir::new("not_onnx_path");
+        let present = dir.path().join("model.gguf");
+        std::fs::write(&present, b"GGUF\x03\x00\x00\x00").unwrap();
+        for model_path in [
+            present,
+            dir.path().join("absent.gguf"),
+            dir.path().join("model"),
+        ] {
+            let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
+                model_path: model_path.clone(),
+                ..Default::default()
+            });
+            match rt.load() {
+                Err(EmbeddingError::InvalidModelFile { path, reason }) => {
+                    assert_eq!(path, model_path.display().to_string());
+                    assert!(reason.contains("does not end in .onnx"), "{reason}");
+                }
+                other => panic!(
+                    "{} must be refused by its name, got {other:?}",
+                    model_path.display()
+                ),
+            }
+            assert!(!rt.is_loaded());
+            assert!(rt.model_checksum().is_none());
+        }
+    }
+
+    /// The defaults are the production model's, as its identity file declares it, so a
+    /// default configuration is one the official artifact can be opened with — and the
+    /// default model path names an ONNX graph.
+    #[test]
+    fn defaults_are_the_production_identity() {
+        let identity: serde_json::Value = serde_json::from_str(include_str!(
+            "../../config/models/meivin-round2-onnx/model.json"
+        ))
+        .unwrap();
+        let config = EmbeddingConfig::default();
+        assert_eq!(
+            u64::from(config.embedding_dim),
+            identity["embedding_dim"].as_u64().unwrap()
+        );
+        assert_eq!(
+            config.max_tokens as u64,
+            identity["max_tokens"].as_u64().unwrap()
+        );
+        assert_eq!(
+            config.pooling.as_str(),
+            identity["pooling"].as_str().unwrap()
+        );
+        assert!(crate::semantic::model_package::names_an_onnx_graph(
+            &config.model_path
+        ));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1990,7 +1318,7 @@ mod tests {
             }
             Self {
                 reported_dim: dim,
-                pooling: Pooling::LastToken,
+                pooling: Pooling::InGraph,
                 max_tokens: 512,
                 vector,
                 vectors_per_input: 1,
@@ -2036,7 +1364,7 @@ mod tests {
         }
     }
 
-    /// A real backend reads its width from the GGUF, so a 512-dimension model
+    /// A real backend reads its width from the model, so a 512-dimension model
     /// behind a 1024 configuration can really happen. Caught at load, because the
     /// alternative is wrong-width vectors reaching the store mid-index.
     #[test]
@@ -2069,14 +1397,14 @@ mod tests {
 
     /// A *valid* configuration against a backend that pools otherwise — the case no
     /// configuration-time guard can pre-empt, since nothing about the configuration
-    /// is wrong. A model built with `--pooling mean` behind a `last-token`
+    /// is wrong. A backend that mean-pools token states itself behind an `in-graph`
     /// configuration lands here, and this is why [`Pooling::Mean`] must stay a
     /// variant.
     #[test]
     fn a_backend_that_pools_differently_from_the_configuration_is_refused() {
         let config = EmbeddingConfig {
             embedding_dim: 16,
-            pooling: Pooling::LastToken,
+            pooling: Pooling::InGraph,
             ..Default::default()
         };
         let backend = FakeBackend {
@@ -2088,7 +1416,7 @@ mod tests {
             Err(EmbeddingError::PoolingMismatch {
                 configured, actual, ..
             }) => {
-                assert_eq!(configured, "last-token");
+                assert_eq!(configured, "in-graph");
                 assert_eq!(actual, "mean");
             }
             Err(other) => panic!("expected a pooling mismatch, got {other:?}"),
@@ -2102,7 +1430,7 @@ mod tests {
     #[test]
     fn load_refuses_a_pooling_no_backend_implements_before_reading_the_model() {
         let dir = TempDir::new("pooling_unimplemented");
-        let absent = dir.path().join("not-even-there.gguf");
+        let absent = dir.path().join("not-even-there.onnx");
 
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: absent,
@@ -2118,7 +1446,7 @@ mod tests {
             }) => {
                 assert_eq!(pooling, "mean");
                 assert!(
-                    implemented.contains("last-token"),
+                    implemented.contains("in-graph"),
                     "unhelpful reason: {implemented}"
                 );
             }
@@ -2153,7 +1481,7 @@ mod tests {
     #[test]
     fn a_nonsensical_configuration_is_refused_before_the_model_is_read() {
         let dir = TempDir::new("bad_config");
-        let absent = dir.path().join("not-even-there.gguf");
+        let absent = dir.path().join("not-even-there.onnx");
 
         for config in [
             EmbeddingConfig {
@@ -2173,12 +1501,11 @@ mod tests {
         }
     }
 
-    /// An ONNX cap past any encoder's context is a configuration nothing can serve, and
-    /// is refused as one — before the file is opened, as the paths here do not exist —
-    /// naming the ceiling. A GGUF cap is not bounded here: llama.cpp clamps it to the
-    /// model's trained context, which only the model knows.
+    /// A cap past any encoder's context is a configuration nothing can serve, and is
+    /// refused as one — before the file is opened, as the paths here do not exist —
+    /// naming the ceiling.
     #[test]
-    fn validate_bounds_an_onnx_cap_and_leaves_a_gguf_one_to_the_backend() {
+    fn validate_bounds_the_token_cap_past_any_encoder() {
         let dir = TempDir::new("cap_ceiling");
         let onnx = |max_tokens: usize| EmbeddingConfig {
             model_path: dir.path().join("absent.onnx"),
@@ -2207,36 +1534,6 @@ mod tests {
         assert!(onnx(crate::semantic::backend::ONNX_MAX_TOKENS_CEILING)
             .validate()
             .is_ok());
-
-        let gguf = EmbeddingConfig {
-            model_path: dir.path().join("absent.gguf"),
-            max_tokens: u32::MAX as usize,
-            ..Default::default()
-        };
-        assert!(gguf.validate().is_ok(), "unchanged for GGUF");
-    }
-
-    /// The pairing is refused before the file is opened, like a pooling nothing
-    /// performs: the model paths here do not exist, so `ModelNotFound` would prove the
-    /// check ran too late.
-    #[test]
-    fn load_refuses_a_pooling_the_models_format_does_not_serve_before_reading_it() {
-        let dir = TempDir::new("pooling_wrong_format");
-        for (model, pooling) in [
-            ("absent.gguf", Pooling::InGraph),
-            ("absent.onnx", Pooling::LastToken),
-        ] {
-            let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
-                model_path: dir.path().join(model),
-                pooling,
-                ..Default::default()
-            });
-            assert!(
-                matches!(rt.load(), Err(EmbeddingError::PoolingNotForFormat { .. })),
-                "{model} with {pooling}"
-            );
-            assert!(!rt.is_loaded());
-        }
     }
 
     /// Pins the guard to `EmbeddingConfig::validate` rather than to the order of
@@ -2359,12 +1656,11 @@ mod tests {
     }
 
     /// The request reaches the backend, and the backend's effective answer is what
-    /// the runtime reports — a real one clamps to the model's context length.
+    /// the runtime reports.
     #[test]
     fn the_requested_token_cap_reaches_the_backend_and_the_backends_answer_wins() {
         let dir = TempDir::new("max_tokens");
-        let model = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model, 3).unwrap();
+        let model = mock::write_stub_onnx_package(dir.path());
 
         let mut rt = EmbeddingRuntime::new(EmbeddingConfig {
             model_path: model,

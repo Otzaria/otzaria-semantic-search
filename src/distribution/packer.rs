@@ -974,12 +974,12 @@ mod tests {
 
     fn model() -> ModelIdentity {
         ModelIdentity {
-            model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
+            model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
             model_checksum: "a".repeat(64),
-            model_quantization: "Q4_K_M".to_string(),
-            embedding_backend: "llama-cpp-2-0.1.153".to_string(),
+            model_quantization: "int8".to_string(),
+            embedding_backend: "onnxruntime-sentence-v1".to_string(),
             embedding_dim: DIM,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             max_tokens: 512,
             embedding_text_version: 1,
             normalization_version: 1,

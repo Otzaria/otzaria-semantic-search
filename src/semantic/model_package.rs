@@ -1,12 +1,13 @@
-//! What a model path names on disk: which container format it is, and — for ONNX —
-//! which files around it make up the package that produces the vectors, whether each of
-//! them is whole, and the one checksum that names them all.
+//! What a model path names on disk: an ONNX graph — the only kind of model this crate
+//! reads — and which files around it make up the package that produces the vectors,
+//! whether each of them is whole, and the one checksum that names them all.
 //!
-//! Always compiled, and free of any inference dependency: the format decides which
-//! backend [`select_backend`](crate::semantic::backend::select_backend) may walk to and
-//! which validator [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load)
-//! runs, and both decisions have to be made identically in a build that can serve the
-//! format and in one that can only say which feature is missing.
+//! Always compiled, and free of any inference dependency: whether a path names a graph
+//! at all, and whether the package around it is whole, are decided before any backend is
+//! asked — by [`EmbeddingConfig::validate`](crate::semantic::embedding::EmbeddingConfig::validate)
+//! and by the validator [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load)
+//! runs — and have to be decided identically in a build that can run the model and in one
+//! that can only say which feature is missing.
 //!
 //! # The ONNX package
 //!
@@ -36,69 +37,49 @@
 //! have to reach.
 
 use crate::errors::EmbeddingError;
-use crate::semantic::embedding::{
-    hex_encode, validate_and_checksum_gguf, HashingReader, ReadError,
-};
+use crate::semantic::embedding::{hex_encode, HashingReader, ReadError};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
-/// The container a model path names.
+/// Whether `model_path` names an ONNX graph: its extension is `onnx`, in any ASCII case.
 ///
-/// Decided by the path alone, before anything is opened, because it selects the
-/// *validator* as well as the backend: sniffing the bytes first would mean reading a
-/// file with a parser chosen by guessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelFormat {
-    /// A llama.cpp GGUF container: one self-contained file, tokenizer included.
-    Gguf,
-    /// An ONNX graph. The path names the graph file; the package is the graph plus
-    /// `tokenizer.json` (and any external-data file) in the same directory — see
-    /// [`onnx_package_root`].
-    Onnx,
+/// Decided by the path alone, before anything is opened, because it decides whether the
+/// file is read at all: sniffing the bytes first would mean reading a file with a parser
+/// chosen by guessing. A `.gguf`, a path with no extension and `model.onnx.part` name no
+/// graph, and neither does `.onnx`, a hidden file with no extension at all.
+pub fn names_an_onnx_graph(model_path: &Path) -> bool {
+    model_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("onnx"))
 }
 
-impl ModelFormat {
-    /// Every format, in the order error messages list them.
-    pub const ALL: [Self; 2] = [Self::Gguf, Self::Onnx];
+/// Why a path that [`names_an_onnx_graph`] refuses cannot be a model.
+const NOT_AN_ONNX_GRAPH: &str = "its name does not end in .onnx, and an ONNX graph is the \
+                                 only model this build reads (GGUF support was removed); \
+                                 point model_path at the package's graph, <name>.onnx, with \
+                                 its tokenizer.json beside it";
 
-    /// `.onnx` in any ASCII case is ONNX; **every other path is GGUF**, including a path
-    /// with no extension at all.
-    ///
-    /// The default is GGUF and not "unknown" so that every model path that worked before
-    /// ONNX existed keeps meaning what it meant, byte for byte — the production model has
-    /// always been configured by path, and nothing ever required its extension to be
-    /// `.gguf`.
-    pub fn of(model_path: &Path) -> Self {
-        match model_path.extension() {
-            Some(extension) if extension.eq_ignore_ascii_case("onnx") => Self::Onnx,
-            _ => Self::Gguf,
-        }
+/// Refuse a model path that names no ONNX graph, the only kind of model this crate reads.
+///
+/// [`EmbeddingConfig::validate`](crate::semantic::embedding::EmbeddingConfig::validate)
+/// and [`validate_model`] both ask it, so a configuration naming a GGUF file — the format
+/// of the llama.cpp backend this crate no longer has — is refused before anything is
+/// opened, wherever it enters.
+///
+/// # Errors
+///
+/// [`EmbeddingError::InvalidModelFile`] naming the path, whether or not a file is there:
+/// nothing at a path like that could be served.
+pub fn ensure_onnx_model_path(model_path: &Path) -> Result<(), EmbeddingError> {
+    if names_an_onnx_graph(model_path) {
+        return Ok(());
     }
-
-    /// The format's name as messages spell it.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Gguf => "GGUF",
-            Self::Onnx => "ONNX",
-        }
-    }
-
-    /// The cargo feature that compiles in this format's real backend — what a message
-    /// that no backend serves the format has to name, since the fix is a rebuild.
-    pub const fn backend_feature(self) -> &'static str {
-        match self {
-            Self::Gguf => "llama-backend",
-            Self::Onnx => "onnx-backend",
-        }
-    }
-}
-
-impl std::fmt::Display for ModelFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+    Err(EmbeddingError::InvalidModelFile {
+        path: model_path.display().to_string(),
+        reason: NOT_AN_ONNX_GRAPH.to_string(),
+    })
 }
 
 /// The file name the tokenizer must have, directly under the package root.
@@ -128,49 +109,17 @@ pub fn onnx_tokenizer_path(graph: &Path) -> PathBuf {
     onnx_package_root(graph).join(ONNX_TOKENIZER_FILE)
 }
 
-/// A model that validated, and the `model_checksum` that names it.
-#[derive(Debug, Clone)]
-pub enum ValidatedModel {
-    /// A GGUF container. Its checksum is the file's own SHA-256.
-    Gguf { checksum: String },
-    /// An ONNX package. Its checksum is the package checksum over every file in it.
-    Onnx(OnnxPackage),
-}
-
-impl ValidatedModel {
-    pub fn format(&self) -> ModelFormat {
-        match self {
-            Self::Gguf { .. } => ModelFormat::Gguf,
-            Self::Onnx(_) => ModelFormat::Onnx,
-        }
-    }
-
-    /// What the manifest records as `model_checksum`.
-    pub fn checksum(&self) -> &str {
-        match self {
-            Self::Gguf { checksum } => checksum,
-            Self::Onnx(package) => package.checksum(),
-        }
-    }
-}
-
-/// Validate the model `model_path` names and compute its `model_checksum`, by the format
-/// the path names — the one entry point
-/// [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load) calls.
-///
-/// A GGUF path goes to [`validate_and_checksum_gguf`], unchanged; an ONNX path to
-/// [`validate_onnx_package`].
+/// Validate the model `model_path` names and compute its `model_checksum` — the one entry
+/// point [`EmbeddingRuntime::load`](crate::semantic::embedding::EmbeddingRuntime::load)
+/// calls: [`ensure_onnx_model_path`], then [`validate_onnx_package`].
 ///
 /// # Errors
 ///
-/// Whatever the format's validator refuses the model with.
-pub fn validate_model(model_path: &Path) -> Result<ValidatedModel, EmbeddingError> {
-    match ModelFormat::of(model_path) {
-        ModelFormat::Gguf => {
-            validate_and_checksum_gguf(model_path).map(|checksum| ValidatedModel::Gguf { checksum })
-        }
-        ModelFormat::Onnx => validate_onnx_package(model_path).map(ValidatedModel::Onnx),
-    }
+/// [`EmbeddingError::InvalidModelFile`] for a path that names no ONNX graph, and whatever
+/// [`validate_onnx_package`] refuses the package with.
+pub fn validate_model(model_path: &Path) -> Result<OnnxPackage, EmbeddingError> {
+    ensure_onnx_model_path(model_path)?;
+    validate_onnx_package(model_path)
 }
 
 /// One file of an ONNX package, as the checksum describes it.
@@ -298,8 +247,8 @@ const SNIFF_BYTES: usize = 64;
 ///    and at least as long as its references need; each is hashed;
 /// 5. `tokenizer.json` is hashed and is a JSON object.
 ///
-/// **Not download verification**, exactly as for GGUF: a checksum computed from the
-/// files cannot attest to them. It detects that the bytes behind a model path changed.
+/// **Not download verification**: a checksum computed from the files cannot attest to
+/// them. It detects that the bytes behind a model path changed.
 ///
 /// # Errors
 ///
@@ -534,8 +483,8 @@ fn sniff_non_onnx(prefix: &[u8], file_len: u64) -> Option<&'static str> {
     }
     if prefix.starts_with(b"GGUF") {
         return Some(
-            "it is a GGUF container, not an ONNX graph. Only a path ending in .onnx is read \
-             as ONNX; give a GGUF model its own .gguf name",
+            "it is a GGUF container, not an ONNX graph, and this build no longer reads GGUF \
+             models; point model_path at the model's ONNX graph",
         );
     }
     if prefix.starts_with(b"PK\x03\x04") {
@@ -1786,10 +1735,10 @@ mod tests {
         hex_encode(&Sha256::digest(bytes))
     }
 
-    // ── format and layout ──
+    // ── the path, and the layout ──
 
     #[test]
-    fn an_onnx_extension_in_any_ascii_case_is_onnx() {
+    fn an_onnx_extension_in_any_ascii_case_names_an_onnx_graph() {
         for path in [
             "model.onnx",
             "model.ONNX",
@@ -1797,18 +1746,19 @@ mod tests {
             "dir/seforim-embed-round2-fp32.onnx",
             "/abs/dir.with.dots/graph.onnx",
         ] {
-            assert_eq!(
-                ModelFormat::of(Path::new(path)),
-                ModelFormat::Onnx,
+            assert!(
+                names_an_onnx_graph(Path::new(path)),
                 "{path} names an ONNX graph"
             );
+            assert!(ensure_onnx_model_path(Path::new(path)).is_ok(), "{path}");
         }
     }
 
-    /// Every path that worked before ONNX existed must keep meaning GGUF, including the
-    /// ones that never had a `.gguf` extension.
+    /// Every other path is refused before anything is opened, as an invalid model naming
+    /// the path — a GGUF above all, the format of the llama.cpp backend that is gone, and
+    /// the paths that never had an extension at all.
     #[test]
-    fn every_other_path_is_gguf() {
+    fn every_other_path_is_refused_as_naming_no_onnx_graph() {
         for path in [
             "model.gguf",
             "models/otzaria-embedding-v1-flash-q4.gguf",
@@ -1821,20 +1771,20 @@ mod tests {
             "model.onnx ",
             "",
         ] {
-            assert_eq!(
-                ModelFormat::of(Path::new(path)),
-                ModelFormat::Gguf,
-                "{path:?} must stay GGUF"
-            );
+            assert!(!names_an_onnx_graph(Path::new(path)), "{path:?}");
+            match ensure_onnx_model_path(Path::new(path)) {
+                Err(error @ EmbeddingError::InvalidModelFile { .. }) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.starts_with(&format!("Not a valid ONNX model file ({path}): "))
+                            && message.contains("does not end in .onnx")
+                            && message.contains("GGUF support was removed"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{path:?} must be refused as naming no graph, got {other:?}"),
+            }
         }
-    }
-
-    #[test]
-    fn each_format_names_the_feature_that_serves_it() {
-        assert_eq!(ModelFormat::Gguf.backend_feature(), "llama-backend");
-        assert_eq!(ModelFormat::Onnx.backend_feature(), "onnx-backend");
-        assert_eq!(ModelFormat::Gguf.to_string(), "GGUF");
-        assert_eq!(ModelFormat::Onnx.to_string(), "ONNX");
     }
 
     #[test]
@@ -1892,34 +1842,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_model_dispatches_on_the_format_the_path_names() {
-        let dir = TempDir::new("dispatch");
-        let gguf = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&gguf, 3).unwrap();
-        match validate_model(&gguf).unwrap() {
-            ValidatedModel::Gguf { checksum } => assert_eq!(
-                checksum,
-                validate_and_checksum_gguf(&gguf).unwrap(),
-                "GGUF keeps the file's own SHA-256"
-            ),
-            other => panic!("a .gguf path is GGUF, got {other:?}"),
-        }
-
+    fn validate_model_validates_a_graph_and_refuses_a_path_that_names_none() {
+        let dir = TempDir::new("validate_model");
         let onnx = mock::write_stub_onnx_package(&dir.path().join("onnx"));
         let validated = validate_model(&onnx).unwrap();
-        assert_eq!(validated.format(), ModelFormat::Onnx);
         assert_eq!(
             validated.checksum(),
             validate_onnx_package(&onnx).unwrap().checksum()
         );
 
-        // The same bytes under a GGUF name are read as GGUF, and refused as GGUF.
-        let misnamed = dir.path().join("model.bin");
+        // The same bytes under another name are refused for the name, before the file is
+        // read: the reason is the path's, not the graph's.
+        let misnamed = dir.path().join("onnx").join("model.bin");
         std::fs::copy(&onnx, &misnamed).unwrap();
-        assert!(matches!(
-            validate_model(&misnamed),
-            Err(EmbeddingError::InvalidModelFile { .. })
-        ));
+        match validate_model(&misnamed) {
+            Err(EmbeddingError::InvalidModelFile { reason, .. }) => {
+                assert!(reason.contains("does not end in .onnx"), "{reason}")
+            }
+            other => panic!("a .bin path names no graph, got {other:?}"),
+        }
+
+        // A GGUF container is refused by its name the same way, and never opened.
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"GGUF\x03\x00\x00\x00").unwrap();
+        match validate_model(&gguf) {
+            Err(EmbeddingError::InvalidModelFile { path, reason }) => {
+                assert_eq!(path, gguf.display().to_string());
+                assert!(reason.contains("does not end in .onnx"), "{reason}");
+            }
+            other => panic!("a .gguf path names no graph, got {other:?}"),
+        }
     }
 
     /// The value the build tooling has to reproduce, bit for bit, from these exact
@@ -2973,7 +2925,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_onnx_model_is_described_as_onnx_not_as_gguf() {
+    fn an_invalid_model_is_described_as_an_onnx_model() {
         let dir = TempDir::new("display");
         let graph = package_with(&dir, b"<html>");
         let message = validate_onnx_package(&graph).unwrap_err().to_string();
@@ -2984,10 +2936,10 @@ mod tests {
 
         let gguf = dir.path().join("model.gguf");
         std::fs::write(&gguf, b"not gguf at all, nope").unwrap();
-        let message = validate_and_checksum_gguf(&gguf).unwrap_err().to_string();
+        let message = validate_model(&gguf).unwrap_err().to_string();
         assert!(
-            message.starts_with("Not a valid GGUF model file ("),
-            "GGUF keeps its exact wording: {message}"
+            message.starts_with("Not a valid ONNX model file ("),
+            "a model of any other name is an invalid ONNX model too: {message}"
         );
     }
 }

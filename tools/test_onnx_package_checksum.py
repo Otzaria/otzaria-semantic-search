@@ -313,7 +313,7 @@ def test_a_model_without_its_required_parts_is_refused_by_name(tmp_path):
     assert "version 0" in refusal(package(tmp_path / "d", opset_zero))
 
 
-def test_a_path_the_crate_reads_as_gguf_is_refused(tmp_path):
+def test_a_path_that_names_no_onnx_graph_is_refused(tmp_path):
     write_golden(tmp_path)
     # Windows strips a trailing space from a file name, so it cannot hold the last one.
     names = ["model.bin", "model.onnx.part", ".onnx"] + ([] if os.name == "nt" else ["model.onnx "])
