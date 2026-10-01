@@ -1,6 +1,8 @@
 //! The ONNX backend as a downstream crate reaches it: through `select_backend`, whose
 //! constructor pair is compiled only outside `cfg(test)` and so is unreachable from the
-//! in-crate suite, and through `EmbeddingRuntime`.
+//! in-crate suite, through `EmbeddingRuntime`, and through the two public paths a host
+//! opens a session with — `SemanticEngine` and `OfficialSemanticIndex` — carrying the
+//! runtime library the host passes.
 //!
 //! Also the guard for the one thing in the ONNX gating a compiler cannot check on the
 //! machine it runs on: that the target condition is spelled the same in every place that
@@ -103,9 +105,17 @@ fn the_target_condition_is_spelled_identically_everywhere() {
     )
 ))]
 mod with_the_backend {
-    use otzaria_semantic_search::errors::EmbeddingError;
+    use otzaria_semantic_search::errors::{ArtifactError, EmbeddingError, SemanticSearchError};
     use otzaria_semantic_search::semantic::backend::{select_backend, Pooling};
-    use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+    use otzaria_semantic_search::semantic::embedding::{
+        EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime,
+    };
+    use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
+    use otzaria_semantic_search::semantic::official_index::{
+        LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
+    };
+    use otzaria_semantic_search::semantic::store::VectorStoreConfig;
+    use otzaria_semantic_search::semantic::versioning::CorpusIdentity;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -176,6 +186,63 @@ mod with_the_backend {
             max_tokens: 32,
             batch_size: 4,
             pooling: Pooling::InGraph,
+        }
+    }
+
+    /// The engine — the on-device development path — for the fixture package.
+    fn engine_config(
+        dir: &TempDir,
+        model_path: PathBuf,
+        deployment: EmbeddingDeployment,
+    ) -> SemanticConfig {
+        let root = dir.0.join("semantic");
+        SemanticConfig {
+            root_dir: root.clone(),
+            model_path,
+            deployment,
+            embedding_model_id: "onnx-fixture".to_string(),
+            embedding_dim: 4,
+            pooling: "in-graph".to_string(),
+            embedding_max_tokens: 32,
+            model_quantization: "fp32".to_string(),
+            store: VectorStoreConfig {
+                db_path: root.join("vectors"),
+                embedding_dim: 4,
+                collection_name: "chunks".to_string(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The application's path for the fixture package, with no artifact installed. The
+    /// model is loaded before the artifact is read, so how opening fails says how far the
+    /// model got.
+    fn official_config(
+        dir: &TempDir,
+        model_path: PathBuf,
+        deployment: EmbeddingDeployment,
+    ) -> OfficialIndexConfig {
+        OfficialIndexConfig {
+            artifact_path: dir.0.join("no-artifact-installed"),
+            corpus: CorpusIdentity {
+                corpus_id: "4d".repeat(32),
+                library_version: "onnx-fixture".to_string(),
+                tantivy_schema_version: 3,
+                document_id_scheme_version: 1,
+            },
+            model: LocalModel {
+                model_path,
+                model_id: "onnx-fixture".to_string(),
+                model_quantization: "fp32".to_string(),
+                embedding_dim: 4,
+                pooling: "in-graph".to_string(),
+                max_tokens: 32,
+                embedding_text_version: 2,
+                normalization_version: 1,
+                chunking_identity: 0,
+            },
+            deployment,
+            published_digest: None,
         }
     }
 
@@ -320,6 +387,177 @@ mod with_the_backend {
             .expect("a correct runtime loads after a refused one");
         let vectors = backend.embed_batch_raw(&["the fox"]).unwrap();
         assert_eq!(vectors[0].len(), 4);
+    }
+
+    /// Set by the parent test for its child: the runtime the child passes as the
+    /// application's, with `OTZARIA_ONNX_RUNTIME` removed from its environment.
+    const APPLICATION_RUNTIME_ENV: &str = "OTZARIA_TEST_APPLICATION_ONNX_RUNTIME";
+
+    /// A host that ships ONNX Runtime passes its path and needs nothing else — no variable,
+    /// no file beside the graph — through `EmbeddingRuntime` and through both public paths
+    /// a host opens a session with.
+    ///
+    /// A process holds one runtime, and this one may already run the variable's, so only a
+    /// fresh process can show where its runtime came from: the check runs in a child of
+    /// this test binary, alone, with the variable removed.
+    #[test]
+    fn a_runtime_the_application_passes_needs_neither_the_variable_nor_a_file_beside_the_graph() {
+        if !runtime_configured() {
+            return;
+        }
+        let application_runtime = std::env::var_os(RUNTIME_ENV).expect("checked above");
+        // Held across the spawn for the reason `a_refused_runtime_leaves_the_process_able_to_
+        // load_a_correct_one` gives: the child inherits the environment of that moment.
+        let _guard = lock_env();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "with_the_backend::the_applications_runtime_loads_in_a_fresh_process_without_the_variable",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove(ENV_THREADS)
+            .env_remove(ENV_SESSIONS)
+            .env_remove(RUNTIME_ENV)
+            .env(APPLICATION_RUNTIME_ENV, application_runtime)
+            .output()
+            .expect("the test binary can run itself");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child process failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The child half of
+    /// `a_runtime_the_application_passes_needs_neither_the_variable_nor_a_file_beside_the_graph`,
+    /// meaningless anywhere but in a process of its own.
+    #[test]
+    #[ignore = "run by a_runtime_the_application_passes_needs_neither_the_variable_nor_a_file_beside_the_graph"]
+    fn the_applications_runtime_loads_in_a_fresh_process_without_the_variable() {
+        let Some(application_runtime) = std::env::var_os(APPLICATION_RUNTIME_ENV) else {
+            println!("SKIPPED: only meaningful as the child of the test that spawns it");
+            return;
+        };
+        assert!(
+            std::env::var_os(RUNTIME_ENV).is_none(),
+            "the parent removes {RUNTIME_ENV}"
+        );
+        let application_runtime = PathBuf::from(application_runtime);
+        let deployment = EmbeddingDeployment {
+            onnx_runtime: Some(application_runtime.clone()),
+        };
+        let dir = TempDir::new("application_runtime");
+        let model = package(&dir, "dynamic.onnx");
+
+        // First with nothing anywhere — passed, set, or beside the graph: refused, the three
+        // places named in the order they are looked at, and nothing loaded by it.
+        match EmbeddingRuntime::new(config_for(model.clone())).load() {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
+                let at = |place: &str| {
+                    reason
+                        .find(place)
+                        .unwrap_or_else(|| panic!("{place} is not named: {reason}"))
+                };
+                assert!(
+                    at("EmbeddingDeployment::onnx_runtime") < at(RUNTIME_ENV)
+                        && at(RUNTIME_ENV) < at("beside the model"),
+                    "{reason}"
+                );
+            }
+            other => panic!("with no runtime anywhere the load must fail, got {other:?}"),
+        }
+
+        // The application's path: loaded and run, with nothing else to find it by.
+        let mut runtime =
+            EmbeddingRuntime::with_deployment(config_for(model.clone()), deployment.clone());
+        runtime
+            .load()
+            .expect("the runtime the application passes loads");
+        assert_eq!(runtime.backend_id(), Some("onnxruntime-sentence-v1"));
+        assert_eq!(runtime.embed_batch(&["the fox"]).unwrap()[0].len(), 4);
+
+        // Both public paths hand it to the backend. The engine loads its model with it...
+        let mut engine =
+            SemanticEngine::open(engine_config(&dir, model.clone(), deployment.clone())).unwrap();
+        engine
+            .load_model()
+            .expect("SemanticConfig::deployment reaches the backend");
+        assert_eq!(
+            engine.status().embedding_backend.as_deref(),
+            Some("onnxruntime-sentence-v1")
+        );
+        // ...and so does the application's path, which loads the model before it reads the
+        // artifact: with none installed, what is missing is the artifact, not the runtime.
+        match OfficialSemanticIndex::open(official_config(&dir, model.clone(), deployment)) {
+            Err(SemanticSearchError::Artifact(ArtifactError::MetadataUnusable {
+                path, ..
+            })) => {
+                assert!(path.ends_with("manifest.json"), "{path}");
+            }
+            Err(other) => panic!("expected the artifact to be what is missing, got {other}"),
+            Ok(_) => panic!("opened an artifact that is not there"),
+        }
+
+        // One runtime per process: a different path now is refused, naming both.
+        let other = fixture("tokenizer.json");
+        let refused = EmbeddingRuntime::with_deployment(
+            config_for(model),
+            EmbeddingDeployment {
+                onnx_runtime: Some(other.clone()),
+            },
+        )
+        .load();
+        match refused {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
+                for named in [&application_runtime, &other] {
+                    let named = named.canonicalize().unwrap().display().to_string();
+                    assert!(reason.contains(&named), "{named} is not named: {reason}");
+                }
+            }
+            other => panic!("a second, different runtime must be refused, got {other:?}"),
+        }
+    }
+
+    /// A path the application passes is not one candidate among three: where it names
+    /// nothing, both public paths fail naming it — even where `OTZARIA_ONNX_RUNTIME` names
+    /// a working runtime, as it does in CI, that would have loaded. Refused before any
+    /// runtime is touched, so it needs no library and changes nothing in this process.
+    #[test]
+    fn an_application_runtime_that_names_nothing_is_refused_by_both_public_paths() {
+        let _guard = lock_env();
+        let dir = TempDir::new("application_runtime_absent");
+        let model = package(&dir, "dynamic.onnx");
+        let absent = dir.0.join("not-installed").join("onnxruntime-library");
+        let deployment = EmbeddingDeployment {
+            onnx_runtime: Some(absent.clone()),
+        };
+        let is_the_refusal = |error: &EmbeddingError| {
+            matches!(
+                error,
+                EmbeddingError::OnnxRuntimeUnavailable { reason }
+                    if reason.contains("EmbeddingDeployment::onnx_runtime")
+                        && reason.contains(&absent.display().to_string())
+            )
+        };
+
+        let mut engine =
+            SemanticEngine::open(engine_config(&dir, model.clone(), deployment.clone())).unwrap();
+        match engine.load_model() {
+            Err(SemanticSearchError::EmbeddingRuntime(error)) => {
+                assert!(is_the_refusal(&error), "{error}");
+            }
+            other => panic!("the engine must refuse the path, got {other:?}"),
+        }
+        match OfficialSemanticIndex::open(official_config(&dir, model, deployment)) {
+            Err(SemanticSearchError::EmbeddingRuntime(error)) => {
+                assert!(is_the_refusal(&error), "{error}");
+            }
+            Err(other) => panic!("the official index must refuse the path, got {other}"),
+            Ok(_) => panic!("opened on a runtime that does not exist"),
+        }
     }
 
     /// End to end through `EmbeddingRuntime::load`: the package is validated and

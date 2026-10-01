@@ -7,7 +7,7 @@
 
 use crate::errors::EmbeddingError;
 use crate::semantic::backend::{
-    ensure_pooling_is_implemented_for, max_tokens_past_the_format, select_backend,
+    ensure_pooling_is_implemented_for, max_tokens_past_the_format, select_backend_for,
     EmbeddingBackend, Pooling,
 };
 use crate::semantic::model_package::{validate_model, ModelFormat};
@@ -91,7 +91,7 @@ impl Default for EmbeddingConfig {
 
 impl EmbeddingConfig {
     /// Reject a configuration no backend could serve, before the model file is
-    /// opened. Also called by [`select_backend`], reachable without `load`.
+    /// opened. Also called by [`select_backend_for`], reachable without `load`.
     ///
     /// `batch_size` is deliberately absent: zero there is recoverable and means
     /// "one text per call" ([`EmbeddingRuntime::batch_size`] clamps it), whereas a
@@ -134,11 +134,52 @@ impl EmbeddingConfig {
     }
 }
 
+/// Where this machine keeps what a backend loads besides the model — today, the ONNX
+/// Runtime shared library.
+///
+/// Deployment, not identity. [`EmbeddingConfig`] says what the vectors are, and is persisted
+/// as an index's identity; this says where the code that computes them lives, which differs
+/// between the build machine and every device while their vectors stay comparable. So
+/// nothing here reaches a manifest, an artifact's identity, a chunking identity or a backend
+/// id, and changing it invalidates nothing. A type of its own, held beside the configuration
+/// rather than inside it, so that no code deriving an identity from an [`EmbeddingConfig`]
+/// can pick it up.
+///
+/// A host passes it through
+/// [`SemanticConfig::deployment`](crate::semantic::engine::SemanticConfig::deployment) or
+/// [`OfficialIndexConfig::deployment`](crate::semantic::official_index::OfficialIndexConfig::deployment);
+/// [`EmbeddingRuntime::with_deployment`] hands it to the backend. The default passes
+/// nothing, which leaves every lookup at its own default — what the build-machine tools run
+/// with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbeddingDeployment {
+    /// The ONNX Runtime shared library an ONNX model runs on (`onnxruntime.dll`,
+    /// `libonnxruntime.so`, `libonnxruntime.dylib`), for an application that ships the
+    /// runtime itself — on macOS signed inside the application's bundle, which is what
+    /// library validation accepts.
+    ///
+    /// `Some` is the first place looked and, once set, the only one: a path that cannot be
+    /// opened or loaded is [`EmbeddingError::OnnxRuntimeUnavailable`] naming it, never a
+    /// fall-back to `OTZARIA_ONNX_RUNTIME` or to the file beside the graph, which would run a
+    /// runtime the application did not choose. An empty path is refused for the same reason:
+    /// it names no file. `None` looks at `OTZARIA_ONNX_RUNTIME`, then beside the graph. A
+    /// relative path is resolved against the current directory, so pass an absolute one.
+    ///
+    /// A process holds one runtime: once one has loaded, a different path is refused rather
+    /// than ignored, because ONNX Runtime cannot be unloaded or replaced. Ignored for a GGUF
+    /// model — the llama backend links llama.cpp into the build and has no runtime to find —
+    /// and by the stand-in, which runs nothing. `docs/ONNX_BACKEND.md` §3 has the whole
+    /// lookup.
+    pub onnx_runtime: Option<PathBuf>,
+}
+
 /// Local embedding runtime: owns the *policy* around a backend, while the backend
 /// owns inference. Batching, the returned-count check, dimension/finiteness/norm
 /// validation and L2 normalization happen here exactly once.
 pub struct EmbeddingRuntime {
     config: EmbeddingConfig,
+    /// Handed to the backend when it is built; never compared with anything.
+    deployment: EmbeddingDeployment,
     /// `None` until a successful [`Self::load`]. Boxed rather than generic: a type
     /// parameter would push a build-time choice into every signature above this
     /// one, up through `SemanticEngine` and the coordinator.
@@ -149,10 +190,19 @@ pub struct EmbeddingRuntime {
 }
 
 impl EmbeddingRuntime {
-    /// Initialize runtime with configuration. No file access happens here.
+    /// Initialize runtime with configuration, deployed as the defaults describe (see
+    /// [`EmbeddingDeployment`]). No file access happens here.
     pub fn new(config: EmbeddingConfig) -> Self {
+        Self::with_deployment(config, EmbeddingDeployment::default())
+    }
+
+    /// Initialize runtime with configuration and where this machine keeps what the backend
+    /// loads besides the model — the path a host that ships ONNX Runtime passes. No file
+    /// access happens here; [`Self::load`] hands `deployment` to the backend it builds.
+    pub fn with_deployment(config: EmbeddingConfig, deployment: EmbeddingDeployment) -> Self {
         Self {
             config,
+            deployment,
             backend: None,
             model_checksum: None,
         }
@@ -175,7 +225,7 @@ impl EmbeddingRuntime {
         // By the format the path names: a GGUF file, or an ONNX graph with the package
         // around it. The same rule picks the backend below.
         let validated = validate_model(&self.config.model_path)?;
-        let backend = select_backend(&self.config)?;
+        let backend = select_backend_for(&self.config, &self.deployment)?;
         self.adopt(backend, Some(validated.checksum().to_string()))
     }
 

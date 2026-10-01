@@ -518,7 +518,9 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
     use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
     use otzaria_semantic_search::distribution::package::ArtifactExpectation;
     use otzaria_semantic_search::semantic::backend::MockHashBackend;
-    use otzaria_semantic_search::semantic::embedding::{mock, validate_and_checksum_gguf};
+    use otzaria_semantic_search::semantic::embedding::{
+        mock, validate_and_checksum_gguf, EmbeddingDeployment,
+    };
     use otzaria_semantic_search::semantic::official_index::{
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
@@ -598,6 +600,7 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
         artifact_path: target,
         corpus: corpus_identity(),
         model: local,
+        deployment: EmbeddingDeployment::default(),
         published_digest: Some(report.digest.clone()),
     })
     .unwrap();

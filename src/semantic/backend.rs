@@ -33,7 +33,7 @@
 //! one wins, since `CANDIDATES` is ordered by preference.
 
 use crate::errors::EmbeddingError;
-use crate::semantic::embedding::EmbeddingConfig;
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment};
 use crate::semantic::model_package::ModelFormat;
 
 /// How a model's per-token hidden states are collapsed into one vector.
@@ -202,7 +202,11 @@ struct BackendCandidate {
     /// [`select_backend`] walked *past* it: with `mock-embedding` also enabled, a
     /// broken model silently answered by hash vectors. `Some(Err(_))` is "mine to
     /// serve, and here is why I could not".
-    construct: fn(&EmbeddingConfig) -> Constructed,
+    ///
+    /// Handed the deployment beside the configuration, never inside it: where this
+    /// machine keeps a runtime is no part of what the vectors are. A backend with nothing
+    /// to find ignores it.
+    construct: fn(&EmbeddingConfig, &EmbeddingDeployment) -> Constructed,
 }
 
 /// `None`: not in this build. `Some(Err(_))`: mine, and here is why it failed.
@@ -426,8 +430,26 @@ fn backends_performing(pooling: Pooling, format: Option<ModelFormat>) -> String 
 /// ONNX backend (`no_backend_reason`).
 /// Otherwise whatever the first compiled-in candidate for the format, or
 /// [`EmbeddingConfig::validate`], failed with.
+///
+/// Built for the default [`EmbeddingDeployment`]; [`select_backend_for`] takes another.
 pub fn select_backend(
     config: &EmbeddingConfig,
+) -> Result<Box<dyn EmbeddingBackend>, EmbeddingError> {
+    select_backend_for(config, &EmbeddingDeployment::default())
+}
+
+/// [`select_backend`], for a model deployed as `deployment`: the backend is built to load
+/// what it needs besides the model from where `deployment` says — for an ONNX model, the
+/// ONNX Runtime library at [`EmbeddingDeployment::onnx_runtime`]. Which backend serves the
+/// model is still the format's to decide, never the deployment's; a backend with nothing
+/// to load ignores it.
+///
+/// # Errors
+///
+/// As [`select_backend`].
+pub fn select_backend_for(
+    config: &EmbeddingConfig,
+    deployment: &EmbeddingDeployment,
 ) -> Result<Box<dyn EmbeddingBackend>, EmbeddingError> {
     config.validate()?;
     let format = ModelFormat::of(&config.model_path);
@@ -435,7 +457,7 @@ pub fn select_backend(
     // `Some(Err(_))` stops the walk just as `Some(Ok(_))` does — see
     // `BackendCandidate::construct`.
     candidates_for(Some(format))
-        .find_map(|candidate| (candidate.construct)(config))
+        .find_map(|candidate| (candidate.construct)(config, deployment))
         .unwrap_or_else(|| {
             Err(EmbeddingError::BackendUnavailable {
                 reason: no_backend_reason(
@@ -488,12 +510,15 @@ fn no_backend_reason(
 ///
 /// `not(target_arch = "arm")` because the llama crates are not dependencies
 /// there; such a build takes the `None` arm below.
+///
+/// The deployment is ignored: llama.cpp is linked into the build, so there is no runtime
+/// library to find, and [`EmbeddingDeployment::onnx_runtime`] is ONNX's alone.
 #[cfg(all(feature = "llama-backend", not(target_arch = "arm"), not(test)))]
-fn llama_cpp_backend(config: &EmbeddingConfig) -> Constructed {
+fn llama_cpp_backend(config: &EmbeddingConfig, _deployment: &EmbeddingDeployment) -> Constructed {
     use crate::semantic::llama_backend::{LlamaBackendConfig, LlamaCppBackend};
 
-    // The constructor receives only an `EmbeddingConfig`, so llama.cpp's own
-    // knobs come from the environment; typed callers use `LlamaCppBackend::open`.
+    // The constructor receives no tuning, so llama.cpp's own knobs come from the
+    // environment; typed callers use `LlamaCppBackend::open`.
     Some(LlamaBackendConfig::from_env_for(config).and_then(|tuning| {
         LlamaCppBackend::open(&config.model_path, config.max_tokens, &tuning)
             .map(|backend| Box::new(backend) as Box<dyn EmbeddingBackend>)
@@ -503,7 +528,7 @@ fn llama_cpp_backend(config: &EmbeddingConfig) -> Constructed {
 /// `None`, not `Some(Err(_))`: without the feature — or on a target the backend
 /// is not built for — there is no such implementation at all.
 #[cfg(not(all(feature = "llama-backend", not(target_arch = "arm"), not(test))))]
-fn llama_cpp_backend(_config: &EmbeddingConfig) -> Constructed {
+fn llama_cpp_backend(_config: &EmbeddingConfig, _deployment: &EmbeddingDeployment) -> Constructed {
     None
 }
 
@@ -520,7 +545,9 @@ fn llama_cpp_backend(_config: &EmbeddingConfig) -> Constructed {
 /// link the library without `cfg(test)` and so see the real table.
 ///
 /// The package's tokenizer is `tokenizer.json` beside the graph — see
-/// [`onnx_tokenizer_path`](crate::semantic::model_package::onnx_tokenizer_path).
+/// [`onnx_tokenizer_path`](crate::semantic::model_package::onnx_tokenizer_path) — and the
+/// runtime library is the one [`EmbeddingDeployment::onnx_runtime`] names, when it names
+/// one.
 #[cfg(all(
     feature = "onnx-backend",
     any(
@@ -541,12 +568,12 @@ fn llama_cpp_backend(_config: &EmbeddingConfig) -> Constructed {
     ),
     not(test)
 ))]
-fn onnx_backend(config: &EmbeddingConfig) -> Constructed {
+fn onnx_backend(config: &EmbeddingConfig, deployment: &EmbeddingDeployment) -> Constructed {
     use crate::semantic::model_package::onnx_tokenizer_path;
     use crate::semantic::onnx_backend::{OnnxBackend, OnnxBackendConfig};
 
-    // As for llama: the table can pass only an `EmbeddingConfig`, so the runtime's own
-    // knobs come from the environment; typed callers use `OnnxBackend::open`.
+    // As for llama: the table passes no tuning, so the runtime's own knobs come from the
+    // environment; typed callers use `OnnxBackend::open`.
     Some(OnnxBackendConfig::from_env_for(config).and_then(|tuning| {
         OnnxBackend::open(
             &config.model_path,
@@ -554,6 +581,7 @@ fn onnx_backend(config: &EmbeddingConfig) -> Constructed {
             config.max_tokens,
             config.pooling,
             &tuning,
+            deployment.onnx_runtime.as_deref(),
         )
         .map(|backend| Box::new(backend) as Box<dyn EmbeddingBackend>)
     }))
@@ -580,14 +608,15 @@ fn onnx_backend(config: &EmbeddingConfig) -> Constructed {
     ),
     not(test)
 )))]
-fn onnx_backend(_config: &EmbeddingConfig) -> Constructed {
+fn onnx_backend(_config: &EmbeddingConfig, _deployment: &EmbeddingDeployment) -> Constructed {
     None
 }
 
 // ── end of the ONNX Runtime constructor pair ────────────────────────────────────
 
+/// The deployment is ignored: the stand-in loads nothing but the configuration.
 #[cfg(any(test, feature = "mock-embedding"))]
-fn mock_hash_backend(config: &EmbeddingConfig) -> Constructed {
+fn mock_hash_backend(config: &EmbeddingConfig, _deployment: &EmbeddingDeployment) -> Constructed {
     Some(Ok(Box::new(MockHashBackend::standing_in_for(
         ModelFormat::of(&config.model_path),
         config.embedding_dim,
@@ -598,7 +627,7 @@ fn mock_hash_backend(config: &EmbeddingConfig) -> Constructed {
 /// A default build has no stand-in, which is what makes [`select_backend`] fail
 /// rather than quietly serve hash vectors.
 #[cfg(not(any(test, feature = "mock-embedding")))]
-fn mock_hash_backend(_config: &EmbeddingConfig) -> Constructed {
+fn mock_hash_backend(_config: &EmbeddingConfig, _deployment: &EmbeddingDeployment) -> Constructed {
     None
 }
 
@@ -932,7 +961,8 @@ mod tests {
                     pooling: candidate.poolings[0],
                     ..Default::default()
                 };
-                let Some(built) = (candidate.construct)(&config) else {
+                let Some(built) = (candidate.construct)(&config, &EmbeddingDeployment::default())
+                else {
                     continue; // not compiled into this build
                 };
                 // "compiled in, but cannot serve this config" — expected for a real

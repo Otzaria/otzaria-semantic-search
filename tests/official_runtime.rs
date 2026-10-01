@@ -26,7 +26,9 @@ use otzaria_semantic_search::distribution::package::{
 };
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::MockHashBackend;
-use otzaria_semantic_search::semantic::embedding::{mock, validate_and_checksum_gguf};
+use otzaria_semantic_search::semantic::embedding::{
+    mock, validate_and_checksum_gguf, EmbeddingDeployment,
+};
 use otzaria_semantic_search::semantic::official_index::{
     readable_store_identity, LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
 };
@@ -224,6 +226,7 @@ fn open_official(target: &Path, model_path: &Path) -> OfficialSemanticIndex {
         artifact_path: target.to_path_buf(),
         corpus: corpus(),
         model: local_model(model_path),
+        deployment: EmbeddingDeployment::default(),
         published_digest: None,
     })
     .unwrap()

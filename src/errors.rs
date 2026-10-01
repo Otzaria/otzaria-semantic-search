@@ -101,10 +101,12 @@ pub enum EmbeddingError {
     /// different one already running in this process.
     ///
     /// Not [`Self::BackendUnavailable`], whose message says the *build* lacks a backend:
-    /// the fix here is a file put in place or an environment variable, never a rebuild,
-    /// and a message saying otherwise sends the reader to the wrong one. The reason says
-    /// how to provide the library — `OTZARIA_ONNX_RUNTIME`, or the platform's file name
-    /// beside the graph.
+    /// the fix here is a file put in place, a path or an environment variable, never a
+    /// rebuild, and a message saying otherwise sends the reader to the wrong one. The
+    /// reason says where the backend looked, in order — the path the application passes
+    /// ([`EmbeddingDeployment::onnx_runtime`](crate::semantic::embedding::EmbeddingDeployment::onnx_runtime)),
+    /// `OTZARIA_ONNX_RUNTIME`, the platform's file name beside the graph — and which of
+    /// them a refused library came from.
     #[error("ONNX Runtime could not be loaded: {reason}")]
     OnnxRuntimeUnavailable { reason: String },
 

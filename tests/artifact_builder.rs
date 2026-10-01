@@ -288,7 +288,9 @@ mod with_a_backend {
     use super::*;
     use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
     use otzaria_semantic_search::distribution::package::ArtifactExpectation;
-    use otzaria_semantic_search::semantic::embedding::{mock, validate_and_checksum_gguf};
+    use otzaria_semantic_search::semantic::embedding::{
+        mock, validate_and_checksum_gguf, EmbeddingDeployment,
+    };
     use otzaria_semantic_search::semantic::official_index::{
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
@@ -506,6 +508,7 @@ mod with_a_backend {
             artifact_path: target,
             corpus: corpus_identity(),
             model: local,
+            deployment: EmbeddingDeployment::default(),
             published_digest: Some(digest),
         })
         .unwrap();

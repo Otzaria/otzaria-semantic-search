@@ -26,9 +26,11 @@
 //!
 //! # ONNX Runtime is loaded, not linked
 //!
-//! The runtime is a shared library found at load time — `OTZARIA_ONNX_RUNTIME`, else
-//! the platform's file name (`libonnxruntime.dylib`, `libonnxruntime.so`,
-//! `onnxruntime.dll`) in the model package beside the graph — and loaded once per
+//! The runtime is a shared library found at load time — the path the application passes
+//! ([`EmbeddingDeployment::onnx_runtime`](crate::semantic::embedding::EmbeddingDeployment::onnx_runtime)),
+//! else `OTZARIA_ONNX_RUNTIME`, else the platform's file name (`libonnxruntime.dylib`,
+//! `libonnxruntime.so`, `onnxruntime.dll`) in the model package beside the graph, never
+//! falling through from one that is set (`resolve_runtime_path`) — and loaded once per
 //! process: `ort` holds one runtime and can neither unload nor replace it, so a second,
 //! different library is refused rather than silently ignored (`RUNTIME`). Until that load
 //! has succeeded no other `ort` function is called, because `ort`'s own fallback search
@@ -113,13 +115,17 @@ const DEFAULT_THREADS_CAP: usize = 4;
 /// inference behind a batch (measured at most 14.7 ms), not for the batch.
 const DEFAULT_SESSIONS: usize = 1;
 
-/// Environment variable naming the ONNX Runtime shared library to load. Read by
-/// [`OnnxBackend::open`], not by [`OnnxBackendConfig`]: it chooses the code that runs,
-/// not a size.
+/// Environment variable naming the ONNX Runtime shared library to load when the
+/// application passes none ([`CONFIGURED_SETTING`]). Read by [`OnnxBackend::open`], not by
+/// [`OnnxBackendConfig`]: it chooses the code that runs, not a size.
 const RUNTIME_ENV: &str = "OTZARIA_ONNX_RUNTIME";
 
+/// Where an application passes the runtime library, as refusals name it: the first place
+/// looked, before [`RUNTIME_ENV`].
+const CONFIGURED_SETTING: &str = "EmbeddingDeployment::onnx_runtime";
+
 /// The runtime's file name on this platform, as Microsoft's releases spell it — what is
-/// looked for beside the graph when [`RUNTIME_ENV`] is unset.
+/// looked for beside the graph when neither the application nor [`RUNTIME_ENV`] names one.
 #[cfg(target_os = "macos")]
 const RUNTIME_FILE_NAME: &str = "libonnxruntime.dylib";
 #[cfg(target_os = "linux")]
@@ -239,10 +245,42 @@ fn available_parallelism() -> usize {
 
 // ─────────────────────────────── the runtime ───────────────────────────────
 
-/// The ONNX Runtime library this process has loaded, once one has.
-struct LoadedRuntime {
+/// The places a runtime library can come from, in the order [`resolve_runtime_path`]
+/// looks at them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSource {
+    /// The application passed it: [`CONFIGURED_SETTING`].
+    Configured,
+    /// [`RUNTIME_ENV`] named it.
+    Environment,
+    /// [`RUNTIME_FILE_NAME`] in the model package, beside the graph.
+    BesideGraph,
+}
+
+/// A runtime library, and the place it came from. Every refusal of a library names both,
+/// because the fix is in that place: the application's setting, the variable, or the
+/// model's folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeLocation {
     /// Canonical, so two spellings of one file compare equal.
     path: PathBuf,
+    source: RuntimeSource,
+}
+
+impl std::fmt::Display for RuntimeLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self.path.display();
+        match self.source {
+            RuntimeSource::Configured => write!(f, "{path} (passed by the application)"),
+            RuntimeSource::Environment => write!(f, "{path} (named by {RUNTIME_ENV})"),
+            RuntimeSource::BesideGraph => write!(f, "{path} (beside the model)"),
+        }
+    }
+}
+
+/// The ONNX Runtime library this process has loaded, once one has.
+struct LoadedRuntime {
+    location: RuntimeLocation,
     /// Its version and build, as log lines name it: `1.28.0 (git-branch=HEAD,
     /// git-commit-id=…, build type=Release)`.
     description: String,
@@ -257,7 +295,10 @@ enum RuntimeSlot {
     Loaded(LoadedRuntime),
     /// `ort` refused a library after the backend's own checks had passed it. `ort` cannot
     /// retry within a process — see `ensure_runtime` — so every later load is refused.
-    Unusable { path: PathBuf, reason: String },
+    Unusable {
+        location: RuntimeLocation,
+        reason: String,
+    },
 }
 
 /// `None` until a library has been handed to `ort`, so an attempt the backend's own checks
@@ -265,49 +306,106 @@ enum RuntimeSlot {
 /// `ort`'s and can be retried with a correct one.
 static RUNTIME: Mutex<Option<RuntimeSlot>> = Mutex::new(None);
 
-/// Where the runtime library must come from for `graph`, in order: [`RUNTIME_ENV`]
-/// (`env_value`), else [`RUNTIME_FILE_NAME`] in the package root. Taken as an argument
-/// rather than read here so the rule is testable without mutating the process
-/// environment. Returns the canonical path.
+/// Where the runtime library must come from for `graph`. The places, in order:
 ///
-/// Set but empty is refused rather than read as unset, as for the tuning variables: it
-/// names no file, and falling back would be a guess about what was meant.
+/// 1. `configured`, the path the application passed ([`CONFIGURED_SETTING`]);
+/// 2. [`RUNTIME_ENV`] (`env_value`);
+/// 3. [`RUNTIME_FILE_NAME`] in the package root, beside the graph.
+///
+/// The first place that is *set* decides, and a later one is never tried in its place: a
+/// path the application passed, or the variable, that names nothing is refused rather than
+/// skipped, because falling back would run a runtime nobody chose. Set but empty is refused
+/// rather than read as unset, as for the tuning variables: it names no file, and falling
+/// back would be a guess about what was meant. Every refusal says what each place looked
+/// at held, in this order, so whoever reads it knows which one to fix.
+///
+/// Taken as arguments rather than read here so the rule is testable without mutating the
+/// process environment. Returns the canonical path and the place it came from, which every
+/// later refusal of the library names too.
 fn resolve_runtime_path(
+    configured: Option<&Path>,
     env_value: Option<std::ffi::OsString>,
     graph: &Path,
-) -> Result<PathBuf, EmbeddingError> {
+) -> Result<RuntimeLocation, EmbeddingError> {
     let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
-    if let Some(raw) = env_value {
-        let requested = PathBuf::from(&raw);
-        if raw.is_empty() {
+    let beside = onnx_package_root(graph).join(RUNTIME_FILE_NAME);
+
+    if let Some(requested) = configured {
+        if requested.as_os_str().is_empty() {
             return Err(unavailable(format!(
-                "{RUNTIME_ENV} is set but empty; it must name the ONNX Runtime shared library \
-                 ({RUNTIME_FILE_NAME}), or be unset to use the one beside the model"
+                "the application passed an empty path as the ONNX Runtime library \
+                 ({CONFIGURED_SETTING}), the first place looked; it must name the shared \
+                 library ({RUNTIME_FILE_NAME}), or be None to look at {RUNTIME_ENV} and then \
+                 beside the model"
             )));
         }
-        return requested.canonicalize().map_err(|e| {
+        let path = requested.canonicalize().map_err(|e| {
             unavailable(format!(
-                "{RUNTIME_ENV} is set to {}, which cannot be opened: {e}",
+                "the application passed {} as the ONNX Runtime library ({CONFIGURED_SETTING}), \
+                 which cannot be opened: {e}. It is the first place looked and, once passed, the \
+                 only one: neither {RUNTIME_ENV} nor the model's folder is tried in its place",
                 requested.display()
             ))
+        })?;
+        if let Some(passed_over) = env_value.filter(|value| !value.is_empty()) {
+            log::info!(
+                "Embedding backend '{}': {RUNTIME_ENV} is set to {}, but the application passed \
+                 {}, which comes first",
+                OnnxBackend::ID,
+                Path::new(&passed_over).display(),
+                path.display()
+            );
+        }
+        return Ok(RuntimeLocation {
+            path,
+            source: RuntimeSource::Configured,
         });
     }
 
-    let beside = onnx_package_root(graph).join(RUNTIME_FILE_NAME);
-    beside.canonicalize().map_err(|_| {
+    if let Some(raw) = env_value {
+        if raw.is_empty() {
+            return Err(unavailable(format!(
+                "the application passed no ONNX Runtime library ({CONFIGURED_SETTING}), and \
+                 {RUNTIME_ENV}, the next place looked, is set but empty; it must name the shared \
+                 library ({RUNTIME_FILE_NAME}), or be unset to use the one beside the model at {}",
+                beside.display()
+            )));
+        }
+        let requested = PathBuf::from(&raw);
+        let path = requested.canonicalize().map_err(|e| {
+            unavailable(format!(
+                "the application passed no ONNX Runtime library ({CONFIGURED_SETTING}), and \
+                 {RUNTIME_ENV}, the next place looked, is set to {}, which cannot be opened: {e}. \
+                 Once set, the variable is the only place looked: the file beside the model is \
+                 not tried in its place",
+                requested.display()
+            ))
+        })?;
+        return Ok(RuntimeLocation {
+            path,
+            source: RuntimeSource::Environment,
+        });
+    }
+
+    let path = beside.canonicalize().map_err(|e| {
         unavailable(format!(
-            "no ONNX Runtime shared library to load for {}: set {RUNTIME_ENV} to the path of \
-             {RUNTIME_FILE_NAME} (ONNX Runtime 1.17 or newer; the reference is Microsoft's \
-             official 1.28.0 release), or place it beside the model at {}",
+            "no ONNX Runtime shared library to load for {}. Looked, in order, at (1) the path \
+             the application passes ({CONFIGURED_SETTING}): none passed; (2) {RUNTIME_ENV}: not \
+             set; (3) {}, beside the model: {e}. Provide {RUNTIME_FILE_NAME} (ONNX Runtime 1.17 \
+             or newer; the reference is Microsoft's official 1.28.0 release) in any one of them",
             graph.display(),
             beside.display()
         ))
+    })?;
+    Ok(RuntimeLocation {
+        path,
+        source: RuntimeSource::BesideGraph,
     })
 }
 
-/// Load the runtime at `path` unless this process already has — the same file again is
-/// a no-op, a different one is refused. Returns the runtime's version and build, for the
-/// load log.
+/// Load the runtime `runtime` names unless this process already has — the same file again
+/// is a no-op, from whichever place it came, and a different one is refused. Returns the
+/// runtime's version and build, for the load log.
 ///
 /// The library is opened and checked here first (`open_runtime_library`), and only then
 /// handed to `ort::init_from`. The order is load-bearing: `ort` 2.0.0-rc.13 cannot survive
@@ -323,63 +421,60 @@ fn resolve_runtime_path(
 /// The first successful load also commits `ort`'s process-wide environment, so that the
 /// runtime's log goes to the [`log`] facade — a library linked into a Flutter application
 /// must not write to the host's stderr — and so that telemetry is off.
-fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
+fn ensure_runtime(runtime: &RuntimeLocation) -> Result<String, EmbeddingError> {
     let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
 
     // Held across the load, so two first loads cannot race. Recovered from poisoning:
     // the slot only ever goes from empty to one complete value.
     let mut slot = RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
     match slot.as_ref() {
-        Some(RuntimeSlot::Loaded(runtime)) if runtime.path == path => {
-            return Ok(runtime.description.clone());
+        Some(RuntimeSlot::Loaded(loaded)) if loaded.location.path == runtime.path => {
+            return Ok(loaded.description.clone());
         }
-        Some(RuntimeSlot::Loaded(runtime)) => {
+        Some(RuntimeSlot::Loaded(loaded)) => {
             return Err(unavailable(format!(
                 "this process already runs ONNX Runtime from {}, and a process can hold only \
-                 one; {} was requested. Point {RUNTIME_ENV} at the library already loaded, or \
-                 restart the process to switch",
-                runtime.path.display(),
-                path.display()
+                 one; {runtime} was requested. Ask for the library already loaded, or restart \
+                 the process to switch",
+                loaded.location
             )));
         }
         Some(RuntimeSlot::Unusable {
-            path: refused,
+            location: refused,
             reason,
         }) => {
             return Err(unavailable(format!(
-                "ONNX Runtime from {} was refused earlier in this process ({reason}), and the \
-                 runtime binding cannot load another after that; restart the process with a \
-                 working library",
-                refused.display()
+                "ONNX Runtime from {refused} was refused earlier in this process ({reason}), and \
+                 the runtime binding cannot load another after that; restart the process with a \
+                 working library"
             )));
         }
         None => {}
     }
 
     // Nothing of `ort`'s is touched if this fails.
-    let (library, version) = open_runtime_library(path)?;
+    let (library, version) = open_runtime_library(runtime)?;
 
     // Absolute on purpose: for a relative path `ort` resolves against the executable's
     // directory through two `expect`s.
-    let environment = match ort::init_from(path) {
+    let environment = match ort::init_from(&runtime.path) {
         Ok(environment) => environment,
         Err(e) => {
             let reason = e.to_string();
             *slot = Some(RuntimeSlot::Unusable {
-                path: path.to_path_buf(),
+                location: runtime.clone(),
                 reason: reason.clone(),
             });
             return Err(unavailable(format!(
-                "ONNX Runtime {version} at {} passed this backend's checks but the runtime \
-                 binding refused it: {reason}",
-                path.display()
+                "ONNX Runtime {version} at {runtime} passed this backend's checks but the \
+                 runtime binding refused it: {reason}"
             )));
         }
     };
     // Recorded the moment `ort` holds the library, before anything else can fail: it
     // cannot be unloaded, and `ort` would silently ignore a later, different path.
     *slot = Some(RuntimeSlot::Loaded(LoadedRuntime {
-        path: path.to_path_buf(),
+        location: runtime.clone(),
         description: version.clone(),
         _library: library,
     }));
@@ -401,8 +496,7 @@ fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
     // hand every internal trace to the facade.
     let environment = ort::environment::Environment::current().map_err(|e| {
         unavailable(format!(
-            "ONNX Runtime from {} loaded, but its environment could not be created: {e}",
-            path.display()
+            "ONNX Runtime from {runtime} loaded, but its environment could not be created: {e}"
         ))
     })?;
     environment.set_log_level(LogLevel::Warning);
@@ -414,30 +508,30 @@ fn ensure_runtime(path: &Path) -> Result<String, EmbeddingError> {
     Ok(description)
 }
 
-/// Open `path` as an ONNX Runtime library and check it the way `ort::init_from` will —
+/// Open `runtime` as an ONNX Runtime library and check it the way `ort::init_from` will —
 /// so that `init_from` is never handed a library it refuses (see `ensure_runtime`).
 /// Returns the handle, to be kept, and the runtime's version string
 /// (`OrtGetApiBase()->GetVersionString()`), which `ort` reads but does not expose.
-fn open_runtime_library(path: &Path) -> Result<(libloading::Library, String), EmbeddingError> {
+fn open_runtime_library(
+    runtime: &RuntimeLocation,
+) -> Result<(libloading::Library, String), EmbeddingError> {
     type GetApiBase = unsafe extern "system" fn() -> *const ort::sys::OrtApiBase;
     let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
 
     // SAFETY: loading a library runs its initializers, and there is no way to vet a file
     // before that: this is the library the process is about to run semantic search on,
-    // chosen by the deployment (`OTZARIA_ONNX_RUNTIME` or the package's own file), and
-    // loading it is what `ort::init_from` does next in any case.
-    let library = unsafe { libloading::Library::new(path) }.map_err(|e| {
+    // chosen by the deployment (the application's path, `OTZARIA_ONNX_RUNTIME` or the
+    // package's own file), and loading it is what `ort::init_from` does next in any case.
+    let library = unsafe { libloading::Library::new(&runtime.path) }.map_err(|e| {
         unavailable(format!(
-            "{} is not a loadable shared library for this platform: {e}",
-            path.display()
+            "{runtime} is not a loadable shared library for this platform: {e}"
         ))
     })?;
     // SAFETY: the type is ONNX Runtime's C declaration of its entry point,
     // `const OrtApiBase* ORT_API_CALL OrtGetApiBase(void)`, exactly as `ort-sys` binds it.
     let get_api_base = unsafe { library.get::<GetApiBase>(b"OrtGetApiBase") }.map_err(|_| {
         unavailable(format!(
-            "{} loads but does not export OrtGetApiBase, so it is not ONNX Runtime",
-            path.display()
+            "{runtime} loads but does not export OrtGetApiBase, so it is not ONNX Runtime"
         ))
     })?;
     // SAFETY: a call with no arguments into the loaded runtime, which returns null or a
@@ -445,8 +539,7 @@ fn open_runtime_library(path: &Path) -> Result<(libloading::Library, String), Em
     let base = unsafe { get_api_base() };
     if base.is_null() {
         return Err(unavailable(format!(
-            "{}: OrtGetApiBase returned nothing",
-            path.display()
+            "{runtime}: OrtGetApiBase returned nothing"
         )));
     }
     // SAFETY: `base` is non-null and points at that table. `GetVersionString` returns a
@@ -455,8 +548,7 @@ fn open_runtime_library(path: &Path) -> Result<(libloading::Library, String), Em
     let raw_version = unsafe { ((*base).GetVersionString)() };
     if raw_version.is_null() {
         return Err(unavailable(format!(
-            "{}: the runtime reports no version",
-            path.display()
+            "{runtime}: the runtime reports no version"
         )));
     }
     // SAFETY: non-null and NUL-terminated, per the contract above.
@@ -472,9 +564,8 @@ fn open_runtime_library(path: &Path) -> Result<(libloading::Library, String), Em
         .unwrap_or(0);
     if minor < ort::MINOR_VERSION {
         return Err(unavailable(format!(
-            "{} is ONNX Runtime {version}; this backend needs 1.{} or newer (the reference is \
-             Microsoft's official 1.28.0 release)",
-            path.display(),
+            "{runtime} is ONNX Runtime {version}; this backend needs 1.{} or newer (the \
+             reference is Microsoft's official 1.28.0 release)",
             ort::MINOR_VERSION
         )));
     }
@@ -864,7 +955,7 @@ pub struct OnnxBackend {
     special_tokens: usize,
     intra_threads: usize,
     graph: PathBuf,
-    runtime: PathBuf,
+    runtime: RuntimeLocation,
 }
 
 impl OnnxBackend {
@@ -890,6 +981,12 @@ impl OnnxBackend {
     /// [`Pooling::InGraph`], and proves at load that the graph's first output is a
     /// finished `[batch, dim]` sentence vector.
     ///
+    /// `runtime_library` is the ONNX Runtime library the application passes
+    /// ([`EmbeddingDeployment::onnx_runtime`](crate::semantic::embedding::EmbeddingDeployment::onnx_runtime)):
+    /// the first place looked, and once given the only one. `None` looks at
+    /// `OTZARIA_ONNX_RUNTIME`, then for the platform's file name beside the graph (see the
+    /// module docs). A deployment fact like `tuning`, and like it no part of [`Self::ID`].
+    ///
     /// Everything is checked here rather than on the first search, cheapest first: the
     /// pooling, the tuning and a cap no encoder has — above
     /// [`ONNX_MAX_TOKENS_CEILING`](crate::semantic::backend::ONNX_MAX_TOKENS_CEILING),
@@ -909,7 +1006,8 @@ impl OnnxBackend {
     ///   any encoder's context or one that leaves no room for content, or a session that
     ///   will not allocate;
     /// * [`EmbeddingError::OnnxRuntimeUnavailable`] when no ONNX Runtime can be loaded —
-    ///   none found, too old, not a runtime, or a different one already loaded;
+    ///   none found, a path passed or named that cannot be opened, too old, not a runtime,
+    ///   or a different one already loaded — saying where the backend looked;
     /// * [`EmbeddingError::InvalidModelFile`] for a tokenizer or graph this backend
     ///   cannot serve, or a graph that fails the probe.
     pub fn open(
@@ -918,6 +1016,7 @@ impl OnnxBackend {
         max_tokens: usize,
         pooling: Pooling,
         tuning: &OnnxBackendConfig,
+        runtime_library: Option<&Path>,
     ) -> Result<Self, EmbeddingError> {
         let started = std::time::Instant::now();
 
@@ -964,8 +1063,9 @@ impl OnnxBackend {
         let (tokenizer_impl, special_tokens) = load_tokenizer(graph, tokenizer, max_tokens)?;
 
         // ── the runtime ──
-        let runtime_path = resolve_runtime_path(std::env::var_os(RUNTIME_ENV), graph)?;
-        let runtime = ensure_runtime(&runtime_path)?;
+        let runtime_location =
+            resolve_runtime_path(runtime_library, std::env::var_os(RUNTIME_ENV), graph)?;
+        let runtime = ensure_runtime(&runtime_location)?;
 
         let cores = available_parallelism();
         let demand = tuning.sessions.saturating_mul(tuning.intra_threads);
@@ -1029,7 +1129,7 @@ impl OnnxBackend {
             special_tokens,
             intra_threads: tuning.intra_threads,
             graph: graph.to_path_buf(),
-            runtime: runtime_path,
+            runtime: runtime_location,
         };
 
         // ── the probe: only running the graph proves it serves this cap ──
@@ -1062,7 +1162,7 @@ impl OnnxBackend {
             backend.wiring.output,
             backend.pool.size,
             backend.intra_threads,
-            backend.runtime.display(),
+            backend.runtime,
             started.elapsed().as_millis(),
         );
         Ok(backend)
@@ -1416,6 +1516,7 @@ mod tests {
             max_tokens,
             Pooling::InGraph,
             tuning,
+            None,
         )
     }
 
@@ -1522,6 +1623,7 @@ mod tests {
                 256,
                 pooling,
                 &OnnxBackendConfig::default(),
+                None,
             );
             match refused {
                 Err(EmbeddingError::PoolingMismatch {
@@ -1561,6 +1663,7 @@ mod tests {
             32,
             Pooling::InGraph,
             &tuning(1, 1),
+            None,
         );
         assert!(
             matches!(&missing_graph, Err(EmbeddingError::ModelNotFound { path }) if path.ends_with("absent.onnx")),
@@ -1573,6 +1676,7 @@ mod tests {
             32,
             Pooling::InGraph,
             &tuning(1, 1),
+            None,
         );
         assert!(
             matches!(&missing_tokenizer, Err(EmbeddingError::TokenizerNotFound { path }) if path.ends_with("absent-tokenizer.json")),
@@ -1834,47 +1938,162 @@ mod tests {
         }
     }
 
+    /// A file at `path`, directories made, standing in for a runtime library where only the
+    /// lookup is under test. Returns its canonical path.
+    fn touch(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"not really a runtime").unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    fn located(path: PathBuf, source: RuntimeSource) -> RuntimeLocation {
+        RuntimeLocation { path, source }
+    }
+
+    /// First hit wins: the application's path, then the variable, then the file beside the
+    /// graph — each only when every place before it is unset.
     #[test]
-    fn the_runtime_comes_from_the_variable_first_then_from_beside_the_graph() {
+    fn the_runtime_comes_from_the_application_then_the_variable_then_beside_the_graph() {
         let dir = TempDir::new("runtime_path");
         let graph = dir.0.join("model.onnx");
         std::fs::write(&graph, b"graph").unwrap();
+        let beside = touch(&dir.0.join(RUNTIME_FILE_NAME));
+        let named = touch(&dir.0.join("named").join(RUNTIME_FILE_NAME));
+        let passed = touch(&dir.0.join("bundled").join(RUNTIME_FILE_NAME));
+        let resolve = |configured: Option<&Path>, env: Option<&Path>| {
+            resolve_runtime_path(configured, env.map(|path| path.into()), &graph).unwrap()
+        };
 
-        // Neither: the error names both ways to provide one.
-        match resolve_runtime_path(None, &graph) {
-            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
-                assert!(reason.contains(RUNTIME_ENV), "{reason}");
-                assert!(reason.contains(RUNTIME_FILE_NAME), "{reason}");
-                assert!(reason.contains(&dir.0.display().to_string()), "{reason}");
+        assert_eq!(
+            resolve(None, None),
+            located(beside, RuntimeSource::BesideGraph)
+        );
+        assert_eq!(
+            resolve(None, Some(&named)),
+            located(named.clone(), RuntimeSource::Environment)
+        );
+        for env in [Some(named.as_path()), None] {
+            assert_eq!(
+                resolve(Some(&passed), env),
+                located(passed.clone(), RuntimeSource::Configured)
+            );
+        }
+        // Two spellings of one file are one location, so the one-runtime rule sees one file.
+        let spelled_otherwise = dir.0.join("named/../bundled").join(RUNTIME_FILE_NAME);
+        assert_eq!(
+            resolve(Some(&spelled_otherwise), None),
+            located(passed, RuntimeSource::Configured)
+        );
+    }
+
+    /// A place that is set decides even when it names nothing: refused, naming what it held,
+    /// and never skipped in favour of a later place — although here both later places would
+    /// resolve.
+    #[test]
+    fn a_place_that_is_set_but_names_nothing_is_refused_not_skipped() {
+        let dir = TempDir::new("runtime_set_but_wrong");
+        let graph = dir.0.join("model.onnx");
+        std::fs::write(&graph, b"graph").unwrap();
+        touch(&dir.0.join(RUNTIME_FILE_NAME));
+        let named = touch(&dir.0.join("named").join(RUNTIME_FILE_NAME));
+        let absent = dir.0.join("not-installed").join(RUNTIME_FILE_NAME);
+        let refused = |configured: Option<&Path>, env: Option<&Path>| {
+            let resolved = resolve_runtime_path(configured, env.map(|path| path.into()), &graph);
+            match resolved {
+                Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => reason,
+                other => panic!("{configured:?} / {env:?} must be refused, got {other:?}"),
             }
-            other => panic!("expected OnnxRuntimeUnavailable, got {other:?}"),
+        };
+
+        // The application's path, with the variable set to a library that exists.
+        let empty = refused(Some(Path::new("")), Some(&named));
+        assert!(
+            empty.contains(CONFIGURED_SETTING) && empty.contains("empty path"),
+            "{empty}"
+        );
+        let wrong = refused(Some(&absent), Some(&named));
+        assert!(
+            wrong.contains(CONFIGURED_SETTING)
+                && wrong.contains(&absent.display().to_string())
+                && wrong.contains(&format!(
+                    "neither {RUNTIME_ENV} nor the model's folder is tried"
+                )),
+            "{wrong}"
+        );
+        for reason in [&empty, &wrong] {
+            assert!(
+                !reason.contains(&named.display().to_string()),
+                "the variable is not looked at: {reason}"
+            );
         }
 
-        // Beside the graph, when the variable is unset.
-        let beside = dir.0.join(RUNTIME_FILE_NAME);
-        std::fs::write(&beside, b"not really a runtime").unwrap();
-        assert_eq!(
-            resolve_runtime_path(None, &graph).unwrap(),
-            beside.canonicalize().unwrap()
+        // The variable, with a file beside the graph; the refusal says the application
+        // passed nothing first.
+        let empty = refused(None, Some(Path::new("")));
+        assert!(
+            empty.contains(CONFIGURED_SETTING)
+                && empty.contains(&format!(
+                    "{RUNTIME_ENV}, the next place looked, is set but empty"
+                )),
+            "{empty}"
+        );
+        let wrong = refused(None, Some(&absent));
+        assert!(
+            wrong.contains(CONFIGURED_SETTING)
+                && wrong.contains(&format!("{RUNTIME_ENV}, the next place looked, is set to"))
+                && wrong.contains(&absent.display().to_string())
+                && wrong.contains("the file beside the model is not tried"),
+            "{wrong}"
         );
 
-        // The variable wins over the file beside the graph.
-        let elsewhere = dir.0.join("elsewhere").join(RUNTIME_FILE_NAME);
-        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
-        std::fs::write(&elsewhere, b"another").unwrap();
+        // Under a path the application passes, the variable is not read at all — not even
+        // refused when it is empty.
+        let passed = touch(&dir.0.join("bundled").join(RUNTIME_FILE_NAME));
         assert_eq!(
-            resolve_runtime_path(Some(elsewhere.clone().into_os_string()), &graph).unwrap(),
-            elsewhere.canonicalize().unwrap()
+            resolve_runtime_path(Some(&passed), Some("".into()), &graph).unwrap(),
+            located(passed, RuntimeSource::Configured)
         );
+    }
 
-        // A variable naming nothing is refused, not skipped in favour of the file beside.
-        for wrong in ["", "/definitely/not/here/libonnxruntime"] {
-            match resolve_runtime_path(Some(wrong.into()), &graph) {
-                Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
-                    assert!(reason.contains(RUNTIME_ENV), "{reason}");
-                }
-                other => panic!("{RUNTIME_ENV}={wrong:?} must be refused, got {other:?}"),
-            }
+    /// With nothing set and nothing beside the graph, the refusal goes through the three
+    /// places in the order they are looked at: what a support message needs to say which
+    /// one to fix.
+    #[test]
+    fn nothing_found_is_reported_place_by_place_in_lookup_order() {
+        let dir = TempDir::new("no_runtime_anywhere");
+        let graph = dir.0.join("model.onnx");
+        std::fs::write(&graph, b"graph").unwrap();
+        let reason = match resolve_runtime_path(None, None, &graph) {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => reason,
+            other => panic!("expected OnnxRuntimeUnavailable, got {other:?}"),
+        };
+        let beside = dir.0.join(RUNTIME_FILE_NAME).display().to_string();
+        let at = |place: &str| {
+            reason
+                .find(place)
+                .unwrap_or_else(|| panic!("{place} is not named: {reason}"))
+        };
+        assert!(
+            at(CONFIGURED_SETTING) < at(RUNTIME_ENV) && at(RUNTIME_ENV) < at(&beside),
+            "{reason}"
+        );
+    }
+
+    /// Every refusal of a library names it through its location, so the place it came from
+    /// travels with the path.
+    #[test]
+    fn a_location_says_which_place_it_came_from() {
+        let path = PathBuf::from("/opt/ort").join(RUNTIME_FILE_NAME);
+        let named = format!("named by {RUNTIME_ENV}");
+        for (source, place) in [
+            (RuntimeSource::Configured, "passed by the application"),
+            (RuntimeSource::Environment, named.as_str()),
+            (RuntimeSource::BesideGraph, "beside the model"),
+        ] {
+            assert_eq!(
+                located(path.clone(), source).to_string(),
+                format!("{} ({place})", path.display())
+            );
         }
     }
 
@@ -1888,7 +2107,7 @@ mod tests {
         let graph = dir.0.join("model.onnx");
         std::fs::write(&graph, b"graph").unwrap();
 
-        let missing = resolve_runtime_path(None, &graph).unwrap_err();
+        let missing = resolve_runtime_path(None, None, &graph).unwrap_err();
         assert!(
             matches!(missing, EmbeddingError::OnnxRuntimeUnavailable { .. }),
             "{missing:?}"
@@ -1898,16 +2117,21 @@ mod tests {
             missing.starts_with("ONNX Runtime could not be loaded: "),
             "{missing}"
         );
-        // Still both ways to provide one.
+        // Still every way to provide one.
+        assert!(missing.contains(CONFIGURED_SETTING), "{missing}");
         assert!(missing.contains(RUNTIME_ENV), "{missing}");
         assert!(
             missing.contains(&dir.0.join(RUNTIME_FILE_NAME).display().to_string()),
             "{missing}"
         );
 
-        let not_a_runtime = fixture("expected.json").canonicalize().unwrap();
+        let not_a_runtime = located(
+            fixture("expected.json").canonicalize().unwrap(),
+            RuntimeSource::Configured,
+        );
         for refused in [
-            resolve_runtime_path(Some("".into()), &graph).unwrap_err(),
+            resolve_runtime_path(Some(Path::new("")), None, &graph).unwrap_err(),
+            resolve_runtime_path(None, Some("".into()), &graph).unwrap_err(),
             ensure_runtime(&not_a_runtime).unwrap_err(),
         ] {
             let message = refused.to_string();
@@ -2329,6 +2553,7 @@ mod tests {
             32,
             Pooling::InGraph,
             &tuning(1, 1),
+            None,
         ) {
             Err(error @ EmbeddingError::InvalidModelFile { .. }) => {
                 let message = error.to_string();
@@ -2344,24 +2569,25 @@ mod tests {
     }
 
     /// Whether or not a runtime is already loaded in this test process, a file that is
-    /// not one is refused as unavailable and named — never a panic, which is what `ort`'s
-    /// own search would have been.
+    /// not one is refused as unavailable and named, with the place it came from — never a
+    /// panic, which is what `ort`'s own search would have been.
     #[test]
     fn a_file_that_is_not_a_runtime_library_is_refused_and_named() {
-        let not_a_library = fixture("expected.json").canonicalize().unwrap();
+        let not_a_library = located(
+            fixture("expected.json").canonicalize().unwrap(),
+            RuntimeSource::Configured,
+        );
         match ensure_runtime(&not_a_library) {
             Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
-                assert!(
-                    reason.contains(&not_a_library.display().to_string()),
-                    "{reason}"
-                );
+                assert!(reason.contains(&not_a_library.to_string()), "{reason}");
             }
             other => panic!("expected OnnxRuntimeUnavailable, got {other:?}"),
         }
     }
 
     /// One runtime per process: once one is loaded, asking for another file is an
-    /// error that names both, and asking for the same one again is not.
+    /// error that names both, with where each came from, and asking for the same one
+    /// again is not — from whichever place.
     #[test]
     fn a_second_different_runtime_library_is_refused() {
         if !runtime_configured() {
@@ -2373,19 +2599,28 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
         {
-            Some(RuntimeSlot::Loaded(runtime)) => runtime.path.clone(),
+            Some(RuntimeSlot::Loaded(runtime)) => runtime.location.clone(),
             _ => panic!("a runtime is loaded"),
         };
-        assert!(
-            ensure_runtime(&loaded).is_ok(),
-            "the same library is a no-op"
-        );
+        for source in [
+            RuntimeSource::Configured,
+            RuntimeSource::Environment,
+            RuntimeSource::BesideGraph,
+        ] {
+            assert!(
+                ensure_runtime(&located(loaded.path.clone(), source)).is_ok(),
+                "the same library is a no-op, {source:?}"
+            );
+        }
 
-        let other = fixture("tokenizer.json").canonicalize().unwrap();
+        let other = located(
+            fixture("tokenizer.json").canonicalize().unwrap(),
+            RuntimeSource::Configured,
+        );
         match ensure_runtime(&other) {
             Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
-                assert!(reason.contains(&loaded.display().to_string()), "{reason}");
-                assert!(reason.contains(&other.display().to_string()), "{reason}");
+                assert!(reason.contains(&loaded.to_string()), "{reason}");
+                assert!(reason.contains(&other.to_string()), "{reason}");
             }
             other => panic!("a second runtime must be refused, got {other:?}"),
         }
@@ -2805,6 +3040,7 @@ mod golden {
                 sessions,
                 ..OnnxBackendConfig::default()
             },
+            None,
         )
         .expect("the golden model must load")
     }
@@ -3009,7 +3245,7 @@ mod golden {
             .collect();
         let fp32 = (goldens.arithmetic == Arithmetic::DynamicInt8).then(|| fp32_reference(dim));
 
-        let runtime = resolve_runtime_path(std::env::var_os(RUNTIME_ENV), &graph)
+        let runtime = resolve_runtime_path(None, std::env::var_os(RUNTIME_ENV), &graph)
             .expect("the runtime library");
         ensure_runtime(&runtime).expect("the runtime must load");
         let threads = OnnxBackendConfig::default().intra_threads;

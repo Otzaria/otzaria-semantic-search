@@ -14,7 +14,7 @@ use crate::semantic::backend::{
     ensure_pooling_is_implemented_for, max_tokens_past_the_format, Pooling,
 };
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
-use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
 use crate::semantic::manifest::{
     describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
@@ -35,6 +35,10 @@ pub struct SemanticConfig {
     pub embedding_model_id: String,
     pub embedding_dim: u32,
     pub model_path: PathBuf,
+    /// Where this machine keeps what the model runs on: the ONNX Runtime library, for an
+    /// ONNX model. A deployment fact, never written to the manifest, so changing it
+    /// invalidates no index — see [`EmbeddingDeployment`].
+    pub deployment: EmbeddingDeployment,
     /// Pooling strategy the model requires (e.g. `"last-token"`); the manifest
     /// persists it verbatim, so [`SemanticConfig::validate`] refuses both a spelling
     /// [`Pooling`] cannot parse and a strategy no backend implements.
@@ -73,6 +77,7 @@ impl Default for SemanticConfig {
             embedding_model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
             embedding_dim: 1024,
             model_path: PathBuf::from("models/otzaria-embedding-v1-flash-q4.gguf"),
+            deployment: EmbeddingDeployment::default(),
             pooling: Pooling::LastToken.as_str().to_string(),
             embedding_max_tokens: 512,
             model_quantization: "Q4".to_string(),
@@ -335,14 +340,17 @@ impl SemanticEngine {
 
         // No `..Default::default()` tail: a new `EmbeddingConfig` field should fail
         // to compile here rather than silently take a default the caller cannot set.
-        let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: self.config.model_path.clone(),
-            embedding_dim: self.config.embedding_dim,
-            // `?` rather than `expect`: a bad spelling must not abort the host.
-            pooling: self.config.pooling_strategy()?,
-            max_tokens: self.config.embedding_max_tokens,
-            batch_size: self.config.embedding_batch_size,
-        });
+        let mut runtime = EmbeddingRuntime::with_deployment(
+            EmbeddingConfig {
+                model_path: self.config.model_path.clone(),
+                embedding_dim: self.config.embedding_dim,
+                // `?` rather than `expect`: a bad spelling must not abort the host.
+                pooling: self.config.pooling_strategy()?,
+                max_tokens: self.config.embedding_max_tokens,
+                batch_size: self.config.embedding_batch_size,
+            },
+            self.config.deployment.clone(),
+        );
 
         if let Err(e) = runtime.load() {
             self.last_error = Some(e.to_string());
@@ -2376,6 +2384,56 @@ mod tests {
                 111u64
             )]))
             .is_up_to_date());
+    }
+
+    /// Where the runtime lives is a deployment fact, not identity: an index built under one
+    /// deployment reopens under another — the model loaded again and the manifest compared
+    /// in full — as current, and the manifest never records the path.
+    #[test]
+    fn a_changed_deployment_leaves_the_index_current() {
+        let dir = TempDir::new("deployment_not_identity");
+        let config = config_at(&dir);
+        let deployed_at = |folder: &str| SemanticConfig {
+            deployment: EmbeddingDeployment {
+                onnx_runtime: Some(dir.path().join(folder).join("onnxruntime.dll")),
+            },
+            ..config.clone()
+        };
+
+        {
+            let mut engine =
+                SemanticEngine::with_store(deployed_at("build-machine"), zevc_store(&config))
+                    .unwrap();
+            engine.load_model().unwrap();
+            assert_eq!(
+                engine.index_book(&three_line_book()).unwrap(),
+                IndexOutcome::Indexed { chunks: 3 }
+            );
+        }
+
+        let mut engine =
+            SemanticEngine::with_store(deployed_at("device"), zevc_store(&config)).unwrap();
+        engine.load_model().unwrap();
+        assert!(
+            engine.incompatibilities().is_empty(),
+            "{:?}",
+            engine.incompatibilities()
+        );
+        let status = engine.status();
+        assert!(status.needs_full_reindex.is_none());
+        assert_eq!(status.vector_count, 3);
+        assert!(engine
+            .diff_against_tantivy(&HashMap::from([(
+                "otzaria/tanach/genesis.txt".to_string(),
+                111u64
+            )]))
+            .is_up_to_date());
+
+        let manifest =
+            std::fs::read_to_string(config.root_dir.join("semantic_manifest.json")).unwrap();
+        for folder in ["build-machine", "device", "onnxruntime.dll"] {
+            assert!(!manifest.contains(folder), "{manifest}");
+        }
     }
 
     /// The manifest records the backend that is actually open. Without that, reopening a

@@ -54,7 +54,7 @@ use crate::distribution::package::{
 };
 use crate::errors::{ArtifactError, SemanticSearchError};
 use crate::semantic::backend::Pooling;
-use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::store_backend::VectorSearchBackend;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, SemanticStatus};
@@ -161,6 +161,11 @@ pub struct OfficialIndexConfig {
     /// constant; see the module documentation.
     pub corpus: CorpusIdentity,
     pub model: LocalModel,
+    /// Where this machine keeps what the model runs on: the ONNX Runtime library the
+    /// application ships, for an ONNX model. Not part of what the artifact has to agree
+    /// with — no identity field reads it, so no deployment makes an artifact the wrong
+    /// one — see [`EmbeddingDeployment`].
+    pub deployment: EmbeddingDeployment,
     /// A digest that arrived from outside the artifact, when there is one. Without it,
     /// opening detects damage and the wrong artifact but not a deliberately rebuilt one —
     /// see [`ArtifactExpectation`].
@@ -208,6 +213,7 @@ impl OfficialSemanticIndex {
             artifact_path,
             corpus,
             model,
+            deployment,
             published_digest,
         } = config;
 
@@ -232,15 +238,18 @@ impl OfficialSemanticIndex {
         let text_recipe = EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
         let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
 
-        let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: model.model_path.clone(),
-            embedding_dim: model.embedding_dim,
-            pooling: model.pooling_strategy()?,
-            max_tokens: model.max_tokens,
-            // One query at a time is all this path ever embeds; batching belongs to the
-            // builder, which has a library to get through.
-            batch_size: 1,
-        });
+        let mut runtime = EmbeddingRuntime::with_deployment(
+            EmbeddingConfig {
+                model_path: model.model_path.clone(),
+                embedding_dim: model.embedding_dim,
+                pooling: model.pooling_strategy()?,
+                max_tokens: model.max_tokens,
+                // One query at a time is all this path ever embeds; batching belongs to the
+                // builder, which has a library to get through.
+                batch_size: 1,
+            },
+            deployment,
+        );
         runtime.load()?;
 
         let identity = IndexVersion {
@@ -645,6 +654,7 @@ mod tests {
             artifact_path: artifact_path.to_path_buf(),
             corpus: corpus(),
             model: local_model(model_path),
+            deployment: EmbeddingDeployment::default(),
             published_digest: None,
         }
     }
@@ -981,6 +991,25 @@ mod tests {
         // An empty query has nothing to embed under either.
         assert!(index.embed_query("   ").is_err());
         assert!(v1.embed_query("").is_err());
+    }
+
+    /// Where this machine keeps the runtime is no part of what an artifact must agree with:
+    /// the same artifact opens, under the same identity, whatever the deployment says.
+    #[test]
+    fn the_deployment_is_not_compared_with_the_artifact() {
+        let dir = TempDir::new("deployment");
+        let (model_path, target, digest) = installed(&dir);
+
+        let index = OfficialSemanticIndex::open(OfficialIndexConfig {
+            deployment: EmbeddingDeployment {
+                onnx_runtime: Some(dir.path().join("bundled").join("onnxruntime.dll")),
+            },
+            published_digest: Some(digest.clone()),
+            ..config_for(&target, &model_path)
+        })
+        .unwrap();
+        assert_eq!(index.identity(), &built_identity(&model_path));
+        assert_eq!(index.artifact_digest(), digest);
     }
 
     /// A missing model is not a broken artifact, and the host has to be able to tell them
