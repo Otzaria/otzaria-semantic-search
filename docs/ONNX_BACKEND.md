@@ -638,8 +638,10 @@ references' ids for both and vectors for the first.
   the M4 x86's per-tensor arithmetic, at a small cost against fp32 (0.998597 at worst, against
   0.999113) and with new int8 goldens. Not decided; the x86 numbers come first.
 - **The cap, 256 vs 128** (§5), for retrieval-quality measurement to settle.
-- **Linux and Windows** were checked to compile, not run; CI's `onnx-backend` job is what
-  runs them, and it has not run yet.
+- **The production graph on Windows.** CI's `onnx-backend` job runs the backend's tests on
+  Linux, macOS and Windows, all green, but against the fixture package; the production
+  graph runs here on Linux x64 only (`golden-onnx`). The plugin's real-model job
+  (`otzaria_search_engine`) is what runs it on all three.
 - **Report the `ort` rc.13 `OnceLock` bug upstream** (§3); the pre-check stays needed until
   a fixed release is pinned.
 - **Mobile.** No runtime ships for iOS or Android in v1; the gating keeps both building.
