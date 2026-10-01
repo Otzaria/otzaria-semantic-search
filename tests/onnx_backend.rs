@@ -264,6 +264,12 @@ mod with_the_backend {
             return;
         }
         let good = std::env::var_os(RUNTIME_ENV).expect("checked above");
+        // The child inherits this process's environment as it is at the spawn, and
+        // `a_bad_tuning_variable_is_refused_through_the_selection_table` writes the tuning
+        // variables on another thread: a child spawned in that window refused
+        // `OTZARIA_ONNX_THREADS=several` before it reached the runtime. So the spawn holds
+        // the lock the writer holds, and the child gets no tuning variable from here at all.
+        let _guard = lock_env();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -272,6 +278,8 @@ mod with_the_backend {
                 "--nocapture",
                 "--test-threads=1",
             ])
+            .env_remove(ENV_THREADS)
+            .env_remove(ENV_SESSIONS)
             .env(RUNTIME_ENV, fixture("expected.json"))
             .env(GOOD_RUNTIME_ENV, good)
             .output()
