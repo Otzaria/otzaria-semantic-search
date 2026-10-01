@@ -156,15 +156,27 @@ without an x86 CPU — measured on the M4, not on x86:
 | the int8 goldens (KleidiAI on) against the fp32 goldens | 0.999113 | 0.999438 |
 | the U8S8 clamp emulated, against the int8 goldens | 0.980947 | 0.991078 |
 
-**Measured on x86 — to be filled in from CI.** `golden-onnx` now prints the runner's CPU and
-the U8S8 kernel it gets; the gate prints every int8 vector against both golden files; and
+**Measured on x86, in CI.** `golden-onnx` prints the runner's CPU and the U8S8 kernel it
+gets; the gate prints every int8 vector against both golden files; and
 `what_the_x86_int8_entry_changes_on_this_cpu_is_reported` runs the same ids with the entry
-and without it, timed. The cross-machine bound (§8) is to be set from these numbers, not
-from the M4's.
+and without it, timed (best of three passes, four intra-op threads, a debug-built test
+binary around a release-built runtime):
 
 | run | CPU, U8S8 kernel | int8 against the int8 goldens, worst | against the fp32 goldens, worst / median | without the entry: worst; vectors identical | 41 texts, with / without the entry | fp32, 41 texts |
 |---|---|---:|---:|---:|---:|---:|
-| *pending — the first CI run with the entry* | — | — | — | — | — | — |
+| 712f70c, CI run 36829959414 | AMD EPYC 7763, 4 vCPU: AVX2 without VNNI, saturating | 0.9990642 (`query_starts_with_punctuation`) | 0.9985966 (`passage_literal_bert_specials`) / 0.9990811 | 0.9809472 (`query_single_word`); 0 of 41 | 548.7 / 481.1 ms | 741.2 ms |
+
+So on a saturating CPU the entry is the whole difference: without it, the runner reproduces
+the first runs' 0.9809471732 to all ten digits — the same arithmetic, which also says what
+CPU they ran on — and with it, int8 lies within 0.9986 of fp32 at worst, as on the M4 with
+KleidiAI off (0.998597, the prediction above). It costs 14% (548.7 against 481.1 ms), and
+int8 still runs 26% faster than the fp32 graph on the same CPU. The fp32 graph came out at
+cosine 1.0000000000 against its goldens, and bit-identical with the entry and without.
+
+The cross-machine bound (§8) stays 0.995: the saturated arithmetic misses it by a wide
+margin, and the exact arithmetic clears it by 0.004. 0.998 would hold too, and would fail
+every saturated case rather than the worst alone (the best of them reached 0.99787) — worth
+adopting once a second x86 CPU type has run the gate.
 
 ---
 
@@ -627,16 +639,16 @@ references' ids for both and vectors for the first.
 
 ## 9. Open issues
 
-- **int8 on x86, measured** (§0.1): the first CI run with `session.x64quantprecision` —
-  the runner's CPU, int8 against both golden files, and the entry's cost — fills in §0.1's
-  table, and the cross-machine bound (§8) is set from it.
-- **int8 on a weak PC** (§0): latency on an old x86 CPU without VNNI, now through the U8U8
-  kernels the entry selects, and how far its vectors lie from the ones the library is built
-  with.
+- **The x86 bound, 0.995 or 0.998** (§0.1): one x86 CPU type has run the gate (AMD EPYC
+  7763, AVX2 without VNNI: 0.99906 at worst). 0.998 once a second type has.
+- **int8 on a weak PC** (§0): latency on an old x86 CPU without VNNI, through the U8U8
+  kernels the entry selects. CI's EPYC 7763 pays 14% for them and still runs int8 26% faster
+  than fp32; a desktop CPU of that class has not been measured.
 - **Whether the M4 should compute what x86 does.** Exact, x86 and the M4 still differ by
   KleidiAI's per-row activation quantization (§0.1): `mlas.disable_kleidiai = 1` would give
   the M4 x86's per-tensor arithmetic, at a small cost against fp32 (0.998597 at worst, against
-  0.999113) and with new int8 goldens. Not decided; the x86 numbers come first.
+  0.999113) and with new int8 goldens. Not decided: as measured, the two lie within 0.99906
+  of each other, which no ranking is expected to notice.
 - **The cap, 256 vs 128** (§5), for retrieval-quality measurement to settle.
 - **The production graph on Windows.** CI's `onnx-backend` job runs the backend's tests on
   Linux, macOS and Windows, all green, but against the fixture package; the production
