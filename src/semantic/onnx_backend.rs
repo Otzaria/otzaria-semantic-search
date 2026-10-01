@@ -669,9 +669,20 @@ fn inspect_graph(session: &Session, graph: &Path) -> Result<Wiring, EmbeddingErr
 /// which is neither `Send` nor `Sync` — into a plain `ort::Error` here, before it can
 /// reach an error type that must be.
 fn build_session(graph: &Path, intra_threads: usize) -> ort::Result<Session> {
+    build_session_as(graph, intra_threads, true)
+}
+
+/// [`build_session`], with [`X64_QUANT_PRECISION`] on or off. The backend only ever asks
+/// for on; off is for the golden tests, which report what the entry changes on the CPU
+/// they run on, and need every other setting to be the backend's for that to mean anything.
+fn build_session_as(
+    graph: &Path,
+    intra_threads: usize,
+    exact_x86_int8: bool,
+) -> ort::Result<Session> {
     Session::builder()?
         .with_optimization_level(GRAPH_OPTIMIZATION)?
-        .with_config_entry(X64_QUANT_PRECISION, "1")?
+        .with_config_entry(X64_QUANT_PRECISION, if exact_x86_int8 { "1" } else { "0" })?
         .with_intra_threads(intra_threads)?
         // Spinning keeps idle intra-op threads busy between runs: throughput on a
         // benchmark, battery on a phone, and no effect on a vector.
@@ -2407,6 +2418,7 @@ mod tests {
 mod golden {
     use super::*;
     use crate::semantic::model_package::onnx_tokenizer_path;
+    use std::collections::HashMap;
 
     /// Names either graph of the package: `seforim-embed-round2-int8.onnx` or
     /// `seforim-embed-round2-fp32.onnx`.
@@ -2591,17 +2603,7 @@ mod golden {
         let graph_sha = sha256_of(graph);
         let mut known = Vec::new();
         for (file, arithmetic) in GOLDEN_FILES {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/data")
-                .join(file);
-            let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!(
-                    "cannot read {}: {e}. Generate it with tools/generate_onnx_golden_vectors.py",
-                    path.display()
-                )
-            });
-            let data: serde_json::Value = serde_json::from_str(&raw)
-                .unwrap_or_else(|e| panic!("{file} is not valid JSON: {e}"));
+            let data = read_golden_file(file);
             let header = &data["header"];
             let described = header["graph_sha256"].as_str().unwrap_or_default();
             if described == graph_sha {
@@ -2623,6 +2625,77 @@ mod golden {
             graph.display(),
             known.join("\n  ")
         )
+    }
+
+    /// One file of `GOLDEN_FILES`, parsed. A missing or broken one fails: the gate was asked for.
+    fn read_golden_file(file: &str) -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data")
+            .join(file);
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {}: {e}. Generate it with tools/generate_onnx_golden_vectors.py",
+                path.display()
+            )
+        });
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{file} is not valid JSON: {e}"))
+    }
+
+    /// The fp32 graph's golden vectors, by case name, each with the ids it was computed
+    /// from: what an int8 vector is held against to see what quantization costs on the CPU
+    /// at hand. Reported, never a gate — that bound is for CI's numbers to decide.
+    fn fp32_reference(dim: usize) -> HashMap<String, (Vec<u32>, Vec<f32>)> {
+        let (file, _) = GOLDEN_FILES
+            .iter()
+            .find(|(_, arithmetic)| *arithmetic == Arithmetic::Fp32)
+            .expect("an fp32 golden file");
+        read_golden_file(file)["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .map(|case| {
+                let vector =
+                    golden_vector(case["vector_f32_le_base64"].as_str().expect("vector"), dim);
+                (
+                    case["name"].as_str().expect("name").to_string(),
+                    (golden_ids(case), vector),
+                )
+            })
+            .collect()
+    }
+
+    /// A case's token ids, as the generator recorded them.
+    fn golden_ids(case: &serde_json::Value) -> Vec<u32> {
+        case["token_ids"]
+            .as_array()
+            .expect("token_ids")
+            .iter()
+            .map(|id| id.as_u64().expect("an id") as u32)
+            .collect()
+    }
+
+    /// The lowest cosine among the cases that have one, with its case's name.
+    fn worst_case<'n>(cosines: impl IntoIterator<Item = (Option<f64>, &'n str)>) -> String {
+        cosines
+            .into_iter()
+            .filter_map(|(cos, name)| cos.map(|cos| (cos, name)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or_else(
+                || "no case comparable".to_string(),
+                |(cos, name)| format!("{cos:.10} ({name})"),
+            )
+    }
+
+    /// The median of `values`, which must not be empty.
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let middle = sorted.len() / 2;
+        if sorted.len().is_multiple_of(2) {
+            (sorted[middle - 1] + sorted[middle]) / 2.0
+        } else {
+            sorted[middle]
+        }
     }
 
     fn sha256_of(path: &Path) -> String {
@@ -2751,6 +2824,11 @@ mod golden {
     /// assertion a tautology. The ids carry the weight: truncation, the role prefix and
     /// special-token matching are all decided before the graph runs, and none of them is
     /// reliably visible in a cosine.
+    ///
+    /// For the int8 graph every vector is also held against the fp32 graph's golden for
+    /// the same case — reported, not asserted, and printed before any assertion can fail:
+    /// "int8 on this CPU against fp32" is the number quality depends on, and it is what
+    /// a cross-machine bound has to be decided from.
     #[test]
     #[ignore = "needs a Meivin graph (int8 or fp32); set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
     fn token_ids_match_the_reference_exactly_and_vectors_agree() {
@@ -2776,15 +2854,26 @@ mod golden {
             header["tokenizers_version"]
         );
         println!("required cosine >= {min_cosine} ({why})");
+        let fp32 = (goldens.arithmetic == Arithmetic::DynamicInt8).then(|| fp32_reference(dim));
 
         let cases = data["cases"].as_array().expect("cases");
         assert!(!cases.is_empty(), "the goldens hold no cases");
         let mut id_mismatches = Vec::new();
         let mut worst = (1.0f64, String::new());
         let mut identical = 0usize;
+        let mut against_fp32 = Vec::new();
         println!(
-            "\n{:<38} {:<8} {:>5} {:>14} {:>10}",
-            "case", "role", "ids", "cosine", "max|Δ|"
+            "\n{:<38} {:<8} {:>5} {:>14} {:>10}{}",
+            "case",
+            "role",
+            "ids",
+            "cosine",
+            "max|Δ|",
+            if fp32.is_some() {
+                format!(" {:>14}", "vs fp32")
+            } else {
+                String::new()
+            }
         );
         for case in cases {
             let name = case["name"].as_str().expect("name");
@@ -2796,12 +2885,7 @@ mod golden {
                 "raw" => {}
                 other => panic!("{name}: unknown role {other:?}"),
             }
-            let golden_ids: Vec<u32> = case["token_ids"]
-                .as_array()
-                .expect("token_ids")
-                .iter()
-                .map(|id| id.as_u64().expect("an id") as u32)
-                .collect();
+            let golden_ids = golden_ids(case);
 
             // Proves the exact bytes were read, invisible characters included.
             if let Some(digest) = case["input_utf8_sha256"].as_str() {
@@ -2841,12 +2925,41 @@ mod golden {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             identical += usize::from(vector == reference);
+            // The same case in the fp32 file, provided it is the same input: the ids say so.
+            let versus_fp32 = fp32.as_ref().map(|fp32| match fp32.get(name) {
+                Some((ids, vector_fp32)) if *ids == golden_ids => {
+                    let cos = cosine(&vector, vector_fp32);
+                    against_fp32.push((cos, name.to_string()));
+                    format!(" {cos:>14.10}")
+                }
+                _ => format!(" {:>14}", "not comparable"),
+            });
             println!(
-                "{name:<38} {role:<8} {:>5} {cos:>14.10} {max_abs:>10.3e}",
-                produced.len()
+                "{name:<38} {role:<8} {:>5} {cos:>14.10} {max_abs:>10.3e}{}",
+                produced.len(),
+                versus_fp32.unwrap_or_default()
             );
             if cos < worst.0 {
                 worst = (cos, name.to_string());
+            }
+        }
+
+        if fp32.is_some() {
+            match against_fp32.iter().min_by(|a, b| a.0.total_cmp(&b.0)) {
+                Some((cos, name)) => {
+                    let values: Vec<f64> = against_fp32.iter().map(|(cos, _)| *cos).collect();
+                    println!(
+                        "int8 on this CPU against the fp32 graph's goldens: worst cosine {cos:.10} \
+                         ({name}), median {:.10}, over {} of {} cases — reported, not a gate",
+                        median(&values),
+                        values.len(),
+                        cases.len()
+                    );
+                }
+                None => println!(
+                    "int8 on this CPU against the fp32 graph's goldens: no case comparable \
+                     (no fp32 golden with the same name and ids)"
+                ),
             }
         }
 
@@ -2867,6 +2980,120 @@ mod golden {
             "worst cosine {:.10} on {} is below {min_cosine} ({why})",
             worst.0,
             worst.1
+        );
+    }
+
+    /// What `X64_QUANT_PRECISION` changes on the CPU this runs on: the golden ids through
+    /// two sessions built alike but for that entry — the backend's, and the runtime's
+    /// default — compared and timed. Reported, never asserted, because the answer belongs
+    /// to the CPU: nothing on ARM, on an x86 CPU with VNNI or for an fp32 graph; every int8
+    /// vector on an AVX2 or AVX-512 CPU without VNNI, whose default kernels clamp. The
+    /// timings are what the exact products cost there; each is the best of three passes
+    /// after a warm-up, in alternation, and means something only when the tests run one at
+    /// a time (`--test-threads=1`, as CI runs them).
+    #[test]
+    #[ignore = "needs a Meivin graph (int8 or fp32); set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
+    fn what_the_x86_int8_entry_changes_on_this_cpu_is_reported() {
+        let Some(graph) = model_path() else { return };
+        let goldens = goldens_for(&graph);
+        let dim = goldens.header()["dim"].as_u64().expect("dim") as usize;
+        let cases = goldens.data["cases"].as_array().expect("cases");
+        let names: Vec<&str> = cases
+            .iter()
+            .map(|case| case["name"].as_str().expect("name"))
+            .collect();
+        let ids: Vec<Vec<u32>> = cases.iter().map(golden_ids).collect();
+        let references: Vec<Vec<f32>> = cases
+            .iter()
+            .map(|case| golden_vector(case["vector_f32_le_base64"].as_str().expect("vector"), dim))
+            .collect();
+        let fp32 = (goldens.arithmetic == Arithmetic::DynamicInt8).then(|| fp32_reference(dim));
+
+        let runtime = resolve_runtime_path(std::env::var_os(RUNTIME_ENV), &graph)
+            .expect("the runtime library");
+        ensure_runtime(&runtime).expect("the runtime must load");
+        let threads = OnnxBackendConfig::default().intra_threads;
+        let mut variants: Vec<(&str, Wiring, Worker)> =
+            [(true, "= 1, the backend's"), (false, "= 0, the default")]
+                .into_iter()
+                .map(|(exact, label)| {
+                    let session = build_session_as(&graph, threads, exact).expect("a session");
+                    let wiring =
+                        inspect_graph(&session, &graph).expect("the golden graph's wiring");
+                    let worker = Worker::new(session, &wiring).expect("a worker");
+                    (label, wiring, worker)
+                })
+                .collect();
+
+        let run_all =
+            |wiring: &Wiring, worker: &mut Worker| -> (Vec<Vec<f32>>, std::time::Duration) {
+                let started = std::time::Instant::now();
+                let vectors = ids
+                    .iter()
+                    .map(|ids| match worker.run(wiring, ids).expect("a run") {
+                        RunOutput::Tensor { data, .. } => data,
+                        RunOutput::Missing => panic!("the run returned no '{}'", wiring.output),
+                    })
+                    .collect();
+                (vectors, started.elapsed())
+            };
+        let mut vectors = Vec::new();
+        let mut best = vec![std::time::Duration::MAX; variants.len()];
+        for pass in 0..4 {
+            for (index, (_, wiring, worker)) in variants.iter_mut().enumerate() {
+                let (pass_vectors, elapsed) = run_all(wiring, worker);
+                if pass == 0 {
+                    vectors.push(pass_vectors);
+                } else {
+                    best[index] = best[index].min(elapsed);
+                }
+            }
+        }
+
+        println!(
+            "\n{X64_QUANT_PRECISION} on this CPU ({}), {} texts, {threads} intra-op thread(s), \
+             graph {}:",
+            std::env::consts::ARCH,
+            ids.len(),
+            goldens.header()["graph_file"]
+        );
+        for ((label, _, _), (vectors, best)) in variants.iter().zip(vectors.iter().zip(&best)) {
+            println!("  {X64_QUANT_PRECISION} {label}");
+            let against_goldens = vectors
+                .iter()
+                .zip(&references)
+                .map(|(vector, reference)| Some(cosine(vector, reference)));
+            println!(
+                "    worst cosine against {}: {}",
+                goldens.file,
+                worst_case(against_goldens.zip(names.iter().copied()))
+            );
+            if let Some(fp32) = &fp32 {
+                let against_fp32 = vectors.iter().enumerate().map(|(i, vector)| {
+                    fp32.get(names[i])
+                        .filter(|(fp32_ids, _)| *fp32_ids == ids[i])
+                        .map(|(_, reference)| cosine(vector, reference))
+                });
+                println!(
+                    "    worst cosine against the fp32 graph's goldens: {}",
+                    worst_case(against_fp32.zip(names.iter().copied()))
+                );
+            }
+            println!("    {} texts in {best:.1?} (best of 3 passes)", ids.len());
+        }
+        let same = vectors[0]
+            .iter()
+            .zip(&vectors[1])
+            .filter(|(a, b)| a == b)
+            .count();
+        println!(
+            "  the two agree bit for bit on {same} of {} vectors{}",
+            ids.len(),
+            if same == ids.len() {
+                " — the entry changes nothing on this CPU for this graph"
+            } else {
+                ""
+            }
         );
     }
 

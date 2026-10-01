@@ -359,6 +359,14 @@ jobs:
   # approval. The mirror is private: the Hugging Face account behind the OTZARIA_HF_TOKEN
   # secret needs read access to it, or every download below answers 401 and the job fails.
   # The SHA-256 checks are what say the bytes are the goldens' ones.
+  #
+  # Linux x64 only. With `session.x64quantprecision` (`X64_QUANT_PRECISION` in
+  # src/semantic/onnx_backend.rs) every x86 CPU computes the int8 products exactly, so a
+  # Windows runner would run the same arithmetic through Microsoft's other build of the same
+  # sources. Doing it robustly needs more than a matrix row: a native path for the model
+  # (Git Bash hands on `/d/a/...`, and a path the test cannot open makes it skip, green), a
+  # Python on PATH for the checks, the `onnx-backend` job's zip extraction, and a second
+  # 210 MB gated download per run.
   golden-onnx:
     name: Golden Vectors (ONNX model)
     if: >-
@@ -368,6 +376,37 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Runner CPUs differ from run to run, and an int8 vector depends on the int8 kernels
+      # the CPU gets (src/semantic/onnx_backend.rs, `X64_QUANT_PRECISION`): ONNX Runtime's
+      # U8S8 kernels sum product pairs in saturating 16 bits (VPMADDUBSW) unless the CPU has
+      # VNNI or AMX, which sum in 32. So every run says first which CPU its numbers are from,
+      # and which U8S8 kernel ONNX Runtime 1.28.0 picks for it (mlas/lib/platform.cpp: the
+      # first that applies of AMX, AVX-512 VNNI, AVX-512 core, AVX-VNNI and AVX2).
+      - name: The runner's CPU and its int8 instructions
+        run: |
+          model=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1)
+          flags=" $(sed -n 's/^flags[[:space:]]*: //p' /proc/cpuinfo | head -n 1) "
+          has() { case "$flags" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          echo "CPU: ${model:-unknown}, $(nproc) logical CPUs"
+          for flag in avx2 fma avx512f avx512bw avx512_vnni avx_vnni avx_vnni_int8 amx_int8; do
+            if has "$flag"; then echo "  $flag: present"; else echo "  $flag: absent"; fi
+          done
+          if has amx_int8; then
+            kernel="AMX: products summed in 32 bits, exact either way"
+          elif has avx512_vnni && has avx512bw; then
+            kernel="AVX-512 VNNI: products summed in 32 bits, exact either way"
+          elif has avx512bw; then
+            kernel="AVX-512 without VNNI: VPMADDUBSW saturates; exact only with session.x64quantprecision"
+          elif has avx_vnni; then
+            kernel="AVX-VNNI: products summed in 32 bits, exact either way"
+          elif has avx2; then
+            kernel="AVX2 without VNNI: VPMADDUBSW saturates; exact only with session.x64quantprecision"
+          else
+            kernel="no AVX2: SSE kernels widen to 16 bits first, exact either way"
+          fi
+          echo "U8S8 int8 kernel: $kernel"
+          echo "::notice title=golden-onnx CPU::${model:-unknown}; U8S8 int8 kernel: $kernel"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -416,6 +455,7 @@ jobs:
 
       # The linux-x64 row of the `onnx-backend` matrix; bump the two together.
       - name: Fetch ONNX Runtime 1.28.0
+        id: runtime
         run: |
           archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
           curl -fSL --retry 5 --retry-all-errors --output "$archive" \
@@ -452,13 +492,22 @@ jobs:
           check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx-fp32/model.json
 
       # `--ignored` is what selects them; the name selects the ONNX gate alone. The gate
-      # picks each graph's goldens by its hash.
+      # picks each graph's goldens by its hash. One test at a time, so that the output reads
+      # in order and the timings it prints measure one test, not four.
+      #
+      # Each step runs whenever what it needs is in place — the verified package and the
+      # runtime — so a failure in one never hides the other's numbers. The int8 step prints
+      # every vector against the fp32 graph's goldens too, before its gate can fail, and a
+      # test of its own prints what the x86 entry changes on this CPU, whatever the gate
+      # decides; the fp32 step is the reference they are read against.
       - name: Golden parity, int8 (the default identity)
+        if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
         env:
           OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
-        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture --test-threads=1
 
       - name: Golden parity, fp32 (the reference graph)
+        if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
         env:
           OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.fp32 }}
-        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture
+        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture --test-threads=1
