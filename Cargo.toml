@@ -48,6 +48,14 @@ serde_json = "1.0"
 log = "0.4"
 sha2 = "0.10"
 
+# The vector store (`semantic::oxv`): segments are mapped rather than read into the heap,
+# and every 1 MiB block of one carries a CRC-32. Both crates are already in the
+# application's dependency graph through tantivy, at these versions (memmap2 0.9.11,
+# crc32fast 1.5.0 in otzaria_search_engine's lockfile), so they add no crate to it. The
+# requirements stay ranges so cargo unifies them with tantivy's.
+memmap2 = "0.9"
+crc32fast = "1.5"
+
 # Optional, behind `onnx-backend`. See `src/semantic/onnx_backend.rs` and
 # `docs/ONNX_BACKEND.md`.
 #

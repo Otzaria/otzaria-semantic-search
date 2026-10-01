@@ -17,6 +17,7 @@
 //! - Semantic engine (orchestration of the builder path: chunk, embed, write)
 //! - The official read-only index (the application path: open a verified artifact
 //!   and query it)
+//! - The vector store's segment files, `.oxv`: mapped, checksummed, addressed by key
 
 pub mod backend;
 pub mod chunk_key;
@@ -27,6 +28,7 @@ pub mod engine;
 pub mod manifest;
 pub mod model_package;
 pub mod official_index;
+pub mod oxv;
 // Real ONNX inference through ONNX Runtime. Compiled only with
 // `--features onnx-backend`; which backend a build actually gets is decided in
 // `backend`, not here.
