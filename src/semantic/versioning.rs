@@ -78,17 +78,17 @@ pub struct CorpusIdentity {
 pub struct ModelIdentity {
     pub model_id: String,
     /// Checksum of the model the vectors were produced with, as 64 lowercase hex digits:
-    /// the file's SHA-256 for a GGUF, and for an ONNX graph the checksum of its whole
-    /// package — graph, external data and `tokenizer.json` — as
-    /// [`model_package`](crate::semantic::model_package) defines it. Guards what
+    /// the checksum of the ONNX graph's whole package — graph, external data and
+    /// `tokenizer.json` — as [`model_package`](crate::semantic::model_package) defines it. Guards what
     /// `model_id` cannot: the same id over different weights, or the same weights read
     /// through a different tokenizer.
     pub model_checksum: String,
-    /// Quantization the vectors were produced under (e.g. `"Q4_K_M"`). Redundant
+    /// Quantization the vectors were produced under (e.g. `"int8"`). Redundant
     /// against `model_checksum` by design — it is what makes a rejection readable.
     pub model_quantization: String,
-    /// Inference backend that produced the vectors (e.g. `"llama-cpp-2-0.1.153"`).
-    /// Two backends over the same weights agree to about cosine 0.995, not exactly.
+    /// Inference backend that produced the vectors (e.g. `"onnxruntime-sentence-v1"`).
+    /// Two backends over the same weights need not agree exactly, so the vectors of one
+    /// are not the vectors of the other.
     pub embedding_backend: String,
     pub embedding_dim: u32,
     pub pooling: String,
@@ -488,12 +488,12 @@ pub(crate) fn test_identity() -> IndexVersion {
             document_id_scheme_version: 1,
         },
         model: ModelIdentity {
-            model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
+            model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
             model_checksum: "a".repeat(64),
-            model_quantization: "Q4_K_M".to_string(),
-            embedding_backend: "llama-cpp-2-0.1.153".to_string(),
+            model_quantization: "int8".to_string(),
+            embedding_backend: "onnxruntime-sentence-v1".to_string(),
             embedding_dim: 1024,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             max_tokens: 512,
             embedding_text_version: 1,
             normalization_version: 1,
@@ -540,10 +540,10 @@ mod tests {
                 v.model.model_checksum = "b".repeat(64)
             }),
             (F::ModelQuantization, |v| {
-                v.model.model_quantization = "Q8_0".to_string()
+                v.model.model_quantization = "fp32".to_string()
             }),
             (F::EmbeddingBackend, |v| {
-                v.model.embedding_backend = "candle-gguf-v1".to_string()
+                v.model.embedding_backend = "some-other-backend-v1".to_string()
             }),
             (F::EmbeddingDim, |v| v.model.embedding_dim = 256),
             (F::Pooling, |v| v.model.pooling = "mean".to_string()),
@@ -786,7 +786,7 @@ mod tests {
 
         let identity = sample_identity();
         let rendered = identity.to_string();
-        for fragment in ["corpus", "model", "store", "1024", "last-token", "f32"] {
+        for fragment in ["corpus", "model", "store", "1024", "in-graph", "f32"] {
             assert!(
                 rendered.contains(fragment),
                 "{fragment} missing from Display"

@@ -78,14 +78,13 @@
 //! containing the literal string `[CLS]`, `[SEP]` or `[QUERY]` gets that token too. The
 //! Python `tokenizers` package does exactly the same (`tests/data/onnx_fixture/
 //! expected.json` holds its answers, and the tests assert them); the match is on the raw
-//! text and case-sensitive, so `[query]` stays text. This is the opposite of the llama
-//! backend's `parse_special = false`, and for the opposite reason: there a control token
-//! inside a book is an accident, here the prefix *is* one.
+//! text and case-sensitive, so `[query]` stays text. Matching them is the point, not an
+//! accident: the role prefix *is* one.
 
 use crate::errors::EmbeddingError;
-use crate::semantic::backend::{max_tokens_past_the_format, EmbeddingBackend, Pooling};
+use crate::semantic::backend::{max_tokens_past_any_encoder, EmbeddingBackend, Pooling};
 use crate::semantic::embedding::EmbeddingConfig;
-use crate::semantic::model_package::{onnx_package_root, ModelFormat};
+use crate::semantic::model_package::onnx_package_root;
 
 use ort::logging::LogLevel;
 use ort::session::builder::GraphOptimizationLevel;
@@ -174,10 +173,10 @@ const TOKEN_TYPE_IDS: &str = "token_type_ids";
 /// `max_tokens`. Three scripts, so no normalizer can strip all of them.
 const PROBE_WORDS: [&str; 3] = ["בראשית", "the", "1"];
 
-/// Tuning for [`OnnxBackend`]. Separate from [`EmbeddingConfig`] for the reason
-/// `LlamaBackendConfig` is: that type is persisted as an index's identity, while these
-/// are deployment facts that must not change a stored vector, and so must not
-/// invalidate an index when they change. Measured not to: `docs/ONNX_BACKEND.md`.
+/// Tuning for [`OnnxBackend`]. Separate from [`EmbeddingConfig`] because that type is
+/// persisted as an index's identity, while these are deployment facts that must not
+/// change a stored vector, and so must not invalidate an index when they change.
+/// Measured not to: `docs/ONNX_BACKEND.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnnxBackendConfig {
     /// ONNX Runtime intra-op threads per session. At least one.
@@ -204,8 +203,7 @@ impl OnnxBackendConfig {
     pub const ENV_SESSIONS: &'static str = "OTZARIA_ONNX_SESSIONS";
 
     /// Defaults, with environment-variable overrides applied — the backend-selection
-    /// table can hand a constructor nothing but an [`EmbeddingConfig`], exactly as for
-    /// `LlamaBackendConfig::from_env_for`, whose signature this mirrors.
+    /// table can hand a constructor nothing but an [`EmbeddingConfig`].
     ///
     /// # Errors
     ///
@@ -586,7 +584,7 @@ fn describe_build(info: &str) -> String {
 /// Forwards one runtime log record to the [`log`] facade. Called from ONNX Runtime's
 /// threads through `extern "C"`, so it must not panic, and does nothing that could.
 fn forward_runtime_log(level: LogLevel, _category: &str, _id: &str, location: &str, message: &str) {
-    // Info is mapped down, as for llama.cpp: session creation is chatty at that level.
+    // Info is mapped down: session creation is chatty at that level.
     let level = match level {
         LogLevel::Verbose => log::Level::Trace,
         LogLevel::Info => log::Level::Debug,
@@ -1173,9 +1171,8 @@ impl OnnxBackend {
     /// graph optimization `All` (`GRAPH_OPTIMIZATION`), and exact int8 products on x86 —
     /// from the CPU's VNNI kernels, or through `X64_QUANT_PRECISION` where its kernels
     /// saturate (`X86Int8`), two paths to the same products, so which one a CPU takes is not
-    /// part of it. Deliberately **not** the runtime's version or the thread count, as
-    /// `LlamaCppBackend::ID` leaves out the llama.cpp build: `docs/ONNX_BACKEND.md` measures
-    /// what they move.
+    /// part of it. Deliberately **not** the runtime's version or the thread count:
+    /// `docs/ONNX_BACKEND.md` measures what they move.
     pub const ID: &'static str = "onnxruntime-sentence-v1";
 
     /// Load the graph at `graph` with the tokenizer at `tokenizer`, truncating every
@@ -1247,9 +1244,7 @@ impl OnnxBackend {
         }
         // Checked here too, for a caller that never went through `EmbeddingConfig::validate`:
         // the probe below is as long as the cap (`ONNX_MAX_TOKENS_CEILING` says why).
-        if let Some(reason) =
-            max_tokens_past_the_format("max_tokens", max_tokens, ModelFormat::Onnx)
-        {
+        if let Some(reason) = max_tokens_past_any_encoder("max_tokens", max_tokens) {
             return Err(EmbeddingError::LoadFailed { reason });
         }
         if !graph.is_file() {
@@ -1824,7 +1819,7 @@ mod tests {
     /// otherwise be what the error reported.
     #[test]
     fn a_pooling_other_than_in_graph_is_refused_before_anything_is_read() {
-        for pooling in [Pooling::LastToken, Pooling::Mean] {
+        for pooling in Pooling::ALL.into_iter().filter(|p| *p != Pooling::InGraph) {
             let refused = OnnxBackend::open(
                 Path::new("absent/model.onnx"),
                 Path::new("absent/tokenizer.json"),

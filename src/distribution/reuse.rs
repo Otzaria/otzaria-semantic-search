@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! plan_split           plan + ledger + its manifest -> reuse.jsonl + embed.jsonl
-//! embed_shard          embed.jsonl                  -> vectors + records     (GPU)
+//! embed_shard          embed.jsonl                  -> vectors + records     (worker)
 //! assemble             reuse + base + shards        -> vectors + records
 //! pack                 those two                    -> artifact
 //! ledger_from_artifact artifact + records           -> the next ledger
@@ -513,9 +513,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Streams the plan, so the memory cost is the ledger alone — 32 bytes of digest and 8 of
 /// offset per previous vector, which for a six-million-line library is a few hundred
-/// megabytes on a build machine and nothing on the GPU worker, which never sees it.
+/// megabytes on a build machine and nothing on the worker, which never sees it.
 ///
-/// An empty ledger is not an error. It is the first build, and every line goes to the GPU.
+/// An empty ledger is not an error. It is the first build, and every line is embedded.
 ///
 /// # Errors
 ///
@@ -605,7 +605,7 @@ pub fn verify_shards(
     model: &ModelIdentity,
     total: usize,
 ) -> Result<Vec<ShardStreams>, PackError> {
-    // A release where no embedding text changed needs no GPU at all: every vector comes
+    // A release where no embedding text changed needs no inference at all: every vector comes
     // from the base and there are no shard directories. That is the cheapest path there
     // is, and refusing an empty set unconditionally made it the one path that could not
     // run.
@@ -657,7 +657,7 @@ pub fn verify_shards(
         }
         // The window, held to the plan. `read_plan` skips and takes over *records*, so a
         // shard covers exactly what remains of the plan after its skip, capped by its take
-        // — and a shard that stopped early is a truncated GPU session, not a short window.
+        // — and a shard that stopped early is a truncated session, not a short window.
         let remaining =
             total
                 .checked_sub(manifest.skip)
@@ -933,10 +933,10 @@ mod tests {
         ModelIdentity {
             model_id: "otzaria-embedding-v1".to_string(),
             model_checksum: checksum.to_string(),
-            model_quantization: "Q4_K_M".to_string(),
+            model_quantization: "int8".to_string(),
             embedding_backend: "mock-hash-v1".to_string(),
             embedding_dim: DIM_U32,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             max_tokens: 512,
             embedding_text_version: 1,
             normalization_version: 1,
@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     /// The whole point, as one assertion: a line whose embedding text is unchanged does
-    /// not reach the GPU, and one whose text is new does.
+    /// not reach the model, and one whose text is new does.
     #[test]
     fn only_the_digests_the_ledger_does_not_know_are_sent_to_be_embedded() {
         let base = base_with(

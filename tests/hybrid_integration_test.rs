@@ -4,8 +4,8 @@
 //!
 //! Driving the engine end to end requires an embedding backend, and requires the
 //! deterministic stand-in to be the one actually *selected* — every fixture builds
-//! its model with [`mock::write_stub_gguf`], a weightless stub that real inference
-//! rightly refuses — hence `mock-embedding` without `llama-backend`.
+//! its model with [`mock::write_stub_onnx_package`], a weightless stub that real
+//! inference rightly refuses — hence `mock-embedding` without `onnx-backend`.
 //!
 //! Consequently the hybrid pipeline is not exercised in a build holding both
 //! backends. That is acceptable: fusion, grouping, paging, filters and the manifest
@@ -14,7 +14,7 @@
 //! — a default build refusing to embed at all — in
 //! `tests/production_backend_gate.rs`.
 
-#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+#![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::cancellation::CancellationToken;
@@ -71,8 +71,7 @@ impl Drop for TempDir {
 
 /// A configuration rooted in `dir`, with a small embedding dimension for speed.
 fn config_at(dir: &TempDir) -> SemanticConfig {
-    let model_path = dir.path().join("model.gguf");
-    mock::write_stub_gguf(&model_path, 3).unwrap();
+    let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
     let root = dir.path().join("semantic");
     SemanticConfig {
@@ -321,7 +320,7 @@ fn a_lexical_only_search_never_touches_the_semantic_index() {
 fn lexical_search_keeps_working_when_the_semantic_model_is_missing() {
     let dir = TempDir::new("degraded");
     let mut config = config_at(&dir);
-    config.model_path = dir.path().join("never-downloaded.gguf");
+    config.model_path = dir.path().join("never-downloaded.onnx");
 
     let engine = SemanticEngine::open(config).unwrap();
     let api = OtzariaHybridEngine::new(HybridCoordinator::new(Some(engine)));
@@ -780,9 +779,11 @@ fn a_swapped_model_file_behind_the_same_id_is_detected() {
     }
 
     // Same path, same model id, different bytes.
-    let mut bytes = std::fs::read(&config.model_path).unwrap();
-    bytes.extend_from_slice(b"a completely different set of weights");
-    std::fs::write(&config.model_path, bytes).unwrap();
+    std::fs::write(
+        &config.model_path,
+        mock::onnx::stub_graph_named("a completely different set of weights"),
+    )
+    .unwrap();
 
     let mut engine = SemanticEngine::open(config).unwrap();
     engine.load_model().unwrap();

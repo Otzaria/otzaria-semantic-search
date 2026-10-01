@@ -201,12 +201,12 @@ fn embedded_unchanged(line_id: u64, text: &str) -> (u64, Vec<f32>, String, Strin
 
 fn stand_in_model() -> ModelIdentity {
     ModelIdentity {
-        model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
+        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
         model_checksum: "c".repeat(64),
-        model_quantization: "Q4_K_M".to_string(),
-        embedding_backend: "llama-cpp-2-0.1.153".to_string(),
+        model_quantization: "int8".to_string(),
+        embedding_backend: "onnxruntime-sentence-v1".to_string(),
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
@@ -512,31 +512,33 @@ fn the_cli_refuses_an_artifact_that_covers_part_of_the_corpus() {
 /// and queried — with no fixture assembled by hand anywhere in between. If the packer and
 /// the reader ever stop agreeing about the payload, the identity or the counts, this is
 /// what fails.
-#[cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+///
+/// The query is embedded by the deterministic stand-in, which has to be the selected
+/// backend — the model is a weightless stub ONNX package that real inference rightly
+/// refuses — hence `mock-embedding` without `onnx-backend`.
+#[cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 #[test]
 fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
     use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
     use otzaria_semantic_search::distribution::package::ArtifactExpectation;
     use otzaria_semantic_search::semantic::backend::MockHashBackend;
-    use otzaria_semantic_search::semantic::embedding::{
-        mock, validate_and_checksum_gguf, EmbeddingDeployment,
-    };
+    use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
+    use otzaria_semantic_search::semantic::model_package::validate_model;
     use otzaria_semantic_search::semantic::official_index::{
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
 
     let dir = TempDir::new("runtime");
-    let model_path = dir.path().join("model.gguf");
-    mock::write_stub_gguf(&model_path, 3).unwrap();
+    let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
     // What the installation declares about itself, and what the build records: the same
     // values, plus the two facts only the loaded model can supply.
     let local = LocalModel {
         model_path: model_path.clone(),
-        model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
-        model_quantization: "Q4_K_M".to_string(),
+        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+        model_quantization: "int8".to_string(),
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
@@ -544,7 +546,7 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
     };
     let model = ModelIdentity {
         model_id: local.model_id.clone(),
-        model_checksum: validate_and_checksum_gguf(&model_path).unwrap(),
+        model_checksum: validate_model(&model_path).unwrap().checksum().to_string(),
         model_quantization: local.model_quantization.clone(),
         embedding_backend: MockHashBackend::ID.to_string(),
         embedding_dim: local.embedding_dim,

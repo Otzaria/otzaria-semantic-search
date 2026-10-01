@@ -168,12 +168,12 @@ fn write_fixture(dir: &Path, model: &ModelIdentity, chunking: &ChunkerConfig) ->
 /// which only a real file can supply.
 fn model_identity(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
     ModelIdentity {
-        model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
+        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
         model_checksum: checksum.to_string(),
-        model_quantization: "Q4_K_M".to_string(),
+        model_quantization: "int8".to_string(),
         embedding_backend: "mock-hash-v1".to_string(),
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
@@ -222,7 +222,7 @@ fn a_recipe_that_is_not_the_one_the_model_declares_is_refused() {
             // Never opened: the recipe is checked first, so this path does not have to
             // exist for the rejection to be the right one.
             "--model-file",
-            dir.path().join("absent.gguf").to_str().unwrap(),
+            dir.path().join("absent.onnx").to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
         ])
@@ -244,7 +244,7 @@ fn a_recipe_that_is_not_the_one_the_model_declares_is_refused() {
 /// A release binary must not be able to produce vectors at all — the same guarantee
 /// `tests/production_backend_gate.rs` makes for the engine, at the one command whose entire
 /// job is inference. A default build gets as far as opening the model and stops there.
-#[cfg(not(any(feature = "mock-embedding", feature = "llama-backend")))]
+#[cfg(not(any(feature = "mock-embedding", feature = "onnx-backend")))]
 #[test]
 fn a_build_without_an_inference_backend_refuses_rather_than_inventing_vectors() {
     let dir = TempDir::new("no_backend");
@@ -252,7 +252,7 @@ fn a_build_without_an_inference_backend_refuses_rather_than_inventing_vectors() 
     let model = model_identity(&"ab".repeat(32), &chunking);
     let fixture = write_fixture(dir.path(), &model, &chunking);
 
-    let model_file = dir.path().join("model.gguf");
+    let model_file = dir.path().join("model.onnx");
     std::fs::write(&model_file, b"not a model").unwrap();
 
     let out = dir.path().join("artifact");
@@ -282,15 +282,16 @@ fn a_build_without_an_inference_backend_refuses_rather_than_inventing_vectors() 
     assert!(!out.exists(), "a refused build writes nothing");
 }
 
-/// Everything below is a build, and a build is inference.
-#[cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+/// Everything below is a build, and a build is inference — on the deterministic
+/// stand-in, which has to be the selected backend: the model is a weightless stub ONNX
+/// package that real inference rightly refuses, hence no `onnx-backend`.
+#[cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 mod with_a_backend {
     use super::*;
     use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
     use otzaria_semantic_search::distribution::package::ArtifactExpectation;
-    use otzaria_semantic_search::semantic::embedding::{
-        mock, validate_and_checksum_gguf, EmbeddingDeployment,
-    };
+    use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
+    use otzaria_semantic_search::semantic::model_package::validate_model;
     use otzaria_semantic_search::semantic::official_index::{
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
@@ -309,11 +310,10 @@ mod with_a_backend {
             .to_string()
     }
 
-    /// A stub GGUF and the checksum an artifact must declare for it.
+    /// A stub ONNX package and the checksum an artifact must declare for it.
     fn write_model_file(dir: &Path) -> (PathBuf, String) {
-        let path = dir.join("model.gguf");
-        mock::write_stub_gguf(&path, 3).unwrap();
-        let checksum = validate_and_checksum_gguf(&path).unwrap();
+        let path = mock::write_stub_onnx_package(&dir.join("model"));
+        let checksum = validate_model(&path).unwrap().checksum().to_string();
         (path, checksum)
     }
 
@@ -547,44 +547,56 @@ mod with_a_backend {
 /// Every other test here runs on a backend that echoes its own configuration back, so the
 /// half of the model check that only real weights can drive is never exercised: a declared
 /// width, pooling or token cap that the model does not have. This is also the only place
-/// the recipe is applied to text a real tokenizer sees.
+/// the recipe is applied to text a real tokenizer sees — text recipe 2, the role prefixes
+/// the production identity declares.
 ///
 /// `#[ignore]`d and **skips loudly**, matching the rest of the crate's real-model tests:
-/// the ordinary suite stays green without a 396 MB gated download, and CI runs it with
-/// `--ignored` after fetching the file.
-#[cfg(all(feature = "llama-backend", not(feature = "mock-embedding")))]
+/// the ordinary suite stays green without the gated download, and CI's `golden-onnx` job
+/// runs it with `--ignored` after fetching the package and the runtime.
+#[cfg(all(feature = "onnx-backend", not(feature = "mock-embedding")))]
 #[test]
-#[ignore = "needs the real GGUF; set OTZARIA_TEST_MODEL"]
+#[ignore = "needs a Meivin graph and ONNX Runtime; set OTZARIA_TEST_ONNX_MODEL and OTZARIA_ONNX_RUNTIME"]
 fn the_real_model_builds_an_artifact_that_verifies() {
     use otzaria_semantic_search::distribution::builder::{build, BuildRequest};
     use otzaria_semantic_search::distribution::corpus::JsonlCorpus;
     use otzaria_semantic_search::distribution::packer::validate_artifact;
-    use otzaria_semantic_search::semantic::embedding::validate_and_checksum_gguf;
-    use otzaria_semantic_search::semantic::llama_backend::LlamaCppBackend;
+    use otzaria_semantic_search::semantic::model_package::validate_model;
 
-    let Ok(model_file) = std::env::var("OTZARIA_TEST_MODEL") else {
+    let Ok(model_file) = std::env::var("OTZARIA_TEST_ONNX_MODEL") else {
         println!(
-            "SKIPPED: OTZARIA_TEST_MODEL is not set. This test needs the 396 MB gated \
-             model file."
+            "SKIPPED: OTZARIA_TEST_ONNX_MODEL is not set. This test needs one of the Meivin \
+             Round 2 graphs, with its tokenizer.json beside it."
         );
         return;
     };
     let model_file = PathBuf::from(model_file);
     if !model_file.exists() {
-        println!("SKIPPED: OTZARIA_TEST_MODEL points at {model_file:?}, which does not exist");
+        println!("SKIPPED: OTZARIA_TEST_ONNX_MODEL points at {model_file:?}, which does not exist");
+        return;
+    }
+    if std::env::var_os("OTZARIA_ONNX_RUNTIME").is_none() {
+        println!(
+            "SKIPPED: OTZARIA_ONNX_RUNTIME is not set; running the graph needs an ONNX Runtime \
+             shared library"
+        );
         return;
     }
 
     let dir = TempDir::new("real_model");
-    let chunking = ChunkerConfig::default();
-    // The dimension and the token cap are the model's, not this test's: declaring anything
-    // else is exactly what the build is supposed to refuse, and asserting that here would
-    // be asserting the check rather than the build.
+    let chunking = ChunkerConfig {
+        embedding_text_version: 2,
+        ..ChunkerConfig::default()
+    };
+    // The dimension, the pooling and the token cap are the model's, not this test's:
+    // declaring anything else is exactly what the build is supposed to refuse, and
+    // asserting that here would be asserting the check rather than the build.
     let model = ModelIdentity {
-        model_checksum: validate_and_checksum_gguf(&model_file).unwrap(),
-        embedding_backend: LlamaCppBackend::ID.to_string(),
-        embedding_dim: 1024,
-        max_tokens: 512,
+        model_checksum: validate_model(&model_file).unwrap().checksum().to_string(),
+        // `OnnxBackend::ID`, spelled out: the module exists on desktop targets only.
+        embedding_backend: "onnxruntime-sentence-v1".to_string(),
+        embedding_dim: 256,
+        max_tokens: 256,
+        embedding_text_version: 2,
         ..model_identity("unused", &chunking)
     };
     let fixture = write_fixture(dir.path(), &model, &chunking);
@@ -610,7 +622,7 @@ fn the_real_model_builds_an_artifact_that_verifies() {
         report.vector_count, 4,
         "one line is below min_embeddable_chars"
     );
-    assert_eq!(report.identity.model.embedding_dim, 1024);
+    assert_eq!(report.identity.model.embedding_dim, 256);
 
     // Verified independently, against the same corpus seen through the same recipe.
     let corpus = JsonlCorpus::load(&fixture.corpus_identity, &fixture.corpus_lines).unwrap();

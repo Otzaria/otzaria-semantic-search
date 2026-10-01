@@ -12,11 +12,17 @@
 //! Both can regress with every Rust test still green, so they are pinned here through the
 //! binary. The corpus is four lines; what is being tested is the wiring, not the volume.
 
-#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+//!
+//! Embedding a shard needs the deterministic stand-in to be the selected backend — the
+//! model is a weightless stub ONNX package that real inference rightly refuses — hence
+//! `mock-embedding` without `onnx-backend`.
+
+#![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord};
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
-use otzaria_semantic_search::semantic::embedding::{mock, validate_and_checksum_gguf};
+use otzaria_semantic_search::semantic::embedding::mock;
+use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,7 +157,7 @@ fn write_corpus(dir: &TempDir, name: &str, lines: &[(u64, &str)]) -> (PathBuf, P
 }
 
 #[test]
-fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs_no_gpu() {
+fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embeds_nothing() {
     let dir = TempDir::new("chain");
     let chunking = ChunkerConfig::default();
     let chunking_path = dir.at("chunking.json");
@@ -161,16 +167,15 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
     )
     .unwrap();
 
-    let model_file = dir.at("model.gguf");
-    mock::write_stub_gguf(&model_file, 3).unwrap();
-    let checksum = validate_and_checksum_gguf(&model_file).unwrap();
+    let model_file = mock::write_stub_onnx_package(&dir.at("model"));
+    let checksum = validate_model(&model_file).unwrap().checksum().to_string();
     let model = ModelIdentity {
         model_id: "otzaria-embedding-v1".to_string(),
         model_checksum: checksum,
-        model_quantization: "Q4_K_M".to_string(),
+        model_quantization: "int8".to_string(),
         embedding_backend: "mock-hash-v1".to_string(),
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
@@ -425,7 +430,7 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_needs
     assert_eq!(
         std::fs::read_to_string(split.join("embed.jsonl")).unwrap(),
         "",
-        "nothing goes to a GPU"
+        "nothing goes to the model"
     );
 
     // 8. Assemble from the base alone: no shard directory exists, and none should.

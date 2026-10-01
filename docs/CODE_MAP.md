@@ -70,12 +70,11 @@ otzaria-semantic-search/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Semantic
     │   ├── chunker.rs                      # Anchored Chunking & SHA256 IDs
     │   ├── recipe.rs                       # גרסאות המתכון: chunking, טקסט (כולל תחיליות תפקיד), נרמול
-    │   ├── embedding.rs                    # אימות המודל, batching ונרמול
-    │   ├── model_package.rs                # פורמט המודל; חבילת ONNX: אימות ו-checksum
+    │   ├── embedding.rs                    # בדיקות התצורה, batching ונרמול
+    │   ├── model_package.rs                # נתיב המודל: גרף ONNX או דחייה; החבילה: אימות ו-checksum
     │   ├── embedding_cache.rs              # cache לווקטורים של טקסטים שהוטמעו
-    │   ├── backend.rs                      # חוזה ה-backend ובחירתו לפי פורמט המודל
-    │   ├── llama_backend.rs                # inference אמיתי ל-GGUF (feature `llama-backend`)
-    │   ├── onnx_backend.rs                 # inference אמיתי ל-ONNX (feature `onnx-backend`)
+    │   ├── backend.rs                      # חוזה ה-backend ובחירתו
+    │   ├── onnx_backend.rs                 # inference אמיתי ל-ONNX (feature `onnx-backend`) — ה-backend היחיד
     │   ├── engine.rs                       # מתאם צד ה-build: chunk → embed → כתיבה
     │   ├── official_index.rs               # מסלול האפליקציה: פתיחת ארטיפקט מאומת, read-only
     │   ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
@@ -285,10 +284,12 @@ otzaria-semantic-search/
 
 * [`src/semantic/model_package.rs`](../src/semantic/model_package.rs) — מה נתיב מודל אומר
   על הדיסק. מקומפל תמיד, בלי תלות inference.
-  - `ModelFormat::of()` — סיומת `onnx` (בכל רישיות ASCII) היא ONNX, **כל נתיב אחר הוא
-    GGUF**. אותו כלל בוחר את ה-validator ואת ה-backend.
-  - `validate_model()` — נקודת הכניסה של `EmbeddingRuntime::load()`: GGUF הולך
-    ל-`validate_and_checksum_gguf` ללא שינוי, ONNX ל-`validate_onnx_package`.
+  - `names_an_onnx_graph()` / `ensure_onnx_model_path()` — מודל הוא גרף ONNX: סיומת `onnx`
+    (בכל רישיות ASCII). **כל נתיב אחר נדחה** כ-`InvalidModelFile` לפני שנפתח דבר, בין שיש
+    שם קובץ ובין שאין — GGUF קודם כול, שהתמיכה בו הוסרה אחרי `62f0c44`.
+    `EmbeddingConfig::validate` ו-`validate_model` שואלים אותו שניהם.
+  - `validate_model()` — נקודת הכניסה של `EmbeddingRuntime::load()`:
+    `ensure_onnx_model_path`, ואחריו `validate_onnx_package`; מחזיר את ה-`OnnxPackage`.
   - `validate_onnx_package()` — החבילה היא הגרף, `tokenizer.json` שלידו (חובה —
     `TokenizerNotFound`, נבדק ראשון) וכל קובץ external-data שהגרף מצביע עליו. הגרף נקרא
     ב-**protobuf walk** חסום וזורם, ומגובב באותו מעבר: אורך שחורג מסוף הקובץ = הורדה שלא
@@ -305,24 +306,18 @@ otzaria-semantic-search/
     נכנס. ההגדרה המלאה: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §4.2.1.
 
 * [`src/semantic/embedding.rs`](../src/semantic/embedding.rs)
-  - `EmbeddingRuntime` & `EmbeddingConfig` — ממשק הרצת מודל מקומי, GGUF או חבילת ONNX.
-    `load()` מאמת ומחשב את `model_checksum` דרך `model_package::validate_model`, לפי
-    הפורמט שהנתיב אומר.
+  - `EmbeddingRuntime` & `EmbeddingConfig` — ממשק הרצת מודל מקומי: חבילת ONNX.
+    `validate()` דוחה תצורה שאף backend אינו יכול לשרת, ובכלל זה נתיב שאינו גרף ONNX;
+    `load()` מאמת ומחשב את `model_checksum` דרך `model_package::validate_model`. ברירת
+    המחדל היא זהות הייצור, גרף ה-int8 של Meivin Round 2.
   - `EmbeddingDeployment` — עובדות פריסה ולא זהות: היכן המכונה הזו מחזיקה את מה שה-backend
     טוען מלבד המודל, היום ספריית ONNX Runtime (`onnx_runtime`). מוחזק **לצד**
     `EmbeddingConfig` ולא בתוכו, כך שקוד שגוזר זהות מ-`EmbeddingConfig` אינו יכול לאסוף
     אותו. האפליקציה מעבירה אותו ב-`OfficialIndexConfig::deployment` או
     `SemanticConfig::deployment`; `EmbeddingRuntime::with_deployment` ו-`select_backend_for`
-    מוסרים אותו ל-backend, ו-llama מתעלם ממנו.
-  - `validate_and_checksum_gguf()` — אימות קונטיינר וחישוב SHA-256 **במעבר אחד** על
-    הקובץ (מודל של מאות MB נקרא פעם אחת בלבד). ה-header נבדק אחרי 24 בייטים, לפני
-    שממשיכים; אחריו נפרסר כל אזור ה-descriptors, ומתוך ה-offsets המוצהרים נגזר חסם
-    תחתון על גודל הקובץ — ביט אחד לאיבר, נכון לכל טיפוס ggml. חסם תחתון בכוונה: טבלת
-    block sizes שגויה *דוחה מודל תקין*, וזה כשל גרוע יותר. `HashingReader` הוא מה
-    שמאפשר לפרסר ולחשב hash בלי לקרוא פעמיים.
-    קונטיינר ללא tensors, metadata type לא מוכר בגרסה נתמכת, alignment שאינו כפולה
-    של 8 או tensor offset לא מיושר — נדחים; אין fallback לקבלת descriptors שלא
-    הצלחנו לפרסר.
+    מוסרים אותו ל-backend, וה-stand-in מתעלם ממנו.
+  - `HashingReader` — קורא קדימה שמגבב כל מה שהוא עובר, כך שגרף של מאות MB נבדק
+    ומגובב בקריאה אחת; ה-protobuf walk של `model_package` רץ עליו.
   - `embed_batch()` — ה-primitive; `embed_one()` עוטף אותו. זו **נקודת החניקה
     הראשית**: היא מחלקת ל-batches בגודל `batch_size`, בודקת שהוחזר וקטור לכל קלט,
     ומריצה `normalize_validated` על כל אחד. ה-backends מחזירים וקטורים גלמיים ולא
@@ -335,9 +330,10 @@ otzaria-semantic-search/
     נורמל — ונכנס לאינדקס כשהציון שלו הוא הגודל שלו ולא קוסינוס.
   - `l2_normalize()` — נורמליזציית L2, מחזירה את הנורמה שהייתה לפני כן.
   - `mock` — ה-stand-in הדטרמיניסטי, זמין רק תחת `cfg(test)` או
-    `--features mock-embedding`. **אינו מודל סמנטי.** לצידו ה-fixtures: `write_stub_gguf`,
-    ו-`write_stub_onnx_package` שכותב חבילת ONNX מינימלית ותקינה (גרף מקודד ביד ו-
-    `tokenizer.json`) ומחזיר את נתיב הגרף.
+    `--features mock-embedding`. **אינו מודל סמנטי.** לצידו ה-fixtures:
+    `write_stub_onnx_package`, שכותב חבילת ONNX מינימלית ותקינה (גרף מקודד ביד ו-
+    `tokenizer.json`) ומחזיר את נתיב הגרף, ו-`onnx::stub_graph_named`, גרף תקין אחר
+    לבדיקה שצריכה מודל שני או קובץ שהוחלף.
 
 * [`src/semantic/backend.rs`](../src/semantic/backend.rs) — החוזה שכל backend מקיים.
   - `EmbeddingBackend` — trait עם `Send + Sync`, כי הקואורדינטור מחזיק את המנוע
@@ -347,21 +343,19 @@ otzaria-semantic-search/
   - `tokenize()` — קיים כי בדיקת ה-parity של P2 מחייבת שוויון `token_ids`, ואין דרך
     לאמת אותה בלי לחשוף את הטוקנייזר. ה-stand-in מחזיר `TokenizationUnsupported`
     ולא מימוש מנוון — ids "סבירים" היו הופכים את הבדיקה להשוואה בין שתי המצאות.
-  - `Pooling` — `LastToken` / `Mean` / `InGraph`, עם התאמת מחרוזות **מדויקת** (לא
-    case-insensitive ובלי trim): אותה מחרוזת נשמרת ב-manifest ומושווית תו-בתו בסשן הבא, כך
-    שקבלת `"Last-Token"` כאליאס הייתה מייצרת mismatch מדומה ובנייה מחדש של האינדקס.
-    `Mean` בר-ייצוג ובלתי-שמיש: הוא מה שמאפשר לבטא "הקונפיג חולק על ה-backend". `InGraph`
-    (`"in-graph"`) — הגרף עצמו מוציא את וקטור המשפט הגמור; זה מה ש-backend ה-ONNX משרת.
-  - `ensure_pooling_is_implemented_for()` — ה-pooling נבדק מול **פורמט המודל**, כי הוא נכתב
-    ל-manifest לפני שנשאל backend כלשהו: `"in-graph"` ליד GGUF הוא `PoolingNotForFormat`
-    שנוקב בשני חצאי הזיווג, ו-pooling שאיש אינו מבצע נשאר `PoolingNotImplemented` —
-    ב-GGUF באותו נוסח בדיוק כמו קודם.
+  - `Pooling` — `Mean` / `InGraph`, עם התאמת מחרוזות **מדויקת** (לא case-insensitive ובלי
+    trim): אותה מחרוזת נשמרת ב-manifest ומושווית תו-בתו בסשן הבא, כך שקבלת `"In-Graph"`
+    כאליאס הייתה מייצרת mismatch מדומה ובנייה מחדש של האינדקס. `Mean` בר-ייצוג ובלתי-שמיש:
+    הוא מה שמאפשר לבטא "הקונפיג חולק על ה-backend". `InGraph` (`"in-graph"`) — הגרף עצמו
+    מוציא את וקטור המשפט הגמור; זה מה ש-backend ה-ONNX משרת. `"last-token"`, ה-pooling של
+    ה-backend של GGUF, אינו מאוית עוד ונדחה כ-`UnknownPooling`.
+  - `ensure_pooling_is_implemented()` — pooling שאיש אינו מבצע נדחה כ-`PoolingNotImplemented`
+    בעודו תצורה, כי הוא נכתב ל-manifest לפני שנשאל backend כלשהו.
   - `CANDIDATES` / `select_backend()` — טבלה אחת שממנה קוראים גם הבחירה וגם בדיקת
-    ה-pooling, ולכן הוספת backend היא שורה. כל שורה מצהירה על **הפורמטים** שהיא משרתת,
-    ו-`select_backend` עובר רק על השורות של פורמט הנתיב — backend של פורמט אחד לעולם אינו
-    נשאל על מודל של האחר. ה-stand-in מופיע פעם לכל פורמט, וטוען מה שה-backend האמיתי של
-    אותו פורמט טוען (`last-token` ל-GGUF, `in-graph` ל-ONNX). אין backend לפורמט →
-    `BackendUnavailable` שנוקב ב-feature (`llama-backend` / `onnx-backend`). הטבלה **אינה** מותנית ב-feature: היא
+    ה-pooling, ולכן הוספת backend היא שורה. ה-backend האמיתי קודם ל-stand-in, וה-stand-in
+    טוען מה שה-backend האמיתי טוען (`in-graph`). אין backend → `BackendUnavailable` שנוקב
+    ב-feature (`onnx-backend`) — או, כשה-feature דלוק על target שאין לו backend, אומר זאת
+    במקום לבקש את ה-feature. הטבלה **אינה** מותנית ב-feature: היא
     מתארת אילו מימושים קיימים ב-crate, אחרת "אין backend" היה מדווח כ"קונפיגורציה
     שגויה". מחזירה `Option<Result<..>>` — `None` = לא מקומפל (המשך לחפש),
     `Some(Err)` = מקומפל ונכשל (עצור ודווח). עם `Option` בלבד, backend אמיתי שנכשל
@@ -376,32 +370,6 @@ otzaria-semantic-search/
   מעבירה (`EmbeddingDeployment::onnx_runtime`), אחריו `OTZARIA_ONNX_RUNTIME`, ואחריו הקובץ
   לצד הגרף — המקום הראשון שהוגדר מכריע, ונתיב שאינו נפתח נדחה ואינו מדולג
   (`resolve_runtime_path`).
-
-* [`src/semantic/llama_backend.rs`](../src/semantic/llama_backend.rs) — inference אמיתי,
-  מאחורי `--features llama-backend` (ראו [`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md)).
-  - `ContextPool` — thread עובד לכל context, שיוצר את ה-context שלו מ-`Arc<LlamaModel>`
-    על ה-stack שלו. `LlamaContext<'a>` שואל את המודל, ולכן אחסון שלהם יחד היה
-    self-referential; כך ה-borrow לא יוצא ממסגרת ה-stack וה-context ש-`!Sync` לא חוצה
-    thread. ה-mutex שומר רק `Vec<usize>` של עובדים פנויים ומוחזק ל-`pop`/`push`,
-    **לא** על פני decode. mutex בודד סביב context אחד היה מסרייל את כל ה-inference.
-  - `tokenizer::RawVocab` — ה-`unsafe` היחיד ב-crate. `llama-cpp-2` מקדד בקשיחות
-    `parse_special = true`, וחוזה הזהב מחייב `false` (מדוד: `<|endoftext|>` בתוך ספר
-    שינה טקסט מ-162 ל-158 טוקנים). הפריסה היא **פרט מימוש בלתי מתועד** שהפין המדויק
-    לגרסה מקפיא — upstream מכחיש יציבות פריסה במפורש לטיפוסים אחיים.
-  - `truncate_with_eos()` — `max_tokens` הוא הסך **כולל** EOS. ה-EOS נדחף *אחרי*
-    החיתוך, ולכן שום אורך לא יכול להדיח אותו; בלעדיו pooling של הטוקן האחרון היה
-    קורא טוקן תוכן והוקטור היה חסר משמעות. חולץ לפונקציה חופשית כדי שיהיה ניתן
-    לבדיקה בלי המודל בן 396MB — הכרחי, כי הסבילות הווקטורית **אינה** רואה באגי
-    טרנקציה (off-by-one מקבל cosine 0.99838).
-  - `micro_batch_for()` — `n_ubatch = 256` ולא `n_ctx`, מה שחוסך ~162 MiB reserve
-    לכל context (טנזור logits ש-backend של embeddings לא קורא). מגודר בקאוזליות
-    מוכחת: `GGML_ASSERT((causal_attn || n_ubatch >= n_tokens_all))` — במודל לא-קאוזלי
-    התהליך קורס, ולא בטעינה אלא ב-batch האמיתי הראשון. 256 היא ההפחתה הגדולה ביותר
-    שמשאירה את כל 65 הוקטורים זהים סיבית.
-  - `release_contexts_at_exit()` — נרשם ב-`atexit` מתוך `spawn`, אחרי שה-context
-    הראשון קיים. `static` אינו נהרס לעולם, ולכן host שמחזיק את המנוע ב-global היה
-    מקבל `GGML_ASSERT` ב-destructor סטטי של ggml **אחרי** עבודה מוצלחת — crash
-    reporter מדווח על זה כקריסה. atexit רץ בסדר הפוך לרישום, ולכן ההקדמה מובטחת.
 
 * [`src/semantic/store.rs`](../src/semantic/store.rs) — **ה-store שברירת המחדל של
   המנוע פותחת** (אב-טיפוס ובדיקות; מסלול הריצה פותח ארטיפקט).
@@ -811,10 +779,10 @@ otzaria-semantic-search/
   - תהליך CI מלא ב-GitHub Actions הרץ על Ubuntu, Windows ו-macOS, **בשתי
     קונפיגורציות features**, כולל `cargo fmt --check`, clippy עם `-D warnings`,
     ואימות קישורי תיעוד (`cargo doc`).
-  - job נפרד ל-`llama-backend` (Linux + macOS), ו-job **Golden Vectors** שמריץ את
-    שער ה-parity מול המודל האמיתי. השער דורש את הסוד `OTZARIA_HF_TOKEN`, וכשהוא
-    חסר הוא נכשל במפורש ולא מדווח דילוג כהצלחה. ראו
-    [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §5.
+  - job נפרד ל-`onnx-backend` (Linux, macOS ו-Windows) מול ONNX Runtime 1.28.0, ו-job
+    **Golden Vectors** שמריץ את שער ה-parity לשני הגרפים של המודל האמיתי ובונה ומאמת
+    ארטיפקט אמיתי אחד מגרף ה-int8. השער דורש את הסוד `OTZARIA_HF_TOKEN`, וכשהוא חסר הוא
+    נכשל במפורש ולא מדווח דילוג כהצלחה. ראו [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §5.
 
 ## מדידות
 
@@ -854,21 +822,23 @@ cargo test --lib --tests --features mock-embedding                  # החביל
 ## בניית ארטיפקט (S4b)
 
 ```bash
-cargo run --release --features llama-backend -- build \
+OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
+cargo run --release --features onnx-backend -- build \
   --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
-  --model model.json --model-file model.gguf --chunking chunking.json \
+  --model config/models/meivin-round2-onnx/model.json \
+  --model-file /abs/path/seforim-embed-round2-int8.onnx \
+  --chunking config/models/meivin-round2-onnx/chunking.json \
   --out ./artifact
 ```
 
 * `chunking.json` — `ChunkerConfig`, כלומר המתכון עצמו ולא תיאור שלו:
   `{"min_meaningful_chars": 20, "context_window_lines": 2, "max_chunk_chars": 512,
-  "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 1,
-  "normalization_version": 1}` — כל השדות חובה. הוא חייב לגבב ל-`chunking_identity`
+  "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 2,
+  "normalization_version": 1}` (של זהות הייצור) — כל השדות חובה. הוא חייב לגבב ל-`chunking_identity`
   שהמודל מצהיר, אחרת הבנייה נדחית — ארטיפקט רושם את ה-hash, ו-hash אינו הפיך למתכון.
-* `--model-file` הוא המודל שממנו נוצרים הווקטורים בפועל: קובץ GGUF, או גרף ONNX עם החבילה
-  שלידו. ה-checksum שלו חייב להיות זה שב-`model.json`, וכך גם ה-backend, הרוחב, ה-pooling
+* `--model-file` הוא המודל שממנו נוצרים הווקטורים בפועל: גרף ONNX, והחבילה שלידו. ה-checksum שלו חייב להיות זה שב-`model.json`, וכך גם ה-backend, הרוחב, ה-pooling
   ותקרת ה-tokens האפקטיבית. `model-checksum --model-file <path>` מדפיס את ה-checksum
-  שצריך להצהיר — וב-ONNX גם כל קובץ בחבילה ואת ה-manifest המדויק — בבנייה רגילה.
+  שצריך להצהיר, את כל קובצי החבילה ואת ה-manifest המדויק — בבנייה רגילה.
 * מי מקבל וקטור **נגזר**: ה-`Chunker` מוחל על הקורפוס לפני כל inference. שורה קצרה מדי
   מכדי לשאת משמעות מדולגת, וארטיפקט שדילג עליה שלם ולא חסר.
 * דורש backend inference, כי בנייה היא inference. `pack` ו-`validate` אינם.

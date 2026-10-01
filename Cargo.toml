@@ -22,39 +22,17 @@ default = []
 # build fails with `BackendUnavailable` instead of serving fake vectors.
 mock-embedding = []
 
-# Real GGUF inference. Non-default because it compiles llama.cpp and ggml through
-# cmake in every downstream build.
-#
-# Its crates are declared under `cfg(not(target_arch = "arm"))`: a 0.6B model at
-# Q4 is unusable on 32-bit ARM, and `llama-cpp-sys-2`'s build script panics there
-# anyway — it `.expect()`s `CARGO_CFG_TARGET_FEATURE`, which cargo omits for
-# `armv7-linux-androideabi` (zero target features). The feature can therefore be
-# on with no backend behind it; `semantic::backend` gates on the same condition.
-llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
-
-# Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer. Non-default,
-# like `llama-backend`: real inference is opt-in, and a default build must be unable to
-# produce embeddings at all (`tests/production_backend_gate.rs`). Which backend serves a
-# model is decided by the model file's format — `.onnx` is ONNX, every other path GGUF —
-# not by which features are on; see `semantic::backend`.
+# Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer — the only
+# inference this crate has. Non-default: real inference is opt-in, and a default build
+# must be unable to produce embeddings at all (`tests/production_backend_gate.rs`). A
+# model is an ONNX graph, `*.onnx`; any other model path is refused as an invalid model
+# before a backend is asked (`semantic::model_package::ensure_onnx_model_path`).
 #
 # Nothing is linked: ONNX Runtime is a shared library loaded when the first ONNX model
 # is (see the `ort` declaration below), so this feature adds no build-time download and
 # no native code to the binary. Its crates are declared for desktop targets only; on
-# every other target the feature is on with no backend behind it, as `llama-backend`
-# is on 32-bit ARM.
+# every other target the feature is on with no backend behind it.
 onnx-backend = ["dep:ort", "dep:tokenizers", "dep:libloading"]
-
-# CUDA offload, for the build machine that produces the library's vectors — never
-# for the application, which ships no CUDA runtime.
-#
-# It does not change what the artifact declares: `LlamaCppBackend::ID` names the
-# implementation and the wiring, deliberately not the ggml backend, exactly as
-# `n_gpu_layers` on Metal does not change it today. What it does change is the
-# arithmetic, at the same order as the CPU-vs-Metal divergence
-# `docs/P2_REFERENCE_VECTORS.md` §5 already measures, so a build that uses it owes
-# the same parity evidence against the goldens.
-cuda = ["llama-backend", "llama-cpp-2/cuda"]
 
 [[bench]]
 name = "vector_search"
@@ -69,64 +47,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
 sha2 = "0.10"
-
-# Optional, behind `llama-backend`. See `src/semantic/llama_backend.rs` and
-# `docs/P2_INFERENCE_SPIKE.md`.
-#
-# Pinned exactly, for three reasons — read them before bumping:
-#
-# 1. It vendors a specific llama.cpp commit, and the stored vectors depend on it
-#    (agreement between two builds is cosine 0.9948, not 1.0). The manifest records
-#    the backend as index identity, so the version cannot move implicitly.
-# 2. `llama_backend::tokenizer` derives the model pointer from `LlamaModel`'s
-#    `repr(transparent)` layout, which upstream documents nowhere and explicitly
-#    disclaims for sibling types. The pin is what makes that cast sound; the
-#    runtime cross-checks only detect a break after the fact. Read
-#    `llama_backend::tokenizer::RawVocab` first.
-# 3. `llama_backend::micro_batch_for` lowers `n_ubatch` below `n_ctx`, which is
-#    legal only for a causal model — llama.cpp aborts otherwise. Its list of
-#    non-causal architectures is correct for this commit only; re-check with
-#    `grep -rn 'causal_attn = false' llama.cpp/src/models/`.
-#
-# `default-features = false` because upstream defaults to
-# `["openmp", "android-shared-stdcxx", "common"]` and this crate builds on five
-# toolchains through Cargokit:
-#
-# * `android-shared-stdcxx` kept — sets `ANDROID_STL=c++_shared`, inert elsewhere.
-#   A process holding both a static and a shared libc++ crashes obscurely.
-# * `openmp` omitted — ggml has its own thread pool, and Apple clang ships no
-#   `libomp`.
-# * `common` omitted — it only gates grammar samplers, `json_schema_to_grammar`,
-#   speculative decoding and memory reporting. Re-check if a stage wants generation.
-#
-# No GPU feature is requested, but on Apple Silicon `llama-cpp-2` attaches
-# `metal` to its sys crate unconditionally, and Metal is then compiled *and used*:
-# a 270.61 MiB MTL0 compute buffer per context and `graph splits = 2`.
-# `n_gpu_layers = 0` keeps the weights on the CPU, not the backend out of the graph.
-# Consequence: CPU-versus-Metal agreement is cosine 0.99491, so this platform and a
-# CPU-only Android build may not produce identical vectors.
-#
-# Vendored: upstream's own `llama-cpp-sys-2` declaration omits
-# `default-features = false`, so sys's `default = ["common"]` came back on
-# regardless of what is set here, and the unlinkable `cpp-httplib` dependency
-# it drags in breaks the Apple app link. See vendor/llama-cpp-2/README-VENDORED.md.
-[target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-2]
-path = "vendor/llama-cpp-2"
-version = "=0.1.153"
-default-features = false
-features = ["android-shared-stdcxx"]
-optional = true
-
-# Reached directly for the one call `llama-cpp-2` does not expose: `llama_tokenize`
-# with `parse_special = false`. It hardcodes `true`, which promotes a literal
-# `<|endoftext|>` inside a book to a control token (measured: 162 tokens -> 158).
-#
-# Version-locked to `llama-cpp-2` so cargo unifies both on one build of llama.cpp;
-# a mismatch would compile ggml twice and hand the tokenizer a foreign vocabulary.
-[target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-sys-2]
-version = "=0.1.153"
-default-features = false
-optional = true
 
 # Optional, behind `onnx-backend`. See `src/semantic/onnx_backend.rs` and
 # `docs/ONNX_BACKEND.md`.
@@ -166,8 +86,8 @@ optional = true
 # aarch64 and x86_64 — the platforms Microsoft publishes that runtime for. iOS and
 # Android have no runtime to load in v1: an iOS app cannot load code it did not ship
 # signed, and shipping a runtime on either is future work. Elsewhere the feature is on
-# with no backend behind it and an ONNX model gets `BackendUnavailable`, as a GGUF
-# model does on 32-bit ARM. `semantic/mod.rs`, `semantic::backend` and
+# with no backend behind it and an ONNX model gets `BackendUnavailable`.
+# `semantic/mod.rs`, `semantic::backend` and
 # `tests/onnx_backend.rs` carry the same condition, and a test in the last holds all
 # the spellings together.
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.ort]

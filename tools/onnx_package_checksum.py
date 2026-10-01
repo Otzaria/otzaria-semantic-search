@@ -257,8 +257,8 @@ def sniff_non_onnx(prefix: bytes, file_len: int) -> Optional[str]:
         )
     if prefix.startswith(b"GGUF"):
         return (
-            "it is a GGUF container, not an ONNX graph. Only a path ending in .onnx is read "
-            "as ONNX; give a GGUF model its own .gguf name"
+            "it is a GGUF container, not an ONNX graph, and this build no longer reads GGUF "
+            "models; point model_path at the model's ONNX graph"
         )
     if prefix.startswith(b"PK\x03\x04"):
         return "it is a ZIP archive; extract the model from it first"
@@ -1087,8 +1087,8 @@ def validate_onnx_package(graph) -> OnnxPackage:
 
     if not graph.name.lower().endswith(".onnx") or graph.name.lower() == ".onnx":
         raise refuse(
-            "its name does not end in .onnx, and the crate reads every other path as a GGUF "
-            "model; name the graph <something>.onnx"
+            "its name does not end in .onnx, and an ONNX graph is the only model the crate "
+            "reads (GGUF support was removed); name the graph <something>.onnx"
         )
     try:
         is_file = graph.is_file()

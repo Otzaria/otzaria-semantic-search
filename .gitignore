@@ -19,7 +19,11 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
+
+# GGUF support was removed (the last commit with it is 62f0c44), but a GGUF model from before
+# may still sit in a checkout, 396 MB of it, and must never be committed.
+*.gguf
+
 # The ONNX model's graphs (config/models/meivin-round2-onnx/), wherever they are put,
 # and the directory CI's golden-onnx job downloads the package into.
 seforim-embed-round2-fp32.onnx
@@ -27,8 +31,8 @@ seforim-embed-round2-int8.onnx
 /onnx-model/
 semantic_db/
 
-# Byte-code left behind by the golden-vector tooling in tools/. Running
-# `generate_golden_vectors.py` writes `tools/__pycache__/*.pyc`, which is
+# Byte-code left behind by the Python tooling in tools/. Running the golden-vector
+# generator or the tools' tests writes `tools/__pycache__/*.pyc`, which is
 # otherwise committable — it has already been staged accidentally once.
 __pycache__/
 *.pyc

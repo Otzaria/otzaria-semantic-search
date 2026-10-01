@@ -3,7 +3,6 @@
 //! Design: errors are categorized by subsystem so callers can decide
 //! whether to propagate, log, or gracefully degrade.
 
-use crate::semantic::model_package::ModelFormat;
 use crate::semantic::versioning::{describe_identity_mismatches, IdentityField, IdentityMismatch};
 use thiserror::Error;
 
@@ -113,24 +112,17 @@ pub enum EmbeddingError {
     #[error("Model loading failed: {reason}")]
     LoadFailed { reason: String },
 
-    /// The file exists but is not a usable model of the format its path names: a GGUF
-    /// container, or an ONNX package — for which `path` is always the graph, and the
-    /// reason names whichever file of the package was at fault. Guards against a
-    /// truncated download or a placeholder file being accepted as a model.
-    ///
-    /// The format in the message is derived from `path` by the rule that chose the
-    /// validator ([`ModelFormat::of`]), so a GGUF refusal reads exactly as it always has
-    /// and no variant or field had to be added for ONNX.
-    #[error(
-        "Not a valid {} model file ({path}): {reason}",
-        ModelFormat::of(std::path::Path::new(path))
-    )]
+    /// Not a usable ONNX model: a path that names no ONNX graph at all — one that does
+    /// not end in `.onnx`, such as a GGUF file, whose support was removed — whether or not
+    /// a file is there, or an ONNX package that is not whole, for which `path` is always
+    /// the graph and the reason names whichever file of the package was at fault. Guards
+    /// against a truncated download or a placeholder file being accepted as a model.
+    #[error("Not a valid ONNX model file ({path}): {reason}")]
     InvalidModelFile { path: String, reason: String },
 
-    /// No inference backend for the model's format is compiled in. A default build has
-    /// none by choice, so a production binary can never fall back to the hash-based
-    /// stand-in embedder; real inference is opt-in through `--features llama-backend`,
-    /// which compiles llama.cpp and ggml through cmake, and `--features onnx-backend`.
+    /// No inference backend is compiled in. A default build has none by choice, so a
+    /// production binary can never fall back to the hash-based stand-in embedder; real
+    /// inference is opt-in through `--features onnx-backend`.
     #[error("No embedding backend is available in this build: {reason}")]
     BackendUnavailable { reason: String },
 
@@ -175,25 +167,6 @@ pub enum EmbeddingError {
     PoolingNotImplemented {
         pooling: String,
         implemented: String,
-    },
-
-    /// A pooling some backend performs, but none that serves this model's format.
-    ///
-    /// Distinct from [`Self::PoolingNotImplemented`] because the fix is: `in-graph` is
-    /// exactly right for an ONNX graph that pools inside itself and meaningless for a
-    /// GGUF, so the value is not wrong — the pairing is, and either half may be the one
-    /// to change. Refused while it is still a configuration, for the reason that variant
-    /// is: a manifest written with it would outlive the mistake.
-    #[error(
-        "Pooling '{pooling}' is not available for {format} models (for {format}: \
-         {implemented}); it is implemented for {implemented_elsewhere}. Configure the \
-         pooling this model's format uses, or a model of the format that uses this one"
-    )]
-    PoolingNotForFormat {
-        pooling: String,
-        format: String,
-        implemented: String,
-        implemented_elsewhere: String,
     },
 
     /// The loaded backend pools differently from the configuration it was loaded

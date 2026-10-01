@@ -7,10 +7,10 @@
 //! - The recipe versions an artifact declares, as closed sets this build either
 //!   implements or refuses
 //! - Embedding backend contract (what an inference implementation must provide)
-//! - Embedding runtime (model validation, batching, normalization)
-//! - Real GGUF inference through llama.cpp (behind the `llama-backend` feature)
-//! - Real ONNX inference through ONNX Runtime (behind the `onnx-backend` feature)
-//! - What a model path names on disk: its format, and an ONNX model's package
+//! - Embedding runtime (the configuration's checks, batching, normalization)
+//! - Real ONNX inference through ONNX Runtime (behind the `onnx-backend` feature) — the
+//!   only inference this crate has
+//! - What a model path names on disk: an ONNX graph, and the package around it
 //! - Vector store backend contract, split into a read side the runtime gets and a
 //!   write side only a builder gets, plus an in-memory and a snapshot-persisting
 //!   implementation. Neither is an ANN index, and neither is the `zvec` library.
@@ -23,30 +23,21 @@ pub mod chunker;
 pub mod embedding;
 pub mod embedding_cache;
 pub mod engine;
-// Real GGUF inference (delivered in PR #2). Compiled only with
-// `--features llama-backend`, which is what keeps a default build from pulling
-// llama.cpp and ggml through cmake on every `cargo build`. Which backend a build
-// actually gets is decided in `backend`, not here.
-//
-// The `target_arch` half mirrors the dependency declarations in `Cargo.toml`.
-//
-// A plain comment rather than a doc comment on purpose: an outer `///` here would
-// be concatenated with the module's own `//!` header, and rustdoc then resolves
-// that whole text's intra-doc links in *this* module's scope instead of the
-// module's own — turning every correct link in `llama_backend` into an unresolved
-// one under `RUSTDOCFLAGS="-D warnings"`.
-#[cfg(all(feature = "llama-backend", not(target_arch = "arm")))]
-pub mod llama_backend;
 pub mod manifest;
 pub mod model_package;
 pub mod official_index;
 // Real ONNX inference through ONNX Runtime. Compiled only with
-// `--features onnx-backend`; which backend a model gets is decided in `backend`, by
-// the model's format.
+// `--features onnx-backend`; which backend a build actually gets is decided in
+// `backend`, not here.
 //
 // `backend::onnx_backend` is gated on the same condition, so a target restriction
-// added here must be added there too. A plain comment for the reason given above
-// `llama_backend`.
+// added here must be added there too.
+//
+// A plain comment rather than a doc comment on purpose: an outer `///` here would
+// be concatenated with the module's own `//!` header, and rustdoc then resolves
+// that whole text's intra-doc links in *this* module's scope instead of the
+// module's own — turning every correct link in `onnx_backend` into an unresolved
+// one under `RUSTDOCFLAGS="-D warnings"`.
 //
 // The target half is the desktop set a loadable ONNX Runtime exists for, and mirrors
 // the dependency declarations in `Cargo.toml`; `tests/onnx_backend.rs` fails if the
