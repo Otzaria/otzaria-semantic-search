@@ -74,6 +74,15 @@ pub enum SemanticSearchError {
         requirement: &'static str,
     },
 
+    /// The application's resolver could not tie the vectors a scan returned to live lines
+    /// — its index could not be read, say. The semantic side of that one search fails, and
+    /// the search degrades to its lexical results as it does for any other semantic failure.
+    ///
+    /// Distinct from a hit that resolves nowhere, which is not an error: a vector whose
+    /// text no live line holds any more is skipped, and counted.
+    #[error("The semantic results could not be resolved to live lines: {reason}")]
+    Resolution { reason: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -327,7 +336,7 @@ pub enum ArtifactError {
         declared: u32,
     },
 
-    /// The artifact describes a different corpus, model or store format than this
+    /// The artifact describes a different line recipe, model or store format than this
     /// installation. Lists every disagreement, not the first.
     #[error(
         "Artifact does not match this installation: {}",
@@ -383,6 +392,27 @@ pub enum ArtifactError {
     /// non-directory, or a path inside the package itself.
     #[error("Invalid install target: {reason}")]
     InvalidInstallTarget { reason: String },
+
+    /// A delta that is not the next step for the vector set it was offered to.
+    ///
+    /// `field` names what disagreed: `delta.from_library_version` for a delta that starts
+    /// past the set's library version, or overlaps it — a gap, which applying would paper
+    /// over with vectors the set never had — and `delta.codec_params` for one quantized in
+    /// another codec epoch, whose bytes mean something else. A delta the set has already
+    /// absorbed is not this error; it is reported as already applied.
+    #[error("The delta does not apply to this vector set: {field} — {reason}")]
+    DeltaDoesNotApply { field: &'static str, reason: String },
+
+    /// The device lacks the free space an install or a compaction needs.
+    ///
+    /// `available` is what the filesystem reported, or — where it could not be asked — what
+    /// the operation managed to write before the device filled up. Nothing was installed or
+    /// replaced, and the partial output was removed.
+    #[error(
+        "Not enough free space: the operation needs {needed} byte(s) and {available} are \
+         available"
+    )]
+    InsufficientSpace { needed: u64, available: u64 },
 
     /// A crash interrupted an install and the leftovers could not be resolved.
     ///

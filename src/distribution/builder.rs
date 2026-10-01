@@ -34,7 +34,7 @@
 //! the **text**; L2 normalization of the finished vector is an unconditional invariant of
 //! cosine and is deliberately not versioned. See [`recipe`](crate::semantic::recipe).
 //!
-//! What is left declared and unverifiable: `model_id` and `model_quantization`. Nothing in
+//! What is left declared and unverifiable: `family_id` and each package's quantization. Nothing in
 //! an ONNX package states either in a form anything here could check, and inventing a
 //! check that reads them from the same place that wrote them would prove nothing.
 //!
@@ -71,6 +71,7 @@
 //! says what the plan assumed. The packer then reads each line a third time to join the
 //! finished vector back. All three are build-machine costs, and none is on a device.
 
+use crate::distribution::corpus::CorpusIdentity;
 use crate::distribution::corpus::{CorpusBooks, CorpusIndex, CorpusLine};
 use crate::distribution::packer::{
     compose_identity, ensure_output_is_free, pack, PackReport, PackRequest, VectorInput,
@@ -81,7 +82,7 @@ use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::recipe::EmbeddingRecipe;
 use crate::semantic::types::{BookForIndexing, BookLine, SemanticChunk};
-use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use crate::semantic::versioning::{EmbeddingWorker, ModelIdentity, VectorProvenance};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -301,7 +302,7 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackRepo
     // normalization is applied there, where the digest of the embedded string is computed.
     EmbeddingRecipe::resolve(&request.chunking, &request.model)?;
     ensure_recipe_matches(&request.chunking, &request.model)?;
-    let runtime = load_model(&request)?;
+    let (runtime, provenance) = load_model(&request)?;
 
     let planned = PlannedCorpus::new(corpus, &request.chunking, &request.model)?;
     log::info!(
@@ -316,6 +317,7 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackRepo
         PackRequest {
             output_path: request.output_path,
             model: request.model,
+            provenance,
             created_at: request.created_at,
             collection_name: request.collection_name,
         },
@@ -324,17 +326,18 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackRepo
     )
 }
 
-/// Open the model and prove it is the one the artifact will name.
+/// Open the model and prove it is a package of the family the artifact will name.
 ///
 /// The runtime refuses a width or a pooling that disagrees with the loaded backend before
-/// this returns, so two of the five comparisons below can only fail through it. They are
-/// listed anyway: this table is the statement of what the loaded runtime can be held to,
-/// and leaving a field out of it because something else happens to cover it today is how
-/// such a check quietly stops covering it.
+/// this returns, so two of the comparisons below can only fail through it. They are listed
+/// anyway: this table is the statement of what the loaded runtime can be held to, and
+/// leaving a field out of it because something else happens to cover it today is how such
+/// a check quietly stops covering it.
 ///
-/// Not all five are facts about the *file* — see the module header. The checksum is; the
-/// backend id is which implementation was selected for it.
-fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
+/// The package itself has to be one of the family's: its checksum among
+/// `query_packages`, which is also where the precision it is recorded under comes from.
+/// What it is, and the backend that ran it, become the artifact's provenance.
+fn load_model(request: &BuildRequest) -> Result<(EmbeddingRuntime, VectorProvenance), PackError> {
     let declared = &request.model;
     let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
         model_path: request.model_path.clone(),
@@ -347,14 +350,9 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
 
     for (field, declared, loaded) in [
         (
-            "model_checksum",
-            declared.model_checksum.clone(),
-            runtime.model_checksum().unwrap_or_default().to_string(),
-        ),
-        (
-            "embedding_backend",
-            declared.embedding_backend.clone(),
-            runtime.backend_id().unwrap_or_default().to_string(),
+            "tokenizer_checksum",
+            declared.tokenizer_checksum.clone(),
+            runtime.tokenizer_checksum().unwrap_or_default().to_string(),
         ),
         (
             "embedding_dim",
@@ -384,13 +382,37 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
         }
     }
 
+    let checksum = runtime.model_checksum().unwrap_or_default();
+    let package = declared
+        .query_packages
+        .iter()
+        .find(|package| package.checksum == checksum)
+        .ok_or_else(|| PackError::ModelDisagreesWithFile {
+            field: "query_packages",
+            declared: declared
+                .query_packages
+                .iter()
+                .map(|package| format!("{} {}", package.quantization, package.checksum))
+                .collect::<Vec<_>>()
+                .join(", "),
+            loaded: checksum.to_string(),
+        })?
+        .clone();
+
     if !runtime.backend_is_semantic() && !request.allow_non_semantic_backend {
         return Err(PackError::NonSemanticBackend {
             backend: runtime.backend_id().unwrap_or("none").to_string(),
         });
     }
 
-    Ok(runtime)
+    let provenance = VectorProvenance {
+        passage_package: package,
+        worker: EmbeddingWorker {
+            backend: runtime.backend_id().unwrap_or("none").to_string(),
+            device: "cpu".to_string(),
+        },
+    };
+    Ok((runtime, provenance))
 }
 
 /// The recipe applied to one book: the corpus's lines in corpus order, chunked.
@@ -626,6 +648,7 @@ mod tests {
     use crate::semantic::embedding::mock;
     use crate::semantic::model_package::validate_model;
     use crate::semantic::versioning::IndexVersion;
+    use crate::semantic::versioning::ModelPackage;
     use crate::semantic::zevc_store::ReadOnlyZevcStore;
     use std::collections::HashMap;
     use std::path::Path;
@@ -671,9 +694,9 @@ mod tests {
 
     fn corpus_identity() -> CorpusIdentity {
         CorpusIdentity {
-            corpus_id: "5c".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
+            text: crate::semantic::versioning::TextIdentity::with_line_text_version(1),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         }
     }
@@ -739,10 +762,12 @@ mod tests {
 
     fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
         ModelIdentity {
-            model_id: "otzaria-embedding-v1".to_string(),
-            model_checksum: checksum.to_string(),
-            model_quantization: "int8".to_string(),
-            embedding_backend: "mock-hash-v1".to_string(),
+            family_id: "otzaria-embedding-v1".to_string(),
+            tokenizer_checksum: crate::semantic::embedding::mock::stub_tokenizer_checksum(),
+            query_packages: vec![ModelPackage {
+                checksum: checksum.to_string(),
+                quantization: "int8".to_string(),
+            }],
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
@@ -785,7 +810,7 @@ mod tests {
         model: &ModelIdentity,
     ) -> HashMap<u64, crate::semantic::types::VectorMetadata> {
         let identity = IndexVersion {
-            corpus: corpus_identity(),
+            text: corpus_identity().text,
             model: model.clone(),
             store: crate::semantic::official_index::readable_store_identity(),
         };
@@ -1036,16 +1061,19 @@ mod tests {
 
         for (field, wrong) in [
             (
-                "model_checksum",
+                "query_packages",
                 ModelIdentity {
-                    model_checksum: "cd".repeat(32),
+                    query_packages: vec![ModelPackage {
+                        checksum: "cd".repeat(32),
+                        quantization: "int8".to_string(),
+                    }],
                     ..truthful.clone()
                 },
             ),
             (
-                "embedding_backend",
+                "tokenizer_checksum",
                 ModelIdentity {
-                    embedding_backend: "onnxruntime-sentence-v1".to_string(),
+                    tokenizer_checksum: "cd".repeat(32),
                     ..truthful.clone()
                 },
             ),
@@ -1081,7 +1109,7 @@ mod tests {
         let mut incomplete = build_request(
             &dir,
             ModelIdentity {
-                model_id: String::new(),
+                family_id: String::new(),
                 ..truthful.clone()
             },
             chunking.clone(),

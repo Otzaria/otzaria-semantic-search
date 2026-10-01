@@ -59,7 +59,9 @@ use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, Embedding
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::store_backend::VectorSearchBackend;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, SemanticStatus};
-use crate::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity, StoreIdentity};
+use crate::semantic::versioning::{
+    IndexVersion, ModelIdentity, ModelPackage, StoreIdentity, TextIdentity,
+};
 use crate::semantic::zevc_store::{self, ReadOnlyZevcStore, SNAPSHOT_FILENAMES};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -88,14 +90,18 @@ pub fn readable_store_identity() -> StoreIdentity {
 /// `chunking_identity`). The read path derives none of the second group: a query is not
 /// chunked, so nothing here could infer them. They are compared anyway, because an
 /// artifact built from differently-chunked or differently-normalized text is a different
-/// artifact — the results would be plausible and subtly wrong, and the granularity a
-/// `line_id` refers to would no longer be the one the caller hydrates.
+/// artifact — the results would be plausible and subtly wrong.
+///
+/// The package's checksum and its tokenizer's are not declared at all: the loaded runtime
+/// computes both, and the package must be one the artifact accepts for queries.
 #[derive(Debug, Clone)]
 pub struct LocalModel {
     pub model_path: PathBuf,
-    pub model_id: String,
-    /// Quantization of the weights, e.g. `"int8"`. Redundant against the checksum by
-    /// design: it is what makes a rejection readable.
+    /// The family the package at `model_path` belongs to — see
+    /// [`ModelIdentity::family_id`].
+    pub family_id: String,
+    /// Quantization of the package at `model_path`, e.g. `"int8"`. Redundant against its
+    /// checksum by design: it is what makes a rejection readable.
     pub model_quantization: String,
     pub embedding_dim: u32,
     pub pooling: String,
@@ -106,8 +112,24 @@ pub struct LocalModel {
 }
 
 impl LocalModel {
+    /// The package at `model_path`, of precision `quantization`, as a member of `family` —
+    /// the family a deployment declares (`config/models/meivin-round2-onnx/model.json`).
+    pub fn of_family(model_path: PathBuf, family: &ModelIdentity, quantization: &str) -> Self {
+        Self {
+            model_path,
+            family_id: family.family_id.clone(),
+            model_quantization: quantization.to_string(),
+            embedding_dim: family.embedding_dim,
+            pooling: family.pooling.clone(),
+            max_tokens: family.max_tokens,
+            embedding_text_version: family.embedding_text_version,
+            normalization_version: family.normalization_version,
+            chunking_identity: family.chunking_identity,
+        }
+    }
+
     /// Compose the model half of the identity from what was declared here and what the
-    /// loaded runtime knows.
+    /// loaded runtime knows: the one package it loaded, and that package's tokenizer.
     fn identity(&self, runtime: &EmbeddingRuntime) -> Result<ModelIdentity, SemanticSearchError> {
         let unknown = |what: &str| {
             SemanticSearchError::Config(format!(
@@ -118,15 +140,10 @@ impl LocalModel {
         };
 
         Ok(ModelIdentity {
-            model_id: self.model_id.clone(),
-            model_checksum: runtime
-                .model_checksum()
-                .ok_or_else(|| unknown("model checksum"))?
-                .to_string(),
-            model_quantization: self.model_quantization.clone(),
-            embedding_backend: runtime
-                .backend_id()
-                .ok_or_else(|| unknown("backend id"))?
+            family_id: self.family_id.clone(),
+            tokenizer_checksum: runtime
+                .tokenizer_checksum()
+                .ok_or_else(|| unknown("tokenizer checksum"))?
                 .to_string(),
             embedding_dim: self.embedding_dim,
             pooling: self.pooling.clone(),
@@ -134,6 +151,13 @@ impl LocalModel {
             embedding_text_version: self.embedding_text_version,
             normalization_version: self.normalization_version,
             chunking_identity: self.chunking_identity,
+            query_packages: vec![ModelPackage {
+                checksum: runtime
+                    .model_checksum()
+                    .ok_or_else(|| unknown("model checksum"))?
+                    .to_string(),
+                quantization: self.model_quantization.clone(),
+            }],
         })
     }
 
@@ -154,9 +178,10 @@ pub struct OfficialIndexConfig {
     /// Directory the artifact was installed into — the target
     /// [`IndexImporter`](crate::distribution::importer::IndexImporter) swaps into place.
     pub artifact_path: PathBuf,
-    /// Identity of the corpus this installation actually has open. Never this crate's
-    /// constant; see the module documentation.
-    pub corpus: CorpusIdentity,
+    /// The line recipe of the index this installation actually has open, and the key
+    /// version it computes keys with. Never this crate's constant; see the module
+    /// documentation.
+    pub text: TextIdentity,
     pub model: LocalModel,
     /// Where this machine keeps what the model runs on: the ONNX Runtime library the
     /// application ships, for an ONNX model. Not part of what the artifact has to agree
@@ -208,7 +233,7 @@ impl OfficialSemanticIndex {
     pub fn open(config: OfficialIndexConfig) -> Result<Self, SemanticSearchError> {
         let OfficialIndexConfig {
             artifact_path,
-            corpus,
+            text,
             model,
             deployment,
             published_digest,
@@ -250,7 +275,7 @@ impl OfficialSemanticIndex {
         runtime.load()?;
 
         let identity = IndexVersion {
-            corpus,
+            text,
             model: model.identity(&runtime)?,
             store: readable_store_identity(),
         };
@@ -354,7 +379,7 @@ impl OfficialSemanticIndex {
             model_loaded: self.runtime.is_loaded(),
             indexed_book_count: self.book_count(),
             vector_count,
-            model_id: self.identity().model.model_id.clone(),
+            model_id: self.identity().model.family_id.clone(),
             embedding_dim: self.store.embedding_dim(),
             embedding_backend: self.runtime.backend_id().map(str::to_string),
             vector_backend: self.store.backend_id().to_string(),
@@ -461,19 +486,19 @@ pub(crate) fn verify_counts_against_payload(
 ) -> Result<u32, ArtifactError> {
     let disagrees = |reason: String| ArtifactError::ManifestDisagreesWithPayload { reason };
 
-    let vectors = store.count();
-    if vectors != verified.vector_count() {
+    let vectors = u64::from(store.count());
+    if vectors != verified.counts().slots {
         return Err(disagrees(format!(
             "the manifest declares {} vector(s) and the payload holds {vectors}",
-            verified.vector_count()
+            verified.counts().slots
         )));
     }
 
     let books = store.book_keys().len().min(u32::MAX as usize) as u32;
-    if books != verified.book_count() {
+    if books != verified.counts().books {
         return Err(disagrees(format!(
             "the manifest declares {} book(s) and the payload's vectors belong to {books}",
-            verified.book_count()
+            verified.counts().books
         )));
     }
     Ok(books)
@@ -550,20 +575,15 @@ mod tests {
         ),
     ];
 
-    fn corpus() -> CorpusIdentity {
-        CorpusIdentity {
-            corpus_id: "1f".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
-            document_id_scheme_version: 1,
-        }
+    fn text() -> TextIdentity {
+        TextIdentity::with_line_text_version(1)
     }
 
     /// What this installation implements — the values a host passes in.
     fn local_model(model_path: &Path) -> LocalModel {
         LocalModel {
             model_path: model_path.to_path_buf(),
-            model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+            family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6".to_string(),
             model_quantization: "int8".to_string(),
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
@@ -579,12 +599,14 @@ mod tests {
     fn built_identity(model_path: &Path) -> IndexVersion {
         let model = local_model(model_path);
         IndexVersion {
-            corpus: corpus(),
+            text: text(),
             model: ModelIdentity {
-                model_id: model.model_id,
-                model_checksum: validate_model(model_path).unwrap().checksum().to_string(),
-                model_quantization: model.model_quantization,
-                embedding_backend: crate::semantic::backend::MockHashBackend::ID.to_string(),
+                family_id: model.family_id,
+                tokenizer_checksum: crate::semantic::embedding::mock::stub_tokenizer_checksum(),
+                query_packages: vec![ModelPackage {
+                    checksum: validate_model(model_path).unwrap().checksum().to_string(),
+                    quantization: model.model_quantization,
+                }],
                 embedding_dim: model.embedding_dim,
                 pooling: model.pooling,
                 max_tokens: model.max_tokens,
@@ -653,9 +675,9 @@ mod tests {
             .collect();
         let mut manifest = PackageManifest::new(
             built_identity(model_path),
+            crate::distribution::package::test_description(2, LINES.len() as u64),
+            crate::semantic::versioning::test_provenance(),
             "2026-08-06T00:00:00Z".to_string(),
-            2,
-            LINES.len() as u32,
             payloads.values().map(|payload| payload.size_bytes).sum(),
         );
         adjust(&mut manifest);
@@ -668,7 +690,7 @@ mod tests {
     fn config_for(artifact_path: &Path, model_path: &Path) -> OfficialIndexConfig {
         OfficialIndexConfig {
             artifact_path: artifact_path.to_path_buf(),
-            corpus: corpus(),
+            text: text(),
             model: local_model(model_path),
             deployment: EmbeddingDeployment::default(),
             published_digest: None,
@@ -782,9 +804,9 @@ mod tests {
         for (label, adjust) in [
             (
                 "vector",
-                (|m: &mut PackageManifest| m.vector_count += 1) as fn(&mut PackageManifest),
+                (|m: &mut PackageManifest| m.counts.slots += 1) as fn(&mut PackageManifest),
             ),
-            ("book", |m: &mut PackageManifest| m.book_count = 7),
+            ("book", |m: &mut PackageManifest| m.counts.books = 7),
         ] {
             let source = dir.path().join(format!("artifact-{label}"));
             build_artifact(&source, &model_path, adjust);
@@ -883,9 +905,9 @@ mod tests {
         )]);
         let manifest = PackageManifest::new(
             built_identity(&model_path),
+            crate::distribution::package::test_description(2, LINES.len() as u64),
+            crate::semantic::versioning::test_provenance(),
             "2026-08-06T00:00:00Z".to_string(),
-            2,
-            LINES.len() as u32,
             payloads[decoy].size_bytes,
         );
         IndexPackage::write(&source, &IndexPackage { manifest, payloads }).unwrap();
@@ -908,25 +930,25 @@ mod tests {
         let dir = TempDir::new("mismatch");
         let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
-        // Same library name, one book inserted in the middle: every `line_id` after it
-        // now names a different line, and nothing in the vectors says so.
+        // Keyed against lines made by another recipe: no key would resolve, and nothing
+        // in the vectors says so.
         let foreign_corpus = dir.path().join("foreign-corpus");
         build_artifact(&foreign_corpus, &model_path, |manifest| {
-            manifest.identity.corpus.corpus_id = "2e".repeat(32)
+            manifest.identity.text.line_text_version = 2
         });
 
-        // Same `model_id`, different weights behind it.
+        // The same family, a package it does not accept for queries.
         let other_model = mock::write_stub_onnx_package(&dir.path().join("other-model"));
         std::fs::write(&other_model, mock::onnx::stub_graph_named("other weights")).unwrap();
         let foreign_model = dir.path().join("foreign-model");
         build_artifact(&foreign_model, &model_path, |manifest| {
-            manifest.identity.model.model_checksum =
+            manifest.identity.model.query_packages[0].checksum =
                 validate_model(&other_model).unwrap().checksum().to_string()
         });
 
         for (source, field) in [
-            (foreign_corpus, IdentityField::CorpusId),
-            (foreign_model, IdentityField::ModelChecksum),
+            (foreign_corpus, IdentityField::LineTextVersion),
+            (foreign_model, IdentityField::QueryPackages),
         ] {
             match OfficialSemanticIndex::open(config_for(&source, &model_path))
                 .map(|index| index.vector_count())
@@ -938,6 +960,70 @@ mod tests {
                     assert_eq!(mismatches[0].field, field);
                 }
                 other => panic!("{field} must refuse the artifact, got {other:?}"),
+            }
+        }
+    }
+
+    /// A set's passages come from one package of a family, and a query may come from any
+    /// package the set accepts. An installation running the int8 package and one running
+    /// the fp32 package both open a set built from fp32 that accepts the two; one running a
+    /// package outside the list, a package with another tokenizer, another family or
+    /// another recipe is refused, by the field that disagreed.
+    #[test]
+    fn an_installation_opens_a_set_with_any_package_the_set_accepts() {
+        let dir = TempDir::new("packages");
+        let int8 = mock::write_stub_onnx_package(&dir.path().join("int8"));
+        let fp32 = mock::write_stub_onnx_package(&dir.path().join("fp32"));
+        fs::write(&fp32, mock::onnx::stub_graph_named("fp32 weights")).unwrap();
+        let package = |path: &Path, quantization: &str| ModelPackage {
+            checksum: validate_model(path).unwrap().checksum().to_string(),
+            quantization: quantization.to_string(),
+        };
+        let source = dir.path().join("set");
+        build_artifact(&source, &int8, |manifest| {
+            manifest.identity.model.query_packages =
+                vec![package(&int8, "int8"), package(&fp32, "fp32")];
+            manifest.provenance.passage_package = package(&fp32, "fp32");
+        });
+
+        for (model_path, quantization) in [(&int8, "int8"), (&fp32, "fp32")] {
+            let mut config = config_for(&source, model_path);
+            config.model.model_quantization = quantization.to_string();
+            let index = OfficialSemanticIndex::open(config)
+                .unwrap_or_else(|error| panic!("{quantization} must open the set: {error}"));
+            assert_eq!(index.vector_count(), LINES.len() as u32);
+        }
+
+        let int4 = mock::write_stub_onnx_package(&dir.path().join("int4"));
+        fs::write(&int4, mock::onnx::stub_graph_named("int4 weights")).unwrap();
+        let retokenized = mock::write_stub_onnx_package(&dir.path().join("retokenized"));
+        fs::write(
+            retokenized.with_file_name("tokenizer.json"),
+            mock::STUB_TOKENIZER_JSON.replace("[UNK]", "[unk]"),
+        )
+        .unwrap();
+        let mut another_family = config_for(&source, &int8);
+        another_family.model.family_id.push_str("-round3");
+        let mut another_recipe = config_for(&source, &int8);
+        another_recipe.model.chunking_identity += 1;
+
+        for (config, field) in [
+            (config_for(&source, &int4), IdentityField::QueryPackages),
+            (
+                config_for(&source, &retokenized),
+                IdentityField::TokenizerChecksum,
+            ),
+            (another_family, IdentityField::FamilyId),
+            (another_recipe, IdentityField::ChunkingIdentity),
+        ] {
+            match OfficialSemanticIndex::open(config).map(|index| index.vector_count()) {
+                Err(SemanticSearchError::Artifact(ArtifactError::IdentityMismatch {
+                    mismatches,
+                })) => assert!(
+                    mismatches.iter().any(|mismatch| mismatch.field == field),
+                    "{field} must be among {mismatches:?}"
+                ),
+                other => panic!("{field} must refuse the set, got {other:?}"),
             }
         }
     }

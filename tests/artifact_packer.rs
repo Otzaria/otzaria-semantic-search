@@ -18,11 +18,12 @@
 //! only under `mock-embedding`. Claim 1 needs none — packing never embeds anything — and
 //! runs in a default build, which is the build a release pipeline has.
 
+use otzaria_semantic_search::distribution::corpus::CorpusIdentity;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackRequest, VectorInputRecord,
 };
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,9 +86,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// The corpus identity a build takes off the Tantivy index it opened.
 fn corpus_identity() -> CorpusIdentity {
     CorpusIdentity {
-        corpus_id: "3f".repeat(32),
-        library_version: "otzaria-library-2026-08".to_string(),
-        tantivy_schema_version: 3,
+        text: otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+            1,
+        ),
+        library_version: 30,
+        library_release_tag: "v30-20260930120000".to_string(),
         document_id_scheme_version: 1,
     }
 }
@@ -199,12 +202,35 @@ fn embedded_unchanged(line_id: u64, text: &str) -> (u64, Vec<f32>, String, Strin
     )
 }
 
+/// What a pack records about the vectors it was handed: the package and the worker.
+fn provenance() -> otzaria_semantic_search::semantic::versioning::VectorProvenance {
+    otzaria_semantic_search::semantic::versioning::VectorProvenance {
+        passage_package: ModelPackage {
+            checksum: "c".repeat(64),
+            quantization: "int8".to_string(),
+        },
+        worker: otzaria_semantic_search::semantic::versioning::EmbeddingWorker {
+            backend: "mock-hash-v1".to_string(),
+            device: "cpu".to_string(),
+        },
+    }
+}
+
+/// [`provenance`], where the CLI reads it.
+fn write_provenance(dir: &Path) -> PathBuf {
+    let path = dir.join("provenance.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&provenance()).unwrap()).unwrap();
+    path
+}
+
 fn stand_in_model() -> ModelIdentity {
     ModelIdentity {
-        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
-        model_checksum: "c".repeat(64),
-        model_quantization: "int8".to_string(),
-        embedding_backend: "onnxruntime-sentence-v1".to_string(),
+        family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6".to_string(),
+        tokenizer_checksum: "7".repeat(64),
+        query_packages: vec![ModelPackage {
+            checksum: "c".repeat(64),
+            quantization: "int8".to_string(),
+        }],
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
         max_tokens: 512,
@@ -231,6 +257,8 @@ fn the_cli_packs_ready_made_vectors_into_a_verified_artifact() {
     let packed = Command::new(env!("CARGO_BIN_EXE_otzaria-semantic-search"))
         .args([
             "pack",
+            "--provenance",
+            write_provenance(dir.path()).to_str().unwrap(),
             "--vectors",
             vectors_path.to_str().unwrap(),
             "--records",
@@ -330,6 +358,8 @@ fn the_cli_refuses_vectors_that_do_not_belong_to_the_lines_they_name() {
     let packed = Command::new(env!("CARGO_BIN_EXE_otzaria-semantic-search"))
         .args([
             "pack",
+            "--provenance",
+            write_provenance(dir.path()).to_str().unwrap(),
             "--vectors",
             vectors_path.to_str().unwrap(),
             "--records",
@@ -381,6 +411,7 @@ fn the_library_entry_point_packs_the_same_artifact_the_cli_does() {
         PackRequest {
             output_path: out.clone(),
             model: stand_in_model(),
+            provenance: provenance(),
             created_at: "2026-08-08T00:00:00Z".to_string(),
             collection_name: "chunks".to_string(),
         },
@@ -391,7 +422,7 @@ fn the_library_entry_point_packs_the_same_artifact_the_cli_does() {
 
     assert_eq!(report.vector_count, LINES.len() as u32);
     assert_eq!(report.book_count, 2);
-    assert_eq!(report.identity.corpus, corpus_identity());
+    assert_eq!(report.identity.text, corpus_identity().text);
     assert_eq!(report.identity.model, stand_in_model());
     assert_eq!(
         validate_artifact(&out, &stand_in_model(), &corpus)
@@ -423,6 +454,7 @@ fn packing_the_same_vectors_twice_produces_the_same_artifact() {
             PackRequest {
                 output_path: dir.path().join(name),
                 model: stand_in_model(),
+                provenance: provenance(),
                 // Deliberately different, because `created_at` is excluded from the digest
                 // and this is the test that would notice if it stopped being.
                 created_at: format!("2026-08-0{}T00:00:00Z", name.len()),
@@ -475,6 +507,8 @@ fn the_cli_refuses_an_artifact_that_covers_part_of_the_corpus() {
     let packed = Command::new(env!("CARGO_BIN_EXE_otzaria-semantic-search"))
         .args([
             "pack",
+            "--provenance",
+            write_provenance(dir.path()).to_str().unwrap(),
             "--vectors",
             partial_vectors.to_str().unwrap(),
             "--records",
@@ -521,7 +555,6 @@ fn the_cli_refuses_an_artifact_that_covers_part_of_the_corpus() {
 fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
     use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
     use otzaria_semantic_search::distribution::package::ArtifactExpectation;
-    use otzaria_semantic_search::semantic::backend::MockHashBackend;
     use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
     use otzaria_semantic_search::semantic::model_package::validate_model;
     use otzaria_semantic_search::semantic::official_index::{
@@ -535,7 +568,7 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
     // values, plus the two facts only the loaded model can supply.
     let local = LocalModel {
         model_path: model_path.clone(),
-        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+        family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6".to_string(),
         model_quantization: "int8".to_string(),
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
@@ -545,10 +578,13 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
         chunking_identity: 0x0BAD_C0DE,
     };
     let model = ModelIdentity {
-        model_id: local.model_id.clone(),
-        model_checksum: validate_model(&model_path).unwrap().checksum().to_string(),
-        model_quantization: local.model_quantization.clone(),
-        embedding_backend: MockHashBackend::ID.to_string(),
+        family_id: local.family_id.clone(),
+        tokenizer_checksum:
+            otzaria_semantic_search::semantic::embedding::mock::stub_tokenizer_checksum(),
+        query_packages: vec![ModelPackage {
+            checksum: validate_model(&model_path).unwrap().checksum().to_string(),
+            quantization: local.model_quantization.clone(),
+        }],
         embedding_dim: local.embedding_dim,
         pooling: local.pooling.clone(),
         max_tokens: local.max_tokens,
@@ -576,6 +612,7 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
         PackRequest {
             output_path: source.clone(),
             model,
+            provenance: provenance(),
             created_at: "2026-08-08T00:00:00Z".to_string(),
             collection_name: "chunks".to_string(),
         },
@@ -600,7 +637,7 @@ fn an_artifact_this_packer_wrote_installs_opens_and_answers_a_query() {
 
     let index = OfficialSemanticIndex::open(OfficialIndexConfig {
         artifact_path: target,
-        corpus: corpus_identity(),
+        text: corpus_identity().text,
         model: local,
         deployment: EmbeddingDeployment::default(),
         published_digest: Some(report.digest.clone()),

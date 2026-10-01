@@ -9,10 +9,10 @@
 //! So the packer takes a [`CorpusIndex`] rather than a directory. Two consequences, and
 //! both are the point:
 //!
-//! * **The corpus identity comes from the corpus.** `corpus_id`, `library_version` and
-//!   the two scheme versions are read off the index that is actually open, never typed
-//!   into a configuration file beside the vectors. An artifact cannot be labelled for a
-//!   catalogue it was not built from.
+//! * **The corpus identity comes from the corpus.** The line recipe its text was produced
+//!   by, the library edition it holds and its id scheme are read off the index that is
+//!   actually open, never typed into a configuration file beside the vectors. An artifact
+//!   cannot be labelled for lines it was not keyed against.
 //! * **Every field of a record comes from the corpus too** — except the one only the
 //!   producer can know, which is a digest of the text it embedded. The title, reference,
 //!   section, facets and the rest are whatever the corpus says today, so there is no
@@ -39,12 +39,34 @@
 //! behind it.
 
 use crate::errors::PackError;
-use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use crate::semantic::versioning::{ModelIdentity, TextIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+
+/// What a corpus says about itself to a build.
+///
+/// Not an artifact's identity: that is [`IndexVersion`](crate::semantic::versioning::IndexVersion),
+/// and only `text` reaches it. The library edition places the artifact in a chain of
+/// releases, and the id scheme is what the join below relies on to read a `line_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusIdentity {
+    /// How the library was turned into the lines this corpus holds, and how a line is
+    /// keyed — the text group of every artifact built from it.
+    pub text: TextIdentity,
+    /// The library edition (`db_version`) the corpus holds.
+    pub library_version: u32,
+    /// The release that edition was published as, for people.
+    pub library_release_tag: String,
+    /// Version of the scheme that composes a `line_id`.
+    ///
+    /// Version 1 is what `otzaria_search_engine` builds today, matching the app's
+    /// `buildCatalogueDocumentId`: `((catalogue_order + 1) << 32) + (ordinal + 1)`. Both
+    /// halves are 1-based, so no live document has id 0.
+    pub document_id_scheme_version: u32,
+}
 
 /// What the corpus holds for one line.
 ///
@@ -401,9 +423,9 @@ mod tests {
 
     fn identity() -> CorpusIdentity {
         CorpusIdentity {
-            corpus_id: "7a".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
+            text: TextIdentity::with_line_text_version(1),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         }
     }

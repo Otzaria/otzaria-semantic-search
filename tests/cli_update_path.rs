@@ -19,11 +19,12 @@
 
 #![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
+use otzaria_semantic_search::distribution::corpus::CorpusIdentity;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord};
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
 use otzaria_semantic_search::semantic::embedding::mock;
 use otzaria_semantic_search::semantic::model_package::validate_model;
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -120,9 +121,12 @@ fn write_corpus(dir: &TempDir, name: &str, lines: &[(u64, &str)]) -> (PathBuf, P
     std::fs::write(
         &identity,
         serde_json::to_vec_pretty(&CorpusIdentity {
-            corpus_id: "7f".repeat(32),
-            library_version: "otzaria-library-test".to_string(),
-            tantivy_schema_version: 3,
+            text:
+                otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+                    1,
+                ),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         })
         .unwrap(),
@@ -170,10 +174,13 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embed
     let model_file = mock::write_stub_onnx_package(&dir.at("model"));
     let checksum = validate_model(&model_file).unwrap().checksum().to_string();
     let model = ModelIdentity {
-        model_id: "otzaria-embedding-v1".to_string(),
-        model_checksum: checksum,
-        model_quantization: "int8".to_string(),
-        embedding_backend: "mock-hash-v1".to_string(),
+        family_id: "otzaria-embedding-v1".to_string(),
+        tokenizer_checksum:
+            otzaria_semantic_search::semantic::embedding::mock::stub_tokenizer_checksum(),
+        query_packages: vec![ModelPackage {
+            checksum,
+            quantization: "int8".to_string(),
+        }],
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
         max_tokens: 512,
@@ -183,6 +190,24 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embed
     };
     let model_path = dir.at("model.json");
     std::fs::write(&model_path, serde_json::to_vec_pretty(&model).unwrap()).unwrap();
+    let provenance_path = dir.at("provenance.json");
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(
+            &otzaria_semantic_search::semantic::versioning::VectorProvenance {
+                passage_package: ModelPackage {
+                    checksum: model.query_packages[0].checksum.clone(),
+                    quantization: "int8".to_string(),
+                },
+                worker: otzaria_semantic_search::semantic::versioning::EmbeddingWorker {
+                    backend: "mock-hash-v1".to_string(),
+                    device: "cpu".to_string(),
+                },
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
 
     // Same width, same recipe, another file. A manifest that copied `--model` would take
     // this and `VerifiedBase` would then verify the ledger perfectly against it.
@@ -190,7 +215,7 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embed
     std::fs::write(
         &foreign_path,
         serde_json::to_vec_pretty(&ModelIdentity {
-            model_checksum: "cd".repeat(32),
+            family_id: "another/model@0000000".to_string(),
             ..model.clone()
         })
         .unwrap(),
@@ -277,6 +302,8 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embed
         &[
             &[
                 "pack",
+                "--provenance",
+                &provenance_path.display().to_string(),
                 "--vectors",
                 &merged.join("vectors.f32").display().to_string(),
                 "--records",
@@ -313,7 +340,7 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embed
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&ledger_manifest).unwrap()).unwrap();
     assert_eq!(
-        manifest["model"]["model_checksum"], model.model_checksum,
+        manifest["model"]["family_id"], model.family_id,
         "the model comes from the package, not from --model"
     );
     assert_eq!(
@@ -465,6 +492,8 @@ fn the_ledger_takes_its_identity_from_the_artifact_and_an_unchanged_corpus_embed
         &[
             &[
                 "pack",
+                "--provenance",
+                &provenance_path.display().to_string(),
                 "--vectors",
                 &merged2.join("vectors.f32").display().to_string(),
                 "--records",

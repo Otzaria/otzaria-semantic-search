@@ -78,7 +78,9 @@ impl Default for SemanticConfig {
         let model = EmbeddingConfig::default();
         Self {
             root_dir: root.clone(),
-            embedding_model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+            embedding_model_id:
+                "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca"
+                    .to_string(),
             embedding_dim: model.embedding_dim,
             model_path: model.model_path,
             deployment: EmbeddingDeployment::default(),
@@ -1044,11 +1046,14 @@ mod tests {
         let config = SemanticConfig::default();
         assert_eq!(
             config.embedding_model_id,
-            identity["model_id"].as_str().unwrap()
+            identity["family_id"].as_str().unwrap()
         );
+        // The family's first package is the application's default.
         assert_eq!(
             config.model_quantization,
-            identity["model_quantization"].as_str().unwrap()
+            identity["query_packages"][0]["quantization"]
+                .as_str()
+                .unwrap()
         );
         assert_eq!(
             u64::from(config.embedding_dim),

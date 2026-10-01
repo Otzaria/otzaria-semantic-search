@@ -30,7 +30,7 @@ use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRun
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
-use otzaria_semantic_search::semantic::versioning::ModelIdentity;
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, VectorProvenance};
 use otzaria_semantic_search::semantic::zevc_store::VECTORS_FILENAME;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -72,7 +72,8 @@ Options for 'status':
   --dir <path>       Directory holding semantic database (default: "./semantic_db")
 
 Options for 'build':
-  --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
+  --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it: its
+                             text identity, library version and release tag, and id scheme
   --corpus-lines <path>      JSONL, one corpus line per document
   --model <path>             JSON ModelIdentity describing how the vectors are produced
   --model-file <path>        The model the vectors are produced with: an ONNX graph, with
@@ -161,6 +162,9 @@ smaller artifact.
 Options for 'pack':
   --vectors <path>           Raw little-endian f32 vectors, count x embedding_dim, no header
   --records <path>           JSONL, one record per vector, in the same order (see below)
+  --provenance <path>        JSON: the package of the family that embedded the vectors and
+                             the worker that ran it — {{"passage_package": {{"checksum": …,
+                             "quantization": …}}, "worker": {{"backend": …, "device": …}}}}
   --corpus-identity <path>   As above
   --corpus-lines <path>      As above
   --model <path>             As above
@@ -608,19 +612,26 @@ fn run_embed_shard(args: &[String]) {
         .load()
         .unwrap_or_else(|error| exit_with("Could not load the model", error));
 
-    // The same five comparisons `build` makes, for the same reason: a worker that embeds
-    // with a different file or a different width produces vectors the merge cannot use,
-    // and it should learn that in the second it takes rather than at the end of the shard.
+    // The comparisons `build` makes, for the same reason: a worker that embeds with a
+    // package of another family or a different width produces vectors the merge cannot
+    // use, and it should learn that in the second it takes rather than at the end of the
+    // shard.
+    let checksum = runtime.model_checksum().unwrap_or_default().to_string();
+    if !model
+        .query_packages
+        .iter()
+        .any(|package| package.checksum == checksum)
+    {
+        exit_with(
+            "The model file is not a package of the family the plan was made for",
+            format!("its package checksum is {checksum}"),
+        );
+    }
     for (field, declared, loaded) in [
         (
-            "model_checksum",
-            model.model_checksum.clone(),
-            runtime.model_checksum().unwrap_or_default().to_string(),
-        ),
-        (
-            "embedding_backend",
-            model.embedding_backend.clone(),
-            runtime.backend_id().unwrap_or_default().to_string(),
+            "tokenizer_checksum",
+            model.tokenizer_checksum.clone(),
+            runtime.tokenizer_checksum().unwrap_or_default().to_string(),
         ),
         (
             "embedding_dim",
@@ -1029,12 +1040,12 @@ fn run_ledger(args: &[String]) {
         .sync_all()
         .unwrap_or_else(|error| abandon("Could not flush the ledger to disk", error.to_string()));
 
-    if entries != package.manifest.vector_count as usize {
+    if entries as u64 != package.manifest.counts.slots {
         abandon(
             "The ledger does not describe this artifact",
             format!(
                 "{entries} entry(ies) against {} vector(s)",
-                package.manifest.vector_count
+                package.manifest.counts.slots
             ),
         );
     }
@@ -1268,10 +1279,18 @@ fn run_pack(args: &[String]) {
     )
     .unwrap_or_else(|error| exit_with("Could not read the vectors", error));
 
+    let provenance_path = require_arg(args, "--provenance");
+    let provenance: VectorProvenance = serde_json::from_str(
+        &std::fs::read_to_string(&provenance_path)
+            .unwrap_or_else(|error| exit_with("Could not read the provenance", error)),
+    )
+    .unwrap_or_else(|error| exit_with("The provenance is not the JSON this build reads", error));
+
     let report = pack(
         PackRequest {
             output_path: PathBuf::from(&out),
             model,
+            provenance,
             created_at: parse_arg(args, "--created-at")
                 .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
             collection_name: parse_arg(args, "--collection")

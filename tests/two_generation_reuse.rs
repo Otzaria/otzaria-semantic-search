@@ -25,6 +25,7 @@
 #![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
 use otzaria_semantic_search::distribution::builder::PlannedCorpus;
+use otzaria_semantic_search::distribution::corpus::CorpusIdentity;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};
 use otzaria_semantic_search::distribution::package::IndexPackage;
 use otzaria_semantic_search::distribution::packer::{pack, read_vector_inputs, PackRequest};
@@ -37,7 +38,7 @@ use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
 use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingConfig, EmbeddingRuntime};
 use otzaria_semantic_search::semantic::model_package::validate_model;
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
 use std::path::{Path, PathBuf};
 
 const DIM: u32 = 64;
@@ -112,9 +113,12 @@ fn write_corpus(dir: &TempDir, name: &str, lines: &[(u64, &str, &str)]) -> Jsonl
         serde_json::to_vec_pretty(&CorpusIdentity {
             // One identity for both generations: the artifacts must differ because their
             // vectors differ, not because their corpus ids do.
-            corpus_id: "7f".repeat(32),
-            library_version: "otzaria-library-test".to_string(),
-            tantivy_schema_version: 3,
+            text:
+                otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+                    1,
+                ),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         })
         .unwrap(),
@@ -139,10 +143,13 @@ fn write_corpus(dir: &TempDir, name: &str, lines: &[(u64, &str, &str)]) -> Jsonl
 
 fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
     ModelIdentity {
-        model_id: "otzaria-embedding-v1".to_string(),
-        model_checksum: checksum.to_string(),
-        model_quantization: "int8".to_string(),
-        embedding_backend: "mock-hash-v1".to_string(),
+        family_id: "otzaria-embedding-v1".to_string(),
+        tokenizer_checksum:
+            otzaria_semantic_search::semantic::embedding::mock::stub_tokenizer_checksum(),
+        query_packages: vec![ModelPackage {
+            checksum: checksum.to_string(),
+            quantization: "int8".to_string(),
+        }],
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
         max_tokens: 512,
@@ -280,6 +287,16 @@ fn build_the_long_way(
         PackRequest {
             output_path: artifact.clone(),
             model: model.clone(),
+            provenance: otzaria_semantic_search::semantic::versioning::VectorProvenance {
+                passage_package: ModelPackage {
+                    checksum: model.query_packages[0].checksum.clone(),
+                    quantization: "int8".to_string(),
+                },
+                worker: otzaria_semantic_search::semantic::versioning::EmbeddingWorker {
+                    backend: "mock-hash-v1".to_string(),
+                    device: "cpu".to_string(),
+                },
+            },
             created_at: "2026-08-10T00:00:00Z".to_string(),
             collection_name: "chunks".to_string(),
         },

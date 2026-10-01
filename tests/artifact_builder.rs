@@ -18,9 +18,10 @@
 //! model is opened, which is the difference between a build that fails in a second and one
 //! that fails after loading half a gigabyte of weights.
 
+use otzaria_semantic_search::distribution::corpus::CorpusIdentity;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord};
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -91,9 +92,11 @@ impl Drop for TempDir {
 
 fn corpus_identity() -> CorpusIdentity {
     CorpusIdentity {
-        corpus_id: "9e".repeat(32),
-        library_version: "otzaria-library-2026-08".to_string(),
-        tantivy_schema_version: 3,
+        text: otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+            1,
+        ),
+        library_version: 30,
+        library_release_tag: "v30-20260930120000".to_string(),
         document_id_scheme_version: 1,
     }
 }
@@ -168,10 +171,12 @@ fn write_fixture(dir: &Path, model: &ModelIdentity, chunking: &ChunkerConfig) ->
 /// which only a real file can supply.
 fn model_identity(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
     ModelIdentity {
-        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
-        model_checksum: checksum.to_string(),
-        model_quantization: "int8".to_string(),
-        embedding_backend: "mock-hash-v1".to_string(),
+        family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6".to_string(),
+        tokenizer_checksum: "7".repeat(64),
+        query_packages: vec![ModelPackage {
+            checksum: checksum.to_string(),
+            quantization: "int8".to_string(),
+        }],
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
         max_tokens: 512,
@@ -292,6 +297,14 @@ mod with_a_backend {
     use otzaria_semantic_search::distribution::package::ArtifactExpectation;
     use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
     use otzaria_semantic_search::semantic::model_package::validate_model;
+
+    /// [`model_identity`] for the stub package: its tokenizer is the stub's.
+    fn stub_identity(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
+        ModelIdentity {
+            tokenizer_checksum: mock::stub_tokenizer_checksum(),
+            ..model_identity(checksum, chunking)
+        }
+    }
     use otzaria_semantic_search::semantic::official_index::{
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
@@ -363,7 +376,7 @@ mod with_a_backend {
         let dir = TempDir::new("gate");
         let chunking = ChunkerConfig::default();
         let (model_file, checksum) = write_model_file(dir.path());
-        let fixture = write_fixture(dir.path(), &model_identity(&checksum, &chunking), &chunking);
+        let fixture = write_fixture(dir.path(), &stub_identity(&checksum, &chunking), &chunking);
 
         let out = dir.path().join("artifact");
         let stdout = run_build(&fixture, &model_file, &out, "2026-08-08T00:00:00Z");
@@ -439,7 +452,7 @@ mod with_a_backend {
         let dir = TempDir::new("reproducible");
         let chunking = ChunkerConfig::default();
         let (model_file, checksum) = write_model_file(dir.path());
-        let fixture = write_fixture(dir.path(), &model_identity(&checksum, &chunking), &chunking);
+        let fixture = write_fixture(dir.path(), &stub_identity(&checksum, &chunking), &chunking);
 
         let first = dir.path().join("first");
         let second = dir.path().join("second");
@@ -468,26 +481,16 @@ mod with_a_backend {
         let dir = TempDir::new("runtime");
         let chunking = ChunkerConfig::default();
         let (model_file, checksum) = write_model_file(dir.path());
-        let model = model_identity(&checksum, &chunking);
+        let model = stub_identity(&checksum, &chunking);
         let fixture = write_fixture(dir.path(), &model, &chunking);
 
         let source = dir.path().join("build-output");
         let stdout = run_build(&fixture, &model_file, &source, "2026-08-08T00:00:00Z");
         let digest = reported_digest(&stdout);
 
-        let local = LocalModel {
-            model_path: model_file.clone(),
-            model_id: model.model_id.clone(),
-            model_quantization: model.model_quantization.clone(),
-            embedding_dim: model.embedding_dim,
-            pooling: model.pooling.clone(),
-            max_tokens: model.max_tokens,
-            embedding_text_version: model.embedding_text_version,
-            normalization_version: model.normalization_version,
-            chunking_identity: model.chunking_identity,
-        };
+        let local = LocalModel::of_family(model_file.clone(), &model, "int8");
         let identity = otzaria_semantic_search::semantic::versioning::IndexVersion {
-            corpus: corpus_identity(),
+            text: corpus_identity().text,
             model: model.clone(),
             store: otzaria_semantic_search::semantic::official_index::readable_store_identity(),
         };
@@ -506,7 +509,7 @@ mod with_a_backend {
 
         let index = OfficialSemanticIndex::open(OfficialIndexConfig {
             artifact_path: target,
-            corpus: corpus_identity(),
+            text: corpus_identity().text,
             model: local,
             deployment: EmbeddingDeployment::default(),
             published_digest: Some(digest),
@@ -590,14 +593,20 @@ fn the_real_model_builds_an_artifact_that_verifies() {
     // The dimension, the pooling and the token cap are the model's, not this test's:
     // declaring anything else is exactly what the build is supposed to refuse, and
     // asserting that here would be asserting the check rather than the build.
+    let package = validate_model(&model_file).unwrap();
+    let tokenizer = package
+        .files()
+        .iter()
+        .find(|file| file.relpath == "tokenizer.json")
+        .unwrap()
+        .sha256
+        .clone();
     let model = ModelIdentity {
-        model_checksum: validate_model(&model_file).unwrap().checksum().to_string(),
-        // `OnnxBackend::ID`, spelled out: the module exists on desktop targets only.
-        embedding_backend: "onnxruntime-sentence-v1".to_string(),
+        tokenizer_checksum: tokenizer,
         embedding_dim: 256,
         max_tokens: 256,
         embedding_text_version: 2,
-        ..model_identity("unused", &chunking)
+        ..model_identity(package.checksum(), &chunking)
     };
     let fixture = write_fixture(dir.path(), &model, &chunking);
 

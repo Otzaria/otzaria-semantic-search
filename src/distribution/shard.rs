@@ -423,12 +423,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::distribution::builder::{build, BuildRequest, PlannedCorpus};
+    use crate::distribution::corpus::CorpusIdentity;
     use crate::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};
     use crate::distribution::packer::{pack, read_vector_inputs, PackRequest};
     use crate::semantic::backend::Pooling;
     use crate::semantic::embedding::{mock, EmbeddingConfig};
     use crate::semantic::model_package::validate_model;
-    use crate::semantic::versioning::CorpusIdentity;
+    use crate::semantic::versioning::ModelPackage;
     use std::path::PathBuf;
 
     const DIM: u32 = 64;
@@ -471,9 +472,9 @@ mod tests {
 
     fn corpus_identity() -> CorpusIdentity {
         CorpusIdentity {
-            corpus_id: "3a".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
+            text: crate::semantic::versioning::TextIdentity::with_line_text_version(1),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         }
     }
@@ -530,10 +531,12 @@ mod tests {
 
     fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
         ModelIdentity {
-            model_id: "otzaria-embedding-v1".to_string(),
-            model_checksum: checksum.to_string(),
-            model_quantization: "int8".to_string(),
-            embedding_backend: "mock-hash-v1".to_string(),
+            family_id: "otzaria-embedding-v1".to_string(),
+            tokenizer_checksum: crate::semantic::embedding::mock::stub_tokenizer_checksum(),
+            query_packages: vec![ModelPackage {
+                checksum: checksum.to_string(),
+                quantization: "int8".to_string(),
+            }],
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
@@ -622,10 +625,20 @@ mod tests {
         drop((vectors, records));
 
         let planned = PlannedCorpus::new(&corpus, &chunking, &model).unwrap();
+        // What the single-process build records about itself: the package it loaded, and
+        // the backend that ran it.
+        let provenance = crate::semantic::versioning::VectorProvenance {
+            passage_package: model.query_packages[0].clone(),
+            worker: crate::semantic::versioning::EmbeddingWorker {
+                backend: runtime.backend_id().unwrap().to_string(),
+                device: "cpu".to_string(),
+            },
+        };
         let merged = pack(
             PackRequest {
                 output_path: dir.0.join("merged"),
                 model: model.clone(),
+                provenance,
                 created_at: "2026-08-09T00:00:00Z".to_string(),
                 collection_name: "chunks".to_string(),
             },
@@ -817,6 +830,7 @@ mod tests {
             PackRequest {
                 output_path: dir.0.join("merged"),
                 model: model.clone(),
+                provenance: crate::semantic::versioning::test_provenance(),
                 created_at: "2026-08-09T00:00:00Z".to_string(),
                 collection_name: "chunks".to_string(),
             },

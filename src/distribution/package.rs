@@ -40,7 +40,7 @@
 //! See `docs/ARTIFACT_CONTRACT.md`.
 
 use crate::errors::ArtifactError;
-use crate::semantic::versioning::{IdentityField, IndexVersion};
+use crate::semantic::versioning::{IdentityField, IndexVersion, VectorProvenance};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -51,13 +51,16 @@ use std::path::{Path, PathBuf};
 /// Version of the artifact *metadata* documents — this module's two JSON files.
 ///
 /// Distinct from the identity fields it carries: `store.store_format_version` versions
-/// the payload, `corpus.tantivy_schema_version` versions the lexical index, and this
+/// the payload, `text.line_text_version` versions the lines it was keyed against, and this
 /// versions the envelope that declares them. Bump it when the documents change shape.
 /// Version 2 replaced the bare `name → sha256` map with [`PayloadDescriptor`], because a
 /// checksum alone left the cheap open path unable to check anything per file: it could
 /// only compare the *sum* of the sizes, and two payloads whose lengths changed in
-/// opposite directions cancelled out.
-pub const ARTIFACT_METADATA_VERSION: u32 = 2;
+/// opposite directions cancelled out. Version 3 describes a vector *segment*: the identity
+/// lost its corpus group to the text group, and the manifest gained what a chain of
+/// segments is ordered by — [`PackageKind`], the library versions a segment goes from and
+/// to, the release tag — and the counts of what it holds.
+pub const ARTIFACT_METADATA_VERSION: u32 = 3;
 
 pub const MANIFEST_FILENAME: &str = "manifest.json";
 /// Renamed from `checksums.json` in metadata version 2: the file carries sizes as well.
@@ -97,65 +100,206 @@ impl PayloadDescriptor {
     }
 }
 
+/// What a segment is to the set it joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageKind {
+    /// Every vector of one library version. Replaces whatever a device held.
+    Base,
+    /// What changed from one library version to the next: new vectors, further records of
+    /// them, records of vectors the device already holds, and the keys that are gone.
+    Delta,
+    /// A device's own merge of its set into one segment. Never published.
+    Compacted,
+}
+
+impl PackageKind {
+    /// The name a manifest, a set and a log use for it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Delta => "delta",
+            Self::Compacted => "compacted",
+        }
+    }
+}
+
+impl std::fmt::Display for PackageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a segment holds, as its manifest declares it and its header must repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PackageCounts {
+    /// Books with at least one record in the segment.
+    pub books: u32,
+    /// Vectors, one per distinct key.
+    pub slots: u64,
+    /// Further records of those vectors, in other books or at other lines.
+    pub extras: u64,
+    /// Records of vectors an older segment holds. Deltas only.
+    pub foreign: u64,
+    /// Keys the library no longer holds. Deltas only.
+    pub tombstones: u64,
+}
+
+/// The longest release tag a manifest may carry: the width of the field a segment header
+/// repeats it in.
+pub const LIBRARY_RELEASE_TAG_MAX_BYTES: usize = 64;
+
 /// What the artifact declares about itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageManifest {
     pub metadata_version: u32,
-    /// The corpus, model and store this artifact belongs to. Verified in full before
+    /// The line recipe, model and store this artifact belongs to. Verified in full before
     /// any payload is read — see [`IndexVersion`].
     pub identity: IndexVersion,
+    pub kind: PackageKind,
+    /// The library version a delta applies on top of; `0` for a base.
+    pub from_library_version: u32,
+    /// The library version the segment brings a set to.
+    pub to_library_version: u32,
+    /// The library release the vectors were built from, for people. Ordered by nothing.
+    pub library_release_tag: String,
+    pub counts: PackageCounts,
+    /// Which package of the family embedded the passages, and what ran it. Covered by the
+    /// digest, compared by nothing — see [`VectorProvenance`].
+    pub provenance: VectorProvenance,
     pub created_at: String,
-    pub book_count: u32,
-    pub vector_count: u32,
     /// Sum of the payload file sizes. Checked against the files, so a manifest that
     /// describes a different package than the one it ships with is a rejection.
     pub total_size_bytes: u64,
 }
 
+/// What a segment is, besides its identity and its bytes: where it sits in a chain and
+/// what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageDescription {
+    pub kind: PackageKind,
+    pub from_library_version: u32,
+    pub to_library_version: u32,
+    pub library_release_tag: String,
+    pub counts: PackageCounts,
+}
+
 impl PackageManifest {
     pub fn new(
         identity: IndexVersion,
+        description: PackageDescription,
+        provenance: VectorProvenance,
         created_at: String,
-        book_count: u32,
-        vector_count: u32,
         total_size_bytes: u64,
     ) -> Self {
+        let PackageDescription {
+            kind,
+            from_library_version,
+            to_library_version,
+            library_release_tag,
+            counts,
+        } = description;
         Self {
             metadata_version: ARTIFACT_METADATA_VERSION,
             identity,
+            kind,
+            from_library_version,
+            to_library_version,
+            library_release_tag,
+            counts,
+            provenance,
             created_at,
-            book_count,
-            vector_count,
             total_size_bytes,
         }
     }
 
-    /// Refuse a manifest that declares nothing.
+    /// The chain position and the counts, as one value.
+    pub fn description(&self) -> PackageDescription {
+        PackageDescription {
+            kind: self.kind,
+            from_library_version: self.from_library_version,
+            to_library_version: self.to_library_version,
+            library_release_tag: self.library_release_tag.clone(),
+            counts: self.counts,
+        }
+    }
+
+    /// Refuse a manifest whose chain position or counts cannot describe a segment.
     ///
-    /// What this cannot check is the payload's *content*: that it holds exactly
-    /// `vector_count` vectors across `book_count` books is a claim only a reader of the
-    /// store format can settle, and that check lands with the read-only open path and
-    /// the packer. So this is the floor, not the whole agreement.
-    fn validate_counts(&self) -> Result<(), ArtifactError> {
-        for (label, count) in [
-            ("book_count", self.book_count),
-            ("vector_count", self.vector_count),
-        ] {
-            if count == 0 {
-                return Err(ArtifactError::ManifestDisagreesWithPayload {
-                    reason: format!("{label} is zero, so there is nothing to open"),
-                });
+    /// What this cannot check is the payload's *content*: that it holds exactly the vectors
+    /// and records it counts is a claim only a reader of the segment can settle. So this is
+    /// the floor, not the whole agreement.
+    fn validate_description(&self) -> Result<(), ArtifactError> {
+        let refuse = |reason: String| Err(ArtifactError::ManifestDisagreesWithPayload { reason });
+        if self.to_library_version == 0 {
+            return refuse("to_library_version is zero, so the segment names no edition".into());
+        }
+        match self.kind {
+            PackageKind::Base | PackageKind::Compacted => {
+                if self.from_library_version != 0 {
+                    return refuse(format!(
+                        "a {} starts from no version, and this one declares \
+                         from_library_version {}",
+                        self.kind, self.from_library_version
+                    ));
+                }
+                if self.counts.foreign != 0 || self.counts.tombstones != 0 {
+                    return refuse(format!(
+                        "a {} holds no foreign records and no tombstones, and this one \
+                         declares {} and {}",
+                        self.kind, self.counts.foreign, self.counts.tombstones
+                    ));
+                }
+                for (label, count) in [
+                    ("counts.books", u64::from(self.counts.books)),
+                    ("counts.slots", self.counts.slots),
+                ] {
+                    if count == 0 {
+                        return refuse(format!("{label} is zero, so there is nothing to open"));
+                    }
+                }
+            }
+            // A delta may be empty: a release that changed no embedded text still moves the
+            // chain forward, and refusing it would leave every device a version behind.
+            PackageKind::Delta => {
+                if self.from_library_version == 0
+                    || self.from_library_version >= self.to_library_version
+                {
+                    return refuse(format!(
+                        "a delta goes from one version to a later one, and this one goes \
+                         from {} to {}",
+                        self.from_library_version, self.to_library_version
+                    ));
+                }
             }
         }
-        Ok(())
+        validate_release_tag(&self.library_release_tag)?;
+        self.provenance.validate()
     }
+}
+
+/// A release tag is free text for people, but it sits in a line-oriented digest and in a
+/// fixed-width header field, so it is held to both.
+pub(crate) fn validate_release_tag(tag: &str) -> Result<(), ArtifactError> {
+    let refuse = |reason: &str| {
+        Err(ArtifactError::ManifestDisagreesWithPayload {
+            reason: format!("library_release_tag {tag:?} {reason}"),
+        })
+    };
+    if tag.len() > LIBRARY_RELEASE_TAG_MAX_BYTES {
+        return refuse("is longer than 64 bytes");
+    }
+    if tag.chars().any(char::is_control) || tag.contains('\0') {
+        return refuse("contains a control character");
+    }
+    Ok(())
 }
 
 /// What the installation requires of an artifact.
 ///
-/// `identity` is what this installation *is*: the corpus identity of the Tantivy index
-/// that is actually open, the model identity of the model file that is actually loaded.
-/// It is never this crate's constant.
+/// `identity` is what this installation *is*: the line recipe of the index that is
+/// actually open, the model identity of the model file that is actually loaded, and the
+/// store this build can read. It is never this crate's constant.
 ///
 /// `published_digest` is the trust anchor — see [`IndexPackage::digest`]. Without it,
 /// verification detects damage and the wrong artifact but cannot detect a deliberately
@@ -179,7 +323,7 @@ impl ArtifactExpectation {
     /// Identity and integrity only.
     ///
     /// Named for what it gives up: this detects a damaged package and a package built
-    /// for another corpus or model, and it does **not** establish that the package is
+    /// for another line recipe or model, and it does **not** establish that the package is
     /// the one we published. Correct for a locally built artifact and for a development
     /// fixture; not sufficient for one that arrived over a network.
     pub fn without_published_digest(identity: IndexVersion) -> Self {
@@ -241,8 +385,9 @@ impl IndexPackage {
     }
 
     /// Digest over everything the artifact claims about itself: the metadata version,
-    /// every identity field in [`IdentityField::ALL`] order, the counts, the declared
-    /// total size, and every payload's name, checksum and size.
+    /// every identity field in [`IdentityField::ALL`] order, the segment's kind, its library
+    /// versions and release tag, its counts, its provenance, the declared total size, and
+    /// every payload's name, checksum and size.
     ///
     /// This is the value that can be published *outside* the package and compared
     /// against it, which is the only way to tell the official artifact from one rebuilt
@@ -253,24 +398,43 @@ impl IndexPackage {
     /// artifact *is*, and excluding it lets the same build produce the same digest
     /// twice. It is therefore also the one field a published digest does not pin.
     pub fn digest(&self) -> String {
-        let mut canonical = String::from("otzaria-artifact-digest-v1\n");
-        canonical.push_str(&format!(
-            "metadata_version={}\n",
-            self.manifest.metadata_version
-        ));
+        let manifest = &self.manifest;
+        let mut canonical = String::from("otzaria-artifact-digest-v2\n");
+        canonical.push_str(&format!("metadata_version={}\n", manifest.metadata_version));
         for field in IdentityField::ALL {
             canonical.push_str(&format!(
                 "{}={}\n",
                 field.path(),
-                self.manifest.identity.value(field)
+                manifest.identity.value(field)
             ));
         }
-        canonical.push_str(&format!("book_count={}\n", self.manifest.book_count));
-        canonical.push_str(&format!("vector_count={}\n", self.manifest.vector_count));
+        canonical.push_str(&format!("kind={}\n", manifest.kind));
         canonical.push_str(&format!(
-            "total_size_bytes={}\n",
-            self.manifest.total_size_bytes
+            "from_library_version={}\n",
+            manifest.from_library_version
         ));
+        canonical.push_str(&format!(
+            "to_library_version={}\n",
+            manifest.to_library_version
+        ));
+        canonical.push_str(&format!(
+            "library_release_tag={}\n",
+            manifest.library_release_tag
+        ));
+        let counts = &manifest.counts;
+        canonical.push_str(&format!(
+            "counts books={} slots={} extras={} foreign={} tombstones={}\n",
+            counts.books, counts.slots, counts.extras, counts.foreign, counts.tombstones
+        ));
+        let provenance = &manifest.provenance;
+        canonical.push_str(&format!(
+            "provenance passage_package={} {} worker={} {}\n",
+            provenance.passage_package.checksum,
+            provenance.passage_package.quantization,
+            provenance.worker.backend,
+            provenance.worker.device
+        ));
+        canonical.push_str(&format!("total_size_bytes={}\n", manifest.total_size_bytes));
         for (payload, descriptor) in &self.payloads {
             canonical.push_str(&format!(
                 "payload {payload}={} {}\n",
@@ -407,7 +571,7 @@ impl IndexPackage {
     /// bytes are read.
     fn walk_payloads(&self, root: &Path, depth: VerificationDepth) -> Result<(), ArtifactError> {
         validate_payload_table(&self.payloads)?;
-        self.manifest.validate_counts()?;
+        self.manifest.validate_description()?;
 
         let mut payload_bytes = 0u64;
         for (payload, declared) in &self.payloads {
@@ -523,12 +687,9 @@ impl VerifiedPackage {
         self.payloads.keys().map(String::as_str).collect()
     }
 
-    pub fn book_count(&self) -> u32 {
-        self.manifest.book_count
-    }
-
-    pub fn vector_count(&self) -> u32 {
-        self.manifest.vector_count
+    /// What the manifest declares the segment holds.
+    pub fn counts(&self) -> &PackageCounts {
+        &self.manifest.counts
     }
 }
 
@@ -713,6 +874,23 @@ struct MetadataVersionProbe {
     metadata_version: u32,
 }
 
+/// A base description for tests across this crate: `books` books and `slots` vectors, at
+/// library version 30.
+#[cfg(test)]
+pub(crate) fn test_description(books: u32, slots: u64) -> PackageDescription {
+    PackageDescription {
+        kind: PackageKind::Base,
+        from_library_version: 0,
+        to_library_version: 30,
+        library_release_tag: "v30-20260930120000".to_string(),
+        counts: PackageCounts {
+            books,
+            slots,
+            ..PackageCounts::default()
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,15 +934,32 @@ mod tests {
         let package = IndexPackage {
             manifest: PackageManifest::new(
                 test_identity(),
+                sample_description(),
+                crate::semantic::versioning::test_provenance(),
                 "2026-08-06T00:00:00Z".to_string(),
-                10,
-                100,
                 payload.len() as u64,
             ),
             payloads,
         };
         IndexPackage::write(root, &package).unwrap();
         package
+    }
+
+    /// A base of ten books and a hundred vectors, at library version 30.
+    fn sample_description() -> PackageDescription {
+        PackageDescription {
+            kind: PackageKind::Base,
+            from_library_version: 0,
+            to_library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
+            counts: PackageCounts {
+                books: 10,
+                slots: 100,
+                extras: 6,
+                foreign: 0,
+                tombstones: 0,
+            },
+        }
     }
 
     fn expected_identity() -> IndexVersion {
@@ -782,27 +977,25 @@ mod tests {
 
         let package = IndexPackage::read(dir.path()).unwrap();
         assert_eq!(package.manifest.metadata_version, ARTIFACT_METADATA_VERSION);
-        assert_eq!(package.manifest.book_count, 10);
-        assert_eq!(package.manifest.vector_count, 100);
+        assert_eq!(package.manifest.description(), sample_description());
 
         let verified = IndexPackage::verify_for_install(dir.path(), &expectation()).unwrap();
         assert_eq!(verified.payload_names(), ["vectors.bin"]);
         assert_eq!(verified.payloads().len(), 1);
-        assert_eq!(verified.vector_count(), 100);
-        assert_eq!(verified.book_count(), 10);
+        assert_eq!(verified.counts(), &sample_description().counts);
         assert_eq!(verified.root(), dir.path());
         assert!(verified.identity().is_compatible(&expected_identity()));
     }
 
-    /// The gate: a package built for another corpus is refused, and the rejection says
-    /// which field disagreed rather than "incompatible".
+    /// The gate: a package keyed under another line recipe is refused, and the rejection
+    /// says which field disagreed rather than "incompatible".
     #[test]
-    fn a_package_from_another_corpus_is_refused_by_name() {
-        let dir = TempDir::new("wrong_corpus");
+    fn a_package_from_another_line_recipe_is_refused_by_name() {
+        let dir = TempDir::new("wrong_text");
         write_sample_package(dir.path(), b"vectors");
 
         let mut expected = expected_identity();
-        expected.corpus.corpus_id = "d".repeat(64);
+        expected.text.line_text_version = 2;
 
         match IndexPackage::verify_for_install(
             dir.path(),
@@ -811,9 +1004,9 @@ mod tests {
             Err(ArtifactError::IdentityMismatch { mismatches }) => assert_eq!(
                 mismatches,
                 vec![IdentityMismatch {
-                    field: IdentityField::CorpusId,
-                    artifact: "c".repeat(64),
-                    expected: "d".repeat(64),
+                    field: IdentityField::LineTextVersion,
+                    artifact: "1".to_string(),
+                    expected: "2".to_string(),
                 }]
             ),
             other => panic!("expected an identity rejection, got {other:?}"),
@@ -831,7 +1024,7 @@ mod tests {
         fs::write(dir.path().join("vectors.bin"), b"tampered").unwrap();
 
         let mut expected = expected_identity();
-        expected.model.model_checksum = "b".repeat(64);
+        expected.model.query_packages[0].checksum = "b".repeat(64);
 
         assert!(matches!(
             IndexPackage::verify_for_install(
@@ -892,9 +1085,9 @@ mod tests {
         let package = IndexPackage {
             manifest: PackageManifest::new(
                 test_identity(),
+                crate::distribution::package::test_description(2, 20),
+                crate::semantic::versioning::test_provenance(),
                 "2026-08-06T00:00:00Z".to_string(),
-                2,
-                20,
                 (first.len() + second.len()) as u64,
             ),
             payloads: BTreeMap::from([
@@ -933,9 +1126,9 @@ mod tests {
         let package = IndexPackage {
             manifest: PackageManifest::new(
                 test_identity(),
+                crate::distribution::package::test_description(1, 1),
+                crate::semantic::versioning::test_provenance(),
                 "2026-08-06T00:00:00Z".to_string(),
-                1,
-                1,
                 14,
             ),
             payloads: BTreeMap::from([
@@ -1042,21 +1235,35 @@ mod tests {
     fn a_manifest_declaring_nothing_is_refused() {
         let dir = TempDir::new("zero_counts");
         let package = write_sample_package(dir.path(), b"vectors");
+        let with = |change: fn(&mut PackageManifest)| {
+            let mut manifest = package.manifest.clone();
+            change(&mut manifest);
+            manifest
+        };
 
         for (label, manifest) in [
+            ("books", with(|m| m.counts.books = 0)),
+            ("vectors", with(|m| m.counts.slots = 0)),
+            ("an edition", with(|m| m.to_library_version = 0)),
             (
-                "books",
-                PackageManifest {
-                    book_count: 0,
-                    ..package.manifest.clone()
-                },
+                "a base that starts somewhere",
+                with(|m| m.from_library_version = 29),
+            ),
+            ("a base with tombstones", with(|m| m.counts.tombstones = 1)),
+            (
+                "a delta that goes backwards",
+                with(|m| {
+                    m.kind = PackageKind::Delta;
+                    m.from_library_version = 30;
+                }),
             ),
             (
-                "vectors",
-                PackageManifest {
-                    vector_count: 0,
-                    ..package.manifest.clone()
-                },
+                "a tag with a newline",
+                with(|m| m.library_release_tag = "v30\nkind=delta".to_string()),
+            ),
+            (
+                "a tag past the header's width",
+                with(|m| m.library_release_tag = "v".repeat(65)),
             ),
         ] {
             write_json(&dir.path().join(MANIFEST_FILENAME), &manifest).unwrap();
@@ -1065,9 +1272,18 @@ mod tests {
                     IndexPackage::verify_for_install(dir.path(), &expectation()),
                     Err(ArtifactError::ManifestDisagreesWithPayload { .. })
                 ),
-                "a manifest with no {label} must be refused"
+                "a manifest with {label} must be refused"
             );
         }
+
+        // An empty delta is a release that changed no embedded text, and it is legal.
+        let empty_delta = with(|m| {
+            m.kind = PackageKind::Delta;
+            m.from_library_version = 29;
+            m.counts = PackageCounts::default();
+        });
+        write_json(&dir.path().join(MANIFEST_FILENAME), &empty_delta).unwrap();
+        IndexPackage::verify_for_install(dir.path(), &expectation()).unwrap();
     }
 
     #[test]
@@ -1076,20 +1292,20 @@ mod tests {
         let package = write_sample_package(dir.path(), b"vectors");
 
         let mut blank = package.manifest.clone();
-        blank.identity.corpus.corpus_id = String::new();
+        blank.identity.model.family_id = String::new();
         write_json(&dir.path().join(MANIFEST_FILENAME), &blank).unwrap();
 
         let mut equally_blank = expected_identity();
-        equally_blank.corpus.corpus_id = String::new();
+        equally_blank.model.family_id = String::new();
 
         match IndexPackage::verify_for_install(
             dir.path(),
             &ArtifactExpectation::without_published_digest(equally_blank),
         ) {
             Err(ArtifactError::IncompleteIdentity { field, .. }) => {
-                assert_eq!(field, IdentityField::CorpusId)
+                assert_eq!(field, IdentityField::FamilyId)
             }
-            other => panic!("a blank corpus id must not open anything, got {other:?}"),
+            other => panic!("a blank model id must not open anything, got {other:?}"),
         }
     }
 
@@ -1152,9 +1368,9 @@ mod tests {
         let dir = TempDir::new("unsafe_names");
         let manifest = PackageManifest::new(
             expected_identity(),
+            crate::distribution::package::test_description(1, 1),
+            crate::semantic::versioning::test_provenance(),
             "2026-08-06T00:00:00Z".to_string(),
-            1,
-            1,
             0,
         );
 
@@ -1266,16 +1482,46 @@ mod tests {
         assert_eq!(restamped.digest(), digest);
 
         // Everything that is identity does move it.
-        let mut other_corpus = test_identity();
-        other_corpus.corpus.corpus_id = "d".repeat(64);
+        let mut other_text = test_identity();
+        other_text.text.line_text_version = 2;
         let elsewhere = IndexPackage {
             manifest: PackageManifest {
-                identity: other_corpus,
+                identity: other_text,
                 ..package.manifest.clone()
             },
             payloads: package.payloads.clone(),
         };
         assert_ne!(elsewhere.digest(), digest);
+
+        // And so does every field that places the segment in a chain or counts what it
+        // holds, though identity comparison reads none of them.
+        let changes: [fn(&mut PackageManifest); 11] = [
+            |m| m.provenance.passage_package.quantization.push('x'),
+            |m| m.provenance.worker.device.push('x'),
+            |m| m.kind = PackageKind::Compacted,
+            |m| m.from_library_version = 1,
+            |m| m.to_library_version = 31,
+            |m| m.library_release_tag.push('x'),
+            |m| m.counts.books += 1,
+            |m| m.counts.slots += 1,
+            |m| m.counts.extras += 1,
+            |m| m.counts.foreign += 1,
+            |m| m.counts.tombstones += 1,
+        ];
+        let mut seen = std::collections::HashSet::from([digest]);
+        for change in changes {
+            let mut manifest = package.manifest.clone();
+            change(&mut manifest);
+            let moved = IndexPackage {
+                manifest,
+                payloads: package.payloads.clone(),
+            }
+            .digest();
+            assert!(
+                seen.insert(moved),
+                "every description field moves the digest"
+            );
+        }
     }
 
     /// Opening an installed artifact must not re-read it. At library scale the payload is

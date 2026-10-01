@@ -128,30 +128,34 @@ impl LedgerManifest {
     ///
     /// [`PackError::LedgerDisagreesWithBuild`], naming the first field that differs.
     pub fn ensure_matches(&self, model: &ModelIdentity, dim: u32) -> Result<(), PackError> {
+        let packages = |model: &ModelIdentity| {
+            let mut packages: Vec<String> = model
+                .query_packages
+                .iter()
+                .map(|package| format!("{} {}", package.checksum, package.quantization))
+                .collect();
+            packages.sort();
+            packages.join(",")
+        };
         for (field, base, target) in [
-            ("model_id", &self.model.model_id, &model.model_id),
             (
-                "model_checksum",
-                &self.model.model_checksum,
-                &model.model_checksum,
+                "family_id",
+                self.model.family_id.clone(),
+                model.family_id.clone(),
             ),
             (
-                "model_quantization",
-                &self.model.model_quantization,
-                &model.model_quantization,
+                "tokenizer_checksum",
+                self.model.tokenizer_checksum.clone(),
+                model.tokenizer_checksum.clone(),
             ),
-            (
-                "embedding_backend",
-                &self.model.embedding_backend,
-                &model.embedding_backend,
-            ),
-            ("pooling", &self.model.pooling, &model.pooling),
+            ("pooling", self.model.pooling.clone(), model.pooling.clone()),
+            ("query_packages", packages(&self.model), packages(model)),
         ] {
             if base != target {
                 return Err(PackError::LedgerDisagreesWithBuild {
                     field,
-                    ledger: base.clone(),
-                    build: target.clone(),
+                    ledger: base,
+                    build: target,
                 });
             }
         }
@@ -899,6 +903,7 @@ fn read_error(error: std::io::Error) -> PackError {
 mod tests {
     use super::*;
     use crate::semantic::chunker::ChunkerConfig;
+    use crate::semantic::versioning::ModelPackage;
     use std::io::Cursor;
 
     const DIM: usize = 2;
@@ -931,10 +936,12 @@ mod tests {
 
     fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
         ModelIdentity {
-            model_id: "otzaria-embedding-v1".to_string(),
-            model_checksum: checksum.to_string(),
-            model_quantization: "int8".to_string(),
-            embedding_backend: "mock-hash-v1".to_string(),
+            family_id: "otzaria-embedding-v1".to_string(),
+            tokenizer_checksum: crate::semantic::embedding::mock::stub_tokenizer_checksum(),
+            query_packages: vec![ModelPackage {
+                checksum: checksum.to_string(),
+                quantization: "int8".to_string(),
+            }],
             embedding_dim: DIM_U32,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
@@ -1266,7 +1273,7 @@ mod tests {
 
         // A shard embedded by another model.
         let other_model = ModelIdentity {
-            model_checksum: "cd".repeat(32),
+            family_id: "another/model@0000000".to_string(),
             ..model.clone()
         };
         let mixed = write("mixed", 2, 2, "plan", &other_model);
@@ -1505,14 +1512,14 @@ mod tests {
             vector_count: 2,
             embedding_dim: DIM_U32,
             model: ModelIdentity {
-                // Same texts, same digests, different weights.
-                model_checksum: "cd".repeat(32),
+                // Same texts, same digests, another family's weights.
+                family_id: "another/model@0000000".to_string(),
                 ..mine.clone()
             },
         };
         match manifest.ensure_matches(&mine, DIM_U32) {
             Err(PackError::LedgerDisagreesWithBuild { field, .. }) => {
-                assert_eq!(field, "model_checksum");
+                assert_eq!(field, "family_id");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }

@@ -352,20 +352,20 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
           echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
 
-      # The package checksum is what an artifact built from a graph declares as
-      # `model_checksum`, and it has two implementations: the crate's and
-      # tools/onnx_package_checksum.py. For each graph both must reach the value its golden
-      # file records — from the real package; the unit tests only reach it from a 241-byte
-      # one — and, where an identity declares that graph, the value the identity declares.
+      # A package checksum is what the family's identity lists among its `query_packages`,
+      # and it has two implementations: the crate's and tools/onnx_package_checksum.py. For
+      # each graph both must reach the value its golden file records — from the real
+      # package; the unit tests only reach it from a 241-byte one — and the family must
+      # declare that value for the package of that quantization.
       - name: The package checksums, by both implementations
         run: |
           check() {
             graph="onnx-model/$1"
             recorded=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header']['package_checksum'])" "tests/data/$2")
             if [ -n "${3:-}" ]; then
-              declared=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['model_checksum'])" "$3")
+              declared=$(python3 -c "import json,sys; print(next(p['checksum'] for p in json.load(open(sys.argv[1]))['query_packages'] if p['quantization'] == sys.argv[2]))" "$3" "$4")
               if [ "$declared" != "$recorded" ]; then
-                echo "::error::$3 declares $declared, and $2 records $recorded."
+                echo "::error::$3 declares $declared for its $4 package, and $2 records $recorded."
                 exit 1
               fi
             fi
@@ -376,8 +376,8 @@ jobs:
               exit 1
             fi
           }
-          check seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json config/models/meivin-round2-onnx/model.json
-          check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx-fp32/model.json
+          check seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json config/models/meivin-round2-onnx/model.json int8
+          check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx/model.json fp32
 
       # `--ignored` is what selects them; the name selects the ONNX gate alone. The gate
       # picks each graph's goldens by its hash. One test at a time, so that the output reads

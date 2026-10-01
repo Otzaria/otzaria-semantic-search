@@ -115,7 +115,6 @@ mod with_the_backend {
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
     use otzaria_semantic_search::semantic::store::VectorStoreConfig;
-    use otzaria_semantic_search::semantic::versioning::CorpusIdentity;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -224,15 +223,13 @@ mod with_the_backend {
     ) -> OfficialIndexConfig {
         OfficialIndexConfig {
             artifact_path: dir.0.join("no-artifact-installed"),
-            corpus: CorpusIdentity {
-                corpus_id: "4d".repeat(32),
-                library_version: "onnx-fixture".to_string(),
-                tantivy_schema_version: 3,
-                document_id_scheme_version: 1,
-            },
+            text:
+                otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+                    1,
+                ),
             model: LocalModel {
                 model_path,
-                model_id: "onnx-fixture".to_string(),
+                family_id: "onnx-fixture@0".to_string(),
                 model_quantization: "fp32".to_string(),
                 embedding_dim: 4,
                 pooling: "in-graph".to_string(),

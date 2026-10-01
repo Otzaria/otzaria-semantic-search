@@ -21,9 +21,11 @@
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::distribution::corpus::CorpusIdentity;
 use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
 use otzaria_semantic_search::distribution::package::{
-    ArtifactExpectation, IndexPackage, PackageManifest, PayloadDescriptor,
+    ArtifactExpectation, IndexPackage, PackageCounts, PackageDescription, PackageKind,
+    PackageManifest, PayloadDescriptor,
 };
 use otzaria_semantic_search::errors::SemanticSearchError;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
@@ -37,7 +39,9 @@ use otzaria_semantic_search::semantic::store_backend::VectorStoreBackend;
 use otzaria_semantic_search::semantic::types::{
     ContentFingerprint, LexicalCandidate, SearchMode, VectorMetadata,
 };
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity};
+use otzaria_semantic_search::semantic::versioning::{
+    EmbeddingWorker, IndexVersion, ModelIdentity, ModelPackage, VectorProvenance,
+};
 use otzaria_semantic_search::semantic::zevc_store::{
     ZevcStore, ZevcStoreConfig, SNAPSHOT_FILENAMES,
 };
@@ -100,9 +104,11 @@ impl Drop for TempDir {
 /// The corpus identity a caller takes from the Tantivy index it has open.
 fn corpus() -> CorpusIdentity {
     CorpusIdentity {
-        corpus_id: "4d".repeat(32),
-        library_version: "otzaria-library-2026-08".to_string(),
-        tantivy_schema_version: 3,
+        text: otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+            1,
+        ),
+        library_version: 30,
+        library_release_tag: "v30-20260930120000".to_string(),
         document_id_scheme_version: 1,
     }
 }
@@ -110,7 +116,7 @@ fn corpus() -> CorpusIdentity {
 fn local_model(model_path: &Path) -> LocalModel {
     LocalModel {
         model_path: model_path.to_path_buf(),
-        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+        family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6".to_string(),
         model_quantization: "int8".to_string(),
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
@@ -124,13 +130,15 @@ fn local_model(model_path: &Path) -> LocalModel {
 fn identity(model_path: &Path) -> IndexVersion {
     let model = local_model(model_path);
     IndexVersion {
-        corpus: corpus(),
+        text: corpus().text,
         model: ModelIdentity {
-            model_id: model.model_id,
+            family_id: model.family_id,
+            tokenizer_checksum: mock::stub_tokenizer_checksum(),
             // What the builder had, computed here from the file the runtime will load.
-            model_checksum: validate_model(model_path).unwrap().checksum().to_string(),
-            model_quantization: model.model_quantization,
-            embedding_backend: MockHashBackend::ID.to_string(),
+            query_packages: vec![ModelPackage {
+                checksum: validate_model(model_path).unwrap().checksum().to_string(),
+                quantization: model.model_quantization,
+            }],
             embedding_dim: model.embedding_dim,
             pooling: model.pooling,
             max_tokens: model.max_tokens,
@@ -197,9 +205,28 @@ fn install(dir: &TempDir) -> (PathBuf, PathBuf) {
     let package = IndexPackage {
         manifest: PackageManifest::new(
             identity(&model_path),
+            PackageDescription {
+                kind: PackageKind::Base,
+                from_library_version: 0,
+                to_library_version: 30,
+                library_release_tag: "v30-20260930120000".to_string(),
+                counts: PackageCounts {
+                    books: 2,
+                    slots: LINES.len() as u64,
+                    ..PackageCounts::default()
+                },
+            },
+            VectorProvenance {
+                passage_package: ModelPackage {
+                    checksum: validate_model(&model_path).unwrap().checksum().to_string(),
+                    quantization: "int8".to_string(),
+                },
+                worker: EmbeddingWorker {
+                    backend: MockHashBackend::ID.to_string(),
+                    device: "cpu".to_string(),
+                },
+            },
             "2026-08-06T00:00:00Z".to_string(),
-            2,
-            LINES.len() as u32,
             payloads.values().map(|payload| payload.size_bytes).sum(),
         ),
         payloads,
@@ -224,7 +251,7 @@ fn install(dir: &TempDir) -> (PathBuf, PathBuf) {
 fn open_official(target: &Path, model_path: &Path) -> OfficialSemanticIndex {
     OfficialSemanticIndex::open(OfficialIndexConfig {
         artifact_path: target.to_path_buf(),
-        corpus: corpus(),
+        text: corpus().text,
         model: local_model(model_path),
         deployment: EmbeddingDeployment::default(),
         published_digest: None,

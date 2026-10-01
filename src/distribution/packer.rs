@@ -78,7 +78,8 @@
 
 use crate::distribution::corpus::{CorpusIndex, CorpusLine};
 use crate::distribution::package::{
-    ArtifactExpectation, IndexPackage, PackageManifest, PayloadDescriptor, VerifiedPackage,
+    ArtifactExpectation, IndexPackage, PackageCounts, PackageDescription, PackageKind,
+    PackageManifest, PayloadDescriptor, VerifiedPackage,
 };
 use crate::errors::{EmbeddingError, PackError};
 use crate::semantic::chunker::compute_semantic_id;
@@ -88,7 +89,7 @@ use crate::semantic::official_index::{
 };
 use crate::semantic::store_backend::{VectorSearchBackend, VectorStoreBackend};
 use crate::semantic::types::VectorMetadata;
-use crate::semantic::versioning::{IndexVersion, ModelIdentity};
+use crate::semantic::versioning::{IndexVersion, ModelIdentity, VectorProvenance};
 use crate::semantic::zevc_store::{
     ReadOnlyZevcStore, ZevcStore, ZevcStoreConfig, SNAPSHOT_FILENAMES,
 };
@@ -136,6 +137,9 @@ pub struct PackRequest {
     /// Everything about how the vectors were produced. The one half of the identity
     /// neither the corpus nor this crate can know — see [`ModelIdentity`].
     pub model: ModelIdentity,
+    /// Which package of the family embedded the vectors, and what ran it. Recorded in the
+    /// manifest, compared by nothing.
+    pub provenance: VectorProvenance,
     /// Timestamp recorded in the manifest. Excluded from the artifact digest, so it does
     /// not have to be reproducible for the digest to be.
     pub created_at: String,
@@ -235,12 +239,23 @@ pub fn pack(
     store.commit()?;
     drop(store);
 
+    let corpus_identity = corpus.identity()?;
     write_metadata(
         &request.output_path,
         &identity,
+        request.provenance.clone(),
         &request.created_at,
-        book_count,
-        stored,
+        PackageDescription {
+            kind: PackageKind::Base,
+            from_library_version: 0,
+            to_library_version: corpus_identity.library_version,
+            library_release_tag: corpus_identity.library_release_tag,
+            counts: PackageCounts {
+                books: book_count,
+                slots: u64::from(stored),
+                ..PackageCounts::default()
+            },
+        },
     )?;
 
     log::info!(
@@ -365,7 +380,7 @@ pub(crate) fn compose_identity(
     model: &ModelIdentity,
 ) -> Result<IndexVersion, PackError> {
     let identity = IndexVersion {
-        corpus: corpus.identity()?,
+        text: corpus.identity()?.text,
         model: model.clone(),
         // Not the caller's: an artifact written in a layout this build cannot read would
         // be an artifact for nobody.
@@ -628,9 +643,9 @@ fn verify_records_against_corpus(
 fn write_metadata(
     root: &Path,
     identity: &IndexVersion,
+    provenance: VectorProvenance,
     created_at: &str,
-    book_count: u32,
-    vector_count: u32,
+    description: PackageDescription,
 ) -> Result<(), PackError> {
     let mut payloads: BTreeMap<String, PayloadDescriptor> = BTreeMap::new();
     for name in SNAPSHOT_FILENAMES {
@@ -644,9 +659,9 @@ fn write_metadata(
     let package = IndexPackage {
         manifest: PackageManifest::new(
             identity.clone(),
+            description,
+            provenance,
             created_at.to_string(),
-            book_count,
-            vector_count,
             total_size_bytes,
         ),
         payloads,
@@ -659,7 +674,7 @@ fn report(verified: &VerifiedPackage, identity: IndexVersion, book_count: u32) -
         artifact_path: verified.root().to_path_buf(),
         identity,
         digest: verified.artifact_digest().to_string(),
-        vector_count: verified.vector_count(),
+        vector_count: verified.counts().slots.min(u64::from(u32::MAX)) as u32,
         book_count,
         total_size_bytes: verified.manifest().total_size_bytes,
     }
@@ -857,9 +872,11 @@ impl Iterator for VectorInputReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distribution::corpus::CorpusIdentity;
     use crate::errors::ArtifactError;
     use crate::semantic::chunker::compute_chunk_hash;
-    use crate::semantic::versioning::{CorpusIdentity, IdentityField};
+    use crate::semantic::versioning::IdentityField;
+    use crate::semantic::versioning::ModelPackage;
     use crate::semantic::zevc_store::{METADATA_FILENAME, VECTORS_FILENAME};
     use std::collections::HashMap;
 
@@ -919,9 +936,9 @@ mod tests {
         fn new() -> Self {
             Self {
                 identity: CorpusIdentity {
-                    corpus_id: "9c".repeat(32),
-                    library_version: "otzaria-library-2026-08".to_string(),
-                    tantivy_schema_version: 3,
+                    text: crate::semantic::versioning::TextIdentity::with_line_text_version(1),
+                    library_version: 30,
+                    library_release_tag: "v30-20260930120000".to_string(),
                     document_id_scheme_version: 1,
                 },
                 lines: LINES
@@ -974,10 +991,12 @@ mod tests {
 
     fn model() -> ModelIdentity {
         ModelIdentity {
-            model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
-            model_checksum: "a".repeat(64),
-            model_quantization: "int8".to_string(),
-            embedding_backend: "onnxruntime-sentence-v1".to_string(),
+            family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+            tokenizer_checksum: "7".repeat(64),
+            query_packages: vec![ModelPackage {
+                checksum: "a".repeat(64),
+                quantization: "int8".to_string(),
+            }],
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
@@ -991,6 +1010,7 @@ mod tests {
         PackRequest {
             output_path: output.to_path_buf(),
             model: model(),
+            provenance: crate::semantic::versioning::test_provenance(),
             created_at: "2026-08-08T00:00:00Z".to_string(),
             collection_name: "chunks".to_string(),
         }
@@ -1040,7 +1060,7 @@ mod tests {
         assert_eq!(report.artifact_path, output);
         assert_eq!(report.vector_count, LINES.len() as u32);
         assert_eq!(report.book_count, 2);
-        assert_eq!(report.identity.corpus, corpus.identity().unwrap());
+        assert_eq!(report.identity.text, corpus.identity().unwrap().text);
         assert_eq!(report.identity.model, model());
         assert_eq!(report.identity.store, readable_store_identity());
         assert!(report.total_size_bytes > 0);
@@ -1180,7 +1200,7 @@ mod tests {
         let output = dir.path().join("artifact");
 
         let mut blank = model();
-        blank.model_checksum = String::new();
+        blank.tokenizer_checksum = String::new();
         match pack(
             PackRequest {
                 model: blank,
@@ -1190,7 +1210,7 @@ mod tests {
             &FakeCorpus::new(),
         ) {
             Err(PackError::Artifact(ArtifactError::IncompleteIdentity { field, .. })) => {
-                assert_eq!(field, IdentityField::ModelChecksum)
+                assert_eq!(field, IdentityField::TokenizerChecksum)
             }
             other => panic!("a blank checksum must be refused, got {other:?}"),
         }
@@ -1289,17 +1309,17 @@ mod tests {
         pack(request(&output), good_inputs(), &corpus).unwrap();
 
         let mut elsewhere = FakeCorpus::new();
-        elsewhere.identity.corpus_id = "1b".repeat(32);
+        elsewhere.identity.text.line_text_version = 2;
         let mut other_weights = model();
-        other_weights.model_checksum = "b".repeat(64);
+        other_weights.query_packages[0].checksum = "b".repeat(64);
 
         for (field, verdict) in [
             (
-                IdentityField::CorpusId,
+                IdentityField::LineTextVersion,
                 validate_artifact(&output, &model(), &elsewhere),
             ),
             (
-                IdentityField::ModelChecksum,
+                IdentityField::QueryPackages,
                 validate_artifact(&output, &other_weights, &corpus),
             ),
         ] {

@@ -140,7 +140,7 @@ S3 (זהות הארטיפקט) ו־S6 (התקנה באפליקציה).
 | מקור | `ArieLLL123/judaic-semantic-round2-onnx-zayit` ב־HuggingFace, revision `1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca`, `gated: manual` |
 | מראה | `otzaria/judaic-semantic-round2-onnx-zayit`, פרטית (commit 99b8a61, זהה בבתים למקור בכל שמונת הקבצים) — ממנה מוריד ה־CI, ולכן לחשבון שמאחורי הסוד `OTZARIA_HF_TOKEN` דרושה הרשאת קריאה אליה |
 | גרף ברירת המחדל | **`seforim-embed-round2-int8.onnx`** — §6.0 |
-| זהות | [`config/models/meivin-round2-onnx/`](../config/models/meivin-round2-onnx/) — גרף ה־int8, זהות הייצור; [`config/models/meivin-round2-onnx-fp32/`](../config/models/meivin-round2-onnx-fp32/) — גרף ה־fp32, הייחוס |
+| זהות | [`config/models/meivin-round2-onnx/`](../config/models/meivin-round2-onnx/) — משפחת המודל: חבילות ה־int8 (ברירת המחדל של האפליקציה) וה־fp32 (שבה מוטמעים קטעי הספרייה); סט וקטורים מקבל שאילתה מכל אחת מהן |
 
 ### 6.0 ההכרעה: גרף ה־int8 הוא ברירת המחדל
 

@@ -164,6 +164,8 @@ pub struct EmbeddingRuntime {
     /// The model's `model_checksum`, computed by [`Self::load`] — see
     /// [`Self::model_checksum`] for what it covers per format.
     model_checksum: Option<String>,
+    /// SHA-256 of the package's `tokenizer.json`, read by the same validation.
+    tokenizer_checksum: Option<String>,
 }
 
 impl EmbeddingRuntime {
@@ -182,6 +184,7 @@ impl EmbeddingRuntime {
             deployment,
             backend: None,
             model_checksum: None,
+            tokenizer_checksum: None,
         }
     }
 
@@ -203,7 +206,14 @@ impl EmbeddingRuntime {
         // checksum that names them all.
         let validated = validate_model(&self.config.model_path)?;
         let backend = select_backend_for(&self.config, &self.deployment)?;
-        self.adopt(backend, Some(validated.checksum().to_string()))
+        let tokenizer = validated
+            .files()
+            .iter()
+            .find(|file| file.relpath == crate::semantic::model_package::ONNX_TOKENIZER_FILE)
+            .map(|file| file.sha256.clone());
+        self.adopt(backend, Some(validated.checksum().to_string()))?;
+        self.tokenizer_checksum = tokenizer;
+        Ok(())
     }
 
     /// Install a backend after checking it agrees with this configuration.
@@ -308,6 +318,13 @@ impl EmbeddingRuntime {
     /// the ones an index was built with — not a download verification.
     pub fn model_checksum(&self) -> Option<&str> {
         self.model_checksum.as_deref()
+    }
+
+    /// SHA-256 of the loaded package's `tokenizer.json`, or `None` before a successful
+    /// load — the half of a model family's identity a package can be checked against
+    /// directly: two packages of one family share their tokenizer byte for byte.
+    pub fn tokenizer_checksum(&self) -> Option<&str> {
+        self.tokenizer_checksum.as_deref()
     }
 
     /// Convenience wrapper over [`Self::embed_batch`]; indexing should call the
@@ -774,6 +791,12 @@ pub mod mock {
     /// A `tokenizer.json` in the shape of a Hugging Face tokenizer, and a whole JSON
     /// object — which is all the validator asks of it.
     pub const STUB_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"[CLS]":1,"[SEP]":2,"[QUERY]":3,"[PASSAGE]":4},"unk_token":"[UNK]"}}"#;
+
+    /// SHA-256 of [`STUB_TOKENIZER_JSON`]: the tokenizer checksum of every stub package.
+    pub fn stub_tokenizer_checksum() -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(STUB_TOKENIZER_JSON.as_bytes()))
+    }
 
     /// Write a minimal valid ONNX package into `dir` — [`onnx::stub_graph`] as
     /// `model.onnx`, and [`STUB_TOKENIZER_JSON`] beside it — and return the graph's path,

@@ -55,9 +55,10 @@ library built on one CPU family and queried on another is compared at about cosi
 the order at which int8 and fp32 part anyway, and within the int8 golden gate's
 cross-machine bound (§8).
 
-The identities: `config/models/meivin-round2-onnx/` (int8, `model_checksum`
-`9e408407…d9d065`) and `config/models/meivin-round2-onnx-fp32/` (fp32, `4a4a2ae8…2ade46`),
-which differ in those two fields alone. Each graph has its own golden file.
+The identity: `config/models/meivin-round2-onnx/`, one model family with two query
+packages — int8 (`9e408407…d9d065`, the application's default) and fp32 (`4a4a2ae8…2ade46`,
+which the library's passages are embedded with). A vector set accepts a query from either.
+Each graph has its own golden file.
 
 ### 0.1 int8 on x86: exact products, by VNNI or by `session.x64quantprecision`
 
