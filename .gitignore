@@ -31,8 +31,8 @@ seforim-embed-round2-int8.onnx
 /onnx-model/
 semantic_db/
 
-# Byte-code left behind by the golden-vector tooling in tools/. Running
-# `generate_golden_vectors.py` writes `tools/__pycache__/*.pyc`, which is
+# Byte-code left behind by the Python tooling in tools/. Running the golden-vector
+# generator or the tools' tests writes `tools/__pycache__/*.pyc`, which is
 # otherwise committable — it has already been staged accidentally once.
 __pycache__/
 *.pyc

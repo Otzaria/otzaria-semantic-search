@@ -1,6 +1,6 @@
 {
  "cases_version": 1,
- "description": "Input cases for tools/generate_onnx_golden_vectors.py. Each becomes one record in tests/data/onnx_golden_vectors.json. Most texts are taken from tools/golden_corpus.json by id, so the two golden files exercise the same lines; the rest are here because only a BERT-style tokenizer with role tokens makes them interesting. Plain data: add a case without touching code, then regenerate.",
+ "description": "Input cases for tools/generate_onnx_golden_vectors.py. Each becomes one record in each graph's golden file, tests/data/onnx_golden_vectors_int8.json and tests/data/onnx_golden_vectors.json. Most texts are taken from tools/golden_corpus.json by id; the rest are here because only a BERT-style tokenizer with role tokens makes them interesting. Plain data: add a case without touching code, then regenerate.",
  "field_docs": {
   "name": "Stable, unique, ASCII identifier. Never rename an existing name -- a Rust test may name it.",
   "role": "'passage', 'query' or 'raw'. The model input is '[PASSAGE] ' + text, '[QUERY] ' + text, or the text alone -- exactly what embedding text version 2 hands the backend for a stored passage and for a query, and a raw control with no role token at all.",
