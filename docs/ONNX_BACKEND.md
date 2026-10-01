@@ -47,13 +47,124 @@ is for.
 One property int8 does not share with fp32: **its vectors depend on which int8 kernels
 run.** On the M4 alone, turning KleidiAI off moved them by up to 1.07e-2 (cosine 0.99896),
 and an unfused graph by 1.06e-2 (0.99908), where fp32 moves by a few 1e-7 (§7.2); x86 runs
-MLAS's own int8 kernels. So a library built on one CPU family and queried on another is
-compared at about cosine 0.999 — the order at which int8 and fp32 part anyway, and within
-the int8 golden gate's cross-machine bound (§8).
+MLAS's own int8 kernels, which compute this graph's products exactly only because the
+backend asks for it (`session.x64quantprecision`, §0.1). So a library built on one CPU
+family and queried on another is compared at about cosine 0.999 — the order at which int8
+and fp32 part anyway, and within the int8 golden gate's cross-machine bound (§8).
 
 The identities: `config/models/meivin-round2-onnx/` (int8, `model_checksum`
 `9e408407…d9d065`) and `config/models/meivin-round2-onnx-fp32/` (fp32, `4a4a2ae8…2ade46`),
 which differ in those two fields alone. Each graph has its own golden file.
+
+### 0.1 int8 on x86: exact products, by `session.x64quantprecision`
+
+**What CI found.** The int8 gate's first run on an x86-64 runner (`golden-onnx`,
+ubuntu-latest; the CPU went unrecorded — the job prints it now) disagreed with the M4's
+goldens on every vector: cosine 0.9809 at worst (`query_single_word`), 0.984–0.997
+typically, max |Δ| up to 4.2e-2, none of the 41 bit-identical — where two correct int8
+kernels part at about 0.999.
+
+**Why: ONNX Runtime's x86 U8S8 kernels saturate at 16 bits.** A dynamically quantized
+matrix product multiplies uint8 activations (`DynamicQuantizeLinear`: 0–255, with a zero
+point) by int8 weights. On x86, MLAS's kernel for that pairing (U8S8) multiplies with
+`VPMADDUBSW`, which adds each pair of neighbouring byte products into a **saturating** int16
+before anything widens it: two products of 255 × 127 sum to 64,770, which is clamped to
+32,767. Only VNNI and AMX sum in 32 bits. The kernel is chosen per CPU at load
+(`core/mlas/lib/platform.cpp`; the first that applies of AMX, AVX-512 VNNI, AVX-512 core,
+AVX-VNNI and AVX2 wins):
+
+| CPU | U8S8 kernel | the products |
+|---|---|---|
+| ARM — the goldens' M4 | dot products into 32 bits; KleidiAI for `DynamicQuantizeMatMul` | exact |
+| x86 with AMX, AVX-512 VNNI or AVX-VNNI | `VPDPBUSD(S)`, AMX tiles | exact |
+| x86 with AVX2, or AVX-512 without VNNI | `VPMADDUBSW` (`QgemmU8X8KernelAvx2.S`, `QgemmU8X8KernelAvx512Core.S`) | **saturated** |
+| x86 with SSE4.1 and no AVX2, Microsoft's Windows build only | `PMADDUBSW` (`qgemm_kernel_sse41.cpp`) | **saturated** |
+| x86 without AVX2, the Linux build | SSE2, widened to 16 bits first | exact |
+
+ONNX Runtime says as much where it defines the remedy: "x64 SSE4.1/AVX2/AVX512(with no
+VNNI) has overflow problem with quantizied matrix multiplication with U8S8"
+(`include/onnxruntime/core/session/onnxruntime_session_options_config_keys.h:248`).
+
+**Why this graph.** It is `quantize_dynamic(weight_type=QuantType.QInt8)` with the
+defaults: 49 `MatMulInteger`, each with int8 weights, one scale and an int8 zero point of
+0 — per-tensor, symmetric, no `reduce_range` — and every tensor reaching ±127. Values past
+±64, without which no pair could reach 32,767 (255 × 64 × 2 = 32,640), are up to 2.1% of
+an encoder matrix and 46.6% of the final 512→256 projection. ONNX Runtime's level-2 fusions
+make them 25 `DynamicQuantizeMatMul` and 24 `MatMulIntegerToFloat` — Q, K and V share a
+`DynamicQuantizeLinear` in each layer, which keeps those three out of the first fusion — and
+every one of them runs U8S8.
+
+**Reproduced on the M4.** Each `MatMulInteger` rewritten inside the graph as exact pair
+sums clipped to int16 — what `VPMADDUBSW` computes — and run through ONNX Runtime 1.28.0 on
+the M4 gives CI's numbers case by case: `query_single_word` 0.9809471732 on both, 18 of the
+41 equal to six digits, every one within 5.3e-4 (r = 0.9992). The same rewrite without the
+clip equals the M4's KleidiAI-off vectors (cosine 1.000000), so the rewrite adds nothing of
+its own.
+
+**The fix: `session.x64quantprecision = 1`** on every session the backend builds
+(`X64_QUANT_PRECISION` in `src/semantic/onnx_backend.rs`). In ONNX Runtime 1.28.0:
+
+- the key is `kOrtSessionOptionsAvx2PrecisionMode`
+  (`onnxruntime_session_options_config_keys.h:252`), set through `ort`'s
+  `SessionBuilder::with_config_entry` (`AddSessionConfigEntry`);
+- it is read in `GenerateTransformers` (`core/optimizer/graph_transformer_utils.cc:378–383`)
+  and counts only where `MlasPlatformU8S8Overflow()` is true — the CPU's U8U8 and U8S8
+  dispatches differ (`core/mlas/lib/platform.cpp:952–958`), which is every x86 CPU with
+  AVX2, VNNI or not, and an SSE4.1 one in the Windows build; on any other architecture the
+  code is compiled out;
+- it adds `Avx2WeightS8ToU8Transformer` to level 2 (`graph_transformer_utils.cc:448–452`),
+  after the `MatMulIntegerToFloat` and `DynamicQuantizeMatMul` fusions (`:399–400`), so it
+  meets the fused nodes;
+- the transformer (`core/optimizer/qdq_transformer/avx2_weight_s8_to_u8.cc`) knows
+  `MatMulInteger`, `MatMulIntegerToFloat`, `DynamicQuantizeMatMul`, `QAttention`, `QGemm`,
+  `QLinearMatMul`, `QLinearConv` and `DynamicQuantizeLSTM`. A constant int8 weight tensor
+  with any value outside ±64 becomes uint8 by `w XOR 0x80` — `w + 128` — and its zero point
+  likewise (`qdq_transformer/s8_to_u8.h`, `s8_to_u8.cc`): (w + 128) − (z + 128) = w − z,
+  the same products exactly. All 49 of this graph's tensors qualify;
+- the kernels then take the U8U8 dispatch (`core/mlas/lib/qgemm.h:863–878`), which on AVX2
+  and AVX-512 widens both operands to 16 bits and multiplies with `VPMADDWD`
+  (`QgemmU8X8KernelAvx2.S`, `QgemmU8X8KernelAvx512Core.S`): 255 × 255 × 2 fits a 32-bit
+  lane, and nothing saturates.
+
+**Where it does nothing, and what it costs.** On ARM nothing — compiled out: the M4's
+optimized graph is byte-identical with the entry and without, and both golden gates stay 41
+of 41 bit-identical. For the fp32 graph nothing — it has no int8 weights. On an x86 CPU with
+VNNI or AMX the same products, which were exact already, from U8U8 kernels instead of the
+VNNI ones: the same vectors, more slowly. On one without, different and correct vectors,
+from kernels ONNX Runtime documents as slower. How much slower is for CI to measure (below),
+not to assume.
+
+It is set unconditionally, in the application and on the build machine alike, because it
+decides what an int8 vector is on x86: the library's passages (embedded on the build
+machine, in CI or on Kaggle — x86 CPUs) and the user's queries (embedded on their PC) must
+have computed the same products. The backend id stays `onnxruntime-sentence-v1` — nothing
+had been built with this backend when the entry was added, so v1 is defined with it (§1).
+
+**What remains between x86 and the M4: KleidiAI.** Exact, x86 still does not compute what
+the M4 computes. On the M4 the 25 `DynamicQuantizeMatMul` run KleidiAI, which quantizes the
+activations itself, each row with its own scale (`kai_lhs_quant_pack_qai8dxp_f32`, 8-bit
+asymmetric per-row); x86 quantizes the whole tensor with one scale, as
+`DynamicQuantizeLinear` specifies (the two paths of
+`contrib_ops/cpu/quantization/dynamic_quantize_matmul.cc`, `:231–262` and `:270–311`). The
+M4 with KleidiAI off runs x86's arithmetic, and is the nearest prediction to be had
+without an x86 CPU — measured on the M4, not on x86:
+
+| on the M4, the 41 golden cases | worst | median |
+|---|---:|---:|
+| KleidiAI off — x86's arithmetic, exact — against the int8 goldens | 0.998964 | 0.999425 |
+| KleidiAI off against the fp32 goldens | 0.998597 | 0.999100 |
+| the int8 goldens (KleidiAI on) against the fp32 goldens | 0.999113 | 0.999438 |
+| the U8S8 clamp emulated, against the int8 goldens | 0.980947 | 0.991078 |
+
+**Measured on x86 — to be filled in from CI.** `golden-onnx` now prints the runner's CPU and
+the U8S8 kernel it gets; the gate prints every int8 vector against both golden files; and
+`what_the_x86_int8_entry_changes_on_this_cpu_is_reported` runs the same ids with the entry
+and without it, timed. The cross-machine bound (§8) is to be set from these numbers, not
+from the M4's.
+
+| run | CPU, U8S8 kernel | int8 against the int8 goldens, worst | against the fp32 goldens, worst / median | without the entry: worst; vectors identical | 41 texts, with / without the entry | fp32, 41 texts |
+|---|---|---:|---:|---:|---:|---:|
+| *pending — the first CI run with the entry* | — | — | — | — | — | — |
 
 ---
 
@@ -71,12 +182,13 @@ text                                   # already role-prefixed by the text recip
   -> return RAW                        # the runtime normalizes and validates
 ```
 
-The id names that wiring, plus two settings that change the arithmetic and are therefore
+The id names that wiring, plus three settings that change the arithmetic and are therefore
 part of it: **graph optimization `All`** (`All` and `Disable`/`Level1` measured maxabs
-2.9e-6 apart on one graph; `All` is also the Python reference's default), and **one text
-per run** (§5). It deliberately does not name the ONNX Runtime version, the thread count
-or the session count — the same choice `llama-cpp-qwen3-last-v1` makes about the
-llama.cpp build — because §7 measures them.
+2.9e-6 apart on one graph; `All` is also the Python reference's default), **one text per
+run** (§5), and **exact int8 products on x86** (`session.x64quantprecision`, §0.1). It
+deliberately does not name the ONNX Runtime version, the thread count or the session count
+— the same choice `llama-cpp-qwen3-last-v1` makes about the llama.cpp build — because §7
+measures them.
 
 `EmbeddingBackend::tokenize` and `embed_batch_raw` go through one function, so the ids the
 goldens compare are the ids the graph consumes. Pooling is `in-graph` (`Pooling::InGraph`)
@@ -449,7 +561,9 @@ over two sessions equal to serial.
 runs, fresh sessions and 1/2/4/8 threads, nothing — bit-identical; `ORT_ENABLE_EXTENDED`
 against `ORT_ENABLE_ALL`, nothing; `ORT_DISABLE_ALL` or `ORT_ENABLE_BASIC`, up to 1.06e-2
 (cosine 0.99908); KleidiAI off, up to 1.07e-2 (0.99896). The same levers move fp32 by
-2.1e-7 and 2.7e-7.
+2.1e-7 and 2.7e-7. `session.x64quantprecision` on or off moves nothing here, for either
+graph — on ARM it is compiled out — and every int8 vector on an x86 CPU without VNNI
+(§0.1).
 
 **fp32 vs int8**, same 600 inputs: cosine min 0.999067, median 0.999473, max 0.999742 —
 in line with the author's own floor of 0.99863 (int8 against PyTorch, four samples), and a
@@ -463,7 +577,7 @@ reason the two graphs are different identities (`model_quantization`).
 |---|---|---|
 | `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query and a passage capped on a space reaching it exactly as the bare text does, the stand-in's stub tokenizer | nothing |
 | `onnx_backend::tests` | the fixture against the Python references; truncation; order; batch = single; concurrency; threads and sessions change nothing; static batch; `token_type_ids` as zeros; rank-3, extra-input, over-cap and non-ONNX refusals; one runtime per process | `OTZARIA_ONNX_RUNTIME` |
-| `onnx_backend::golden` | either production graph against its own golden file, chosen by the graph's SHA-256 (a graph no file describes fails loudly): sha256 of the tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine per graph (and how many are bit-identical), batch = single, concurrent = serial | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
+| `onnx_backend::golden` | either production graph against its own golden file, chosen by the graph's SHA-256 (a graph no file describes fails loudly): sha256 of the tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine per graph (and how many are bit-identical), batch = single, concurrent = serial. Reported, not asserted: for the int8 graph each vector against the fp32 graph's golden too, and what `session.x64quantprecision` changes on this CPU, timed (§0.1) | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
 | `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
 
 The tests that run a graph skip loudly without `OTZARIA_ONNX_RUNTIME`, as the model-gated
@@ -484,6 +598,9 @@ for graph in int8 fp32; do
 done
 ```
 
+CI adds `--test-threads=1`, so the output reads in order and the timings the entry's test
+prints measure that test alone.
+
 The cosine bound is per graph. For fp32 it is 0.99999 everywhere, not 1.0, because the
 Python reference and this backend need not share an ONNX Runtime build or an instruction
 set — kernel choice alone moved components by 2.9e-6, a cosine deficit near 1e-11 — while
@@ -491,7 +608,10 @@ every wiring error the ids cannot see (a mask or type ids fed wrong, the wrong o
 half-precision provider) lands far below it. For int8 it is 0.99999 on the goldens' own CPU
 family, where the same kernels run and the vectors came out bit-identical, and 0.995 on
 another, whose int8 kernels differ (§0): two correct int8 approximations, each within
-0.99911 of fp32 on these cases, can be up to 0.9964 apart. A graph standing in for another
+0.99911 of fp32 on these cases, can be up to 0.9964 apart. "Correct" is the operative word:
+on x86 the products are exact only through `session.x64quantprecision`, and without it the
+first x86 run failed the bound at 0.9809 (§0.1). The bound is to be revisited with the x86
+numbers CI now prints; it is unchanged until then. A graph standing in for another
 cannot pass under the looser bound, because the golden file is chosen by the graph's hash.
 Truncation and prefix errors change the ids, which are compared exactly and first.
 
@@ -507,8 +627,16 @@ references' ids for both and vectors for the first.
 
 ## 9. Open issues
 
-- **int8 on a weak PC** (§0): latency on an old x86 CPU without VNNI, and how far its int8
-  kernels' vectors lie from the ones the library is built with.
+- **int8 on x86, measured** (§0.1): the first CI run with `session.x64quantprecision` —
+  the runner's CPU, int8 against both golden files, and the entry's cost — fills in §0.1's
+  table, and the cross-machine bound (§8) is set from it.
+- **int8 on a weak PC** (§0): latency on an old x86 CPU without VNNI, now through the U8U8
+  kernels the entry selects, and how far its vectors lie from the ones the library is built
+  with.
+- **Whether the M4 should compute what x86 does.** Exact, x86 and the M4 still differ by
+  KleidiAI's per-row activation quantization (§0.1): `mlas.disable_kleidiai = 1` would give
+  the M4 x86's per-tensor arithmetic, at a small cost against fp32 (0.998597 at worst, against
+  0.999113) and with new int8 goldens. Not decided; the x86 numbers come first.
 - **The cap, 256 vs 128** (§5), for retrieval-quality measurement to settle.
 - **Linux and Windows** were checked to compile, not run; CI's `onnx-backend` job is what
   runs them, and it has not run yet.
