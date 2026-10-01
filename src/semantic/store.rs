@@ -476,17 +476,17 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 8;
 
     let mut acc = [0.0f32; LANES];
-    let mut a_chunks = a.chunks_exact(LANES);
-    let mut b_chunks = b.chunks_exact(LANES);
+    let (a_chunks, a_rest) = a.as_chunks::<LANES>();
+    let (b_chunks, b_rest) = b.as_chunks::<LANES>();
 
-    for (x, y) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (x, y) in a_chunks.iter().zip(b_chunks) {
         for lane in 0..LANES {
             acc[lane] += x[lane] * y[lane];
         }
     }
 
     let mut sum = acc.iter().sum::<f32>();
-    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+    for (x, y) in a_rest.iter().zip(b_rest) {
         sum += x * y;
     }
     sum
