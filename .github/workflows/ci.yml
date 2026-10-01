@@ -360,13 +360,14 @@ jobs:
   # secret needs read access to it, or every download below answers 401 and the job fails.
   # The SHA-256 checks are what say the bytes are the goldens' ones.
   #
-  # Linux x64 only. With `session.x64quantprecision` (`X64_QUANT_PRECISION` in
-  # src/semantic/onnx_backend.rs) every x86 CPU computes the int8 products exactly, so a
-  # Windows runner would run the same arithmetic through Microsoft's other build of the same
-  # sources. Doing it robustly needs more than a matrix row: a native path for the model
-  # (Git Bash hands on `/d/a/...`, and a path the test cannot open makes it skip, green), a
-  # Python on PATH for the checks, the `onnx-backend` job's zip extraction, and a second
-  # 210 MB gated download per run.
+  # Linux x64 only. Every x86 CPU computes the int8 products exactly — through its VNNI
+  # kernels, or through `session.x64quantprecision` where its kernels saturate (`X86Int8` in
+  # src/semantic/onnx_backend.rs) — so a Windows runner would run the same arithmetic through
+  # Microsoft's other build of the same sources. Doing it robustly needs more than a matrix
+  # row: a native path for the model (Git Bash hands on `/d/a/...`, and a path the test cannot
+  # open makes it skip, green), a Python on PATH for the checks, the `onnx-backend` job's zip
+  # extraction, and a second 210 MB gated download per run. The CPUs the runners do not have
+  # are `golden-onnx-emulated`'s.
   golden-onnx:
     name: Golden Vectors (ONNX model)
     if: >-
@@ -378,35 +379,44 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Runner CPUs differ from run to run, and an int8 vector depends on the int8 kernels
-      # the CPU gets (src/semantic/onnx_backend.rs, `X64_QUANT_PRECISION`): ONNX Runtime's
-      # U8S8 kernels sum product pairs in saturating 16 bits (VPMADDUBSW) unless the CPU has
-      # VNNI or AMX, which sum in 32. So every run says first which CPU its numbers are from,
-      # and which U8S8 kernel ONNX Runtime 1.28.0 picks for it (mlas/lib/platform.cpp: the
-      # first that applies of AMX, AVX-512 VNNI, AVX-512 core, AVX-VNNI and AVX2).
+      # the CPU gets (src/semantic/onnx_backend.rs, `X86Int8`): ONNX Runtime's U8S8 kernels
+      # sum product pairs in saturating 16 bits (VPMADDUBSW) unless the CPU has VNNI or AMX,
+      # which sum in 32, and the backend sets `session.x64quantprecision` wherever they
+      # saturate. So every run says first which CPU its numbers are from, which U8S8 kernel
+      # ONNX Runtime 1.28.0 picks for it, and whether the backend sets the entry there —
+      # derived from the kernel's flags in the order `X86Int8::of` takes them, which is
+      # mlas/lib/platform.cpp's own — and the golden steps are handed that answer as
+      # OTZARIA_EXPECT_X86_INT8_PRECISION: the backend's own detection has to agree with it.
       - name: The runner's CPU and its int8 instructions
+        id: cpu
         run: |
           model=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1)
           flags=" $(sed -n 's/^flags[[:space:]]*: //p' /proc/cpuinfo | head -n 1) "
           has() { case "$flags" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
           echo "CPU: ${model:-unknown}, $(nproc) logical CPUs"
-          for flag in avx2 fma avx512f avx512bw avx512_vnni avx_vnni avx_vnni_int8 amx_int8; do
+          for flag in avx fma avx2 f16c avx_vnni avx512f avx512bw avx512dq avx512vl avx512_vnni avx_vnni_int8 amx_int8; do
             if has "$flag"; then echo "  $flag: present"; else echo "  $flag: absent"; fi
           done
-          if has amx_int8; then
-            kernel="AMX: products summed in 32 bits, exact either way"
-          elif has avx512_vnni && has avx512bw; then
-            kernel="AVX-512 VNNI: products summed in 32 bits, exact either way"
-          elif has avx512bw; then
-            kernel="AVX-512 without VNNI: VPMADDUBSW saturates; exact only with session.x64quantprecision"
+          amx=""
+          if has amx_int8; then amx=", or AMX's tiles"; fi
+          if ! { has avx && has fma && has avx2; }; then
+            kernel="no AVX2: SSE kernels, which widen to 16 bits first in this Linux build"; entry="set"
+          elif ! has f16c; then
+            kernel="AVX2 without F16C: undetermined, since the backend cannot see AVX-512 then"; entry="set"
+          elif has avx512f && has avx512bw && has avx512dq && has avx512vl; then
+            if has avx512_vnni; then
+              kernel="AVX-512 VNNI$amx: products summed in 32 bits, exact"; entry="unset"
+            else
+              kernel="AVX-512 without VNNI: VPMADDUBSW saturates"; entry="set"
+            fi
           elif has avx_vnni; then
-            kernel="AVX-VNNI: products summed in 32 bits, exact either way"
-          elif has avx2; then
-            kernel="AVX2 without VNNI: VPMADDUBSW saturates; exact only with session.x64quantprecision"
+            kernel="AVX-VNNI: products summed in 32 bits, exact"; entry="unset"
           else
-            kernel="no AVX2: SSE kernels widen to 16 bits first, exact either way"
+            kernel="AVX2 without VNNI: VPMADDUBSW saturates"; entry="set"
           fi
-          echo "U8S8 int8 kernel: $kernel"
-          echo "::notice title=golden-onnx CPU::${model:-unknown}; U8S8 int8 kernel: $kernel"
+          echo "U8S8 int8 kernel: $kernel; session.x64quantprecision: $entry"
+          echo "::notice title=golden-onnx CPU::${model:-unknown}; U8S8 int8 kernel: $kernel; session.x64quantprecision: $entry"
+          echo "x86_int8=$entry" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -499,15 +509,164 @@ jobs:
       # runtime — so a failure in one never hides the other's numbers. The int8 step prints
       # every vector against the fp32 graph's goldens too, before its gate can fail, and a
       # test of its own prints what the x86 entry changes on this CPU, whatever the gate
-      # decides; the fp32 step is the reference they are read against.
+      # decides; the fp32 step is the reference they are read against. Both hold the
+      # backend's x86 int8 decision to the one the CPU step derived.
       - name: Golden parity, int8 (the default identity)
         if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
         env:
           OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: ${{ steps.cpu.outputs.x86_int8 }}
         run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture --test-threads=1
 
       - name: Golden parity, fp32 (the reference graph)
         if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
         env:
           OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.fp32 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: ${{ steps.cpu.outputs.x86_int8 }}
         run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture --test-threads=1
+
+  # The x86 int8 decision (`X86Int8` in src/semantic/onnx_backend.rs) on CPUs the runners do
+  # not have. The backend leaves `session.x64quantprecision` off where ONNX Runtime's U8S8
+  # kernels are VNNI ones, which are exact, and sets it where they saturate; the one runner
+  # CPU recorded so far, an AMD EPYC 7763, is of the second kind. Intel's Software
+  # Development Emulator runs the same test binary as three other CPUs — answering CPUID as
+  # they do, emulating what the host lacks — and each step names the decision it expects
+  # (OTZARIA_EXPECT_X86_INT8_PRECISION), so that a wrong detection fails instead of passing
+  # down the other path:
+  #
+  # * Ice Lake (`-icl`): AVX-512 with VNNI, its kernel exact — the entry left off;
+  # * Alder Lake (`-adl`): AVX-VNNI without AVX-512, its kernel exact — left off;
+  # * Skylake-SP (`-skx`): AVX-512 without VNNI, whose kernel saturates — set.
+  #
+  # Each step runs three tests: the decision on its own; the int8 gate, which holds the
+  # backend's vectors to the goldens' cross-machine bound; and the entry's test, which runs
+  # the goldens through a session with the entry and one without and, where the backend
+  # leaves it off, requires the two to agree bit for bit — the claim leaving it off rests on.
+  # The emulator's timings measure the emulator, so that test times nothing here.
+  #
+  # SDE is free for any use under the Intel Simplified Software License; the kit comes from
+  # Intel's download mirror by a pinned URL and SHA-256, for the reason the runtime does. The
+  # gated model is fetched under `golden-onnx`'s policy — the secret, every push and same-repo
+  # PR, failing rather than skipping — the int8 graph and the tokenizer alone.
+  golden-onnx-emulated:
+    name: Golden Vectors (ONNX model, emulated x86 CPUs)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # A named image rather than `-latest`: the emulator works through the kernel's ptrace.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # The three tests, by exact name — the decision's is not `#[ignore]`d — one at a time.
+      EMULATED_TESTS: >-
+        --exact --include-ignored --nocapture --test-threads=1
+        semantic::onnx_backend::tests::this_machine_gets_the_x86_int8_decision_its_cpu_implies
+        semantic::onnx_backend::golden::token_ids_match_the_reference_exactly_and_vectors_agree
+        semantic::onnx_backend::golden::what_the_x86_int8_entry_changes_on_this_cpu_is_reported
+      OTZARIA_X86_INT8_TIMED_PASSES: "0"
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: onnx-backend
+
+      # `golden-onnx`'s download and checks, for the int8 graph and the tokenizer alone.
+      - name: Fetch the int8 graph and its tokenizer
+        id: model
+        env:
+          HF_TOKEN: ${{ secrets.OTZARIA_HF_TOKEN }}
+        run: |
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The emulated ONNX golden gate cannot run, and is NOT being reported as passing."
+            exit 1
+          fi
+          mkdir -p onnx-model
+          for file in seforim-embed-round2-int8.onnx tokenizer.json; do
+            printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+              curl -fSL --retry 5 --retry-all-errors --output "onnx-model/$file" -K - \
+                "https://huggingface.co/otzaria/judaic-semantic-round2-onnx-zayit/resolve/main/$file"
+          done
+          verify() {
+            expected=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header'][sys.argv[2]])" tests/data/onnx_golden_vectors_int8.json "$2")
+            actual=$(sha256sum "onnx-model/$1" | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::$1: SHA-256 mismatch. onnx_golden_vectors_int8.json expects $expected, got $actual."
+              exit 1
+            fi
+          }
+          verify seforim-embed-round2-int8.onnx graph_sha256
+          verify tokenizer.json tokenizer_sha256
+          echo "int8=$(pwd)/onnx-model/seforim-embed-round2-int8.onnx" >> "$GITHUB_OUTPUT"
+
+      # The linux-x64 row of the `onnx-backend` matrix, as in `golden-onnx`; bump all three
+      # together.
+      - name: Fetch ONNX Runtime 1.28.0
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+          echo "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
+
+      # Intel SDE 10.13.1 (2026-07-28), Linux. Its installation notes: "On Ubuntu systems,
+      # you must disable yama" — it injects itself by a ptrace attach to its parent, which
+      # Ubuntu's default ptrace scope forbids.
+      - name: Fetch Intel SDE 10.13.1
+        run: |
+          archive="$RUNNER_TEMP/sde-external-10.13.1-2026-07-28-lin.tar.xz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+          echo "94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50  $archive" | shasum -a 256 -c -
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          sde="$RUNNER_TEMP/sde-external-10.13.1-2026-07-28-lin/sde64"
+          test -x "$sde"
+          echo "SDE=$sde" >> "$GITHUB_ENV"
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+
+      # Built once, natively; only running it is emulated.
+      - name: The test binary
+        id: binary
+        run: |
+          binary=$(cargo test --lib --features onnx-backend --no-run --message-format=json-render-diagnostics |
+            jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable')
+          test -x "$binary"
+          echo "TEST_BINARY=$binary" >> "$GITHUB_ENV"
+
+      # Each leg runs whatever the one before it did, so one failure never hides another's
+      # numbers.
+      - name: Emulated Ice Lake (AVX-512 VNNI) — the entry left off
+        if: ${{ !cancelled() && steps.binary.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: unset
+        run: |
+          read -ra tests <<< "$EMULATED_TESTS"
+          "$SDE" -icl -- "$TEST_BINARY" "${tests[@]}"
+
+      - name: Emulated Alder Lake (AVX-VNNI, no AVX-512) — the entry left off
+        if: ${{ !cancelled() && steps.binary.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: unset
+        run: |
+          read -ra tests <<< "$EMULATED_TESTS"
+          "$SDE" -adl -- "$TEST_BINARY" "${tests[@]}"
+
+      - name: Emulated Skylake-SP (AVX-512 without VNNI) — the entry set
+        if: ${{ !cancelled() && steps.binary.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: set
+        run: |
+          read -ra tests <<< "$EMULATED_TESTS"
+          "$SDE" -skx -- "$TEST_BINARY" "${tests[@]}"
