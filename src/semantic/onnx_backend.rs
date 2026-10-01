@@ -96,7 +96,7 @@ use tokenizers::{
 };
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 /// Default intra-op threads per session: a cap, not a target — phones are big.LITTLE.
 ///
@@ -140,7 +140,8 @@ const RUNTIME_FILE_NAME: &str = "onnxruntime.dll";
 const GRAPH_OPTIMIZATION: GraphOptimizationLevel = GraphOptimizationLevel::All;
 
 /// ONNX Runtime's session entry for exact int8 matrix products on x86
-/// (`kOrtSessionOptionsAvx2PrecisionMode`), set to `"1"` on every session.
+/// (`kOrtSessionOptionsAvx2PrecisionMode`), set to `"1"` on every session where this CPU's
+/// default int8 kernels saturate, or might: [`X86Int8`] decides where, once per process.
 ///
 /// A dynamically quantized graph multiplies uint8 activations by int8 weights, and on x86
 /// ONNX Runtime's kernels for that sum each pair of neighbouring products with `PMADDUBSW`,
@@ -152,16 +153,16 @@ const GRAPH_OPTIMIZATION: GraphOptimizationLevel = GraphOptimizationLevel::All;
 /// reproduced its numbers case by case, to within 6e-4. With the entry set, the runtime
 /// rewrites each int8 weight tensor as uint8 (`Avx2WeightS8ToU8Transformer`: `w + 128`, the
 /// zero point moved with it — the same products exactly) so that its U8U8 kernels run,
-/// which sum them without a 16-bit clamp: exactly.
+/// which sum them without a 16-bit clamp: exactly, at a cost of 14% on CI's EPYC 7763.
 ///
-/// The runtime applies it only where it finds its own U8S8 kernels unsafe
-/// (`MlasPlatformU8S8Overflow`, x86 builds only); on ARM, and for an fp32 graph, it changes
-/// nothing — the M4's optimized graph is byte-identical with and without it. Set
-/// unconditionally, on the build machine and in the application alike, because it decides
-/// what an int8 vector is on x86: a library embedded on one x86 CPU and queried on another
-/// must have computed the same products. The cost is speed alone: ONNX Runtime documents
-/// the U8U8 kernels as slower, and a VNNI CPU, whose int8 products were exact already, gives
-/// up its VNNI kernels for the same result. `docs/ONNX_BACKEND.md` §0.1 has the mechanism.
+/// Not set everywhere, because the runtime's own test of where it is needed
+/// (`MlasPlatformU8S8Overflow`) is true on every x86 CPU with AVX2 in 1.28.0, VNNI or not: a
+/// VNNI CPU given the entry trades kernels that were exact already for the slower U8U8 ones,
+/// and gets the same vectors. So a vector depends on its products being exact, which they
+/// are either way, and not on where the entry was set — the backend id names the first and
+/// not the second. On ARM, and for an fp32 graph, the entry changes nothing: the runtime
+/// compiles it out there, and the M4's optimized graph is byte-identical with and without
+/// it. `docs/ONNX_BACKEND.md` §0.1 has the mechanism.
 const X64_QUANT_PRECISION: &str = "session.x64quantprecision";
 
 /// The three inputs this backend knows how to feed.
@@ -595,6 +596,202 @@ fn forward_runtime_log(level: LogLevel, _category: &str, _id: &str, location: &s
     log::log!(target: "onnxruntime", level, "{message} ({location})");
 }
 
+// ─────────────────────────────── int8 on x86 ───────────────────────────────
+
+/// The int8 kernels ONNX Runtime's MLAS gives this CPU for a dynamically quantized graph's
+/// products — uint8 activations by int8 weights, "U8S8" — and so whether
+/// [`X64_QUANT_PRECISION`] is set: wherever they are not known to be exact.
+///
+/// The backend decides this because the runtime cannot. Its entry takes effect where
+/// `MlasPlatformU8S8Overflow()` is true, and that compares the U8U8 and U8S8 *dispatch*
+/// tables (1.28.0's `core/mlas/lib/platform.cpp:950–958`), which differ on every CPU with
+/// AVX2: a VNNI kernel is another *kernel* under the same AVX2 dispatch (`:531–537`,
+/// `:586–594`), and AMX replaces the U8S8 dispatch alone (`:624–630`). Given the entry, a
+/// VNNI CPU gives up its exact kernels for the U8U8 ones. Up to 1.24 those CPUs pointed
+/// their U8U8 dispatch at the U8S8 one, so the test was false there and the entry did
+/// nothing; microsoft/onnxruntime#27671 removed that in 1.25.0. Which U8S8 kernel a CPU
+/// gets is the same in every release from 1.17.0, the oldest the backend loads, to 1.28.2.
+///
+/// Leaving the entry off there changes no vector. The VNNI kernels sum four products into
+/// each 32-bit lane — `VPDPBUSD`, or `VPDPBUSDS`, which saturates only at the 32-bit limits,
+/// where this graph's sums never come near: its weights lie within ±127 and no dot product
+/// has more than 2,048 terms, so a sum stays within 2,048 × 255 × 127 = 66,324,480. The U8U8
+/// kernels widen both operands to 16 bits first (`VPMADDWD`), and the rewrite moves each
+/// weight and its zero point by the same 128. So each path computes Σ(a − za)(w − zw)
+/// exactly, in int32, before the one conversion to float they share: a library built on one
+/// x86 CPU and queried on another computes the same products, whichever path each takes.
+///
+/// MLAS's choice on x86-64 (`platform.cpp:346–642`: each check that applies replaces the
+/// kernel the one before it chose), in the order [`Self::of`] tests it:
+///
+/// | the CPU | U8S8 kernel | the entry |
+/// |---|---|---|
+/// | not all of AVX, FMA and AVX2 | SSE: `PMADDUBSW` on SSE4.1 in Microsoft's MSVC build | set |
+/// | AVX-512 F, BW, DQ and VL, no AVX-512 VNNI | `VPMADDUBSW`, even with AVX-VNNI, whose kernel it replaces | set |
+/// | AVX-512 F, BW, DQ, VL and VNNI | `VPDPBUSDS`, or AMX's tiles: exact | off |
+/// | AVX2 with AVX-VNNI | `VPDPBUSD`: exact | off |
+/// | AVX2 | `VPMADDUBSW` | set |
+///
+/// Conservative by construction, because the error is one-sided: set where it was not
+/// needed, the entry costs speed; left off where it was, it changes the vectors. So it is
+/// left off only where the kernel is known to be a VNNI one, and set wherever the question
+/// cannot be settled — on macOS ([`Self::Avx512StateOnDemand`]) and without F16C
+/// ([`Self::NoF16c`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X86Int8 {
+    /// Not x86: the architecture's own int8 kernels (on ARM, dot products into 32 bits), and
+    /// the entry compiled out of the runtime.
+    NotX86,
+    /// Not all of AVX, FMA and AVX2, each with its registers saved by the operating system:
+    /// MLAS's SSE kernels — `PMADDUBSW` on an SSE4.1 CPU in Microsoft's MSVC build
+    /// (`platform.cpp:410–423`), elsewhere products widened to 16 bits first and the entry a
+    /// no-op. 32-bit x86 too, whose MLAS has no AVX2 int8 kernels at all (`:445`).
+    BelowAvx2,
+    /// AVX2 without VNNI or AVX-512 (Haswell to Comet Lake, Zen 1 to 3): `VPMADDUBSW`.
+    Avx2,
+    /// AVX2 with AVX-VNNI and without AVX-512 (Alder Lake and its successors): `VPDPBUSD`.
+    AvxVnni,
+    /// AVX-512 BW, DQ and VL without AVX-512 VNNI (Skylake-SP): `VPMADDUBSW`.
+    Avx512Core,
+    /// AVX-512 BW, DQ, VL and VNNI (Cascade Lake, Ice Lake, Zen 4 and later): `VPDPBUSDS`,
+    /// or AMX's tiles where present — every AMX CPU has AVX-512 VNNI too, and both are exact.
+    Avx512Vnni,
+    /// macOS, with AVX2: the system creates threads with AVX-512 masked off in XCR0 and
+    /// unmasks it for a thread on its first AVX-512 instruction (xnu's `osfmk/i386/fpu.c`,
+    /// "On-demand AVX512 support"), so whether MLAS saw AVX-512 when it read XCR0 — and so
+    /// which kernel it chose — cannot be known here.
+    Avx512StateOnDemand,
+    /// AVX2 without F16C, which only a virtual machine presents: the standard library
+    /// reports AVX-512 only alongside F16C, which MLAS does not ask for, so an AVX-512 core
+    /// this cannot see might be what MLAS chose.
+    NoF16c,
+}
+
+impl X86Int8 {
+    /// MLAS's choice for an x86-64 CPU with `cpu`'s features.
+    fn of(cpu: &X86Features) -> Self {
+        // The AVX2 block (`platform.cpp:475`, inside the AVX one, `:430` and `:441`) holds
+        // every int8 kernel past SSE.
+        if !(cpu.avx && cpu.fma && cpu.avx2) {
+            return Self::BelowAvx2;
+        }
+        if cpu.avx512_state_on_demand {
+            return Self::Avx512StateOnDemand;
+        }
+        if !cpu.f16c {
+            return Self::NoF16c;
+        }
+        // AVX-512 core (`:546`, `:571`) is checked after AVX-VNNI (`:531`), so its kernel
+        // replaces AVX-VNNI's, and only its own VNNI (`:586`) makes it exact again.
+        if cpu.avx512f && cpu.avx512bw && cpu.avx512dq && cpu.avx512vl {
+            return if cpu.avx512_vnni {
+                Self::Avx512Vnni
+            } else {
+                Self::Avx512Core
+            };
+        }
+        if cpu.avx_vnni {
+            Self::AvxVnni
+        } else {
+            Self::Avx2
+        }
+    }
+
+    /// Whether the backend sets [`X64_QUANT_PRECISION`]: everywhere but where the int8
+    /// kernels are known to be exact without it.
+    fn sets_entry(self) -> bool {
+        !matches!(self, Self::NotX86 | Self::AvxVnni | Self::Avx512Vnni)
+    }
+
+    /// The kernels, as the load log names them.
+    fn kernels(self) -> &'static str {
+        match self {
+            Self::NotX86 => "not an x86 CPU",
+            Self::BelowAvx2 => {
+                "SSE kernels, below AVX2 (PMADDUBSW, saturating, in Microsoft's MSVC build)"
+            }
+            Self::Avx2 => "AVX2 kernels (VPMADDUBSW, saturating)",
+            Self::AvxVnni => "AVX-VNNI kernels (VPDPBUSD, exact)",
+            Self::Avx512Core => "AVX-512 kernels without VNNI (VPMADDUBSW, saturating)",
+            Self::Avx512Vnni => "AVX-512 VNNI or AMX kernels (VPDPBUSDS or tiles, exact)",
+            Self::Avx512StateOnDemand => {
+                "kernels unknown: macOS enables AVX-512 state on a thread's first use"
+            }
+            Self::NoF16c => "kernels unknown: without F16C no AVX-512 is reported",
+        }
+    }
+}
+
+impl std::fmt::Display for X86Int8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entry = if self.sets_entry() { "= 1" } else { "not set" };
+        write!(f, "{}, so {X64_QUANT_PRECISION} {entry}", self.kernels())
+    }
+}
+
+/// The CPU features MLAS's x86 kernel choice turns on, as the standard library's
+/// `is_x86_feature_detected!` reports them: from the same CPUID bits, and each only where
+/// the operating system also saves the registers it uses (XCR0) — MLAS's condition too.
+/// Plain booleans, so that [`X86Int8::of`] is tested on any machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// Detected on x86-64 only; built everywhere, so the decision's tests run on ARM as well.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+struct X86Features {
+    avx: bool,
+    fma: bool,
+    avx2: bool,
+    /// Not a feature MLAS reads: see [`X86Int8::NoF16c`].
+    f16c: bool,
+    avx_vnni: bool,
+    avx512f: bool,
+    avx512bw: bool,
+    avx512dq: bool,
+    avx512vl: bool,
+    avx512_vnni: bool,
+    /// The system enables AVX-512 register state on first use: see
+    /// [`X86Int8::Avx512StateOnDemand`].
+    avx512_state_on_demand: bool,
+}
+
+impl X86Features {
+    /// This CPU's.
+    #[cfg(target_arch = "x86_64")]
+    fn detect() -> Option<Self> {
+        use std::arch::is_x86_feature_detected;
+        Some(Self {
+            avx: is_x86_feature_detected!("avx"),
+            fma: is_x86_feature_detected!("fma"),
+            avx2: is_x86_feature_detected!("avx2"),
+            f16c: is_x86_feature_detected!("f16c"),
+            avx_vnni: is_x86_feature_detected!("avxvnni"),
+            avx512f: is_x86_feature_detected!("avx512f"),
+            avx512bw: is_x86_feature_detected!("avx512bw"),
+            avx512dq: is_x86_feature_detected!("avx512dq"),
+            avx512vl: is_x86_feature_detected!("avx512vl"),
+            avx512_vnni: is_x86_feature_detected!("avx512vnni"),
+            avx512_state_on_demand: cfg!(target_os = "macos"),
+        })
+    }
+
+    /// None: not an x86-64 CPU.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn detect() -> Option<Self> {
+        None
+    }
+}
+
+/// This process's [`X86Int8`], decided once and kept, so that every session of every
+/// backend in the process is built alike.
+fn x86_int8() -> X86Int8 {
+    static DECIDED: OnceLock<X86Int8> = OnceLock::new();
+    *DECIDED.get_or_init(|| match X86Features::detect() {
+        Some(cpu) => X86Int8::of(&cpu),
+        // 32-bit x86, were the backend ever built for it: MLAS's SSE kernels only.
+        None if cfg!(target_arch = "x86") => X86Int8::BelowAvx2,
+        None => X86Int8::NotX86,
+    })
+}
+
 // ─────────────────────────────── the graph ───────────────────────────────
 
 /// How a graph's inputs and outputs are wired, established once at load.
@@ -754,18 +951,20 @@ fn inspect_graph(session: &Session, graph: &Path) -> Result<Wiring, EmbeddingErr
     })
 }
 
-/// One session, configured the one way this backend's vectors are defined for.
+/// One session, configured the one way this backend's vectors are defined for — with
+/// [`X64_QUANT_PRECISION`] where [`x86_int8`] finds that this CPU's int8 kernels need it.
 ///
 /// Returns `ort::Result` so that `?` converts the builder's `Error<SessionBuilder>` —
 /// which is neither `Send` nor `Sync` — into a plain `ort::Error` here, before it can
 /// reach an error type that must be.
 fn build_session(graph: &Path, intra_threads: usize) -> ort::Result<Session> {
-    build_session_as(graph, intra_threads, true)
+    build_session_as(graph, intra_threads, x86_int8().sets_entry())
 }
 
-/// [`build_session`], with [`X64_QUANT_PRECISION`] on or off. The backend only ever asks
-/// for on; off is for the golden tests, which report what the entry changes on the CPU
-/// they run on, and need every other setting to be the backend's for that to mean anything.
+/// [`build_session`], with [`X64_QUANT_PRECISION`] on or off whatever the CPU. The backend
+/// asks for what [`x86_int8`] decides; both are for the golden tests, which report what the
+/// entry changes on the CPU they run on, and need every other setting to be the backend's
+/// for that to mean anything.
 fn build_session_as(
     graph: &Path,
     intra_threads: usize,
@@ -954,6 +1153,9 @@ pub struct OnnxBackend {
     /// How many special tokens the tokenizer adds to every input.
     special_tokens: usize,
     intra_threads: usize,
+    /// The int8 kernels this CPU gets, and so whether every session was built with
+    /// `X64_QUANT_PRECISION`.
+    x86_int8: X86Int8,
     graph: PathBuf,
     runtime: RuntimeLocation,
 }
@@ -968,10 +1170,12 @@ impl OnnxBackend {
     /// every stored vector.
     ///
     /// Also part of the wiring, and so covered by the same version: one text per run,
-    /// graph optimization `All` (`GRAPH_OPTIMIZATION`), and exact int8 products on x86
-    /// (`X64_QUANT_PRECISION`). Deliberately **not** the runtime's version or the thread
-    /// count, as `LlamaCppBackend::ID` leaves out the llama.cpp build:
-    /// `docs/ONNX_BACKEND.md` measures what they move.
+    /// graph optimization `All` (`GRAPH_OPTIMIZATION`), and exact int8 products on x86 —
+    /// from the CPU's VNNI kernels, or through `X64_QUANT_PRECISION` where its kernels
+    /// saturate (`X86Int8`), two paths to the same products, so which one a CPU takes is not
+    /// part of it. Deliberately **not** the runtime's version or the thread count, as
+    /// `LlamaCppBackend::ID` leaves out the llama.cpp build: `docs/ONNX_BACKEND.md` measures
+    /// what they move.
     pub const ID: &'static str = "onnxruntime-sentence-v1";
 
     /// Load the graph at `graph` with the tokenizer at `tokenizer`, truncating every
@@ -1128,6 +1332,8 @@ impl OnnxBackend {
             max_tokens,
             special_tokens,
             intra_threads: tuning.intra_threads,
+            // What `build_session` read: decided once per process.
+            x86_int8: x86_int8(),
             graph: graph.to_path_buf(),
             runtime: runtime_location,
         };
@@ -1139,8 +1345,8 @@ impl OnnxBackend {
             "Embedding backend '{}' ready: {} — dim {} ({}), max_tokens {max_tokens} \
              ({special_tokens} special), batch dimension {} (one text per run), inputs \
              {INPUT_IDS} + {ATTENTION_MASK}{}, output '{}', {} session(s) x {} intra-op \
-             thread(s), graph optimization {GRAPH_OPTIMIZATION:?}, {X64_QUANT_PRECISION} = 1; \
-             ONNX Runtime {runtime} from {}; loaded in {} ms",
+             thread(s), graph optimization {GRAPH_OPTIMIZATION:?}, int8 on x86: {}; ONNX \
+             Runtime {runtime} from {}; loaded in {} ms",
             Self::ID,
             backend.graph.display(),
             backend.dim,
@@ -1162,6 +1368,7 @@ impl OnnxBackend {
             backend.wiring.output,
             backend.pool.size,
             backend.intra_threads,
+            backend.x86_int8,
             backend.runtime,
             started.elapsed().as_millis(),
         );
@@ -1407,6 +1614,7 @@ impl std::fmt::Debug for OnnxBackend {
             .field("wiring", &self.wiring)
             .field("sessions", &self.pool.size)
             .field("intra_threads", &self.intra_threads)
+            .field("x86_int8", &self.x86_int8)
             .field("runtime", &self.runtime)
             .finish()
     }
@@ -2160,6 +2368,230 @@ mod tests {
             "git-branch=HEAD, git-commit-id=da9b5e364c, fp8-kv-cache=1, build type=Release"
         );
         assert_eq!(describe_build("something else"), "something else");
+    }
+
+    // ── int8 on x86: the decision, on any machine ──
+
+    /// Names the decision a run must find on its CPU — `set` or `unset`, as in "the backend
+    /// sets `X64_QUANT_PRECISION`" — so that a wrong detection fails rather than passing down
+    /// the other path. CI's golden job derives it from the runner's `/proc/cpuinfo`, and its
+    /// emulated runs from the CPU they emulate. Unset, nothing is asserted.
+    pub(super) const EXPECT_X86_INT8_ENV: &str = "OTZARIA_EXPECT_X86_INT8_PRECISION";
+
+    /// Fail unless `decision` is the one [`EXPECT_X86_INT8_ENV`] names, when it names one.
+    pub(super) fn assert_expected_x86_int8(decision: X86Int8) {
+        let Some(raw) = std::env::var_os(EXPECT_X86_INT8_ENV) else {
+            return;
+        };
+        let expected = match raw.to_str() {
+            Some("set") => true,
+            Some("unset") => false,
+            _ => panic!("{EXPECT_X86_INT8_ENV} is {raw:?}; it must be `set` or `unset`"),
+        };
+        assert_eq!(
+            decision.sets_entry(),
+            expected,
+            "{EXPECT_X86_INT8_ENV} expects {X64_QUANT_PRECISION} {} on this CPU, and the \
+             backend decided: {decision}",
+            if expected { "set" } else { "left unset" }
+        );
+        println!("{EXPECT_X86_INT8_ENV}: as expected — {decision}");
+    }
+
+    /// Every branch of MLAS's x86 int8 kernel choice, as the backend reads it and with the
+    /// decision it draws: the entry left off for the VNNI kernels alone. Pure, so it runs on
+    /// any machine; the CPUs named are examples, and "no such CPU" marks a combination only a
+    /// virtual machine could present, where the order of MLAS's checks decides.
+    #[test]
+    fn the_x86_int8_entry_is_left_off_only_where_the_default_kernels_are_exact() {
+        use X86Int8::*;
+        let none = X86Features::default();
+        let avx2 = X86Features {
+            avx: true,
+            fma: true,
+            avx2: true,
+            f16c: true,
+            ..none
+        };
+        let avx512 = X86Features {
+            avx512f: true,
+            avx512bw: true,
+            avx512dq: true,
+            avx512vl: true,
+            ..avx2
+        };
+        let cases = [
+            ("SSE only", none, BelowAvx2),
+            (
+                "AVX without AVX2 (Sandy Bridge)",
+                X86Features { avx: true, ..none },
+                BelowAvx2,
+            ),
+            (
+                "AVX2 without FMA (no such CPU)",
+                X86Features { fma: false, ..avx2 },
+                BelowAvx2,
+            ),
+            (
+                "AVX2 without AVX (no such CPU)",
+                X86Features { avx: false, ..avx2 },
+                BelowAvx2,
+            ),
+            ("AVX2 (Haswell, Zen 3)", avx2, Avx2),
+            (
+                "AVX2 and AVX-VNNI (Alder Lake)",
+                X86Features {
+                    avx_vnni: true,
+                    ..avx2
+                },
+                AvxVnni,
+            ),
+            ("AVX-512 without VNNI (Skylake-SP)", avx512, Avx512Core),
+            (
+                "AVX-512 without its VNNI, with AVX-VNNI (no such CPU)",
+                X86Features {
+                    avx_vnni: true,
+                    ..avx512
+                },
+                Avx512Core,
+            ),
+            (
+                "AVX-512 with VNNI (Ice Lake, Zen 4)",
+                X86Features {
+                    avx512_vnni: true,
+                    ..avx512
+                },
+                Avx512Vnni,
+            ),
+            (
+                "AVX-512 VNNI and AVX-VNNI (Sapphire Rapids, Zen 5)",
+                X86Features {
+                    avx512_vnni: true,
+                    avx_vnni: true,
+                    ..avx512
+                },
+                Avx512Vnni,
+            ),
+            (
+                "AVX-512F without BW, DQ or VL (Knights Landing)",
+                X86Features {
+                    avx512f: true,
+                    ..avx2
+                },
+                Avx2,
+            ),
+            (
+                "AVX-512F without BW, DQ or VL, with AVX-VNNI (no such CPU)",
+                X86Features {
+                    avx512f: true,
+                    avx_vnni: true,
+                    ..avx2
+                },
+                AvxVnni,
+            ),
+            (
+                "AVX-512 without BW, VNNI and AVX-VNNI (no such CPU)",
+                X86Features {
+                    avx512bw: false,
+                    avx512_vnni: true,
+                    avx_vnni: true,
+                    ..avx512
+                },
+                AvxVnni,
+            ),
+            (
+                "AVX-512 VNNI without DQ (no such CPU)",
+                X86Features {
+                    avx512dq: false,
+                    avx512_vnni: true,
+                    ..avx512
+                },
+                Avx2,
+            ),
+            (
+                "AVX-512 VNNI without VL (no such CPU)",
+                X86Features {
+                    avx512vl: false,
+                    avx512_vnni: true,
+                    ..avx512
+                },
+                Avx2,
+            ),
+            (
+                "AVX2 and AVX-VNNI without F16C (no such CPU)",
+                X86Features {
+                    f16c: false,
+                    avx_vnni: true,
+                    ..avx2
+                },
+                NoF16c,
+            ),
+            (
+                "AVX-512 VNNI on macOS (the 2019 Mac Pro)",
+                X86Features {
+                    avx512_vnni: true,
+                    avx512_state_on_demand: true,
+                    ..avx512
+                },
+                Avx512StateOnDemand,
+            ),
+            (
+                "AVX2 on macOS",
+                X86Features {
+                    avx512_state_on_demand: true,
+                    ..avx2
+                },
+                Avx512StateOnDemand,
+            ),
+            (
+                "SSE only on macOS (Rosetta 2 on an M4)",
+                X86Features {
+                    avx512_state_on_demand: true,
+                    ..none
+                },
+                BelowAvx2,
+            ),
+        ];
+        for (cpu, features, expected) in cases {
+            assert_eq!(X86Int8::of(&features), expected, "{cpu}");
+        }
+
+        let entry = format!("{X64_QUANT_PRECISION} = 1");
+        for (decision, sets_entry) in [
+            (NotX86, false),
+            (BelowAvx2, true),
+            (Avx2, true),
+            (AvxVnni, false),
+            (Avx512Core, true),
+            (Avx512Vnni, false),
+            (Avx512StateOnDemand, true),
+            (NoF16c, true),
+        ] {
+            assert_eq!(decision.sets_entry(), sets_entry, "{decision:?}");
+            // The load log says what the sessions were built with.
+            assert_eq!(
+                decision.to_string().ends_with(&entry),
+                sets_entry,
+                "{decision:?}: {decision}"
+            );
+        }
+    }
+
+    /// The decision this machine gets, decided once — and, where [`EXPECT_X86_INT8_ENV`]
+    /// names the one expected, that one. Needs no runtime, so CI's emulated runs start with
+    /// it.
+    #[test]
+    fn this_machine_gets_the_x86_int8_decision_its_cpu_implies() {
+        let decision = x86_int8();
+        println!("int8 on x86 here: {decision} ({decision:?})");
+        assert_eq!(x86_int8(), decision);
+        if cfg!(not(any(target_arch = "x86", target_arch = "x86_64"))) {
+            assert_eq!(decision, X86Int8::NotX86);
+        }
+        if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+            assert!(decision.sets_entry(), "{decision}");
+        }
+        assert_expected_x86_int8(decision);
     }
 
     // ── the pool ──
@@ -3080,6 +3512,10 @@ mod golden {
         assert_eq!(backend.dim() as usize, dim);
         assert_eq!(backend.max_tokens(), max_tokens);
         println!("\n{backend:?}");
+        println!("int8 on x86 here: {}", backend.x86_int8);
+        // Before 41 runs, which on an emulated CPU are minutes: a wrong decision makes the
+        // rest a test of the other path.
+        super::tests::assert_expected_x86_int8(backend.x86_int8);
         println!(
             "goldens: {} ({:?}, from {} on {}); reference: onnxruntime {}, tokenizers {}",
             goldens.file,
@@ -3219,14 +3655,34 @@ mod golden {
         );
     }
 
+    /// How many timed passes the entry's test runs after its warm-up: three when unset, and
+    /// none for an emulated CPU, whose timings measure the emulator — CI's emulated runs set
+    /// it to 0.
+    const TIMED_PASSES_ENV: &str = "OTZARIA_X86_INT8_TIMED_PASSES";
+
+    fn timed_passes() -> usize {
+        let Some(raw) = std::env::var_os(TIMED_PASSES_ENV) else {
+            return 3;
+        };
+        raw.to_str()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{TIMED_PASSES_ENV} is {raw:?}; it must be a whole number"))
+    }
+
     /// What `X64_QUANT_PRECISION` changes on the CPU this runs on: the golden ids through
-    /// two sessions built alike but for that entry — the backend's, and the runtime's
-    /// default — compared and timed. Reported, never asserted, because the answer belongs
-    /// to the CPU: nothing on ARM, on an x86 CPU with VNNI or for an fp32 graph; every int8
-    /// vector on an AVX2 or AVX-512 CPU without VNNI, whose default kernels clamp. The
-    /// timings are what the exact products cost there; each is the best of three passes
-    /// after a warm-up, in alternation, and means something only when the tests run one at
-    /// a time (`--test-threads=1`, as CI runs them).
+    /// two sessions built alike but for that entry — set, and the runtime's default —
+    /// compared and timed, beside the decision the backend takes here (`X86Int8`).
+    ///
+    /// Reported, but for one claim: where the backend leaves the entry off, the entry must
+    /// change no vector, since that is what leaving it off rests on. The rest belongs to the
+    /// CPU: nothing on ARM, on a VNNI CPU or for an fp32 graph; every int8 vector on an x86
+    /// CPU whose default kernels saturate. `OTZARIA_EXPECT_X86_INT8_PRECISION` makes the
+    /// decision a gate too, checked once the report is out.
+    ///
+    /// The timings are what the exact products cost there; each is the best of
+    /// `OTZARIA_X86_INT8_TIMED_PASSES` passes (three by default) after a warm-up, in
+    /// alternation, and means something only when the tests run one at a time
+    /// (`--test-threads=1`, as CI runs them).
     #[test]
     #[ignore = "needs a Meivin graph (int8 or fp32); set OTZARIA_TEST_ONNX_MODEL and pass --ignored"]
     fn what_the_x86_int8_entry_changes_on_this_cpu_is_reported() {
@@ -3248,18 +3704,18 @@ mod golden {
         let runtime = resolve_runtime_path(None, std::env::var_os(RUNTIME_ENV), &graph)
             .expect("the runtime library");
         ensure_runtime(&runtime).expect("the runtime must load");
+        let decision = x86_int8();
+        let timed = timed_passes();
         let threads = OnnxBackendConfig::default().intra_threads;
-        let mut variants: Vec<(&str, Wiring, Worker)> =
-            [(true, "= 1, the backend's"), (false, "= 0, the default")]
-                .into_iter()
-                .map(|(exact, label)| {
-                    let session = build_session_as(&graph, threads, exact).expect("a session");
-                    let wiring =
-                        inspect_graph(&session, &graph).expect("the golden graph's wiring");
-                    let worker = Worker::new(session, &wiring).expect("a worker");
-                    (label, wiring, worker)
-                })
-                .collect();
+        let mut variants: Vec<(bool, Wiring, Worker)> = [true, false]
+            .into_iter()
+            .map(|entry| {
+                let session = build_session_as(&graph, threads, entry).expect("a session");
+                let wiring = inspect_graph(&session, &graph).expect("the golden graph's wiring");
+                let worker = Worker::new(session, &wiring).expect("a worker");
+                (entry, wiring, worker)
+            })
+            .collect();
 
         let run_all =
             |wiring: &Wiring, worker: &mut Worker| -> (Vec<Vec<f32>>, std::time::Duration) {
@@ -3275,7 +3731,7 @@ mod golden {
             };
         let mut vectors = Vec::new();
         let mut best = vec![std::time::Duration::MAX; variants.len()];
-        for pass in 0..4 {
+        for pass in 0..=timed {
             for (index, (_, wiring, worker)) in variants.iter_mut().enumerate() {
                 let (pass_vectors, elapsed) = run_all(wiring, worker);
                 if pass == 0 {
@@ -3288,13 +3744,25 @@ mod golden {
 
         println!(
             "\n{X64_QUANT_PRECISION} on this CPU ({}), {} texts, {threads} intra-op thread(s), \
-             graph {}:",
+             graph {}; the backend's decision here: {decision}",
             std::env::consts::ARCH,
             ids.len(),
             goldens.header()["graph_file"]
         );
-        for ((label, _, _), (vectors, best)) in variants.iter().zip(vectors.iter().zip(&best)) {
-            println!("  {X64_QUANT_PRECISION} {label}");
+        for ((entry, _, _), (vectors, best)) in variants.iter().zip(vectors.iter().zip(&best)) {
+            println!(
+                "  {X64_QUANT_PRECISION} {}{}",
+                if *entry {
+                    "= 1"
+                } else {
+                    "= 0, the runtime's default"
+                },
+                if *entry == decision.sets_entry() {
+                    " — the backend's here"
+                } else {
+                    ""
+                }
+            );
             let against_goldens = vectors
                 .iter()
                 .zip(&references)
@@ -3315,7 +3783,12 @@ mod golden {
                     worst_case(against_fp32.zip(names.iter().copied()))
                 );
             }
-            println!("    {} texts in {best:.1?} (best of 3 passes)", ids.len());
+            if timed > 0 {
+                println!(
+                    "    {} texts in {best:.1?} (best of {timed} passes)",
+                    ids.len()
+                );
+            }
         }
         let same = vectors[0]
             .iter()
@@ -3331,6 +3804,19 @@ mod golden {
                 ""
             }
         );
+
+        super::tests::assert_expected_x86_int8(decision);
+        if !decision.sets_entry() {
+            assert_eq!(
+                same,
+                ids.len(),
+                "the backend leaves {X64_QUANT_PRECISION} off here ({decision}) on the ground \
+                 that the kernels are exact without it, and the entry changed {} of {} vectors: \
+                 the decision is wrong for this CPU or this runtime",
+                ids.len() - same,
+                ids.len()
+            );
+        }
     }
 
     /// A batch is one run per text, so batched and single answers must be *equal*, bit
