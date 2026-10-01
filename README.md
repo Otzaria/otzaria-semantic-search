@@ -323,7 +323,7 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 | default | none | `Err(BackendUnavailable)` — a release build cannot serve fake vectors |
 | `--features mock-embedding` | deterministic hash stand-in | `Ok` — **not a semantic model**, development and testing only |
 | `--features llama-backend` | real llama.cpp GGUF inference | `Ok` |
-| `--features onnx-backend` | real ONNX Runtime inference for an ONNX model package (desktop targets) | `Ok` once the runtime library is found — `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and `Err(OnnxRuntimeUnavailable)` naming both otherwise |
+| `--features onnx-backend` | real ONNX Runtime inference for an ONNX model package (desktop targets) | `Ok` once the runtime library is found — the path the application passes (`EmbeddingDeployment::onnx_runtime`), else `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and `Err(OnnxRuntimeUnavailable)` naming each place it looked otherwise |
 | `mock-embedding` with a real backend | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
 
 Which backend a model gets is decided by its path, not by the features: `.onnx` in any
@@ -335,6 +335,14 @@ The application embeds only queries — the library's vectors are built on the b
 machine, and the app opens them read-only — so an ONNX model needs **one session** there,
 the default; `OTZARIA_ONNX_SESSIONS` above 1 is a build-machine knob, worth it only for
 callers that embed concurrently ([docs/ONNX_BACKEND.md](docs/ONNX_BACKEND.md) §6).
+
+An application that ships ONNX Runtime passes its path as
+`EmbeddingDeployment::onnx_runtime`, through `OfficialIndexConfig::deployment` or
+`SemanticConfig::deployment`. A path passed is the only place looked — one that cannot be
+loaded is an error naming it, never a fall-back — and, like everything in
+`EmbeddingDeployment`, it is no part of an index's or an artifact's identity. The
+application's layout, and where the runtime sits in it:
+[docs/ONNX_BACKEND.md](docs/ONNX_BACKEND.md) §3.
 
 The ONNX model, Meivin Round 2, ships as its **int8 graph** by default
 ([`config/models/meivin-round2-onnx/`](config/models/meivin-round2-onnx/README.md)): 42 MB

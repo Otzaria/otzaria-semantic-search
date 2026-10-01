@@ -280,6 +280,12 @@ otzaria-semantic-search/
   - `EmbeddingRuntime` & `EmbeddingConfig` — ממשק הרצת מודל מקומי, GGUF או חבילת ONNX.
     `load()` מאמת ומחשב את `model_checksum` דרך `model_package::validate_model`, לפי
     הפורמט שהנתיב אומר.
+  - `EmbeddingDeployment` — עובדות פריסה ולא זהות: היכן המכונה הזו מחזיקה את מה שה-backend
+    טוען מלבד המודל, היום ספריית ONNX Runtime (`onnx_runtime`). מוחזק **לצד**
+    `EmbeddingConfig` ולא בתוכו, כך שקוד שגוזר זהות מ-`EmbeddingConfig` אינו יכול לאסוף
+    אותו. האפליקציה מעבירה אותו ב-`OfficialIndexConfig::deployment` או
+    `SemanticConfig::deployment`; `EmbeddingRuntime::with_deployment` ו-`select_backend_for`
+    מוסרים אותו ל-backend, ו-llama מתעלם ממנו.
   - `validate_and_checksum_gguf()` — אימות קונטיינר וחישוב SHA-256 **במעבר אחד** על
     הקובץ (מודל של מאות MB נקרא פעם אחת בלבד). ה-header נבדק אחרי 24 בייטים, לפני
     שממשיכים; אחריו נפרסר כל אזור ה-descriptors, ומתוך ה-offsets המוצהרים נגזר חסם
@@ -338,7 +344,10 @@ otzaria-semantic-search/
   `"onnxruntime-sentence-v1"`; `OnnxBackendConfig::from_env_for` קורא את
   `OTZARIA_ONNX_THREADS` ו-`OTZARIA_ONNX_SESSIONS` ודוחה ערך שאינו מספר חיובי. באפליקציה
   session אחד (ברירת המחדל) — היא מטמיעה רק שאילתות; יותר מ-session אחד הוא כפתור של
-  מכונת ה-build, ומשתלם רק כשכמה קוראים מטמיעים בו-זמנית.
+  מכונת ה-build, ומשתלם רק כשכמה קוראים מטמיעים בו-זמנית. ספריית הריצה: הנתיב שהאפליקציה
+  מעבירה (`EmbeddingDeployment::onnx_runtime`), אחריו `OTZARIA_ONNX_RUNTIME`, ואחריו הקובץ
+  לצד הגרף — המקום הראשון שהוגדר מכריע, ונתיב שאינו נפתח נדחה ואינו מדולג
+  (`resolve_runtime_path`).
 
 * [`src/semantic/llama_backend.rs`](../src/semantic/llama_backend.rs) — inference אמיתי,
   מאחורי `--features llama-backend` (ראו [`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md)).

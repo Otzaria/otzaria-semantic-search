@@ -142,9 +142,10 @@ optional = true
 #    as index identity, so the version cannot move implicitly.
 #
 # `default-features = false, features = ["std", "load-dynamic"]`: the runtime is a
-# shared library loaded at run time — from `OTZARIA_ONNX_RUNTIME`, else the platform's
-# file name beside the graph — and never linked. The default, `download-binaries`,
-# links pyke's static builds, and each of those disqualifies itself:
+# shared library loaded at run time — from the path the application passes, else
+# `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and never
+# linked. The default, `download-binaries`, links pyke's static builds, and each of those
+# disqualifies itself:
 #
 # * Windows x64: compiled with `/arch:AVX2` into `search_engine.dll`, where AVX2 code
 #   can run at DLL load, so a pre-Haswell CPU loses the whole application — lexical

@@ -66,8 +66,9 @@ vector: `README.md`, `LICENSE.md`, the author's `manifest.json`, `.gitattributes
 export script — and `seforim-embed-round2-fp32.onnx`, which is a different model, with its
 own identity beside this one. The two graphs can share a directory: the package is the
 graph `model_path` names, and neither graph's checksum sees the other. Neither is the ONNX
-Runtime library part of it, which is found separately (`OTZARIA_ONNX_RUNTIME`, or the
-platform's file name beside the graph) and is code, not model data.
+Runtime library part of it, which is found separately (the path the application passes,
+`OTZARIA_ONNX_RUNTIME`, or the platform's file name beside the graph) and is code, not
+model data.
 
 ## The fields
 

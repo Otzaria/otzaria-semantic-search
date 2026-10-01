@@ -206,12 +206,20 @@ otzaria-onnx-package-v1
 ה־backend טוען את ספריית ONNX Runtime בזמן ריצה, ואינו מקשר אותה לבינארי. הוא מחפש אותה
 לפי הסדר:
 
-1. משתנה הסביבה `OTZARIA_ONNX_RUNTIME` — הנתיב המלא לספרייה;
-2. שם הקובץ של הפלטפורמה בתיקיית החבילה, לצד הגרף: `onnxruntime.dll`, `libonnxruntime.so`
+1. הנתיב שהאפליקציה מעבירה — `EmbeddingDeployment::onnx_runtime`, דרך
+   `OfficialIndexConfig::deployment` או `SemanticConfig::deployment` — לאפליקציה שמצרפת את
+   הספרייה בעצמה;
+2. משתנה הסביבה `OTZARIA_ONNX_RUNTIME` — הנתיב המלא לספרייה;
+3. שם הקובץ של הפלטפורמה בתיקיית החבילה, לצד הגרף: `onnxruntime.dll`, `libonnxruntime.so`
    או `libonnxruntime.dylib`;
-3. אחרת — `OnnxRuntimeUnavailable` („ONNX Runtime could not be loaded: …”), שמציין את
-   שתי האפשרויות. רק החיפוש הסמנטי אינו זמין; החיפוש הלקסיקלי ממשיך לעבוד. זו אינה
-   `BackendUnavailable`: ה־backend קיים בבנייה, וחסר רק קובץ.
+4. אחרת — `OnnxRuntimeUnavailable` („ONNX Runtime could not be loaded: …”), שעובר על שלושת
+   המקומות לפי הסדר ואומר מה נמצא בכל אחד. רק החיפוש הסמנטי אינו זמין; החיפוש הלקסיקלי
+   ממשיך לעבוד. זו אינה `BackendUnavailable`: ה־backend קיים בבנייה, וחסר רק קובץ.
+
+המקום הראשון שהוגדר הוא שמכריע: נתיב שהועבר או משתנה שהוגדר, ואינם מצביעים על קובץ — או
+שהם ריקים — נדחים, ואין מעבר למקום הבא. מיקום הספרייה הוא עובדת פריסה ולא זהות: הוא אינו
+נכנס למניפסט, לזהות הארטיפקט או למזהה ה־backend, ושינויו אינו פוסל דבר. הפריסה של האפליקציה
+ומקומה של הספרייה בה: [`ONNX_BACKEND.md`](ONNX_BACKEND.md) §3.
 
 ב־macOS, אפליקציה עם Hardened Runtime (שנדרש ל־notarization) טוענת רק ספריות שחתומות
 על ידי Apple או באותו Team ID שלה, אלא אם יש לה את ה־entitlement
@@ -219,7 +227,7 @@ otzaria-onnx-package-v1
 של קובץ שהורד מגבילים. לכן `dlopen` עלול לסרב ל־`libonnxruntime.dylib` של Microsoft
 מתיקיית המודל גם כשהקובץ תקין — הסירוב מגיע כ־`OnnxRuntimeUnavailable`, עם סיבת
 הטוען בהודעה. מה שעובד: לצרף את הספרייה לחבילת האפליקציה, חתומה בזהות של האפליקציה,
-ולהפנות אליה את `OTZARIA_ONNX_RUNTIME`.
+ולהעביר את הנתיב שלה ב־`EmbeddingDeployment::onnx_runtime`.
 
 הספרייה **אינה** נכנסת ל־checksum. היא קוד ולא נתוני מודל, היא שונה בכל פלטפורמה, וזהות
 המודל חייבת להיות זהה במכונת הבנייה ובכל מכשיר. ספרייה שמונחת לצד הגרף אינה משנה את

@@ -271,18 +271,55 @@ compiles; it does not link, and nothing here ran on Linux or Windows.
 
 ## 3. The runtime library
 
-**Where it comes from**, first hit wins:
+**Where it comes from**, three places in this order:
 
-1. `OTZARIA_ONNX_RUNTIME`, the path to the shared library. Set but empty, or naming
-   nothing, is refused — not skipped in favour of the next option.
-2. The platform's file name in the model package, beside the graph:
+1. The path the application passes, `EmbeddingDeployment::onnx_runtime` — carried by
+   `SemanticConfig::deployment` and `OfficialIndexConfig::deployment` — for an application
+   that ships the runtime itself.
+2. `OTZARIA_ONNX_RUNTIME`, the path to the shared library: development, the tests, the
+   build machine.
+3. The platform's file name in the model package, beside the graph:
    `libonnxruntime.dylib`, `libonnxruntime.so`, `onnxruntime.dll`.
-3. Otherwise `OnnxRuntimeUnavailable` — "ONNX Runtime could not be loaded: …" — naming both.
+
+The first place that is *set* decides, and a later one is never tried in its place: a path
+passed or a variable set that names nothing, or is empty, is refused rather than skipped,
+because falling back would load a runtime nobody chose. With a path passed the variable is
+not read at all (a log line says so when it is set). With none of the three,
+`OnnxRuntimeUnavailable` — "ONNX Runtime could not be loaded: …" — goes through the three
+places in order and says what each held.
 
 Every way the library can fail to load is that error: none found, not a runtime, too old,
-refused by `ort`, a different one already running. It is deliberately not
+refused by `ort`, a different one already running — and each names the library with the
+place it came from (`passed by the application`, `named by OTZARIA_ONNX_RUNTIME`, `beside
+the model`), so that a support message says which one to fix. It is deliberately not
 `BackendUnavailable`, whose message says the *build* has no backend for the model: here
-the backend is compiled in, and the fix is a file or a variable, not a rebuild.
+the backend is compiled in, and the fix is a file, a path or a variable, not a rebuild.
+
+Where the runtime lives is a deployment fact, not identity. `EmbeddingDeployment` is held
+beside `EmbeddingConfig`, never inside it, and no manifest, artifact identity, chunking
+identity or backend id reads it, so moving the runtime invalidates nothing. The llama
+backend ignores it: llama.cpp is linked into the build.
+
+**Deployment.** The layout the application uses:
+
+```text
+<root>/
+├── otzaria/                  the data folder
+│   ├── seforim.db
+│   └── <model>/              the model package
+│       ├── seforim-embed-round2-int8.onnx
+│       ├── tokenizer.json
+│       └── model.json        the model identity file
+├── index/                    the Tantivy index
+└── <artifact>/               the vectors artifact, a folder of its own beside index/
+```
+
+The runtime either ships with the application — the host then passes its path as
+`EmbeddingDeployment::onnx_runtime`; on macOS, signed inside the application's bundle, as
+library validation requires (below) — or sits beside the graph in `<model>/`, where the
+default lookup finds it; it must then be the build for that machine's OS and architecture.
+Neither the identity file nor a runtime in that folder is part of the package checksum,
+which covers the graph, the external-data files it names and `tokenizer.json` only.
 
 **macOS: library validation.** An application built with the Hardened Runtime — which
 notarization requires — loads only libraries signed by Apple or with its own Team ID,
@@ -292,8 +329,8 @@ quarantine attribute. So `dlopen` may refuse Microsoft's `libonnxruntime.dylib` 
 model folder even though the file is intact; the refusal arrives as
 `OnnxRuntimeUnavailable`, with the loader's reason (a code-signature or Team ID
 mismatch) in the message. What works is shipping the library inside the application
-bundle, signed with the application's identity, and pointing `OTZARIA_ONNX_RUNTIME` at it
-— or, knowingly, the entitlement above.
+bundle, signed with the application's identity, and passing its path as
+`EmbeddingDeployment::onnx_runtime` — or, knowingly, the entitlement above.
 
 The runtime is code, not model data: it is platform-specific and not part of the package
 checksum (design D4). The reference is **Microsoft's official ONNX Runtime 1.28.0**
@@ -304,9 +341,10 @@ features at run time, so it has no AVX2 requirement. The backend needs ONNX Runt
 or newer — `ort`'s API level with no `api-*` feature enabled.
 
 **One per process.** `ort` holds one runtime and can neither unload nor replace it. The
-same library again is a no-op; a different one is refused, naming both. The load log names
-the runtime as `ONNX Runtime 1.28.0 (git-branch=HEAD, git-commit-id=da9b5e364c,
-fp8-kv-cache=1, build type=Release) from <path>`.
+same library again is a no-op, from whichever place it comes; a different one is refused,
+naming both and where each came from. The load log names the runtime as `ONNX Runtime
+1.28.0 (git-branch=HEAD, git-commit-id=da9b5e364c, fp8-kv-cache=1, build type=Release)
+from <path> (<place>)`.
 
 **`ort` is only handed a library it will accept.** `ort` 2.0.0-rc.13 cannot survive
 refusing one: its library slot is a `OnceLock` whose loader runs under
@@ -463,7 +501,7 @@ lock.
 |---|---|---|
 | `OTZARIA_ONNX_THREADS` | intra-op threads per session | min(4, cores) |
 | `OTZARIA_ONNX_SESSIONS` | sessions in the pool: concurrent inferences. Leave it at 1 in the application; a build-machine knob for concurrent callers | 1 |
-| `OTZARIA_ONNX_RUNTIME` | the runtime library (§3) | beside the graph |
+| `OTZARIA_ONNX_RUNTIME` | the runtime library, when the application passes none (§3) | beside the graph |
 
 Anything but a positive integer is refused, naming the variable. They are deployment
 knobs, not identity — measured not to change a vector (§7). Intra-op spinning is off:
@@ -587,10 +625,11 @@ reason the two graphs are different identities (`model_quantization`).
 
 | where | what | needs |
 |---|---|---|
-| `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery, the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query and a passage capped on a space reaching it exactly as the bare text does, the stand-in's stub tokenizer | nothing |
+| `onnx_backend::tests` | refusals before any runtime (pooling, tuning, missing files, caps too small and too large, a non-tokenizer), runtime discovery (the three places in order, a place that is set never skipped, each place named in a refusal), the pool's FIFO order and unwinding, the production-shaped tokenizer against Python id for id, a padded query and a passage capped on a space reaching it exactly as the bare text does, the stand-in's stub tokenizer | nothing |
 | `onnx_backend::tests` | the fixture against the Python references; truncation; order; batch = single; concurrency; threads and sessions change nothing; static batch; `token_type_ids` as zeros; rank-3, extra-input, over-cap and non-ONNX refusals; one runtime per process | `OTZARIA_ONNX_RUNTIME` |
 | `onnx_backend::golden` | either production graph against its own golden file, chosen by the graph's SHA-256 (a graph no file describes fails loudly): sha256 of the tokenizer, the D4 package checksum, each input's bytes, ids exactly, cosine per graph (and how many are bit-identical), batch = single, concurrent = serial. Reported, not asserted: for the int8 graph each vector against the fp32 graph's golden too, and what `session.x64quantprecision` changes on this CPU, timed (§0.1) | `OTZARIA_TEST_ONNX_MODEL` + runtime; `--ignored` |
-| `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
+| `tests/onnx_backend.rs` | the target condition; `select_backend` serving an ONNX package; env refusals through the table; no fallthrough to the stand-in; the stand-in's stub package refused by the real row; a refused runtime then a correct one in a fresh process; the application's runtime path, with the variable removed, in a fresh process, through `EmbeddingRuntime`, `SemanticEngine` and `OfficialSemanticIndex`, then a different path refused; a passed path that names nothing refused by both public paths although the variable names a runtime; `EmbeddingRuntime::load` end to end, with the D4 checksum recomputed | runtime for most |
+| `engine::tests`, `official_index::tests` | a changed `EmbeddingDeployment` leaves an index current and an artifact's identity unchanged, and never reaches the manifest | nothing |
 
 The tests that run a graph skip loudly without `OTZARIA_ONNX_RUNTIME`, as the model-gated
 tests do without a model. **CI's `onnx-backend` job sets it to Microsoft's ONNX Runtime
