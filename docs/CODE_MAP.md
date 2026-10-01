@@ -113,6 +113,9 @@ otzaria-semantic-search/
     שנקטעה ולא הצליחה להשתחזר. כל וריאנט הוא סירוב, לא התדרדרות — וההבחנה ביניהם קיימת
     כדי שהאפליקציה תוכל להציג „לא מתאים” לעומת „פגום”, שהם שני תיקונים שונים.
   - `ChunkingError` — שגיאות חלוקת ספר לקטעים.
+  - `SemanticSearchError::InvalidRankingParameter` — פרמטר דירוג שהועבר עם חיפוש ואינו
+    בטווח (`NaN`, שלילי, מחוץ לתחום), עם שם השדה (`alpha_by_query_type.short`). נדחה לפני
+    שהחיפוש רץ, ולא מקוצץ למשהו שאיש לא ביקש.
   - `SemanticSearchError::Cancelled` — החיפוש בוטל דרך ה-`CancellationToken` שלו. **לא**
     כשל: המארח ביקש זאת, כי שאילתה חדשה החליפה את הישנה. `VectorStoreError::Cancelled`
     של סריקה שנעצרה מומר אליו בכל שכבה (`From` כתוב ידנית, לא `#[from]`), כדי שמי שבודק
@@ -169,7 +172,8 @@ otzaria-semantic-search/
 
 * [`src/hybrid/coordinator.rs`](../src/hybrid/coordinator.rs)
   - `HybridCoordinator` — מתאם החיפוש הראשי. מריץ חיפוש סמנטי לצד מועמדי BM25, מפעיל ניתוח שאילתא, מיזוג ציונים, קיבוץ, ומבצע Fallback ל-BM25 אם ה-Semantic Engine נכשל.
-  - `HybridSearchParams` — פרמטרי חיפוש (גבולות, Offset, Grouping, Filters, Force Mode).
+  - `HybridSearchParams` — פרמטרי חיפוש (גבולות, Offset, Grouping, Filters, Force Mode), ו-`ranking`:
+    `RankingProfile` שלם לחיפוש הזה במקום ה-preset, שנבדק ב-`validate()` לפני שמשהו רץ.
   - `SemanticSide` — איזה אינדקס סמנטי מוגש: `Official` (ארטיפקט מותקן, read-only —
     מסלול האפליקציה) או `SelfBuilt` (`SemanticEngine`, צד ה-build והאב-טיפוס). הצד
     הקורא זהה בשניהם, ולכן החיפוש אינו יודע במה הוא מחזיק. כל פעולה בונה עוברת
@@ -201,6 +205,7 @@ otzaria-semantic-search/
 * [`src/hybrid/ranking.rs`](../src/hybrid/ranking.rs)
   - `analyze_query()` — מזהה מאפייני שאילתא (ביטוי במרכאות, שאילתא קצרה, מילות קונספט, מספרים).
   - `compute_alpha()` — מחשב דינמית את משקל האלפא (שאילתות מדויקות/קצרות $\to \alpha \in [0.7, 0.9]$, שאילתות מושגיות ארוכות $\to \alpha \in [0.2, 0.4]$).
+    `compute_alpha_with()` הוא אותו חישוב מטבלת `QueryTypeAlphas` של הפרופיל — מה שה-coordinator משתמש בו.
   - `BonusConfig` — הגדרת בונוסים וקנסות (בונוס התאמה מדויקת, קנס כפילויות וכו').
 
 * [`src/hybrid/grouping.rs`](../src/hybrid/grouping.rs)
@@ -557,6 +562,16 @@ otzaria-semantic-search/
   - `SearchProfile` — `Fast` / `Balanced` / `Best`.
   - `RankingProfile` — כל פרמטרי הכיול במקום אחד (thresholds, בונוסים, קיבולות
     cache, אסטרטגיית fusion). מקור אמת יחיד, כדי שלא יהיו שתי קבוצות ברירות מחדל.
+    כולל גם את מה שהיה קבוע בקוד: `alpha_by_query_type` (`QueryTypeAlphas` — 1.0 לביטוי
+    במרכאות, 0.85 / 0.7 / 0.5 / 0.3 / 0.5) ו-`bm25_saturation_k` (`DEFAULT_BM25_SATURATION_K`
+    = 10.0), כך שמארח יכול להעביר פרופיל שלם **לכל חיפוש** (`HybridSearchParams::ranking`,
+    `SearchRequest::ranking`) ולכייל מהאפליקציה בלי שחרור של המנוע.
+  - `validate()` — דוחה פרמטר שהדירוג אינו מוגדר עבורו (`NaN`, שלילי, מחוץ לטווח)
+    ב-`InvalidRankingParameter` שנוקב בשם השדה, במקום לקצץ אותו בשקט. כל ה-presets עוברים.
+  - **ברירות המחדל עדיין לא נמדדו.** הכיול צריך את סט הרלוונטיות המתויג של S1 (שאילתות
+    עבריות מכל סוג, עם השורות הרלוונטיות לכל אחת), מדד על העמוד (nDCG@10 או recall), וריצות
+    שמשנות משפחת פרמטרים אחת בכל פעם. עד אז ברירות המחדל הן הדירוג שהיה תמיד — ובדיקה
+    ב-coordinator משווה אותו ביט-לביט מול עותק קפוא של ה-fusion כפי שהיה.
   - `FusionStrategy` — `Weighted` / `RRF { k }` / `Adaptive`.
 
 * [`src/config/feature_flags.rs`](../src/config/feature_flags.rs)

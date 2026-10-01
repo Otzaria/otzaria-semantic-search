@@ -30,7 +30,7 @@ use crate::hybrid::fusion::{
 };
 use crate::hybrid::grouping::group_results;
 use crate::hybrid::ranking::{
-    analyze_query, compute_alpha, compute_phrase_match_bonus, compute_rare_term_bonus,
+    analyze_query, compute_alpha_with, compute_phrase_match_bonus, compute_rare_term_bonus,
     QueryFeatures,
 };
 use crate::semantic::engine::SemanticEngine;
@@ -43,12 +43,6 @@ use crate::semantic::types::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
-
-/// Saturation constant for BM25 normalization (`score / (k + score)`).
-///
-/// Calibrated to `k = 10.0` so typical BM25 scores (range 2.0 to 30.0) saturate
-/// smoothly without flattening top lexical matches to near 1.0.
-const BM25_SATURATION_K: f32 = 10.0;
 
 /// Upper bound on semantic candidates fetched for one query.
 ///
@@ -65,7 +59,11 @@ const MAX_SEMANTIC_CANDIDATES: usize = 10_000;
 /// approximately 0.1; below that the embedding model considers the texts
 /// essentially unrelated.
 ///
-/// Overridable via `RankingProfile` once profile-driven fusion lands.
+/// The threshold a search applies is its profile's
+/// [`semantic_threshold`](RankingProfile::semantic_threshold), which a host can now pass
+/// per search ([`HybridSearchParams::ranking`]). This constant stands in only for a
+/// threshold that is not a number — which no preset has, the feature flags ignore, and
+/// [`RankingProfile::validate`] refuses in a profile passed with a search.
 const SEMANTIC_RELEVANCE_THRESHOLD: f32 = 0.55;
 
 /// Minimum normalized query length (in characters) to store a result in the
@@ -84,6 +82,20 @@ pub struct HybridSearchParams {
     pub force_mode: Option<SearchMode>,
     pub profile: Option<crate::config::profiles::SearchProfile>,
     pub feature_flags: Option<crate::config::feature_flags::FeatureFlags>,
+    /// Every ranking parameter for this search, in place of the preset `profile` names.
+    ///
+    /// What lets a host tune the ranking — the fusion strategy and RRF's `k`, alpha per
+    /// query type or one fixed alpha, BM25's `k`, the semantic threshold, the bonuses —
+    /// without a release of this crate. It is
+    /// [validated](crate::config::profiles::RankingProfile::validate) before anything runs,
+    /// and a parameter out of range fails the search with
+    /// [`SemanticSearchError::InvalidRankingParameter`] rather than ranking by a value
+    /// nobody chose. `profile` is then not consulted; `feature_flags` still apply on top,
+    /// as they do to a preset.
+    ///
+    /// `None`, the default, ranks by the preset exactly as before. The defaults are
+    /// unmeasured placeholders: [`RankingProfile`] says what calibrating them needs.
+    pub ranking: Option<RankingProfile>,
 }
 
 impl Default for HybridSearchParams {
@@ -96,6 +108,7 @@ impl Default for HybridSearchParams {
             force_mode: None,
             profile: None,
             feature_flags: None,
+            ranking: None,
         }
     }
 }
@@ -276,13 +289,27 @@ impl HybridCoordinator {
         let start_time = std::time::Instant::now();
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
         let flags = params.feature_flags.clone().unwrap_or_default();
-        let selected_profile = params.profile.unwrap_or(SearchProfile::Balanced);
-        let ranking_profile = FeatureFlags::resolve(selected_profile, &flags);
+        let ranking_profile = match &params.ranking {
+            // Refused here, before anything is looked up or computed: a parameter out of
+            // range would otherwise rank, silently, by whatever the arithmetic made of it.
+            Some(ranking) => {
+                ranking.validate()?;
+                let mut ranking = ranking.clone();
+                flags.apply(&mut ranking);
+                ranking
+            }
+            None => {
+                let selected_profile = params.profile.unwrap_or(SearchProfile::Balanced);
+                FeatureFlags::resolve(selected_profile, &flags)
+            }
+        };
         let normalized_query = self.normalizer.normalize(query);
         let query_features = analyze_query(&normalized_query);
         let requested_alpha = ranking_profile
             .alpha_override
-            .unwrap_or_else(|| compute_alpha(&query_features))
+            .unwrap_or_else(|| {
+                compute_alpha_with(&query_features, &ranking_profile.alpha_by_query_type)
+            })
             .clamp(0.0, 1.0);
         let telemetry_per_query = flags.telemetry_per_query.unwrap_or(true);
 
@@ -668,9 +695,11 @@ impl HybridCoordinator {
             .map(|(_, candidate)| candidate.bm25_score)
             .collect();
         let norm_bm25 = match profile.fusion_strategy {
-            FusionStrategy::Adaptive => normalize_bm25_adaptive(&bm25_scores, BM25_SATURATION_K),
+            FusionStrategy::Adaptive => {
+                normalize_bm25_adaptive(&bm25_scores, profile.bm25_saturation_k)
+            }
             FusionStrategy::Weighted | FusionStrategy::RRF { .. } => {
-                normalize_bm25_scores(&bm25_scores, BM25_SATURATION_K)
+                normalize_bm25_scores(&bm25_scores, profile.bm25_saturation_k)
             }
         };
 
@@ -2285,5 +2314,776 @@ mod tests {
             coordinator.get_telemetry_snapshot().total_searches,
             reference.get_telemetry_snapshot().total_searches
         );
+    }
+
+    // ── ranking parameters per search ──
+
+    /// The fusion exactly as it stood before its numbers became parameters: the body of
+    /// `fuse_candidates` at 1865ba0, verbatim, with `self`'s metadata ranker passed in and the
+    /// two constants it read at the values they had.
+    ///
+    /// Frozen on purpose. It is what "the defaults reproduce the ranking" is measured against,
+    /// so it must not follow the code it checks; a deliberate change to the default ranking —
+    /// calibrated numbers, say — replaces it in the same commit.
+    fn fuse_before_profile_parameters(
+        metadata_ranker: &crate::hybrid::metadata_ranker::MetadataRanker,
+        lexical: Vec<LexicalCandidate>,
+        semantic: Vec<SemanticCandidate>,
+        context: FusionContext<'_>,
+    ) -> Vec<FusedCandidate> {
+        const BM25_SATURATION_K: f32 = 10.0;
+        const SEMANTIC_RELEVANCE_THRESHOLD: f32 = 0.55;
+
+        let FusionContext {
+            alpha,
+            mode,
+            profile,
+            query_features,
+            query_facets,
+        } = context;
+        let mut lexical_by_id: HashMap<u64, (usize, LexicalCandidate)> = HashMap::new();
+        for (rank, candidate) in lexical.into_iter().enumerate() {
+            match lexical_by_id.entry(candidate.line_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((rank, candidate));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if candidate
+                        .bm25_score
+                        .total_cmp(&entry.get().1.bm25_score)
+                        .is_gt()
+                    {
+                        entry.insert((rank, candidate));
+                    }
+                }
+            }
+        }
+        let mut lexical: Vec<(usize, LexicalCandidate)> = lexical_by_id.into_values().collect();
+        lexical.sort_by_key(|(rank, _)| *rank);
+
+        let mut semantic_by_id: HashMap<u64, (usize, SemanticCandidate)> = HashMap::new();
+        for (rank, candidate) in semantic.into_iter().enumerate() {
+            match semantic_by_id.entry(candidate.metadata.line_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((rank, candidate));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if candidate
+                        .similarity_score
+                        .total_cmp(&entry.get().1.similarity_score)
+                        .is_gt()
+                    {
+                        entry.insert((rank, candidate));
+                    }
+                }
+            }
+        }
+        let mut semantic: Vec<(usize, SemanticCandidate)> = semantic_by_id.into_values().collect();
+        semantic.sort_by_key(|(rank, _)| *rank);
+
+        let bm25_scores: Vec<f32> = lexical
+            .iter()
+            .map(|(_, candidate)| candidate.bm25_score)
+            .collect();
+        let norm_bm25 = match profile.fusion_strategy {
+            FusionStrategy::Adaptive => normalize_bm25_adaptive(&bm25_scores, BM25_SATURATION_K),
+            FusionStrategy::Weighted | FusionStrategy::RRF { .. } => {
+                normalize_bm25_scores(&bm25_scores, BM25_SATURATION_K)
+            }
+        };
+
+        let sem_scores: Vec<f32> = semantic
+            .iter()
+            .map(|(_, candidate)| candidate.similarity_score)
+            .collect();
+        let threshold = if profile.semantic_threshold.is_finite() {
+            profile.semantic_threshold.clamp(0.0, 1.0)
+        } else {
+            SEMANTIC_RELEVANCE_THRESHOLD
+        };
+        let norm_sem = normalize_semantic_with_threshold(&sem_scores, threshold);
+        let rrf_k = match profile.fusion_strategy {
+            FusionStrategy::RRF { k } if mode == SearchMode::Hybrid => Some(k.max(1)),
+            _ => None,
+        };
+
+        let mut fused_map: HashMap<u64, FusedCandidate> =
+            HashMap::with_capacity(lexical.len() + semantic.len());
+
+        for ((_, candidate), &normalized) in lexical.into_iter().zip(norm_bm25.iter()) {
+            let lexical_rank = fused_map.len() as u32 + 1;
+            let fused_score = rrf_k
+                .map(|k| 1.0 / (k as f32 + lexical_rank as f32))
+                .unwrap_or(alpha * normalized);
+            let line_id = candidate.line_id;
+
+            fused_map.insert(
+                line_id,
+                FusedCandidate {
+                    title: candidate.title,
+                    reference: candidate.reference,
+                    text: candidate.text,
+                    line_id,
+                    section_id: candidate.section_id,
+                    line_hash: candidate.line_hash,
+                    segment: candidate.segment,
+                    is_pdf: candidate.is_pdf,
+                    file_path: candidate.file_path,
+                    needs_hydration: false,
+                    source: ResultSource::Lexical,
+                    raw_bm25_score: Some(candidate.bm25_score),
+                    normalized_bm25: Some(normalized),
+                    raw_semantic_score: None,
+                    normalized_semantic: None,
+                    fused_score,
+                    lexical_weight: alpha,
+                    semantic_weight: 1.0 - alpha,
+                },
+            );
+        }
+
+        for (semantic_rank, ((_, candidate), &normalized)) in
+            semantic.into_iter().zip(norm_sem.iter()).enumerate()
+        {
+            // RRF ignores score magnitudes, so a threshold only has meaning if
+            // candidates below it are excluded. Weighted/adaptive fusion keeps
+            // them at zero to preserve semantic-only paging and grouping.
+            if normalized <= 0.0 && rrf_k.is_some() {
+                continue;
+            }
+            let line_id = candidate.metadata.line_id;
+            let contribution = rrf_k
+                .map(|k| 1.0 / (k as f32 + semantic_rank as f32 + 1.0))
+                .unwrap_or((1.0 - alpha) * normalized);
+            let metadata_bonus = if profile.metadata_ranking_enabled && rrf_k.is_none() {
+                metadata_ranker
+                    .compute_signal(
+                        &candidate.metadata.source_book_key,
+                        &candidate.metadata.facets,
+                        query_facets,
+                    )
+                    .total
+            } else {
+                0.0
+            };
+
+            match fused_map.get_mut(&line_id) {
+                // Found by both engines: keep the lexical text and record both
+                // scores. Provenance must survive fusion.
+                Some(existing) => {
+                    existing.source = ResultSource::Both;
+                    existing.raw_semantic_score = Some(candidate.similarity_score);
+                    existing.normalized_semantic = Some(normalized);
+                    existing.fused_score += contribution + metadata_bonus;
+                    if mode == SearchMode::Hybrid && rrf_k.is_none() {
+                        existing.fused_score += profile.agreement_bonus.max(0.0);
+                    }
+                }
+                // Semantic-only: the vector store holds metadata but no line
+                // body, so the text has to be hydrated from Tantivy by id.
+                None => {
+                    let metadata = candidate.metadata;
+                    fused_map.insert(
+                        line_id,
+                        FusedCandidate {
+                            title: metadata.title,
+                            reference: metadata.reference,
+                            text: String::new(),
+                            line_id,
+                            section_id: metadata.section_id,
+                            line_hash: metadata.line_hash,
+                            segment: metadata.segment,
+                            is_pdf: metadata.is_pdf,
+                            file_path: metadata.source_book_key,
+                            needs_hydration: true,
+                            source: ResultSource::Semantic,
+                            raw_bm25_score: None,
+                            normalized_bm25: None,
+                            raw_semantic_score: Some(candidate.similarity_score),
+                            normalized_semantic: Some(normalized),
+                            fused_score: contribution + metadata_bonus,
+                            lexical_weight: alpha,
+                            semantic_weight: 1.0 - alpha,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut results: Vec<FusedCandidate> = fused_map.into_values().collect();
+        if rrf_k.is_none() {
+            let mut section_counts: HashMap<(String, u64), usize> = HashMap::new();
+            for candidate in &results {
+                *section_counts
+                    .entry((candidate.file_path.clone(), candidate.section_id))
+                    .or_default() += 1;
+            }
+
+            for candidate in &mut results {
+                candidate.fused_score += profile.phrase_match_bonus.max(0.0)
+                    * compute_phrase_match_bonus(&candidate.text, &query_features.quoted_phrases);
+                candidate.fused_score += profile.rare_term_bonus.max(0.0)
+                    * compute_rare_term_bonus(&candidate.text, &query_features.rare_tokens);
+                if section_counts
+                    .get(&(candidate.file_path.clone(), candidate.section_id))
+                    .copied()
+                    .unwrap_or(0)
+                    > 1
+                {
+                    candidate.fused_score += profile.section_coverage_bonus.max(0.0);
+                }
+            }
+        }
+
+        // Ties break on line_id so pagination is stable across calls; `HashMap`
+        // iteration order is not.
+        let sort_results = |results: &mut Vec<FusedCandidate>| {
+            results.sort_by(|a, b| {
+                b.fused_score
+                    .total_cmp(&a.fused_score)
+                    .then_with(|| a.line_id.cmp(&b.line_id))
+            });
+        };
+        sort_results(&mut results);
+
+        if rrf_k.is_none() && profile.duplicate_penalty > 0.0 {
+            let mut seen = std::collections::HashSet::new();
+            for candidate in &mut results {
+                if candidate.line_hash != 0 && !seen.insert(candidate.line_hash) {
+                    candidate.fused_score -= profile.duplicate_penalty;
+                }
+            }
+            sort_results(&mut results);
+        }
+        results
+    }
+
+    /// The alpha a search asked for before the table was a parameter: `compute_alpha` as it
+    /// was, then the same clamp.
+    fn alpha_before_profile_parameters(profile: &RankingProfile, features: &QueryFeatures) -> f32 {
+        use crate::hybrid::ranking::QueryType;
+        profile
+            .alpha_override
+            .unwrap_or(match features.estimated_type {
+                QueryType::ExactReference if features.has_quoted_phrase => 1.0,
+                QueryType::ExactReference => 0.85,
+                QueryType::Short => 0.7,
+                QueryType::Mixed => 0.5,
+                QueryType::Conceptual => 0.3,
+                QueryType::Unknown => 0.5,
+            })
+            .clamp(0.0, 1.0)
+    }
+
+    /// Every field of every fused candidate, each float as its bits.
+    fn fused_bits(fused: &[FusedCandidate]) -> Vec<String> {
+        let bits = |value: Option<f32>| {
+            value.map_or("-".to_string(), |value| format!("{:08x}", value.to_bits()))
+        };
+        fused
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {:?} f={} rb={} nb={} rs={} ns={} lw={} sw={} h={} | {:?} {:?} {:?} {} {} {} {} {:?}",
+                    c.line_id,
+                    c.source,
+                    bits(Some(c.fused_score)),
+                    bits(c.raw_bm25_score),
+                    bits(c.normalized_bm25),
+                    bits(c.raw_semantic_score),
+                    bits(c.normalized_semantic),
+                    bits(Some(c.lexical_weight)),
+                    bits(Some(c.semantic_weight)),
+                    c.needs_hydration,
+                    c.title,
+                    c.reference,
+                    c.text,
+                    c.section_id,
+                    c.line_hash,
+                    c.segment,
+                    c.is_pdf,
+                    c.file_path
+                )
+            })
+            .collect()
+    }
+
+    fn semantic_hit(
+        line_id: u64,
+        similarity_score: f32,
+        book: &str,
+        section_id: u64,
+        line_hash: u64,
+    ) -> SemanticCandidate {
+        SemanticCandidate {
+            metadata: crate::semantic::types::VectorMetadata {
+                semantic_id: format!("{book}#{line_id}"),
+                source_book_key: book.to_string(),
+                source_doc_key: format!("{book}#{line_id}"),
+                line_id,
+                section_id,
+                line_hash,
+                chunk_hash: String::new(),
+                content_hash: 0,
+                reference: format!("הפניה {line_id}"),
+                segment: line_id,
+                is_pdf: false,
+                title: "ספר".to_string(),
+                facets: vec!["/מקרא/תורה".to_string(), "/era/תנך".to_string()],
+            },
+            similarity_score,
+        }
+    }
+
+    /// The defaults reproduce the ranking this crate produced before they were parameters,
+    /// bit for bit. Over every preset; every fusion strategy, and RRF's `k` of 0, which the
+    /// fusion still treats as 1; a threshold that is not a number and thresholds either side
+    /// of the candidates; every mode at the alphas it runs with; and candidates that reach
+    /// the edges — the same line twice on either side, NaN and infinite BM25 scores, negative
+    /// and NaN cosines, line hashes shared for the duplicate penalty, facets for the metadata
+    /// bonus. And the alpha each preset asks for, for every query type.
+    #[test]
+    fn the_default_parameters_rank_exactly_as_the_constants_did() {
+        let coordinator = HybridCoordinator::new(None);
+        let genesis = "otzaria/tanach/genesis.txt";
+        let semantic_sets: [Vec<SemanticCandidate>; 2] = [
+            vec![],
+            vec![
+                semantic_hit(1, 0.93, genesis, 100, 11111),
+                semantic_hit(2, 0.41, genesis, 100, 22222),
+                semantic_hit(5, 0.12, "otzaria/b.txt", 7, 11111),
+                semantic_hit(6, -0.3, "otzaria/b.txt", 7, 0),
+                semantic_hit(7, f32::NAN, "otzaria/b.txt", 8, 9),
+                semantic_hit(1, 0.95, genesis, 100, 11111),
+                semantic_hit(8, 0.1, "otzaria/b.txt", 8, 10),
+                semantic_hit(9, 1.0, "otzaria/c.txt", 1, 12),
+                semantic_hit(10, 0.55, "otzaria/c.txt", 1, 13),
+            ],
+        ];
+        let lexical_sets: [Vec<LexicalCandidate>; 3] = [
+            vec![],
+            vec![
+                lexical(1, LINE_ONE, 45.0),
+                lexical(2, LINE_TWO, 25.0),
+                lexical(3, LINE_THREE, 0.0),
+                lexical(4, "בראשית ברא", f32::INFINITY),
+                lexical(11, "שורה", f32::NAN),
+                lexical(2, LINE_TWO, 25.0),
+                lexical(12, "שורה אחרת", 4.0),
+            ],
+            vec![lexical(1, LINE_ONE, 2.0), lexical(3, LINE_THREE, 9.0)],
+        ];
+        let strategies = [
+            None,
+            Some(FusionStrategy::Weighted),
+            Some(FusionStrategy::RRF { k: 0 }),
+            Some(FusionStrategy::RRF { k: 5 }),
+            Some(FusionStrategy::Adaptive),
+        ];
+        let queries = ["\"בראשית ברא\" אלהים", "בראשית ברא אלהים את", "מה"];
+        let facets = ["/era/תנך".to_string()];
+
+        let mut compared = 0;
+        for preset in [
+            SearchProfile::Fast,
+            SearchProfile::Balanced,
+            SearchProfile::Best,
+        ] {
+            for threshold in [None, Some(f32::NAN), Some(0.7), Some(0.0)] {
+                for strategy in strategies {
+                    let mut profile = RankingProfile::from_profile(preset);
+                    if let Some(threshold) = threshold {
+                        profile.semantic_threshold = threshold;
+                    }
+                    if let Some(strategy) = strategy {
+                        profile.fusion_strategy = strategy;
+                    }
+                    for query in queries {
+                        let features = analyze_query(query);
+                        for (mode, alpha) in [
+                            (SearchMode::Hybrid, 0.3),
+                            (SearchMode::Hybrid, 0.85),
+                            (SearchMode::SemanticOnly, 0.0),
+                            (SearchMode::LexicalOnly, 1.0),
+                        ] {
+                            for lexical in &lexical_sets {
+                                for semantic in &semantic_sets {
+                                    let context = || FusionContext {
+                                        alpha,
+                                        mode,
+                                        profile: &profile,
+                                        query_features: &features,
+                                        query_facets: &facets,
+                                    };
+                                    let now = coordinator.fuse_candidates(
+                                        lexical.clone(),
+                                        semantic.clone(),
+                                        context(),
+                                    );
+                                    let before = fuse_before_profile_parameters(
+                                        coordinator.metadata_ranker(),
+                                        lexical.clone(),
+                                        semantic.clone(),
+                                        context(),
+                                    );
+                                    assert_eq!(
+                                        fused_bits(&now),
+                                        fused_bits(&before),
+                                        "{preset} {threshold:?} {strategy:?} {query:?} {mode} {alpha}"
+                                    );
+                                    compared += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 3 * 4 * 5 * 3 * 4 * 3 * 2);
+
+        for preset in [
+            SearchProfile::Fast,
+            SearchProfile::Balanced,
+            SearchProfile::Best,
+        ] {
+            let profile = RankingProfile::from_profile(preset);
+            for query in [
+                "\"בראשית ברא\"",
+                "ברכות 20",
+                "שלום עולם",
+                "ברכות דף כ",
+                LINE_ONE,
+                "",
+            ] {
+                let features = analyze_query(query);
+                let now = profile
+                    .alpha_override
+                    .unwrap_or_else(|| compute_alpha_with(&features, &profile.alpha_by_query_type))
+                    .clamp(0.0, 1.0);
+                assert_eq!(
+                    now.to_bits(),
+                    alpha_before_profile_parameters(&profile, &features).to_bits(),
+                    "{preset} {query:?}"
+                );
+            }
+        }
+    }
+
+    /// Passing a preset as a ranking profile is naming the preset: the same results, bit for
+    /// bit, in the same mode, at the same alpha, in every mode.
+    #[test]
+    fn a_preset_passed_as_a_ranking_profile_ranks_exactly_as_the_preset() {
+        let dir = TempDir::new("preset_as_ranking");
+        let coordinator = indexed_coordinator(&dir);
+        let lexical_sets = [
+            vec![lexical(1, LINE_ONE, 15.5)],
+            vec![
+                lexical(1, LINE_ONE, 2.0),
+                lexical(2, LINE_TWO, 30.0),
+                lexical(3, LINE_THREE, 9.0),
+            ],
+        ];
+
+        for preset in [
+            SearchProfile::Fast,
+            SearchProfile::Balanced,
+            SearchProfile::Best,
+        ] {
+            for mode in [
+                SearchMode::Hybrid,
+                SearchMode::SemanticOnly,
+                SearchMode::LexicalOnly,
+            ] {
+                for query in [LINE_ONE, "בראשית ברא", "\"בראשית ברא\"", "ויאמר אלהים יהי"]
+                {
+                    for candidates in &lexical_sets {
+                        let run = |params: HybridSearchParams| {
+                            coordinator.clear_query_cache();
+                            coordinator
+                                .search(query, candidates.clone(), &params)
+                                .unwrap()
+                        };
+                        let named = run(HybridSearchParams {
+                            force_mode: Some(mode),
+                            profile: Some(preset),
+                            ..Default::default()
+                        });
+                        let passed = run(HybridSearchParams {
+                            force_mode: Some(mode),
+                            ranking: Some(RankingProfile::from_profile(preset)),
+                            ..Default::default()
+                        });
+
+                        let case = format!("{preset} {mode} {query:?}");
+                        assert_eq!(passed.search_mode, named.search_mode, "{case}");
+                        assert_eq!(ranked(&passed), ranked(&named), "{case}");
+                        assert_eq!(passed.total_count, named.total_count, "{case}");
+                        let (passed, named) = (passed.telemetry.unwrap(), named.telemetry.unwrap());
+                        assert_eq!(passed.alpha.to_bits(), named.alpha.to_bits(), "{case}");
+                        assert_eq!(passed.fusion_strategy, named.fusion_strategy, "{case}");
+                        assert_eq!(passed.profile, named.profile, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each parameter passed with a search is the one that search ranks by.
+    #[test]
+    fn every_parameter_passed_with_a_search_is_the_one_it_ranks_by() {
+        use crate::config::profiles::QueryTypeAlphas;
+
+        let dir = TempDir::new("ranking_takes_effect");
+        let coordinator = indexed_coordinator(&dir);
+        let search = |query: &str, candidates: Vec<LexicalCandidate>, mode, ranking| {
+            coordinator
+                .search(
+                    query,
+                    candidates,
+                    &HybridSearchParams {
+                        force_mode: Some(mode),
+                        ranking: Some(ranking),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let balanced = RankingProfile::default();
+        let score = |result: &HybridSearchResult, id: u64| {
+            result
+                .results
+                .iter()
+                .find(|item| item.id == id)
+                .expect("the line is in the result")
+                .fused_score
+        };
+
+        // The fusion strategy and RRF's `k`: line 1 tops both sides, so it gets 1 / (k + 1)
+        // from each.
+        for k in [5, 60] {
+            let result = search(
+                LINE_ONE,
+                vec![lexical(1, LINE_ONE, 15.5)],
+                SearchMode::Hybrid,
+                RankingProfile {
+                    fusion_strategy: FusionStrategy::RRF { k },
+                    ..balanced.clone()
+                },
+            );
+            let expected = 2.0 / (k as f32 + 1.0);
+            assert!((score(&result, 1) - expected).abs() < 1e-6, "k = {k}");
+            assert_eq!(
+                result.telemetry.unwrap().fusion_strategy,
+                format!("RRF(k={k})")
+            );
+        }
+
+        // One fixed alpha, and alpha per query type: the second line is conceptual.
+        let fixed = search(
+            LINE_TWO,
+            vec![lexical(2, LINE_TWO, 9.0)],
+            SearchMode::Hybrid,
+            RankingProfile {
+                alpha_override: Some(0.25),
+                ..balanced.clone()
+            },
+        );
+        assert_eq!(fixed.telemetry.unwrap().alpha, 0.25);
+        let per_type = search(
+            LINE_TWO,
+            vec![lexical(2, LINE_TWO, 9.0)],
+            SearchMode::Hybrid,
+            RankingProfile {
+                alpha_by_query_type: QueryTypeAlphas {
+                    conceptual: 0.9,
+                    ..QueryTypeAlphas::default()
+                },
+                ..balanced.clone()
+            },
+        );
+        assert_eq!(per_type.telemetry.unwrap().alpha, 0.9);
+
+        // A quoted phrase skips the semantic path at the default alpha of 1.0 only.
+        let quoted = "\"בראשית ברא\"";
+        let skipped = search(
+            quoted,
+            vec![lexical(1, LINE_ONE, 15.5)],
+            SearchMode::Hybrid,
+            balanced.clone(),
+        );
+        assert_eq!(skipped.search_mode, SearchMode::LexicalOnly);
+        let consulted = search(
+            quoted,
+            vec![lexical(1, LINE_ONE, 15.5)],
+            SearchMode::Hybrid,
+            RankingProfile {
+                alpha_by_query_type: QueryTypeAlphas {
+                    quoted_phrase: 0.6,
+                    ..QueryTypeAlphas::default()
+                },
+                ..balanced.clone()
+            },
+        );
+        assert_eq!(consulted.search_mode, SearchMode::Hybrid);
+        assert_eq!(consulted.telemetry.unwrap().alpha, 0.6);
+
+        // BM25's `k`: the lexical score is normalized against it.
+        for k in [2.0, 10.0, 50.0] {
+            let result = search(
+                LINE_ONE,
+                vec![lexical(1, LINE_ONE, 15.5)],
+                SearchMode::LexicalOnly,
+                RankingProfile {
+                    bm25_saturation_k: k,
+                    ..balanced.clone()
+                },
+            );
+            let provenance = result.results[0].provenance.as_ref().unwrap();
+            assert_eq!(
+                provenance.normalized_bm25,
+                Some(crate::hybrid::fusion::normalize_bm25_scores(&[15.5], k)[0]),
+                "k = {k}"
+            );
+        }
+
+        // The semantic threshold: a semantic score below it contributes nothing.
+        let normalized = |threshold: f32| {
+            search(
+                LINE_ONE,
+                vec![],
+                SearchMode::SemanticOnly,
+                RankingProfile {
+                    semantic_threshold: threshold,
+                    ..balanced.clone()
+                },
+            )
+            .results
+            .iter()
+            .map(|item| {
+                (
+                    item.id,
+                    item.provenance
+                        .as_ref()
+                        .unwrap()
+                        .normalized_semantic
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+        let open = normalized(0.0);
+        let strict = normalized(0.9);
+        assert!(
+            open.iter().any(|&(_, score)| score > 0.0 && score < 0.9),
+            "the fixture needs a semantic score between the two thresholds: {open:?}"
+        );
+        assert!(
+            strict
+                .iter()
+                .all(|&(_, score)| score == 0.0 || score >= 0.9),
+            "{strict:?}"
+        );
+        assert!(strict.iter().any(|&(id, score)| id == 1 && score >= 0.9));
+
+        // The agreement bonus: added to the line both sides found, and to no other.
+        let with_bonus = |bonus: f32| {
+            search(
+                LINE_ONE,
+                vec![
+                    lexical(1, LINE_ONE, 15.5),
+                    lexical(999, "שורה לקסיקלית בלבד", 3.0),
+                ],
+                SearchMode::Hybrid,
+                RankingProfile {
+                    agreement_bonus: bonus,
+                    ..balanced.clone()
+                },
+            )
+        };
+        let (without, with) = (with_bonus(0.0), with_bonus(0.3));
+        assert!(((score(&with, 1) - score(&without, 1)) - 0.3).abs() < 1e-6);
+        assert_eq!(score(&with, 999), score(&without, 999));
+    }
+
+    /// A parameter out of its range fails the search before it runs — named, never clamped
+    /// — and the search leaves nothing behind.
+    #[test]
+    fn a_ranking_parameter_out_of_range_fails_the_search_and_names_it() {
+        let dir = TempDir::new("ranking_refused");
+        let coordinator = indexed_coordinator(&dir);
+        let params = |ranking| HybridSearchParams {
+            ranking: Some(ranking),
+            ..Default::default()
+        };
+
+        let refused = coordinator.search(
+            LINE_TWO,
+            vec![lexical(2, LINE_TWO, 9.0)],
+            &params(RankingProfile {
+                bm25_saturation_k: -1.0,
+                ..RankingProfile::default()
+            }),
+        );
+        match refused {
+            Err(SemanticSearchError::InvalidRankingParameter {
+                parameter: "bm25_saturation_k",
+                value,
+                ..
+            }) => assert_eq!(value, "-1"),
+            other => panic!("expected the parameter named, got {other:?}"),
+        }
+        let embeddings = coordinator.embedding_cache_stats();
+        assert_eq!((embeddings.misses, embeddings.size), (0, 0));
+        assert_eq!(coordinator.get_telemetry_snapshot().total_searches, 0);
+
+        // A value the feature flags would have clamped is refused here, not clamped.
+        assert!(matches!(
+            coordinator.search(
+                LINE_TWO,
+                vec![],
+                &params(RankingProfile {
+                    semantic_threshold: 1.5,
+                    ..RankingProfile::default()
+                }),
+            ),
+            Err(SemanticSearchError::InvalidRankingParameter {
+                parameter: "semantic_threshold",
+                ..
+            })
+        ));
+
+        // And a valid profile runs.
+        assert!(coordinator
+            .search(LINE_TWO, vec![], &params(RankingProfile::default()))
+            .is_ok());
+    }
+
+    /// Results ranked by different parameters are different results: the query cache keys on
+    /// the whole profile, so one ranking never answers for another.
+    #[test]
+    fn the_query_cache_never_answers_one_ranking_with_another() {
+        let coordinator = HybridCoordinator::new(None);
+        let candidates = vec![lexical(1, LINE_ONE, 10.0)];
+        let ranked_by = |k: f32| {
+            coordinator
+                .search(
+                    LINE_ONE,
+                    candidates.clone(),
+                    &HybridSearchParams {
+                        ranking: Some(RankingProfile {
+                            bm25_saturation_k: k,
+                            ..RankingProfile::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+
+        let first = ranked_by(10.0);
+        let other = ranked_by(2.0);
+        assert!(!other.telemetry.as_ref().unwrap().cache_hit);
+        assert_ne!(first.results[0].fused_score, other.results[0].fused_score);
+        assert!(ranked_by(10.0).telemetry.unwrap().cache_hit);
     }
 }

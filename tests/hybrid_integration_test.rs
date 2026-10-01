@@ -18,6 +18,7 @@
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::config::profiles::{FusionStrategy, RankingProfile};
 use otzaria_semantic_search::errors::SemanticSearchError;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::embedding::mock;
@@ -1038,4 +1039,50 @@ fn a_search_cancelled_through_the_api_is_told_apart_from_a_failure() {
         "the cancelled search must not have cached a result"
     );
     assert!(plain.telemetry.unwrap().cache_hit);
+}
+
+// ───────────────────────── ranking parameters ─────────────────────────
+
+/// The host tunes the ranking per search, without a release of the engine: a profile passed
+/// with the request is the one the search ranks by, the preset passed as a profile changes
+/// nothing, and a parameter out of range is refused by name instead of clamped.
+#[test]
+fn a_ranking_profile_passed_with_a_request_is_the_one_it_ranks_by() {
+    let dir = TempDir::new("ranking");
+    let api = indexed_api(config_at(&dir));
+    let search = |ranking: Option<RankingProfile>| {
+        api.clear_query_cache();
+        api.search(SearchRequest {
+            query: LINE_ONE.to_string(),
+            lexical_candidates: vec![lexical_hit(1, LINE_ONE, 15.5)],
+            ranking,
+            ..Default::default()
+        })
+    };
+    let scores = |result: &otzaria_semantic_search::semantic::types::HybridSearchResult| {
+        result
+            .results
+            .iter()
+            .map(|item| (item.id, item.fused_score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+
+    let preset = search(None).unwrap();
+    let passed = search(Some(RankingProfile::default())).unwrap();
+    assert_eq!(scores(&passed), scores(&preset));
+
+    let rrf = search(Some(RankingProfile {
+        fusion_strategy: FusionStrategy::RRF { k: 60 },
+        ..RankingProfile::default()
+    }))
+    .unwrap();
+    assert_eq!(rrf.telemetry.as_ref().unwrap().fusion_strategy, "RRF(k=60)");
+    assert_ne!(scores(&rrf), scores(&preset));
+
+    let error = search(Some(RankingProfile {
+        alpha_override: Some(f32::NAN),
+        ..RankingProfile::default()
+    }))
+    .unwrap_err();
+    assert!(error.contains("alpha_override"), "{error}");
 }

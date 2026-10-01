@@ -8,6 +8,12 @@
 //! score calibration at all, which may well make it the better default. Neither has
 //! been measured on Hebrew queries yet — that comparison needs the labelled relevance
 //! set from stage S1.
+//!
+//! The active profile can be passed with each search
+//! ([`HybridSearchParams::ranking`](crate::hybrid::coordinator::HybridSearchParams::ranking)),
+//! the strategy, RRF's `k` and BM25's `k` included, so that comparison — and whatever
+//! tuning follows it — can run from the application without a release of this crate. The
+//! defaults stay as they are until it has.
 
 use crate::semantic::types::ResultSource;
 use std::collections::HashMap;

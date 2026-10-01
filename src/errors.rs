@@ -62,6 +62,19 @@ pub enum SemanticSearchError {
     #[error("The search was cancelled before it finished")]
     Cancelled,
 
+    /// A ranking parameter passed with a search is one the ranking is not defined for: not
+    /// a number, negative, or outside its range. Refused before the search runs, rather
+    /// than clamped into something nobody asked for — see
+    /// [`RankingProfile::validate`](crate::config::profiles::RankingProfile::validate).
+    ///
+    /// `parameter` is the field's path in the profile, `alpha_by_query_type.short` say.
+    #[error("Ranking parameter {parameter} is {value}, and it must be {requirement}")]
+    InvalidRankingParameter {
+        parameter: &'static str,
+        value: String,
+        requirement: &'static str,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

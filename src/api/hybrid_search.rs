@@ -57,6 +57,15 @@ pub struct SearchRequest {
     pub force_mode: Option<crate::semantic::types::SearchMode>,
     pub profile: Option<crate::config::profiles::SearchProfile>,
     pub feature_flags: Option<crate::config::feature_flags::FeatureFlags>,
+    /// Every ranking parameter for this search, in place of the preset `profile` names:
+    /// how the host tunes the fusion strategy, RRF's `k`, alpha, BM25's `k`, the semantic
+    /// threshold and the bonuses without a release of this crate. `None` is the preset.
+    ///
+    /// Validated first; a parameter out of range fails the search, naming the parameter.
+    /// See [`HybridSearchParams::ranking`], and
+    /// [`RankingProfile`](crate::config::profiles::RankingProfile) for why the defaults are
+    /// still placeholders.
+    pub ranking: Option<crate::config::profiles::RankingProfile>,
 }
 
 /// Opaque handle over the hybrid coordinator.
@@ -113,6 +122,7 @@ impl OtzariaHybridEngine {
             force_mode: request.force_mode,
             profile: request.profile,
             feature_flags: request.feature_flags,
+            ranking: request.ranking,
         };
 
         self.coordinator.search_cancellable(

@@ -303,6 +303,7 @@ fn main() {
                 force_mode,
                 profile: None,
                 feature_flags: None,
+                ranking: None,
             };
 
             match hybrid.search(req) {
