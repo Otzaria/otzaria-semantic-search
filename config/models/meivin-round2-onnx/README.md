@@ -27,10 +27,12 @@ quantized matrix products have no dedicated instructions. One more property to k
 vectors depend on which int8 kernels run — on the M4 alone, other kernels moved them to
 cosine 0.99896, where fp32 moves by ~1e-7 — so a library built on one CPU family and
 queried on another is compared at about that precision, the order at which int8 and fp32
-part anyway. On x86 that holds because the backend has ONNX Runtime compute the int8
-products exactly (`session.x64quantprecision`); by default its kernels for CPUs without
-VNNI saturate them, which put CI's x86 runner at cosine 0.9809 (`docs/ONNX_BACKEND.md`
-§0.1). Measuring it between x86 and ARM belongs to the weak-PC measurement.
+part anyway. On x86 that holds because every int8 product is computed exactly: by the CPU's
+VNNI kernels where it has them, and elsewhere because the backend sets
+`session.x64quantprecision`, without which ONNX Runtime's kernels for CPUs without VNNI
+saturate them — which put CI's x86 runner at cosine 0.9809 (`docs/ONNX_BACKEND.md` §0.1).
+Both paths compute the same products, so which one a CPU takes changes no vector. Measuring
+it between x86 and ARM belongs to the weak-PC measurement.
 
 | | |
 |---|---|
