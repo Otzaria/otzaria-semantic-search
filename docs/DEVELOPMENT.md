@@ -128,9 +128,9 @@ BM25 עדיין עובד
 | Manifest                         | ממומש                      |
 | בדיקת שינויי ספרים               | ממומש                      |
 | Embedding abstraction            | קיים                       |
-| הגדרת GGUF                       | קיימת                      |
-| אימות קונטיינר GGUF + checksum   | ממומש (header לפני hash, פרסור descriptors, חסם תחתון על הגודל) |
-| GGUF inference אמיתי             | ממומש מאחורי `--features llama-backend`, מאומת מול golden vectors |
+| אימות חבילת ONNX + checksum      | ממומש (נתיב שאינו `.onnx` נדחה; protobuf walk במעבר אחד, external data, `tokenizer.json`) |
+| ONNX inference אמיתי             | ממומש מאחורי `--features onnx-backend`, מאומת מול golden vectors — ה־backend היחיד |
+| GGUF / llama.cpp                 | **הוסר**; הקומיט האחרון שיש בו תמיכה הוא `62f0c44` |
 | deterministic embedding fallback | ממומש, **מחוץ ל־production** (feature `mock-embedding`) |
 | Batch embedding                  | ממומש (האינדוקס משתמש בו)  |
 | VectorStore abstraction          | קיים                       |
@@ -270,17 +270,20 @@ BM25 עדיין עובד
 
 ## מה הוסיף PR #2 (Inference אמיתי)
 
-`--features llama-backend` מספק inference אמיתי מול קובץ GGUF, ולא stand-in. הפרטים
-המלאים ב־[`P2_INFERENCE_SPIKE.md`](P2_INFERENCE_SPIKE.md) ו־[`P2_REFERENCE_VECTORS.md`](P2_REFERENCE_VECTORS.md);
-מה שחשוב לדעת לפני שנוגעים בקוד:
+> **רשומה בלבד.** ה־backend הזה — GGUF דרך llama.cpp — הוסר יחד עם `P2_INFERENCE_SPIKE.md`,
+> `P2_REFERENCE_VECTORS.md` ווקטורי הזהב שלו; כולם בהיסטוריה של git עד `62f0c44`. ה־backend
+> היחיד היום הוא ONNX ([`ONNX_BACKEND.md`](ONNX_BACKEND.md)), ושער ה־parity שלו בנוי על אותו
+> עיקרון: `token_ids` מדויקים קודם, cosine אחריהם.
+
+`--features llama-backend` סיפק inference אמיתי מול קובץ GGUF, ולא stand-in. מה שנלמד בו:
 
 1. **בדיקת ה־parity הראשית היא שוויון `token_ids` מדויק, לא cosine.** נמדד ש־BOS
    מוטעה מקבל cosine *גבוה יותר* (0.9947938) מרפרנס לגיטימי (0.9947909), ולכן אין סף
    cosine שמפריד ביניהם.
-2. **בנייה רגילה נשארת בלי backend.** ה־feature אינו ברירת מחדל מפני שהוא בונה
-   llama.cpp ו־ggml דרך cmake בכל בנייה של תלוי.
-3. **הבחירה בין Candle ל־llama.cpp לא נמדדה.** הוכרעה llama.cpp לפני שנמדד משהו;
-   הקריטריונים לפתיחה מחדש רשומים באותו מסמך.
+2. **בנייה רגילה נשארת בלי backend.** זה נשאר כך גם עם ONNX: `onnx-backend` אינו ברירת
+   מחדל.
+3. **הבחירה בין Candle ל־llama.cpp לא נמדדה.** הוכרעה llama.cpp לפני שנמדד משהו; ההחלטה
+   הוחלפה כשהמודל עבר ל־ONNX.
 
 ## מה הוסיף PR #3 (Hybrid, פרופילים, אב־טיפוס persistence)
 
@@ -317,26 +320,25 @@ BM25 עדיין עובד
 staging והחלפה אטומית. זה שייך לחיבור לאוצריא (P6/P7), שבו מוכרע מודל ה־threading —
 אינדוקס מלא ארוך שחוסם את ה־UI הוא חסם שם, וכדאי לפתור אותו פעם אחת כמו שצריך.
 
-## מה בדיקת ה־GGUF כן מוכיחה ומה לא
+## מה בדיקת חבילת ה־ONNX כן מוכיחה ומה לא
 
-`validate_and_checksum_gguf` קוראת את הקובץ **פעם אחת** ועושה שלושה דברים:
+`validate_model` דוחה קודם נתיב שאינו מסתיים ב־`.onnx`, ואז `validate_onnx_package` קוראת
+כל קובץ בחבילה **פעם אחת**, הזול ביותר קודם:
 
-1. מאמתת את ה-header (magic, גרסה 2–3, מניינים סבירים) **לפני** שהיא קוראת את שאר
-   הקובץ — קובץ שאינו GGUF נדחה אחרי 24 בייטים, לא אחרי hash של גיגה-בייטים.
-2. מפרסרת את כל אזור ה-descriptors: metadata KV (כולל מערכים ומחרוזות) ותיאורי
-   tensor, וכך יודעת איפה מתחיל אזור הנתונים ומה ה-offset שכל tensor מצהיר עליו.
-   metadata type לא מוכר בגרסה נתמכת נדחה; גם קונטיינר בלי tensors, alignment שאינו
-   כפולה של 8 ו-offset שאינו מכבד אותו נדחים.
-3. דורשת שהקובץ יהיה גדול דיו כדי להחזיק את מה שהוא עצמו מתאר, בחסם של **ביט אחד
-   לאיבר** — נכון לכל טיפוס ggml, כולל הקוונטיזציות הטרנריות האגרסיביות ביותר.
+1. `tokenizer.json` קיים לצד הגרף — חסר נדחה במיקרו־שניות, לפני שהגרף מגובב.
+2. הבתים הראשונים של הגרף אינם סוג ידוע של קובץ *אחר* (Git LFS pointer, דף שגיאה, ZIP,
+   GGUF) — רק הודעה טובה יותר; ה־walk היה דוחה אותם בכל מקרה.
+3. הגרף נקרא כ־protobuf ומגובב באותו מעבר: קובץ שנקטע או פגום נדחה, וכך גם מודל בלי
+   `ir_version`, בלי `opset_import`, בלי גרף או עם גרף בלי קלט או פלט.
+4. כל קובץ external data שהטנזורים מצביעים עליו נמצא בתוך החבילה, קיים, ולפחות באורך
+   שההפניות שלו צריכות; כל אחד מגובב.
+5. `tokenizer.json` מגובב והוא אובייקט JSON שלם.
 
-מה שזה **לא**: החסם הוא חסם תחתון. חישוב הגודל המדויק דורש טבלת block sizes של כל
-קוונטיזציה, וטעות באחת מהשורות שם *דוחה מודל תקין* — כשל גרוע יותר מקבלת מודל פגום,
-כי הוא הופך את הפיצ'ר לבלתי-זמין במקום להיכשל מאוחר עם שגיאה ברורה. לכן הורדה
-שנקטעה **בתוך ה-tensor האחרון** עדיין עוברת. גם אימות הורדה אמיתי אינו כאן: checksum
-שהמנוע מחשב מהקובץ אינו יכול להעיד על הקובץ. השוואה מול SHA-256 מפורסם שייכת להפצת
-המודל (P2/P9); ה-checksum כאן קיים כדי לזהות שהבייטים מאחורי נתיב המודל **השתנו**
-בין הרצות, מה שמבטל בשקט כל וקטור שנשמר.
+מה שזה **לא**: בלי `length` מפורש, החסם על קובץ external data הוא חסם תחתון — ביט אחד
+לאיבר, מתחת לכל טיפוס ONNX — ולכן קובץ כזה שנקטע אחרי החסם עדיין עובר. וגם כאן אין אימות
+הורדה אמיתי: checksum שהמנוע מחשב מהקבצים אינו יכול להעיד עליהם. השוואה מול hash מפורסם
+שייכת להפצת המודל ([`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md)); ה־checksum כאן קיים
+כדי לזהות שהבתים מאחורי נתיב המודל **השתנו** בין הרצות, מה שמבטל בשקט כל וקטור שנשמר.
 
 ## עמידות ה־manifest: מה מובטח בכל פלטפורמה
 
@@ -361,26 +363,30 @@ staging והחלפה אטומית. זה שייך לחיבור לאוצריא (P6
 
 ## Embedding
 
-הקוד מציג את המערכת כ־GGUF embedding runtime, עם:
+הקוד מציג את המערכת כ־ONNX embedding runtime, עם ברירות המחדל של זהות הייצור
+(`config/models/meivin-round2-onnx/`):
 
 ```text
-model: EMD123/Otzaria-Embedding-V1-Flash-0.6B
-dimension: 1024
-quantization: Q4
-pooling: last-token
-max tokens: 512
+model: ArieLLL123/judaic-semantic-round2-onnx-zayit (Meivin Round 2, גרף ה-int8)
+dimension: 256
+quantization: int8
+pooling: in-graph
+max tokens: 256
 batch size: 32
 ```
 
-`load()` מאמת את קונטיינר ה־GGUF ומחשב SHA-256 של הקובץ במעבר אחד, ואז הבחירה נעשית
-ב־`backend::select_backend`:
+`validate()` דוחה נתיב שאינו מסתיים ב־`.onnx` כ־`InvalidModelFile`, לפני שנפתח דבר.
+`load()` מאמת את חבילת ה־ONNX — הגרף, `tokenizer.json` שלצדו וכל קובץ external data —
+ומחשב את ה־checksum שלה, כל קובץ נקרא פעם אחת, ואז הבחירה נעשית ב־`backend::select_backend`:
 
 ```text
 בנייה רגילה (production)               → Err(BackendUnavailable)
 --features mock-embedding               → backend "mock-hash-v1"  (אינו מודל)
---features llama-backend                → inference אמיתי מול ה-GGUF
+--features onnx-backend                 → inference אמיתי דרך ONNX Runtime
 שני ה-features יחד                      → ה-backend האמיתי מנצח
 ```
+
+ה־backend של GGUF ו־llama.cpp הוסר; הקומיט האחרון שיש בו תמיכה בו הוא `62f0c44`.
 
 ה־stand-in מבוסס SHA-256 ו־feature hashing (ואחריו L2 normalization). הוא **אינו
 זמין ב־production** — ראו "מה השתנה ב־PR הראשון" למעלה. וקטור באורך אפס נדחה
@@ -390,24 +396,24 @@ batch size: 32
 
 ```text
 --features mock-embedding (פיתוח/בדיקות):
-GGUF container validated + checksummed
+ONNX package validated + checksummed
        ↓
 fake deterministic embedding
        ↓
 vector
 
---features llama-backend (אמיתי):
-GGUF
+--features onnx-backend (אמיתי):
+ONNX package (graph + tokenizer.json)
  ↓
-Qwen2-BPE tokenizer (parse_special = false)
+tokenizer.json של החבילה: תחילית תפקיד, [CLS]/[SEP], חיתוך ל-max_tokens
  ↓
-llama.cpp inference, EOS מצורף אחרי החיתוך
+ONNX Runtime, טקסט אחד בכל הרצה
  ↓
-last-token pooling
+pooling ונרמול בתוך הגרף (in-graph)
  ↓
 L2 normalization (ב-EmbeddingRuntime, לא ב-backend)
  ↓
-1024-d vector
+256-d vector
 ```
 
 **אסור להתייחס ל־feature hashing כמודל semantic.**
@@ -419,35 +425,35 @@ blocker — ובפרט כדי שבדיקות ה־CI ירוצו גם במכונה
 
 # 5. מודל ה־Embedding
 
-הקונפיגורציה הנוכחית:
+הקונפיגורציה הנוכחית — זהות הייצור, `config/models/meivin-round2-onnx/model.json`:
 
 ```text
 Model:
-EMD123/Otzaria-Embedding-V1-Flash-0.6B
+ArieLLL123/judaic-semantic-round2-onnx-zayit (Meivin Round 2)
 
-GGUF:
-models/otzaria-embedding-v1-flash-q4.gguf
+Graph:
+models/meivin-round2-onnx/seforim-embed-round2-int8.onnx  (ו-tokenizer.json לצדו)
 
 Quantization:
-Q4
+int8
 
 Embedding dimension:
-1024
+256
 
 Pooling:
-last-token
+in-graph
 
 Vector precision:
 f32
 
 Maximum tokens:
-512
+256
 
 Batch size:
 32
 ```
 
-ההגדרות נמצאות ב־`SemanticConfig` וב־`EmbeddingConfig`.
+ההגדרות נמצאות ב־`SemanticConfig` וב־`EmbeddingConfig`, שברירות המחדל שלהן הן הזהות הזו.
 
 הממד, הדיוק, `max_tokens`, pooling וה־normalization אינם „הגדרות” אלא **חלק מזהות
 האינדקס**: שינוי של אחד מהם פוסל כל וקטור שנשמר. הבחירה הסופית ביניהם היא S1, ורק
@@ -457,14 +463,16 @@ Batch size:
 
 ---
 
-# 6. למה Q4
+# 6. למה int8
 
-המודל מיועד לרוץ מקומית, ולכן quantization הוא חלק מרכזי מהארכיטקטורה.
+המודל מיועד לרוץ מקומית, ולכן quantization הוא חלק מרכזי מהארכיטקטורה. גרף ה־int8 הוא
+ברירת המחדל; הנימוקים והמדידות ב־[`config/models/meivin-round2-onnx/README.md`](../config/models/meivin-round2-onnx/README.md)
+וב־[`ONNX_BACKEND.md`](ONNX_BACKEND.md) §0.
 
 חשוב להבדיל בין:
 
 ```text
-Model quantization = Q4
+Model quantization = int8
 ```
 
 לבין:
@@ -478,12 +486,12 @@ Vector precision = f32
 כרגע הכוונה היא:
 
 ```text
-Q4 model weights
+int8 model weights
 +
 f32 output vectors
 ```
 
-ולא Q4 vectors.
+ולא int8 vectors.
 
 ---
 
@@ -619,7 +627,7 @@ db path:
 semantic_db/zvec        ← שם היסטורי; הספרייה zvec אינה בשימוש
 
 embedding dimension:
-1024
+256
 
 collection:
 chunks
@@ -696,7 +704,7 @@ O(N × D)
 
 ```text
 N = מספר הווקטורים
-D = 1024
+D = 256 (ממד המודל)
 ```
 
 זה נכון לשני ה־stores: גם `ZevcStore` סורק את כולם. הוא מוסיף persistence, לא אחזור
@@ -948,9 +956,9 @@ manifest שאינו קריא (JSON פגום, גרסת format אחרת) אינו 
 המטרה:
 
 ```text
-GGUF file
+ONNX package (graph + tokenizer.json + external data)
    ↓
-SHA-256
+package checksum
    ↓
 manifest
 ```
@@ -960,12 +968,12 @@ manifest
 ```text
 model ID = same
 but
-actual GGUF = different
+actual package = different
 ```
 
-זה מחובר: `load_model()` מחשב SHA-256 של קובץ ה־GGUF (במעבר אחד על הקובץ, יחד עם
-אימות הקונטיינר), משווה אותו למה שנשמר ב־manifest, ומשבית את המסלול הסמנטי
-כשהקבצים שונים. אם ה־manifest עדיין לא מכיר checksum — הוא נרשם בטעינה הראשונה.
+זה מחובר: `load_model()` מחשב את ה־checksum של חבילת ה־ONNX (כל קובץ נקרא פעם אחת, יחד
+עם אימות החבילה), משווה אותו למה שנשמר ב־manifest, ומשבית את המסלול הסמנטי כשהחבילות
+שונות. אם ה־manifest עדיין לא מכיר checksum — הוא נרשם בטעינה הראשונה.
 
 ---
 
@@ -1284,7 +1292,7 @@ return BM25 results
 המטרה היא ש־Flutter **לא יכיר** את:
 
 ```text
-GGUF
+the model
 Chunker
 VectorStore
 Manifest
@@ -1443,10 +1451,11 @@ restart — אלא אם הקורא נותן backend מתמיד ל־`with_store`.
 הסדר המחייב הוא S0–S8 ב־[`שלבי ויעדי התקדמות.md`](../שלבי%20ויעדי%20התקדמות.md). מה
 שנוגע למאגר הזה:
 
-## ✅ נעשה: Real Embedding Runtime (PR #2)
+## ✅ נעשה: Real Embedding Runtime
 
-inference אמיתי מול GGUF, tokenizer, EOS, last-token pooling ו־L2, מאומתים מול
-golden vectors. מאחורי `--features llama-backend`.
+inference אמיתי דרך ONNX Runtime: ה־tokenizer של החבילה, pooling בתוך הגרף ו־L2, מאומתים
+מול golden vectors, מאחורי `--features onnx-backend`. (ב־PR #2 זה היה GGUF דרך llama.cpp,
+שהוסר אחרי `62f0c44`.)
 
 ## ✅ נעשה: Batch Embeddings
 
@@ -1580,12 +1589,12 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 
 ### Embedding
 
-* [x] GGUF model נטען באמת (`--features llama-backend`)
-* [x] tokenizer עובד — Qwen2-BPE, `parse_special = false`
+* [x] מודל ONNX נטען באמת (`--features onnx-backend`)
+* [x] tokenizer עובד — `tokenizer.json` של החבילה, תחיליות התפקיד כטוקנים מיוחדים
 * [x] inference עובד
-* [x] pooling תואם למודל — last-token, EOS מצורף אחרי החיתוך
+* [x] pooling תואם למודל — in-graph: הגרף מוציא את וקטור המשפט הגמור
 * [x] normalization תקין — במעבר יחיד ב־`EmbeddingRuntime`
-* [x] Q4 inference נבדק מול golden vectors (`token_ids` מדויק, ואז סבילות וקטורית)
+* [x] גרף ה־int8 וגרף ה־fp32 נבדקים מול golden vectors (`token_ids` מדויק, ואז סבילות וקטורית)
 * [ ] latency של הטמעת שאילתה על מכשירי היעד
 
 ### Vector Store
@@ -1769,7 +1778,7 @@ Architecture
 הסדר המומלץ:
 
 ```text
-✅ 1. Real GGUF inference
+✅ 1. Real inference (GGUF in PR #2; ONNX, the only backend, since)
 ✅ 2. Validate generated embeddings (golden vectors)
 ✅ 3. Batch inference
 ✅ 4. S0 — product contract alignment
@@ -1896,7 +1905,8 @@ src/
 │   ├── embedding.rs      → validation, batching, normalization (choke point)
 │   ├── embedding_cache.rs→ LRU over embedded texts
 │   ├── backend.rs        → EmbeddingBackend contract + selection
-│   ├── llama_backend.rs  → real inference (feature `llama-backend`)
+│   ├── model_package.rs  → the ONNX package: path check, validation, checksum
+│   ├── onnx_backend.rs   → real inference (feature `onnx-backend`), the only backend
 │   ├── engine.rs         → semantic orchestration
 │   ├── manifest.rs       → index compatibility + state
 │   ├── store.rs          → in-memory vector store (the active one)
@@ -1935,8 +1945,9 @@ src/
 
 ### Reach the app (the rest of S4b, then S5), then decide the representation (S1) and measure the store (S2b).
 
-Three tasks this section used to name are **done**. Real GGUF inference runs behind
-`--features llama-backend`, verified against committed golden vectors. The read-only
+Three tasks this section used to name are **done**. Real inference runs behind
+`--features onnx-backend` — ONNX Runtime, the only backend since GGUF and llama.cpp were
+removed after `62f0c44` — verified against committed golden vectors. The read-only
 runtime path exists: the artifact has a reader, the store contract is split so the
 application holds a type with no write on it, and an installed artifact reopens after a
 restart without indexing anything (S2a). And the packer exists (S4a): ready-made vectors
@@ -1984,8 +1995,8 @@ and the store format are **fields in the manifest**, not constants in this crate
 
 **Embedding abstraction:** 🟢 Implemented
 
-**Actual embedding inference:** 🟢 Implemented behind `--features llama-backend`,
-verified against golden vectors. A default build still has no backend at all, by
+**Actual embedding inference:** 🟢 Implemented behind `--features onnx-backend`, the only
+backend, verified against golden vectors. A default build still has no backend at all, by
 design — it fails loudly rather than serving fake vectors.
 
 **Vector abstraction:** 🟢 Split in two: `VectorSearchBackend` is what the runtime
@@ -2070,7 +2081,7 @@ Flutter API
 The main work now is to connect and measure what already exists:
 
 ```text
-✅ Fake embedding              →  Real GGUF inference
+✅ Fake embedding              →  Real ONNX inference
 ✅ Per-chunk inference         →  Batch inference
 ✅ Model-only index identity   →  Corpus + Tantivy + ID-scheme identity
 ✅ Engine bound to VectorStore  →  Read/write split; the application opens a

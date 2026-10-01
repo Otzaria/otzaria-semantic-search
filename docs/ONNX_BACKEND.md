@@ -1,9 +1,11 @@
 # The ONNX backend — `onnxruntime-sentence-v1`
 
 Real inference for ONNX sentence encoders, through ONNX Runtime and the Hugging Face
-tokenizer, behind the non-default `onnx-backend` feature. The code is
-`src/semantic/onnx_backend.rs`; which models reach it is decided in `semantic::backend`
-by the model path's format (`.onnx` in any ASCII case). This document is the decision
+tokenizer, behind the non-default `onnx-backend` feature — the crate's only backend. The
+code is `src/semantic/onnx_backend.rs`. A model is an ONNX graph, a path ending in `.onnx`
+in any ASCII case; any other model path is refused as `InvalidModelFile` before a backend
+is asked (`model_package::ensure_onnx_model_path`). GGUF and the llama.cpp backend were
+removed after `62f0c44`, the last commit that has them. This document is the decision
 record: what the backend promises, why it is built the way it is, and what it measured.
 
 The production model it was written for is "Meivin Round 2"
@@ -269,8 +271,7 @@ part of it: **graph optimization `All`** (`All` and `Disable`/`Level1` measured 
 run** (§5), and **exact int8 products on x86** — the CPU's VNNI kernels, or
 `session.x64quantprecision` where its kernels saturate (§0.1); which of the two a CPU takes
 computes the same products, and is not part of the id. It deliberately does not name the
-ONNX Runtime version, the thread count or the session count — the same choice
-`llama-cpp-qwen3-last-v1` makes about the llama.cpp build — because §7 measures them.
+ONNX Runtime version, the thread count or the session count, because §7 measures them.
 
 `EmbeddingBackend::tokenize` and `embed_batch_raw` go through one function, so the ids the
 goldens compare are the ids the graph consumes. Pooling is `in-graph` (`Pooling::InGraph`)
@@ -313,9 +314,9 @@ neither network nor minimum-OS changes.
 
 **Targets.** The crates are declared for desktop targets only — the platforms Microsoft
 publishes a runtime for. Everywhere else the feature is on with no backend behind it and
-an ONNX model gets `BackendUnavailable`, as a GGUF model does on 32-bit ARM — with a
-reason that says this target has no ONNX backend in this version (desktop only), rather
-than asking for the feature, which the plugin's `semantic` set enables on phones too. The
+an ONNX model gets `BackendUnavailable` — with a reason that says this target has no ONNX
+backend in this version (desktop only), rather than asking for the feature, which the
+plugin's `semantic` set enables on phones too. The
 condition is spelled in `Cargo.toml` (three declarations), `semantic/mod.rs`, the
 constructor pair in `semantic::backend` and `tests/onnx_backend.rs`;
 `the_target_condition_is_spelled_identically_everywhere` fails if any of the seven drifts
@@ -367,8 +368,8 @@ the backend is compiled in, and the fix is a file, a path or a variable, not a r
 
 Where the runtime lives is a deployment fact, not identity. `EmbeddingDeployment` is held
 beside `EmbeddingConfig`, never inside it, and no manifest, artifact identity, chunking
-identity or backend id reads it, so moving the runtime invalidates nothing. The llama
-backend ignores it: llama.cpp is linked into the build.
+identity or backend id reads it, so moving the runtime invalidates nothing. The stand-in
+ignores it: it runs nothing.
 
 **Deployment.** The layout the application uses:
 
@@ -458,7 +459,7 @@ be served fails at load and never in the middle of an index:
 |---|---|
 | pooling other than `in-graph` | `PoolingMismatch` |
 | `intra_threads` or `sessions` of 0 in a literal config | `LoadFailed`, naming the field |
-| `max_tokens` above 65,536 — past any encoder's context; the probe below is that long. Refused before this too, by `EmbeddingConfig::validate` and the engine's configuration — before a manifest records it — while a GGUF cap stays llama.cpp's to clamp | `LoadFailed` (`Config` in the engine) |
+| `max_tokens` above 65,536 — past any encoder's context; the probe below is that long. Refused before this too, by `EmbeddingConfig::validate` and the engine's configuration — before a manifest records it | `LoadFailed` (`Config` in the engine) |
 | graph / `tokenizer.json` absent | `ModelNotFound` / `TokenizerNotFound` |
 | tokenizer not parseable | `InvalidModelFile` (the graph named, the tokenizer in the reason) |
 | `max_tokens` ≤ the special tokens the tokenizer adds | `LoadFailed` — also what keeps the tokenizer's own unchecked subtraction from wrapping |
@@ -494,9 +495,8 @@ keeps both specials and the prefix, and the content's tail is what is cut.
 **Special tokens inside text are matched — deliberately.** The text recipe spells the role
 prefix as text (`"[PASSAGE] "`, `"[QUERY] "`), and it becomes the learned token only
 because the tokenizer matches added special tokens in its input. The consequence: a book
-containing the literal string `[CLS]`, `[SEP]` or `[QUERY]` gets that token too. This is
-the opposite of the llama backend's `parse_special = false`, for the opposite reason —
-there a control token in a book is an accident, here the prefix is one. The Python
+containing the literal string `[CLS]`, `[SEP]` or `[QUERY]` gets that token too, on
+purpose: the prefix is one. The Python
 `tokenizers` package (0.23.2) behaves identically, measured on the fixture's reference
 cases, all equal id for id:
 

@@ -11,9 +11,11 @@ It is not production-ready yet.
 
 The current crate implements chunking, lifecycle contracts, brute-force vector
 search, result fusion, ranking profiles, caches, telemetry, a Rust API seam,
-prototype persistence and packaging, and — behind the non-default `llama-backend`
-feature — **real GGUF inference** against the Otzaria Qwen3 embedding model,
-verified against committed golden reference vectors.
+prototype persistence and packaging, and — behind the non-default `onnx-backend`
+feature — **real ONNX inference** through ONNX Runtime against the Meivin Round 2
+embedding model, verified against committed golden reference vectors. ONNX is the only
+backend: GGUF and llama.cpp support was removed, and the last commit that has it is
+`62f0c44`.
 
 The artifact identity contract is in place: a package declares which corpus, Tantivy
 schema, id scheme, model file, inference backend and store format it was built from, and
@@ -42,8 +44,8 @@ official artifact from Tantivy, and application integration.
 (`EmbeddingError::BackendUnavailable`) rather than producing vectors. That is
 deliberate: the two backends are opt-in for different reasons — the deterministic
 stand-in (`mock-embedding`) because it is *fake*, and real inference
-(`llama-backend`) because it is *expensive*, compiling llama.cpp and ggml through
-cmake on every downstream build.
+(`onnx-backend`) because a build able to embed has to be asked for: it brings in `ort`
+and the tokenizer, and loads ONNX Runtime, a shared library, when a model loads.
 
 ---
 
@@ -52,7 +54,7 @@ cmake on every downstream build.
 1. **Non-Destructive Sidecar Architecture**: The semantic engine operates as an independent sidecar database (`semantic_db`). It **never** mutates, alters, or replaces Otzaria's existing Tantivy lexical database.
 2. **Prebuilt, Read-Only Official Index**: Library vectors are produced on a build machine and shipped as a static artifact. On the user's device the index is opened, verified and read — never rebuilt, and never extended with a writable user overlay.
 3. **Graceful Fallback & Resilience**: If the semantic path fails (e.g. model missing, disk I/O error), the coordinator automatically falls back to lexical-only mode without crashing the app. The degradation is reported (`search_mode`, `fallback_reason`), never disguised as a semantic success.
-4. **Offline & Private Target**: Runs entirely on-device — inference is local llama.cpp over a GGUF file. The crate performs no model download and no network telemetry; obtaining the model is the host application's job.
+4. **Offline & Private Target**: Runs entirely on-device — inference is local ONNX Runtime over an ONNX graph. The crate performs no model download and no network telemetry; obtaining the model is the host application's job.
 5. **Source Retrieval (Not RAG)**: Designed strictly for accurate source and text retrieval within Jewish literature. It returns verifiable textual sources, never hallucinated AI responses.
 6. **Defensive Error Handling**: Known poisoned-lock and input edge cases use error propagation or graceful fallback; this is not an absolute panic-freedom guarantee.
 
@@ -92,8 +94,8 @@ cmake on every downstream build.
 │                                                                                                          │
 │   ┌────────────────────────┐         ┌────────────────────────┐         ┌────────────────────────────┐   │
 │   │    Anchored Chunker    │         │   Embedding Runtime    │         │  Vector Store (in-memory)  │   │
-│   │ (same-section context  │───────▶ │  (GGUF validation +    │───────▶ │  Pre-normalized vectors +  │   │
-│   │   + SHA256 Anchor IDs) │         │   llama.cpp inference) │         │  BinaryHeap Top-K, O(N·D)  │   │
+│   │ (same-section context  │───────▶ │ (ONNX package check +  │───────▶ │  Pre-normalized vectors +  │   │
+│   │   + SHA256 Anchor IDs) │         │  ONNX Runtime)         │         │  BinaryHeap Top-K, O(N·D)  │   │
 │   └────────────────────────┘         └────────────────────────┘         └────────────────────────────┘   │
 │                                                                                        ▲                 │
 │   ┌────────────────────────────────────────────────────────────────────────────────────┴─────────────┐   │
@@ -175,10 +177,11 @@ otzaria-semantic-search/
     ├── semantic/
     │   ├── mod.rs                      ➜ Semantic subsystem module declaration
     │   ├── chunker.rs                  ➜ Anchored semantic chunking & SHA256 ID generation
-    │   ├── embedding.rs                ➜ GGUF validation, batching & L2 normalization
+    │   ├── embedding.rs                ➜ Configuration checks, batching & L2 normalization
     │   ├── embedding_cache.rs          ➜ LRU cache of recently embedded texts
     │   ├── backend.rs                  ➜ EmbeddingBackend contract & backend selection
-    │   ├── llama_backend.rs            ➜ Real llama.cpp inference (feature `llama-backend`)
+    │   ├── model_package.rs            ➜ The ONNX package: what a model path names, its validation & checksum
+    │   ├── onnx_backend.rs             ➜ Real ONNX Runtime inference (feature `onnx-backend`), the only backend
     │   ├── engine.rs                   ➜ SemanticEngine: the build-side orchestrator; its indexing API is a prototype scaffold
     │   ├── official_index.rs           ➜ The application's read path over a verified artifact
     │   ├── manifest.rs                 ➜ Atomic JSON manifest versioning & Tantivy diff tracker
@@ -204,9 +207,10 @@ otzaria-semantic-search/
 | **Result Grouping** | [`src/hybrid/grouping.rs`](src/hybrid/grouping.rs) | `group_by_section`, `group_by_identical_text` | Section-level grouping and identical text line hash deduplication |
 | **Domain Models** | [`src/semantic/types.rs`](src/semantic/types.rs) | `BookLine`, `SemanticChunk`, `FusedCandidate`, `HybridSearchResult` | All data transfer objects, candidate models, and filter definitions |
 | **Text Chunker** | [`src/semantic/chunker.rs`](src/semantic/chunker.rs) | `Chunker`, `ChunkerConfig`, `compute_semantic_id` | Anchored chunking with context constrained to the anchor's section |
-| **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | GGUF structure/checksum validation; the primary choke point that normalizes and validates every vector |
+| **Embedding Runtime** | [`src/semantic/embedding.rs`](src/semantic/embedding.rs) | `EmbeddingRuntime`, `EmbeddingConfig`, `l2_normalize` | The configuration's checks — a model path that names no ONNX graph is refused here — and the primary choke point that normalizes and validates every vector |
 | **Backend Contract** | [`src/semantic/backend.rs`](src/semantic/backend.rs) | `EmbeddingBackend`, `Pooling`, `select_backend` | `Send + Sync` trait every backend implements; backends return **raw** vectors |
-| **Real Inference** | [`src/semantic/llama_backend.rs`](src/semantic/llama_backend.rs) | `LlamaCppBackend`, `ContextPool`, `truncate_with_eos` | llama.cpp GGUF inference behind `--features llama-backend`: Qwen2-BPE tokenizer, EOS appended, last-token pooling, real multi-sequence batching |
+| **Model Package** | [`src/semantic/model_package.rs`](src/semantic/model_package.rs) | `validate_model`, `ensure_onnx_model_path`, `OnnxPackage` | What a model path names — an ONNX graph, or a refusal — and the package around it: the graph, `tokenizer.json` and any external data, each validated, and the one checksum that names them all |
+| **Real Inference** | [`src/semantic/onnx_backend.rs`](src/semantic/onnx_backend.rs) | `OnnxBackend`, `OnnxBackendConfig` | ONNX Runtime inference behind `--features onnx-backend`, the only backend: the package's own `tokenizer.json`, one text per run, pooling in the graph; ONNX Runtime is a shared library loaded at run time, never linked |
 | **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **Volatile**, and what the builder path opens by default |
 | **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorSearchBackend`, `VectorStoreBackend` | Split in two on purpose: the runtime is handed the read side and so has no `insert` to call; the write side is what a builder gets |
 | **Payload Format** | [`src/semantic/zevc_store.rs`](src/semantic/zevc_store.rs) | `ZevcStore`, `ReadOnlyZevcStore` | Checksummed disk snapshots, opened writable by a builder and read-only by the runtime. A checksum **per record** is what catches a same-length edit. **Full scan, not ANN, not `zvec`** |
@@ -250,7 +254,7 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 │ [✔] Anchored chunker, manifest version tracker & in-memory vector store          │
 │ [✔] Correct brute-force baseline (pre-norm dot product + min-heap)               │
 │ [✔] Correctness baseline, lifecycle contracts & complete filters                 │
-│ [✔] Real GGUF inference (llama.cpp) verified against golden vectors              │
+│ [✔] Real ONNX inference (ONNX Runtime) verified against golden vectors           │
 │ [✔] Ranking profiles, fusion strategies, caches, telemetry & packaging prototype │
 ├──────────────────────────────────────────────────────────────────────────────────┤
 │ [✔] S0  Product contract alignment (this section, and the docs around it)        │
@@ -311,8 +315,6 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 
 ### Prerequisites
 - [Rust Toolchain](https://rustup.rs/) (Stable 2021 Edition)
-- For `--features llama-backend` only: **cmake** and a C++ toolchain. `llama-cpp-2`
-  builds llama.cpp and ggml from source (~1–2 minutes cold).
 - For `--features onnx-backend`: nothing at build time. ONNX Runtime is a shared library
   loaded when an ONNX model is, never linked, so running a graph needs one at run time —
   Microsoft's official [1.28.0 release](https://github.com/microsoft/onnxruntime/releases/tag/v1.28.0)
@@ -324,14 +326,13 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 |---|---|---|
 | default | none | `Err(BackendUnavailable)` — a release build cannot serve fake vectors |
 | `--features mock-embedding` | deterministic hash stand-in | `Ok` — **not a semantic model**, development and testing only |
-| `--features llama-backend` | real llama.cpp GGUF inference | `Ok` |
 | `--features onnx-backend` | real ONNX Runtime inference for an ONNX model package (desktop targets) | `Ok` once the runtime library is found — the path the application passes (`EmbeddingDeployment::onnx_runtime`), else `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and `Err(OnnxRuntimeUnavailable)` naming each place it looked otherwise |
-| `mock-embedding` with a real backend | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
+| `mock-embedding` with `onnx-backend` | real inference wins | `Ok`, or the real backend's error — never a silent fall-through to the stand-in |
 
-Which backend a model gets is decided by its path, not by the features: `.onnx` in any
-case is an ONNX package — the graph, the `tokenizer.json` beside it and any external data
-it names — and every other path is GGUF. A build without the backend for a model's format
-says which feature to enable.
+A model is an ONNX package: the graph a path ending in `.onnx`, in any case, names, the
+`tokenizer.json` beside it and any external data it names. Any other model path — a GGUF
+above all — is refused as `EmbeddingError::InvalidModelFile` before a backend is asked. A
+build without the backend says which feature to enable.
 
 The application embeds only queries — the library's vectors are built on the build
 machine, and the app opens them read-only — so an ONNX model needs **one session** there,
@@ -364,8 +365,6 @@ cargo build --release
 # target, overriding its `test = false`, and runs a 200k x 1024 workload unoptimized)
 cargo test --lib --tests
 cargo test --lib --tests --features mock-embedding
-cargo test --lib --tests --features llama-backend
-cargo test --lib --tests --features mock-embedding,llama-backend
 # The ONNX tests that run a graph skip without a runtime library to load
 OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib cargo test --lib --tests --features onnx-backend
 OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib cargo test --lib --tests --features mock-embedding,onnx-backend
@@ -383,17 +382,21 @@ One command: a corpus, a model file and the recipe in, a verified artifact out. 
 inference backend compiled in, because a build *is* inference.
 
 ```bash
-cargo run --release --features llama-backend -- build \
+OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
+cargo run --release --features onnx-backend -- build \
   --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
-  --model model.json --model-file model.gguf --chunking chunking.json \
+  --model config/models/meivin-round2-onnx/model.json \
+  --model-file /abs/path/seforim-embed-round2-int8.onnx \
+  --chunking config/models/meivin-round2-onnx/chunking.json \
   --out ./artifact
 ```
 
-`chunking.json` is a `ChunkerConfig` — the recipe itself, not a description of one:
+`chunking.json` is a `ChunkerConfig` — the recipe itself, not a description of one. The
+production identity's:
 
 ```json
 {"min_meaningful_chars": 20, "context_window_lines": 2, "max_chunk_chars": 512,
- "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 1,
+ "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 2,
  "normalization_version": 1}
 ```
 
@@ -417,7 +420,8 @@ three are about the **text**: `normalization_version` is the text preprocessing 
 before the model sees a string — on both sides, so a query reaches the model the same way
 the stored vectors did. L2 normalization of the finished vector is an invariant of cosine,
 applied by every store unconditionally, and is deliberately not versioned. `model_id` and
-`model_quantization` remain declarations — nothing in a GGUF states either.
+`model_quantization` remain declarations — nothing in an ONNX package states either in a
+form anything here could check.
 
 Which lines get a vector is **derived** by running the chunker over the corpus, before any
 inference. A line too short to carry meaning is skipped, and an artifact that skips it is
@@ -466,24 +470,8 @@ digest, which is what makes publishing one meaningful.
 
 ### Testing against the real model
 
-Tests that need the 396 MB GGUF are `#[ignore]`d and **skip loudly** when the model
-is absent, so CI stays green without it. To run them, point `OTZARIA_TEST_MODEL` at
-the file:
-
-```bash
-OTZARIA_TEST_MODEL=/abs/path/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf \
-  cargo test --lib --features llama-backend -- --ignored --nocapture
-```
-
-These assert **exact `token_ids` equality** against the committed golden vectors in
-[`tests/data/golden_vectors.json`](tests/data/golden_vectors.json), then cosine and
-per-component agreement. The token-id assertion is the primary gate, not the cosine
-one — a wrongly prepended BOS scores *higher* than a legitimate independent
-reference, so no cosine threshold can separate them. See
-[`docs/P2_REFERENCE_VECTORS.md`](docs/P2_REFERENCE_VECTORS.md) for the measurements
-and [`tools/README.md`](tools/README.md) for regenerating the goldens.
-
-The ONNX backend has its own gate, one golden file per graph —
+Tests that need the model are `#[ignore]`d and **skip loudly** when it is absent, so CI
+stays green without it. The parity gate has one golden file per graph —
 [`tests/data/onnx_golden_vectors_int8.json`](tests/data/onnx_golden_vectors_int8.json) for
 the default int8 graph and [`tests/data/onnx_golden_vectors.json`](tests/data/onnx_golden_vectors.json)
 for the fp32 reference — each the answers of a Python reference (`tokenizers` and
@@ -497,9 +485,20 @@ OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
 ```
 
 Token ids must match exactly, then every vector within cosine 0.99999 — for int8 on another
-CPU family than the goldens', 0.995, because int8 vectors depend on the CPU's int8 kernels. The model's
-package, checksum and licence are in
+CPU family than the goldens', 0.995, because int8 vectors depend on the CPU's int8 kernels.
+The token-id assertion is the primary gate, not the cosine one: truncation, the role
+tokens and special-token matching are all decided before the graph runs, and the ids are
+where an error in any of them shows. The model's package, checksum and licence are in
 [`config/models/meivin-round2-onnx/`](config/models/meivin-round2-onnx/README.md).
+
+The build path has one real-weights test of its own: an artifact built from the int8 graph
+and verified end to end, where every other builder test runs on the stand-in.
+
+```bash
+OTZARIA_TEST_ONNX_MODEL=/abs/path/seforim-embed-round2-int8.onnx \
+OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
+  cargo test --test artifact_builder --features onnx-backend -- --ignored --nocapture
+```
 
 ---
 
@@ -516,14 +515,15 @@ Clippy and tests; rustdoc links; and a release build of all targets. Tests use
 `--lib --tests`: `--all-targets` would execute the large benchmark rather than
 merely compile it.
 
-Further jobs: an **inference backend** job that builds and tests `llama-backend` on
-Linux and macOS; an **ONNX backend** job that tests `onnx-backend` on all three, against
+Further jobs: an **ONNX backend** job that tests `onnx-backend` on all three, against
 Microsoft's ONNX Runtime 1.28.0 fetched per platform and checked against a pinned
-SHA-256; and two **golden vectors** jobs that run the real-model parity gates, one per
-model — the second runs the ONNX gate for both of its graphs, int8 and fp32, fetched from
-the private mirror `otzaria/judaic-semantic-round2-onnx-zayit`, and checks that the crate
-and `tools/onnx_package_checksum.py` compute the same package checksum for each, the one
-its identity declares. The golden jobs need the `OTZARIA_HF_TOKEN` secret, whose account
+SHA-256; a **golden vectors** job that runs the parity gate for both of the model's
+graphs, int8 and fp32, fetched from the private mirror
+`otzaria/judaic-semantic-round2-onnx-zayit`, checks that the crate and
+`tools/onnx_package_checksum.py` compute the same package checksum for each, the one its
+identity declares, and builds and verifies one real artifact with the int8 graph; and an
+**emulated** golden job that runs the int8 gate under Intel's SDE as three x86 CPUs the
+runners do not have. The golden jobs need the `OTZARIA_HF_TOKEN` secret, whose account
 must be able to read that mirror; when the secret is absent they fail loudly rather than
 reporting a skip as a pass. That gate is a reason the model's distribution route
 matters — see [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md).
@@ -539,7 +539,7 @@ For detailed architectural invariants, subsystem separation rules, and developme
 - [docs/CODE_MAP.md](docs/CODE_MAP.md) — Detailed code map and component descriptions
 - [docs/MODEL_DISTRIBUTION.md](docs/MODEL_DISTRIBUTION.md) — How the embedding model reaches the device, and what an ONNX model package is (Hebrew)
 - [docs/ONNX_BACKEND.md](docs/ONNX_BACKEND.md) — The ONNX Runtime backend: the runtime library, tuning and determinism
-- [config/README.md](config/README.md) — The model identities: production, and the ONNX model's
+- [config/README.md](config/README.md) — The model identities: the int8 graph's, which is production, and the fp32 reference's
 - [שלבי ויעדי התקדמות.md](שלבי%20ויעדי%20התקדמות.md) — Staged plan S0–S8 across the three repositories (Hebrew)
 
 ---
