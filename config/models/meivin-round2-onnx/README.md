@@ -3,8 +3,8 @@
 `model.json` and `chunking.json` here are the identity of an artifact built with the
 Meivin Round 2 ONNX model's **int8 graph**, `seforim-embed-round2-int8.onnx`: what such an
 artifact declares, and what `build` must be handed to produce one. It is the graph an
-application ships and the one the library's vectors are built with. The pair sits beside
-the production pair in `config/`, which it does not replace — see `../../README.md`.
+application ships and the one the library's vectors are built with: the production
+identity — see `../../README.md`.
 
 The model's fp32 graph, which the int8 graph was quantized from, is the reference: a
 different model with its own identity, in
@@ -77,14 +77,14 @@ model data.
 | Field | Value | Why |
 |---|---|---|
 | `model_checksum` | `9e408407…d9d065` | the package checksum above |
-| `model_quantization` | `int8` | the dynamically quantized graph; a declaration, as for GGUF — the checksum is what tells the graphs apart |
+| `model_quantization` | `int8` | the dynamically quantized graph; a declaration — the checksum is what tells the graphs apart |
 | `embedding_backend` | `onnxruntime-sentence-v1` | ONNX Runtime, `tokenizer.json` → `input_ids` + `attention_mask`, the first output as the sentence vector |
 | `embedding_dim` | `256` | the graph's output width |
 | `pooling` | `in-graph` | the graph pools and normalizes; nothing is pooled outside it. An `.onnx` model declaring anything else is refused |
 | `max_tokens` | `256` | the total sequence length, `[CLS]`, `[SEP]` and the role token included — the cap the model's own search encoder uses |
 | `embedding_text_version` | `2` | the role prefixes: `[PASSAGE] ` before every stored passage, `[QUERY] ` before every query. They are learned special tokens |
 | `normalization_version` | `1` | the text as the corpus supplies it |
-| `chunking_identity` | `2685558872390372738` | `ChunkerConfig::identity` of `chunking.json` here: the production chunking, with `embedding_text_version` 2 |
+| `chunking_identity` | `2685558872390372738` | `ChunkerConfig::identity` of `chunking.json` here: `ChunkerConfig::default`'s chunking, with `embedding_text_version` 2 |
 
 ## Open questions
 
