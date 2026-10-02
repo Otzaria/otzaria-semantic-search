@@ -103,6 +103,17 @@ impl From<VectorStoreError> for SemanticSearchError {
     }
 }
 
+/// A cancelled resolution is a cancelled search, as a cancelled scan is; any other failure
+/// of the index is [`SemanticSearchError::Resolution`].
+impl From<crate::semantic::resolve::ResolveError> for SemanticSearchError {
+    fn from(error: crate::semantic::resolve::ResolveError) -> Self {
+        match error {
+            crate::semantic::resolve::ResolveError::Cancelled => Self::Cancelled,
+            crate::semantic::resolve::ResolveError::Index { reason } => Self::Resolution { reason },
+        }
+    }
+}
+
 /// Errors from the embedding model runtime.
 #[derive(Error, Debug)]
 pub enum EmbeddingError {

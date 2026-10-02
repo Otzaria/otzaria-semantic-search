@@ -12,7 +12,7 @@
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
 use otzaria_semantic_search::distribution::builder::{build, BuildRequest, PlannedCorpus};
 use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
-use otzaria_semantic_search::distribution::package::IndexPackage;
+use otzaria_semantic_search::distribution::package::{utc_timestamp, IndexPackage};
 use otzaria_semantic_search::distribution::packer::{
     pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
 };
@@ -35,7 +35,7 @@ use otzaria_semantic_search::semantic::zevc_store::VECTORS_FILENAME;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 fn print_usage() {
     println!(
@@ -1333,69 +1333,4 @@ fn print_report(report: &PackReport) {
          detects damage\nand the wrong artifact, but not one deliberately rebuilt to \
          match."
     );
-}
-
-/// `YYYY-MM-DDTHH:MM:SSZ`, for the manifest's `created_at`.
-///
-/// Hand-rolled because this crate carries no date dependency and needs one string in one
-/// place. The value is excluded from the artifact digest, so it cannot make a build
-/// irreproducible — but it is what a human reads off a manifest, and seconds since an
-/// epoch is not that.
-fn utc_timestamp(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64);
-    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
-    let second_of_day = seconds.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        second_of_day / 3600,
-        (second_of_day % 3600) / 60,
-        second_of_day % 60
-    )
-}
-
-/// Days since 1970-01-01 → civil date. Howard Hinnant's `civil_from_days`, which is
-/// exact for the whole proleptic Gregorian calendar and needs no lookup tables.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    // Shift the epoch to 0000-03-01, so leap days land at the end of the cycle.
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097); // [0, 146096]
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
-    let month_position = (5 * day_of_year + 2) / 153; // [0, 11], March = 0
-    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    } as u32;
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Anchored on dates that are checkable by hand, including the boundary the
-    /// March-based arithmetic exists to get right.
-    #[test]
-    fn the_timestamp_matches_known_instants() {
-        for (seconds, expected) in [
-            (0, "1970-01-01T00:00:00Z"),
-            (1_000_000_000, "2001-09-09T01:46:40Z"),
-            (1_582_934_400, "2020-02-29T00:00:00Z"),
-            (1_583_020_800, "2020-03-01T00:00:00Z"),
-            (1_609_459_199, "2020-12-31T23:59:59Z"),
-            (1_609_459_200, "2021-01-01T00:00:00Z"),
-        ] {
-            assert_eq!(
-                utc_timestamp(UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
-                expected
-            );
-        }
-    }
 }

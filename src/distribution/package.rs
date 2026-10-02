@@ -224,6 +224,14 @@ impl PackageManifest {
         }
     }
 
+    /// Everything [`IndexPackage::write`] and the verifications hold a manifest to before
+    /// its payload is read: a complete identity, a chain position and counts that describe
+    /// a segment, a release tag a header can carry, a provenance that says something.
+    pub(crate) fn validate(&self) -> Result<(), ArtifactError> {
+        self.identity.validate_complete()?;
+        self.validate_description()
+    }
+
     /// Refuse a manifest whose chain position or counts cannot describe a segment.
     ///
     /// What this cannot check is the payload's *content*: that it holds exactly the vectors
@@ -868,6 +876,43 @@ fn io_error(context: String) -> impl FnOnce(io::Error) -> ArtifactError {
     move |source| ArtifactError::Io { context, source }
 }
 
+/// An instant as RFC 3339 UTC to the second — `2026-10-02T09:15:00Z` — the form every
+/// timestamp this crate writes takes.
+pub fn utc_timestamp(time: std::time::SystemTime) -> String {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let second_of_day = seconds.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3600,
+        (second_of_day % 3600) / 60,
+        second_of_day % 60
+    )
+}
+
+/// Days since 1970-01-01 → civil date. Howard Hinnant's `civil_from_days`, which is
+/// exact for the whole proleptic Gregorian calendar and needs no lookup tables.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Shift the epoch to 0000-03-01, so leap days land at the end of the cycle.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097); // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let month_position = (5 * day_of_year + 2) / 153; // [0, 11], March = 0
+    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    } as u32;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 /// Minimal view used to read `metadata_version` before the full document.
 #[derive(Deserialize)]
 struct MetadataVersionProbe {
@@ -968,6 +1013,25 @@ mod tests {
 
     fn expectation() -> ArtifactExpectation {
         ArtifactExpectation::without_published_digest(test_identity())
+    }
+
+    /// Anchored on dates that are checkable by hand, including the boundary the
+    /// March-based arithmetic exists to get right.
+    #[test]
+    fn the_timestamp_matches_known_instants() {
+        for (seconds, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (1_000_000_000, "2001-09-09T01:46:40Z"),
+            (1_582_934_400, "2020-02-29T00:00:00Z"),
+            (1_583_020_800, "2020-03-01T00:00:00Z"),
+            (1_609_459_199, "2020-12-31T23:59:59Z"),
+            (1_609_459_200, "2021-01-01T00:00:00Z"),
+        ] {
+            assert_eq!(
+                utc_timestamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+                expected
+            );
+        }
     }
 
     #[test]

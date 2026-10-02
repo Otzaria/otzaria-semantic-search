@@ -67,6 +67,7 @@ pub mod oxv;
 pub mod onnx_backend;
 pub mod recipe;
 pub mod resolve;
+pub mod segment_set;
 pub mod store;
 pub mod store_backend;
 pub mod types;

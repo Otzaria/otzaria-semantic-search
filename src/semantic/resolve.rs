@@ -64,3 +64,37 @@ impl<S: Into<Box<str>>> FromIterator<S> for BookSet {
         Self(books.into_iter().map(Into::into).collect())
     }
 }
+
+/// Why the application's index could not answer a question about live lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// The caller's token was cancelled while the index was being read.
+    Cancelled,
+    /// The index could not be read.
+    Index { reason: String },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Index { reason } => write!(f, "the index could not be read: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// The application's index, as compaction asks it: which key each live line of a book
+/// holds today.
+pub trait LiveKeySource {
+    /// The library version the index holds. Records are re-anchored only on an index of the
+    /// set's own version: against another, a missing key is a library change, not a stale
+    /// record.
+    fn library_version(&self) -> u32;
+
+    /// Fill `out` with `(ordinal, chunk key column value)` for every live line of `book`
+    /// — [`ChunkKey::column_value`], `0` for a line that is not embedded — and return
+    /// `false` when the index holds no such book, whose records are then kept as they are.
+    fn book_keys(&self, book: &str, out: &mut Vec<(u32, u64)>) -> Result<bool, ResolveError>;
+}
