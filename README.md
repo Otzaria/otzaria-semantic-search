@@ -149,7 +149,7 @@ otzaria-semantic-search/
 │   └── production_backend_gate.rs      ➜ Proves a default build refuses to embed
 └── src/
     ├── lib.rs                          ➜ Library root, module exports & product contract
-    ├── main.rs                         ➜ Development CLI (audit / smoke) + the build commands: build / export-plan / embed-shard
+    ├── main.rs                         ➜ Development CLI (audit / smoke) + the build commands: build / plan / embed-shard / adopt-shard / warehouse-add / assemble / release-files
     ├── errors.rs                       ➜ Strongly-typed error hierarchy (thiserror)
     ├── cancellation.rs                 ➜ CancellationToken: abandoning a query nobody waits for
     ├── api/

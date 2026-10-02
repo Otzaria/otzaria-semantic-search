@@ -677,7 +677,8 @@ otzaria-semantic-search/
   ה-digest של כל טקסט לפני שהוא מטמיע אותו; `verify_shards` בודק כל shard מול ה-plan —
   plan, מודל, רוחב, חלון, digests, אורכים — ושהחלונות מכסים אותו בדיוק, לפני שנקרא בית;
   `read_vector_inputs` מזרים זוג קבצים של shard (`f32` little-endian ו-JSONL באותו סדר)
-  ותופס את שתי צורות אי-ההתאמה ביניהם. ה-merge — וקטורים לפי מפתח אל segment — הוא S7.
+  ותופס את שתי צורות אי-ההתאמה ביניהם. ההרכבה — וקטורים לפי מפתח אל segment — היא
+  `assemble.rs`, למטה.
 
 * [`src/distribution/builder.rs`](../src/distribution/builder.rs) — **צד ה-build (S4b).**
   - `build()` — קורפוס ומודל → חבילת base: `segment.oxv`, ה-`manifest.json`
@@ -700,7 +701,7 @@ otzaria-semantic-search/
   - **המתכון מוצמד ואינו מנוחש.** `chunking_identity` הוא hash חד-כיווני, ולכן הבנייה
     מקבלת את התצורה הממשית ודוחה אחת שאינה מה שהזהות מצהירה עליו.
   - **מה היא מחזיקה:** קטעי ספר אחד, וכל וקטור נבדל כ-`f32` עד הכיול. זה מסלול פיתוח;
-    בניית הספרייה זורמת (S7).
+    בניית הספרייה זורמת: `assemble.rs`.
   - **שער ה-backend הלא-סמנטי.** וקטורי hash מושלמים מבנית וריקים ממשמעות, ואף בדיקה
     מאוחרת אינה יכולה לדעת — לכן הסירוב חייב להיות כאן. `allow_non_semantic_backend` הוא
     `false` בכל דבר שנשלח.
@@ -832,7 +833,7 @@ cargo run --release --features onnx-backend -- build \
 
 ## בנייה מפוצלת
 
-`export-plan` מחיל את המתכון במכונה שמחזיקה את הקורפוס, ו-`embed-shard --skip --take`
+`plan` מחיל את המתכון במכונה שמחזיקה את הקורפוס, ו-`embed-shard --skip --take`
 מטמיע חלון של ה-plan במכונה שמחזיקה את המודל, ובודק את ה-digest של כל טקסט לפני שהוא
-מטמיע אותו. ה-merge — וקטורים לפי מפתח אל segment של base או של delta — הוא S7; עד אז
-`build` הוא המסלול היחיד שכותב segment.
+מטמיע אותו. `warehouse-add` מקבל shards אל ה-warehouse, ו-`assemble` מרכיב ממנו base או
+delta לפי מפתח, עם `--verify` לשערים — ראו [`VECTOR_BUILD.md`](VECTOR_BUILD.md).

@@ -231,3 +231,89 @@ import then re-reads every row: its digest, its finiteness, its unit norm, and t
 rule for a worker that is not ONNX Runtime on a CPU. The worker's own plan was a version 1
 `plan.jsonl`, so its digest is recorded and not compared. The fp32 package checksum in
 `config/models/meivin-round2-onnx/model.json` (`4a4a2ae8…`) is the run's passage package.
+
+## 5. Assembly
+
+```sh
+otzaria-semantic-search assemble --kind base --plan $P --warehouse $W --out $R \
+    [--codec i8-sym-vec|i8-sym-dim|f32] [--clip-q 1] [--keep-epoch --previous $L] \
+    [--created-at T] [--built-by '{"runId":"…"}'] [--verify]
+otzaria-semantic-search assemble --kind delta --plan $P --warehouse $W --previous $L \
+    [--previous-version N] --out $R [--verify]
+```
+
+`$L` is the directory holding the previous release's ledger — the `--out` of its
+assembly. The plan must have been split against that ledger.
+
+* **A base** ships every (book, key) record of the plan: books in byte order, lines in
+  order, a key's first record its slot, a later one in another book an extra.
+* **A delta** ships the keys the previous ledger lacks as slots, their later records as
+  extras, new (book, key) pairs of keys it holds as foreign records, and the ledger keys
+  the plan no longer has as tombstones.
+* **Vectors** come from the warehouse by the full SHA-256 of their text, read 4096 at a
+  time in warehouse order. A key the warehouse lacks fails the assembly, with the count
+  and the first missing digest.
+* **The codec epoch.** A base takes a new one: `i8-sym-vec` (the default) needs no
+  calibration. `i8-sym-dim` is calibrated here, exactly — the ⌊clip_q·(n−1)⌋-th smallest
+  `|x|` per dimension over the slots' vectors, found in two histogram passes over the
+  warehouse. A delta always keeps its ledger's epoch. The codec's name is the identity's
+  `store.vector_precision`, so a delta in another epoch or identity is refused by the
+  ledger.
+* **Memory.** Records, ledger and warehouse are mapped. About 70 bytes are held per slot
+  shipped (key, hint, warehouse record, the classification's entry), plus 64 MB of
+  histograms for `i8-sym-dim`. The test `assembly_memory_is_bounded` holds the growth to
+  under 200 bytes a slot.
+* **Deterministic.** The same plan, warehouse, ledger and `--created-at` give the same
+  bytes.
+
+`--out` receives `segment.oxv`, `manifest.json` and `payloads.json` (the metadata-v3
+package), `release.json` (the release manifest of
+[`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md), with `requires` =
+`{indexSchemaVersion: 5, lineTextVersion, keyVersion}` and `builtBy`), and this
+version's ledger: `ledger-vN.keys`, `pairs-vN.bin` and `ledger-vN.manifest.json`. The ledger also
+records the passage package, and a delta from a warehouse of another package is refused.
+
+**Published files.** After compressing (and splitting) the segment, the manifest that is
+published lists the files, each entry in the shape of the updater's `PatchFileEntry`:
+
+```sh
+otzaria-semantic-search release-files --release $R/release.json --compression zstd \
+    --files otzaria-vectors-<id8>-v29-v30.oxv.zst --out otzaria-vectors-<id8>-v29-v30.manifest.json
+```
+
+Each entry is `{file, compression, sha256, size, uncompressedSha256, uncompressedSize}`.
+The uncompressed values are the whole segment's, also for one part of a split file. The
+command prints the SHA-256 of the manifest it wrote: that is the value published outside
+it, which an install checks. `files` is not part of the package digest.
+
+A removed book's records go when their keys go. A record of a removed book whose key
+lives on in another book stays in the device's set, and a resolver drops it as stale. A
+compaction keeps it too, because a `LiveKeySource` that does not know a book keeps that
+book's records. It goes with the next base.
+
+## 6. Gates
+
+`assemble --verify` checks the release in `--out` against its inputs. It writes
+`gates.json` and exits with status 2 if a gate fails. Without `--kind`, it checks a
+release that was already assembled.
+
+| Gate | Checks |
+|------|--------|
+| G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped |
+| G5 | Every slot holds its key's warehouse vector, encoded. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals has a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998 |
+| G7 | A base is ≤ 2.0 × 10⁹ bytes; a delta is ≤ 0.15 × its base, otherwise publish a base |
+| G8 | Assembling again into `<out>.g8` gives the same segment, package, release manifest and ledger, byte for byte |
+| G9 | `verify_for_install` passes, reading every payload byte, under the manifest's `packageDigest`; the segment is the manifest's |
+| G10 | Reported, not enforced: the base plus its deltas as a multiple of the base, with a note past 1.3 |
+
+G2–G4 and G6 need the release index and belong to the plugin's validator. The library
+gives it these pieces in `distribution::gates`:
+
+* `simulate_device(dir, chain)` installs releases, oldest first, into a new set and
+  opens it with the runtime reader.
+* `coverage(set, plan)` counts the plan's records whose (book, key) a scan reaches (G3).
+* `book_records(set, book, out)` lists a book's reachable records with their hints, for
+  resolving (G4).
+* `ExactReference::new(set, warehouse).top_k(query, k, threads)` is the exact f32 scan
+  of the set's live keys. `recall(found, exact)` compares it with the set's own scan
+  (G6).

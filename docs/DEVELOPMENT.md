@@ -161,7 +161,7 @@ BM25 עדיין עובד
 | עוגן אמון לשחרור                 | המכניזם קיים (SHA-256 של ה־manifest, מפורסם בנפרד); **אין מי שמפרסם ואין חתימה** |
 | זהות (`IndexVersion`)             | מלאה — מתכון השורות ומפתח / משפחת המודל וחבילות השאילתה / store; נדחית לפי שדה |
 | builder שמייצר את הווקטורים עצמם | קיים — `build` מחיל את המתכון, מטמיע ומפיק base segment, חבילה ו־`release.json` |
-| צינור הבנייה של הספרייה          | `export-plan` / `embed-shard` קיימים; ה־merge לפי מפתחות, warehouse ו־delta — S7 |
+| צינור הבנייה של הספרייה          | קיים (POC) — `plan` / `embed-shard` / `warehouse-add` / `assemble --verify` (S7) |
 | חיבור ל־Tantivy חי | **לא קיים כאן** — ה־resolver ועמודת `chunkKey` הם של `otzaria_search_engine` (P1–P4) |
 | Production persistence במסלול הפעיל | קיימת ונמדדה: סט של 6.0M slots נפתח ב־3.8 ms |
 | אחזור תת־ליניארי (ANN)            | **אין, ואין צורך** (S2b): סריקה מלאה מדויקת ב־int8 — 69 ms בחוט אחד, 17 ms בעשרה, על 6.0M slots |
@@ -1626,7 +1626,7 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [ ] lock לשתי התקנות במקביל לאותו יעד — מתועד כמחוץ להיקף (S6, אם יידרש)
 * [x] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי — פתיחה 3.8 ms, התקנה 5.7 s, delta 0.45 s
 * [ ] חשיפת ה־importer דרך ה־API / FFI (S5)
-* [ ] `assemble` לפי מפתחות, warehouse ו־delta לצינור הבנייה של הספרייה (S7)
+* [x] `assemble` לפי מפתחות, warehouse ו־delta לצינור הבנייה של הספרייה (S7, POC)
 * [x] builder שמייצר את הווקטורים מקורפוס וממודל, ומחיל את המתכון בעצמו (S4b)
 * [ ] מימוש `CorpusIndex`/`CorpusBooks` מעל Tantivy הסופי (יתרת S4b)
 
@@ -1753,8 +1753,8 @@ Architecture
      │
      └── distribution
               ├── ✅ builder: מתכון → embeddings → base segment       (S4b)
-              ├── ✅ export-plan / embed-shard                       (S4b)
-              ├── assemble לפי מפתחות, warehouse, delta             (S7)
+              ├── ✅ plan / embed-shard                              (S4b, S7)
+              ├── ✅ assemble לפי מפתחות, warehouse, delta          (S7)
               └── resolver מעל Tantivy חי, FFI                      (P1–P4)
 ```
 
