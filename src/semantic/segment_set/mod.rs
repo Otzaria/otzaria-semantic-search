@@ -582,12 +582,17 @@ pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
 /// Remove generations neither pointer names and segments only they used. Best effort: a
 /// file that cannot be removed — mapped by a reader, on Windows — is left for the next
 /// call, and a pointer that cannot be read stops the collection altogether, since what it
-/// names cannot be known.
+/// names cannot be known. So does `PREVIOUS` without `CURRENT`, which no flip leaves: what
+/// `CURRENT` named, if it named anything, cannot be known either.
 pub(crate) fn collect_garbage(dir: &Path) {
+    let pointers = [read_pointer(dir, CURRENT), read_pointer(dir, PREVIOUS)];
+    if matches!(pointers, [Ok(None), Ok(Some(_))]) {
+        return;
+    }
     let mut live_generations = BTreeSet::new();
     let mut live_segments = BTreeSet::new();
-    for name in [CURRENT, PREVIOUS] {
-        match read_pointer(dir, name) {
+    for pointer in pointers {
+        match pointer {
             Ok(Some(pointer)) => match read_generation(dir, &pointer) {
                 Ok(document) => {
                     live_generations.insert(generation_dir(pointer.generation));

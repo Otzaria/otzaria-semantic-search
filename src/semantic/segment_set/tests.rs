@@ -1752,6 +1752,31 @@ fn compaction_keeps_the_first_line_of_a_key_a_book_holds_twice() {
     assert_eq!(hits[&key(1)].1, BTreeSet::from([("id:1".to_string(), 2)]));
 }
 
+/// `PREVIOUS` without `CURRENT` is no state a flip leaves — a crash between removing a
+/// directory where `CURRENT` should be and writing the pointer is one way there — and what
+/// `CURRENT` named cannot be known: no collection runs until a `CURRENT` is written again,
+/// and then the generations neither pointer names go.
+#[test]
+fn garbage_waits_while_current_is_missing() {
+    let work = TempDir::new("set_no_current");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let delta = info(&dir).unwrap().unwrap().segments[1].id.clone();
+    std::fs::remove_file(dir.join(CURRENT)).unwrap();
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert!(set.info().recovered_from_previous);
+    drop(set);
+    assert!(dir.join(files::generation_dir(2)).exists());
+    assert!(dir.join(format!("segments/{delta}.oxv")).exists());
+
+    install(&dir, &release(&work, &v31(), None)).unwrap();
+    assert_eq!(previous_generation(&dir), 1);
+    assert!(!dir.join(files::generation_dir(2)).exists());
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
