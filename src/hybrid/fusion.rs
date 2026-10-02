@@ -15,8 +15,21 @@
 //! tuning follows it — can run from the application without a release of this crate. The
 //! defaults stay as they are until it has.
 
-use crate::semantic::types::ResultSource;
+use crate::semantic::types::{FusedCandidate, ResultSource};
+use std::cmp::Ordering;
 use std::collections::HashMap;
+
+/// The order of fused results, best first: the score, then the line id, then the book — two
+/// books can hold lines with the same id, and a line is one per book and id — so the order is
+/// total. Fusion, grouping and the groups themselves all sort by it, so a page is the same on
+/// every call and pagination neither repeats nor skips a result; `HashMap` iteration order,
+/// which every fusion and grouping starts from, differs from one call to the next.
+pub(crate) fn best_first(a: &FusedCandidate, b: &FusedCandidate) -> Ordering {
+    b.fused_score
+        .total_cmp(&a.fused_score)
+        .then_with(|| a.line_id.cmp(&b.line_id))
+        .then_with(|| a.file_path.cmp(&b.file_path))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FusedEntry {

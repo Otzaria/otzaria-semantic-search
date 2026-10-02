@@ -4,6 +4,7 @@
 //! passage, which would otherwise fill a page of results with one source.
 //! Grouping collapses them behind a representative.
 
+use crate::hybrid::fusion::best_first;
 use crate::semantic::types::{FusedCandidate, FusedSibling, GroupedResult, GroupingMode};
 use std::collections::HashMap;
 
@@ -27,24 +28,17 @@ fn into_sibling(candidate: FusedCandidate) -> FusedSibling {
     }
 }
 
-/// Sort candidates best-first, breaking ties on `line_id` so the representative
-/// of a group is chosen deterministically rather than by map iteration order.
+/// Sort candidates best-first, in [`best_first`]'s total order, so the representative of a
+/// group is chosen deterministically rather than by map iteration order.
 fn sort_candidates_by_score(candidates: &mut [FusedCandidate]) {
-    candidates.sort_by(|a, b| {
-        b.fused_score
-            .total_cmp(&a.fused_score)
-            .then_with(|| a.line_id.cmp(&b.line_id))
-    });
+    candidates.sort_by(best_first);
 }
 
-/// Sort groups best-first, breaking ties on the representative's `line_id`.
+/// Sort groups best-first by their representatives, in [`best_first`]'s total order: two
+/// groups whose representatives tie on score and line id are two books, and fall in book
+/// order rather than in the map's.
 fn sort_groups_by_score(groups: &mut [GroupedResult]) {
-    groups.sort_by(|a, b| {
-        b.representative
-            .fused_score
-            .total_cmp(&a.representative.fused_score)
-            .then_with(|| a.representative.line_id.cmp(&b.representative.line_id))
-    });
+    groups.sort_by(|a, b| best_first(&a.representative, &b.representative));
 }
 
 /// Groups candidates by section_id and file_path.
@@ -300,6 +294,46 @@ mod tests {
                 .map(|g| g.representative.line_id)
                 .collect();
             assert_eq!(again, first);
+        }
+    }
+
+    /// Two books can hold lines with the same id, so a tie on score and line id is broken by
+    /// the book. Without it tied groups came out in the map's order, which differs from one
+    /// call to the next, and a page could repeat or skip a result.
+    #[test]
+    fn groups_tied_on_score_and_line_id_are_ordered_by_book() {
+        let candidates: Vec<FusedCandidate> = ["c.txt", "a.txt", "b.txt"]
+            .iter()
+            .enumerate()
+            .map(|(i, book)| {
+                in_file(
+                    mock_candidate(7, 100 + i as u64, 1000 + i as u64, 0.5),
+                    book,
+                )
+            })
+            .collect();
+        for mode in [GroupingMode::SameSection, GroupingMode::IdenticalText] {
+            for _ in 0..200 {
+                let books: Vec<String> = group_results(candidates.clone(), mode)
+                    .into_iter()
+                    .map(|group| group.representative.file_path)
+                    .collect();
+                assert_eq!(books, ["a.txt", "b.txt", "c.txt"], "{mode:?}");
+            }
+        }
+    }
+
+    /// Within a group too: the same text at the same line id of two books, scored alike, has
+    /// one representative whatever order the candidates arrive in.
+    #[test]
+    fn a_tie_within_a_group_is_broken_by_book() {
+        let a = in_file(mock_candidate(7, 1, 555, 0.5), "a.txt");
+        let b = in_file(mock_candidate(7, 2, 555, 0.5), "b.txt");
+        for input in [vec![a.clone(), b.clone()], vec![b, a]] {
+            let groups = group_by_identical_text(input);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].representative.file_path, "a.txt");
+            assert_eq!(groups[0].siblings[0].file_path, "b.txt");
         }
     }
 

@@ -26,7 +26,7 @@ use crate::config::feature_flags::FeatureFlags;
 use crate::config::profiles::{FusionStrategy, RankingProfile, SearchProfile};
 use crate::errors::SemanticSearchError;
 use crate::hybrid::fusion::{
-    normalize_bm25_adaptive, normalize_bm25_scores, normalize_semantic_with_threshold,
+    best_first, normalize_bm25_adaptive, normalize_bm25_scores, normalize_semantic_with_threshold,
 };
 use crate::hybrid::grouping::group_results;
 use crate::hybrid::ranking::{
@@ -35,7 +35,7 @@ use crate::hybrid::ranking::{
 };
 use crate::semantic::engine::SemanticEngine;
 use crate::semantic::official_index::{OfficialSemanticIndex, ReloadOutcome};
-use crate::semantic::resolve::{CandidateResolver, NoResolver};
+use crate::semantic::resolve::{CandidateResolver, NoResolver, ResolvedLine, VectorHit};
 use crate::semantic::segment_set::SetInfo;
 use crate::semantic::types::{
     BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling, HybridResultItem,
@@ -189,42 +189,8 @@ impl SemanticSide {
         let resolve_started = std::time::Instant::now();
         let lines = resolver.resolve(&hits, filters, cancel)?;
         telemetry.resolve_ms = Some(resolve_started.elapsed().as_millis() as u64);
-        let mut resolved = vec![false; hits.len()];
-        let candidates: Vec<SemanticCandidate> = lines
-            .into_iter()
-            .filter_map(|line| {
-                let Some(hit) = hits.get(line.hit as usize) else {
-                    log::warn!(
-                        "The resolver returned a line for hit {} of {}; it is skipped",
-                        line.hit,
-                        hits.len()
-                    );
-                    return None;
-                };
-                resolved[line.hit as usize] = true;
-                let key = hit.key.to_hex();
-                Some(SemanticCandidate {
-                    metadata: VectorMetadata {
-                        semantic_id: key.clone(),
-                        source_doc_key: format!("{}#{}", line.file_path, line.segment),
-                        source_book_key: line.file_path,
-                        line_id: line.line_id,
-                        section_id: line.section_id,
-                        line_hash: line.line_hash,
-                        chunk_hash: key,
-                        content_hash: 0,
-                        reference: line.reference,
-                        segment: line.segment,
-                        is_pdf: line.is_pdf,
-                        title: line.title,
-                        facets: line.facets.to_vec(),
-                    },
-                    similarity_score: hit.score,
-                })
-            })
-            .collect();
-        telemetry.semantic_unresolved =
-            resolved.iter().filter(|resolved| !**resolved).count() as u32;
+        let (candidates, unresolved) = candidates_of(&hits, lines);
+        telemetry.semantic_unresolved = unresolved;
         Ok(candidates)
     }
 
@@ -263,6 +229,57 @@ impl SemanticSide {
             Self::Official(_) => Err(SemanticSearchError::ReadOnlyIndex { operation }),
         }
     }
+}
+
+/// The candidates the lines a resolver returned for `hits` make, and how many hits resolved
+/// to none.
+///
+/// In the scan's order — best hit first, ties by key — and within one hit in the order the
+/// resolver gave its lines, best placed first; whatever order it returned them in. The
+/// position is the rank a fusion by rank reads, and a resolver may well return a hit's lines
+/// late: the application's appends those of text that moved books after all the others.
+fn candidates_of(
+    hits: &[VectorHit],
+    mut lines: Vec<ResolvedLine>,
+) -> (Vec<SemanticCandidate>, u32) {
+    // Stable, so each hit keeps its lines' order.
+    lines.sort_by_key(|line| line.hit);
+    let mut resolved = vec![false; hits.len()];
+    let candidates: Vec<SemanticCandidate> = lines
+        .into_iter()
+        .filter_map(|line| {
+            let Some(hit) = hits.get(line.hit as usize) else {
+                log::warn!(
+                    "The resolver returned a line for hit {} of {}; it is skipped",
+                    line.hit,
+                    hits.len()
+                );
+                return None;
+            };
+            resolved[line.hit as usize] = true;
+            let key = hit.key.to_hex();
+            Some(SemanticCandidate {
+                metadata: VectorMetadata {
+                    semantic_id: key.clone(),
+                    source_doc_key: format!("{}#{}", line.file_path, line.segment),
+                    source_book_key: line.file_path,
+                    line_id: line.line_id,
+                    section_id: line.section_id,
+                    line_hash: line.line_hash,
+                    chunk_hash: key,
+                    content_hash: 0,
+                    reference: line.reference,
+                    segment: line.segment,
+                    is_pdf: line.is_pdf,
+                    title: line.title,
+                    facets: line.facets.to_vec(),
+                },
+                similarity_score: hit.score,
+            })
+        })
+        .collect();
+    let unresolved = resolved.iter().filter(|resolved| !**resolved).count() as u32;
+    (candidates, unresolved)
 }
 
 /// Main hybrid search coordinator.
@@ -955,14 +972,7 @@ impl HybridCoordinator {
 
         // Ties break on the line, then its book, so pagination is stable across calls;
         // `HashMap` iteration order is not.
-        let sort_results = |results: &mut Vec<FusedCandidate>| {
-            results.sort_by(|a, b| {
-                b.fused_score
-                    .total_cmp(&a.fused_score)
-                    .then_with(|| a.line_id.cmp(&b.line_id))
-                    .then_with(|| a.file_path.cmp(&b.file_path))
-            });
-        };
+        let sort_results = |results: &mut Vec<FusedCandidate>| results.sort_by(best_first);
         sort_results(&mut results);
 
         if rrf_k.is_none() && profile.duplicate_penalty > 0.0 {
@@ -2787,6 +2797,56 @@ mod tests {
             },
             similarity_score,
         }
+    }
+
+    /// A resolver may return a hit's lines after a worse hit's — the application's appends
+    /// those of text that moved books after all the others — and a candidate's position is
+    /// its rank to a fusion by rank. So the candidates come in the scan's order whatever the
+    /// resolver's, each hit's lines in the order it gave them.
+    #[test]
+    fn semantic_candidates_follow_the_scan_whatever_order_the_resolver_returns() {
+        let hit = |n: u32, score: f32| VectorHit {
+            score,
+            key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {n}")),
+            records: Vec::new(),
+            seg: 0,
+            slot: n,
+        };
+        let hits = [hit(0, 0.9), hit(1, 0.8), hit(2, 0.7), hit(3, 0.6)];
+        let line = |hit: u32, book: &str, line_id: u64| ResolvedLine {
+            hit,
+            line_id,
+            file_path: book.to_string(),
+            section_id: 0,
+            line_hash: 0,
+            segment: line_id,
+            is_pdf: false,
+            facets: Vec::<String>::new().into(),
+            title: String::new(),
+            reference: String::new(),
+        };
+        // Hit 0's second line arrives last, as moved text does; hit 3 resolves nowhere.
+        let lines = vec![
+            line(0, "b.txt", 5),
+            line(1, "a.txt", 9),
+            line(2, "c.txt", 3),
+            line(0, "a.txt", 7),
+        ];
+        let (candidates, unresolved) = candidates_of(&hits, lines);
+        let order: Vec<(&str, u64)> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.metadata.source_book_key.as_str(),
+                    candidate.metadata.line_id,
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [("b.txt", 5), ("a.txt", 7), ("a.txt", 9), ("c.txt", 3)]
+        );
+        assert_eq!(unresolved, 1);
     }
 
     /// Two books whose lines share an id are two lines, in every mode that fuses. An index
