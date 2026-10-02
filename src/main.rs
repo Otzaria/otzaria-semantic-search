@@ -16,7 +16,6 @@ use otzaria_semantic_search::distribution::builder::{
 };
 use otzaria_semantic_search::distribution::corpus::JsonlCorpus;
 use otzaria_semantic_search::distribution::package::utc_timestamp;
-use otzaria_semantic_search::distribution::shard::{embed_shard, export_plan, read_plan};
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
@@ -45,9 +44,8 @@ Commands:
   build [options]                     Embed a corpus and write a base vector package.
   plan [options]                      Apply the recipe to a corpus and write a vector
                                       build's plan, split against the release before.
-  export-plan [options]               Apply the recipe and write the work out, for a
-                                      machine that will embed it elsewhere.
-  embed-shard [options]               Embed one window of an exported plan.
+  embed-shard [options]               Embed a window of a plan's embed.jsonl on this CPU,
+                                      in one process or several.
   model-checksum --model-file <path>  Validate a model and print the model_checksum an
                                       identity has to declare for it.
 
@@ -91,23 +89,20 @@ Options for 'plan':
                              embed-manifest.json, tombstones.bin and plan-manifest.json
   --created-at <timestamp>   Manifest timestamp (default: now, UTC)
 
-Options for 'export-plan':
-  --corpus-identity <path>   As for 'build'
-  --corpus-lines <path>      As for 'build'
-  --model <path>             As for 'build'; no model file is opened, and none is needed
-  --chunking <path>          The recipe to apply
-  --out <dir>                Receives plan.jsonl and export-manifest.json
-
 Options for 'embed-shard':
-  --plan <path>              plan.jsonl, as 'export-plan' wrote it
-  --model <path>             The identity the plan was exported under
-  --model-file <path>        The ONNX graph; held to every field the identity declares
+  --plan <dir>               The plan: embed.jsonl and embed-manifest.json. The manifest
+                             names the family and the passage package; nothing else is read
+  --model-file <path>        The ONNX graph of the passage package; held to every field
+                             the family declares, and to the package checksum
   --skip <N>                 Records to skip (default: 0)
   --take <N>                 Records to embed (default: all that remain)
   --batch <N>                Texts per inference call (default: 32)
-  --out <dir>                Receives vectors.f32, records.jsonl, shard-manifest.json.
+  --processes <P>            Split the window among P processes, each writing its own
+                             shard into <out>/shard-NNN (default: 1, a shard in <out>)
+  --threads <T>              ONNX Runtime threads per process (OTZARIA_ONNX_THREADS)
+  --out <dir>                Receives vectors.f32, keys.bin, shard-manifest.json.
                              Leftovers from a session that died are overwritten — retrying a
-                             window is normal — but a directory holding all three is not.
+                             window is normal — but a finished shard is not.
   --allow-non-semantic       As for 'build'
 
 Options for 'model-checksum':
@@ -119,16 +114,8 @@ file the graph names, and the checksum is the SHA-256 of a manifest listing each
 with its size and SHA-256 — printed here exactly as it is hashed. Nothing else in the
 directory is part of it: not a README, not a second graph, not an ONNX Runtime library.
 
-A shard's records.jsonl holds one record per vector, in the order of vectors.f32:
-{{"line_id":N,"source_line_sha256":"...","embedding_text_sha256":"..."}}. Both digests
-are lowercase hex SHA-256.
-
-  source_line_sha256     of the corpus line's text, for the merge to check against the
-                         corpus: what catches a vector file that drifted out of step with
-                         its records, which nothing else would notice.
-  embedding_text_sha256  of the text that was actually embedded, after any role prefix,
-                         neighbour context or truncation. Its first 16 bytes are the
-                         vector's chunk key: what it is stored under, and found by.
+A shard is the external embedding interface: docs/VECTOR_BUILD.md describes embed.jsonl,
+vectors.f32, keys.bin and shard-manifest.json exactly, for a worker that is not this CLI.
 
 A chunker configuration is
 {{"min_meaningful_chars":20,"context_window_lines":2,"max_chunk_chars":512,
@@ -327,7 +314,6 @@ fn main() {
         }
         "build" => run_build(&args),
         "plan" => run_plan(&args),
-        "export-plan" => run_export_plan(&args),
         "embed-shard" => run_embed_shard(&args),
         "model-checksum" => run_model_checksum(&args),
         "help" | "-h" | "--help" => {
@@ -492,260 +478,135 @@ fn run_plan(args: &[String]) {
     println!("Foreign pairs:   {}", counts.foreign_pairs);
 }
 
-/// Apply the recipe on the machine that holds the corpus, and write the work out.
-///
-/// No model is opened and none is needed: this is the half of a build that is arithmetic
-/// on strings. What it writes is what a worker with the model and no corpus can act on.
-fn run_export_plan(args: &[String]) {
-    let out = PathBuf::from(require_arg(args, "--out"));
-    let model = read_model(&require_arg(args, "--model"));
-    let chunking = read_chunking(&require_arg(args, "--chunking"));
-    let corpus = load_corpus(args);
-
-    std::fs::create_dir_all(&out)
-        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
-    let plan_path = out.join("plan.jsonl");
-    let file = std::fs::File::create(&plan_path)
-        .unwrap_or_else(|error| exit_with("Could not write the plan", error));
-    let mut sink = std::io::BufWriter::new(file);
-
-    let report = export_plan(&corpus, &chunking, &model, &mut sink)
-        .unwrap_or_else(|error| exit_with("Export failed", error));
-    let manifest = out.join("export-manifest.json");
-    std::fs::write(&manifest, serde_json::to_vec_pretty(&report).unwrap())
-        .unwrap_or_else(|error| exit_with("Could not write the export manifest", error));
-
-    println!("\n=== Exported a build plan ===");
-    println!("Plan:            {}", plan_path.display());
-    println!("Records:         {}", report.records);
-    println!(
-        "line_id range:   {}..={}",
-        report.min_line_id, report.max_line_id
-    );
-    println!("Plan SHA-256:    {}", report.plan_sha256);
-    println!("Chunking:        {}", report.chunking_identity);
-    println!(
-        "\nSplit it by record: --skip and --take name a window, and every record must fall in\n\
-         exactly one. The merge refuses a hole rather than packing around it."
-    );
-}
-
-/// Embed one window of a plan. The half of a build that needs a model and no corpus.
+/// Embed a window of a plan on this machine's CPU: one shard, or — with `--processes` — one
+/// child process per sub-window, each writing its own.
 fn run_embed_shard(args: &[String]) {
-    let out = PathBuf::from(require_arg(args, "--out"));
-    let plan_path = require_arg(args, "--plan");
-    let model = read_model(&require_arg(args, "--model"));
-    let model_file = require_arg(args, "--model-file");
-    let skip: usize = parse_arg(args, "--skip").map_or(0, |value| {
-        value
-            .parse()
-            .unwrap_or_else(|_| exit_with("--skip", "not a number"))
-    });
-    let take: usize = parse_arg(args, "--take").map_or(usize::MAX, |value| {
-        value
-            .parse()
-            .unwrap_or_else(|_| exit_with("--take", "not a number"))
-    });
+    use otzaria_semantic_search::distribution::plan::EmbedManifest;
+    use otzaria_semantic_search::distribution::shard::{embed_shard, WorkerInfo, MODE_MOCK};
 
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let plan_dir = PathBuf::from(require_arg(args, "--plan"));
+    let plan = EmbedManifest::read(&plan_dir)
+        .unwrap_or_else(|error| exit_with("Could not read the plan", error));
+    let number = |flag: &str, default: u64| {
+        parse_arg(args, flag).map_or(default, |value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| exit_with(flag, "not a number"))
+        })
+    };
+    let skip = number("--skip", 0);
+    let take = number("--take", u64::MAX).min(plan.records.saturating_sub(skip));
+    let processes = number("--processes", 1).max(1);
+
+    if processes > 1 {
+        // Sub-windows as even as integers allow; each child is this command with its own.
+        let per = take.div_ceil(processes);
+        let mut children = Vec::new();
+        for index in 0..processes {
+            let from = skip + index * per;
+            let count = per.min((skip + take).saturating_sub(from));
+            if count == 0 {
+                break;
+            }
+            let dir = out.join(format!("shard-{index:03}"));
+            let mut command = process::Command::new(
+                env::current_exe().unwrap_or_else(|error| exit_with("Cannot find myself", error)),
+            );
+            command.args(["embed-shard", "--plan"]).arg(&plan_dir);
+            for flag in ["--model-file", "--batch"] {
+                if let Some(value) = parse_arg(args, flag) {
+                    command.args([flag, &value]);
+                }
+            }
+            command
+                .args(["--skip", &from.to_string(), "--take", &count.to_string()])
+                .arg("--out")
+                .arg(&dir);
+            if args.iter().any(|arg| arg == "--allow-non-semantic") {
+                command.arg("--allow-non-semantic");
+            }
+            if let Some(threads) = parse_arg(args, "--threads") {
+                command.env("OTZARIA_ONNX_THREADS", threads);
+            }
+            let child = command
+                .spawn()
+                .unwrap_or_else(|error| exit_with("Could not start a worker process", error));
+            children.push((dir, child));
+        }
+        let mut failed = 0;
+        for (dir, mut child) in children {
+            let status = child
+                .wait()
+                .unwrap_or_else(|error| exit_with("A worker process was lost", error));
+            if !status.success() {
+                eprintln!("{} failed: {status}", dir.display());
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            exit_with(
+                "Embedding failed",
+                format!("{failed} worker process(es) failed"),
+            );
+        }
+        println!("\n=== Embedded {take} record(s) from {skip} in {processes} processes ===");
+        return;
+    }
+
+    if let Some(threads) = parse_arg(args, "--threads") {
+        env::set_var("OTZARIA_ONNX_THREADS", threads);
+    }
     let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-        model_path: PathBuf::from(&model_file),
-        embedding_dim: model.embedding_dim,
-        max_tokens: model.max_tokens,
+        model_path: PathBuf::from(require_arg(args, "--model-file")),
+        embedding_dim: plan.model.embedding_dim,
+        max_tokens: plan.model.max_tokens,
         batch_size: parse_arg(args, "--batch")
             .and_then(|value| value.parse().ok())
             .unwrap_or(32),
-        pooling: Pooling::parse(&model.pooling).unwrap_or_else(|error| {
-            exit_with("The model declares a pooling nothing performs", error)
+        pooling: Pooling::parse(&plan.model.pooling).unwrap_or_else(|error| {
+            exit_with("The family declares a pooling nothing performs", error)
         }),
     });
     runtime
         .load()
         .unwrap_or_else(|error| exit_with("Could not load the model", error));
-
-    // The comparisons `build` makes, for the same reason: a worker that embeds with a
-    // package of another family or a different width produces vectors the merge cannot
-    // use, and it should learn that in the second it takes rather than at the end of the
-    // shard.
-    let checksum = runtime.model_checksum().unwrap_or_default().to_string();
-    if !model
-        .query_packages
-        .iter()
-        .any(|package| package.checksum == checksum)
-    {
-        exit_with(
-            "The model file is not a package of the family the plan was made for",
-            format!("its package checksum is {checksum}"),
-        );
-    }
-    for (field, declared, loaded) in [
-        (
-            "tokenizer_checksum",
-            model.tokenizer_checksum.clone(),
-            runtime.tokenizer_checksum().unwrap_or_default().to_string(),
-        ),
-        (
-            "embedding_dim",
-            model.embedding_dim.to_string(),
-            runtime.dim().to_string(),
-        ),
-        (
-            "pooling",
-            model.pooling.clone(),
-            runtime.pooling().to_string(),
-        ),
-        (
-            "max_tokens",
-            model.max_tokens.to_string(),
-            runtime.max_tokens().to_string(),
-        ),
-    ] {
-        if declared != loaded {
-            exit_with(
-                "The model file is not the one the plan was made for",
-                format!("{field}: declared {declared}, loaded {loaded}"),
-            );
-        }
-    }
-    if !runtime.backend_is_semantic() && !args.iter().any(|arg| arg == "--allow-non-semantic") {
+    let semantic = runtime.backend_is_semantic();
+    if !semantic && !args.iter().any(|arg| arg == "--allow-non-semantic") {
         exit_with(
             "This backend's vectors mean nothing",
             runtime.backend_id().unwrap_or("none").to_string(),
         );
     }
-
-    std::fs::create_dir_all(&out)
-        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
-    let plan = std::io::BufReader::new(
-        std::fs::File::open(&plan_path)
-            .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
-    );
-    // A finished shard is three files, and this refuses to write over one. Unlike the merge,
-    // *re-running* is normal here — a session that timed out gets retried on another account
-    // — so a directory holding leftovers is fair game and only a complete shard is protected.
-    // Overwriting one silently discarded an hour of embedding and reported success.
-    let manifest_path = out.join("shard-manifest.json");
-    if [
-        &out.join("vectors.f32"),
-        &out.join("records.jsonl"),
-        &manifest_path,
-    ]
-    .iter()
-    .all(|path| path.symlink_metadata().is_ok())
-    {
-        exit_with(
-            &format!("{} already holds a finished shard", out.display()),
-            "its vectors, records and manifest are all there; embed into another directory, \
-             or remove them to re-run this window",
-        );
-    }
-    // `.partial` until the counts and digests are known: a shard killed by a session
-    // timeout must not leave a file the merge could mistake for a finished one.
-    let vectors_partial = out.join("vectors.f32.partial");
-    let records_partial = out.join("records.jsonl.partial");
-    let mut vectors = std::io::BufWriter::new(
-        std::fs::File::create(&vectors_partial)
-            .unwrap_or_else(|error| exit_with("Could not write the vectors", error)),
-    );
-    let mut records = std::io::BufWriter::new(
-        std::fs::File::create(&records_partial)
-            .unwrap_or_else(|error| exit_with("Could not write the records", error)),
-    );
-
-    // The plan's own digest travels into the manifest, so the merge can tell a shard of
-    // this export from a shard of another export with the same window.
-    let plan_sha256 = sha256_of(Path::new(&plan_path));
-    let report = embed_shard(
-        read_plan(plan, skip, take),
-        (plan_sha256, skip, take),
-        &model,
+    let worker = WorkerInfo {
+        name: env!("CARGO_PKG_NAME").to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        device: otzaria_semantic_search::semantic::embedding::cpu_description(),
+        ep: "cpu".to_string(),
+        mode: if semantic {
+            otzaria_semantic_search::distribution::shard::MODE_ONNXRUNTIME.to_string()
+        } else {
+            MODE_MOCK.to_string()
+        },
+    };
+    let manifest = embed_shard(
+        &plan_dir,
+        &plan,
+        skip,
+        take,
         &runtime,
         runtime.batch_size(),
-        &mut vectors,
-        &mut records,
+        worker,
+        &out,
     )
     .unwrap_or_else(|error| exit_with("The shard failed", error));
-    // Onto the disk before either name is published, and the manifest last: it is the digest
-    // witness for both files, so a crash between the renames leaves a pair with the previous
-    // manifest — which `verify_shards` refuses, loudly, because the digests will not match.
-    for writer in [vectors, records] {
-        writer
-            .into_inner()
-            .unwrap_or_else(|error| exit_with("Could not finish writing the shard", error))
-            .sync_all()
-            .unwrap_or_else(|error| exit_with("Could not flush the shard to disk", error));
-    }
-    for (partial, final_name) in [
-        (&vectors_partial, "vectors.f32"),
-        (&records_partial, "records.jsonl"),
-    ] {
-        std::fs::rename(partial, out.join(final_name))
-            .unwrap_or_else(|error| exit_with("Could not publish the shard", error));
-    }
-    write_and_sync(&manifest_path, &serde_json::to_vec_pretty(&report).unwrap());
-    sync_directory(&out);
 
     println!("\n=== Embedded a shard ===");
     println!("Path:            {}", out.display());
-    println!("Records:         {} (skip {skip})", report.records);
-    println!("Dimension:       {}", report.embedding_dim);
-    println!("vectors SHA-256: {}", report.vectors_sha256);
-    println!("records SHA-256: {}", report.records_sha256);
-}
-
-/// Flush a directory entry, so a rename this command has already reported survives a power
-/// loss.
-///
-/// Unix only, and fatal there rather than best-effort — the same rule
-/// [`crate::semantic::manifest`] follows: Windows cannot open a directory as a file, so the
-/// rename is left as the filesystem's own guarantee, and where the call *is* available a
-/// failure is not quietly downgraded to "probably durable".
-#[cfg(unix)]
-fn sync_directory(dir: &Path) {
-    let handle = std::fs::File::open(dir).unwrap_or_else(|error| {
-        exit_with(
-            &format!("Could not open {} to flush its entries", dir.display()),
-            error,
-        )
-    });
-    handle.sync_all().unwrap_or_else(|error| {
-        exit_with(
-            &format!("Could not flush the directory entries of {}", dir.display()),
-            error,
-        )
-    });
-}
-
-/// See the Unix implementation. Nothing to do here; documented, not silent.
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) {}
-
-/// Write a small file and get it onto the disk before anything renames it into place.
-fn write_and_sync(path: &Path, bytes: &[u8]) {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)
-        .unwrap_or_else(|error| exit_with(&format!("Could not write {}", path.display()), error));
-    file.write_all(bytes)
-        .unwrap_or_else(|error| exit_with(&format!("Could not write {}", path.display()), error));
-    file.sync_all()
-        .unwrap_or_else(|error| exit_with(&format!("Could not flush {}", path.display()), error));
-}
-
-/// SHA-256 of a file, streamed.
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)
-        .unwrap_or_else(|error| exit_with(&format!("Could not read {}", path.display()), error));
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let read = std::io::Read::read(&mut file, &mut buffer)
-            .unwrap_or_else(|error| exit_with("Could not read the file to hash it", error));
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    format!("{:x}", hasher.finalize())
+    println!("Records:         {} (skip {skip})", manifest.records);
+    println!("Dimension:       {}", manifest.dim);
+    println!("vectors SHA-256: {}", manifest.vectors_sha256);
+    println!("keys SHA-256:    {}", manifest.keys_sha256);
 }
 
 fn run_build(args: &[String]) {

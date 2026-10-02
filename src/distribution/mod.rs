@@ -31,4 +31,6 @@ pub mod shard;
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]
+mod shard_tests;
+#[cfg(test)]
 pub(crate) mod testing;

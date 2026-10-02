@@ -407,6 +407,63 @@ impl EmbeddingRuntime {
     }
 }
 
+/// What a CPU worker records as its device: the architecture, and — where the ONNX backend
+/// is compiled — the int8 kernels ONNX Runtime gives this CPU and whether the backend makes
+/// them exact (the x86 gate), so a shard says which products its vectors came from.
+pub fn cpu_description() -> String {
+    let arch = std::env::consts::ARCH;
+    match onnx_int8_kernels() {
+        Some(kernels) => format!("cpu {arch}: {kernels}"),
+        None => format!("cpu {arch}"),
+    }
+}
+
+#[cfg(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+))]
+fn onnx_int8_kernels() -> Option<String> {
+    Some(crate::semantic::onnx_backend::cpu_int8_kernels())
+}
+
+#[cfg(not(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+)))]
+fn onnx_int8_kernels() -> Option<String> {
+    None
+}
+
 /// L2-normalize a vector in place after checking it can be compared at all.
 ///
 /// **Unconditional, and deliberately not versioned.** Unit length is what makes a dot
