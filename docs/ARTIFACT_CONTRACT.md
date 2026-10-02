@@ -310,7 +310,7 @@ SHA-256 מעל `"otzaria-vector-identity-v1\n"` ושורת `path=value\n` לכל
 ├── PREVIOUS                     הדור ש־CURRENT הצביע עליו לפני ההחלפה האחרונה
 ├── segments/<sid>.oxv           segments, בלתי משתנים
 ├── segments/<sid>.package.json  ה־manifest שה־segment הותקן ממנו
-├── segments/<sid>.corrupt       פסק הדין של scrub על segment
+├── segments/<sid>.corrupt       פסק הדין של scrub: ה־SHA-256 של הבתים שנכשלו, והסיבה
 ├── gen-000007/set.json          דור אחד: אילו segments, באיזה סדר, ספירות, זהות
 ├── gen-000007/<sid>.del         bitmap של slots מתים ב־segment, בדור הזה (OXVDEL1)
 ├── gen-000007/<sid>.links       לאן כל רשומת foreign של delta מצביעה, בדור הזה (OXVLNK1)
@@ -333,8 +333,12 @@ SHA-256 מעל `"otzaria-vector-identity-v1\n"` ושורת `path=value\n` לכל
    ה־header), כל segment מול הדור שמונה אותו (מזהה, זהות, epoch, גודל, slots, סוג, מהדורות,
    סימן scrub), וכל קובץ נגזר (`.del`, `.links`) מול ה־CRC וה־count שב־`set.json`.
    הווקטורים ממופים, לא נקראים.
-3. **scrub — בזמן סרק.** `scrub(dir)` קורא כל block מול `BLOCK_CRCS`; segment פגום מסומן
-   ב־`.corrupt`, וכל פתיחה מאוחרת מסרבת לו עד שיותקן מחדש.
+3. **scrub — בזמן סרק.** `scrub(dir)` קורא כל block מול `BLOCK_CRCS`; segment פגום נפסל
+   בפסק דין ב־`.corrupt`, שנוקב ב־SHA-256 של הבתים שנכשלו. פתיחה ו־`info()`, שאינם מגבבים
+   segment, עוברים מכל דור שמונה segment פסול אל `PREVIOUS` — שניהם באותו אופן — ו־scrub
+   בודק את הדור ששניהם רואים. התקנה שכותבת את ה־segment מחדש, או מוצאת אותו שלם, מסירה את
+   פסק הדין: הוא היה על בתים שהקובץ כבר אינו מחזיק. scrub שקרא קובץ שהתקנה החליפה בינתיים
+   מגבב אותו שוב אחרי שכתב את פסק הדין, ומסיר אותו כשהקובץ אינו מחזיק עוד את הבתים שנפסלו.
 
 ### 5.3 התקנה והחלה
 
@@ -449,7 +453,7 @@ slots מושווים למקורם; דור חדש מוחלף פנימה. היא �
 | `ArtifactError::UnexpectedArtifactDigest` | התקנה | ה־manifest אינו המפורסם |
 | `ArtifactError::PayloadChecksumFailed`, `ManifestDisagreesWithPayload` | התקנה | ה־segment או ה־manifest פגומים |
 | `ArtifactError::InsufficientSpace { needed, available }` | התקנה, דחיסה | אין מקום — המצב היחיד שהמשתמש יכול לפעול בו בלי הורדה |
-| `VectorStoreError::Corrupted { reason }` | פתיחה, התקנה, scrub | segment או קובץ נגזר פגומים, ושני הדורות אינם נפתחים |
+| `VectorStoreError::Corrupted { reason }` | פתיחה, `info`, התקנה, scrub | segment או קובץ נגזר פגומים, ושני הדורות אינם נפתחים |
 | `EmbeddingError` | פתיחה | המודל חסר או אינו מתאים לתצורה — מתוקן בהשגת המודל, לא הווקטורים |
 | `SemanticSearchError::Resolution { reason }` | חיפוש | האינדקס של המארח לא ענה; החיפוש נשאר עם התוצאות הלקסיקליות ו־`fallback_reason` |
 | `SemanticSearchError::Cancelled` | חיפוש, התקנה, דחיסה | ה־token בוטל; שום דבר לא השתנה |

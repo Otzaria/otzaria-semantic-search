@@ -565,6 +565,11 @@ impl Segment {
         self.map.len() as u64
     }
 
+    /// Every byte of the file, as mapped when it was opened — whatever its path holds now.
+    pub(crate) fn file_bytes(&self) -> &[u8] {
+        &self.map
+    }
+
     pub fn slot_count(&self) -> u32 {
         self.header.slot_count as u32
     }

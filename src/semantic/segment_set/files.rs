@@ -7,7 +7,7 @@
 //!   PREVIOUS                     the generation CURRENT pointed to before the last flip
 //!   segments/<sid>.oxv           immutable segments
 //!   segments/<sid>.package.json  the release manifest a segment was installed from
-//!   segments/<sid>.corrupt       a scrub's verdict on a segment
+//!   segments/<sid>.corrupt       a scrub's verdict: the SHA-256 of the bytes that failed
 //!   gen-000007/set.json          one generation: which segments, in which order
 //!   gen-000007/<sid>.del         which slots of a segment are dead in that generation
 //!   gen-000007/<sid>.links       where a delta's foreign records resolve, in that generation
@@ -21,14 +21,15 @@
 //! only ones ever replaced, and `std::fs::rename` replaces atomically on every platform the
 //! crate builds for (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows).
 
+use crate::cancellation::CancellationToken;
 use crate::distribution::package::{sync_dir, PackageKind};
-use crate::errors::{ArtifactError, VectorStoreError};
+use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
 use crate::semantic::oxv::scan::{Link, LINK_UNRESOLVED};
 use crate::semantic::versioning::{IndexVersion, VectorProvenance};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const CURRENT: &str = "CURRENT";
@@ -445,6 +446,106 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// SHA-256 of a file, read in blocks, cancellably.
+pub(crate) fn hash_file(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<String, SemanticSearchError> {
+    let mut file = File::open(path).map_err(io_error(format!("reading {}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(SemanticSearchError::Cancelled);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(io_error(format!("reading {}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// `segments/<id>.corrupt`: a scrub's verdict on the bytes a segment file held when it read
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Verdict {
+    /// SHA-256 of the file that failed: the bytes condemned, and no others. Empty for a
+    /// marker that names none — one written before verdicts did, or one that does not read
+    /// as a verdict — which condemns whatever the file holds.
+    pub sha256: String,
+    /// What failed.
+    pub reason: String,
+}
+
+pub(crate) fn verdict_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(SEGMENTS_DIR).join(format!("{id}.corrupt"))
+}
+
+/// The verdict on segment `id`, if there is one. Opening cannot hash a segment, so a verdict
+/// stands until what replaces or verifies the segment's bytes withdraws it: an install, or
+/// the scrub that wrote it ([`condemn`]).
+pub(crate) fn read_verdict(dir: &Path, id: &str) -> Option<Verdict> {
+    let path = verdict_path(dir, id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(Verdict {
+                sha256: String::new(),
+                reason: format!("{} could not be read: {error}", path.display()),
+            })
+        }
+    };
+    Some(serde_json::from_slice(&bytes).unwrap_or_else(|_| Verdict {
+        sha256: String::new(),
+        reason: String::from_utf8_lossy(&bytes).trim().to_string(),
+    }))
+}
+
+/// Condemn segment `id`: a verdict naming `sha256` — the bytes a scrub read and found
+/// damaged — and `reason`. The file is then hashed again, and a verdict on bytes it no longer
+/// holds is withdrawn at once: an install replaced the file while the scrub read the old one,
+/// and its bytes were never judged. Whether the verdict stands.
+pub(crate) fn condemn(
+    dir: &Path,
+    id: &str,
+    sha256: &str,
+    reason: &str,
+) -> Result<bool, SemanticSearchError> {
+    let path = verdict_path(dir, id);
+    let verdict = Verdict {
+        sha256: sha256.to_string(),
+        reason: reason.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&verdict).expect("a verdict serializes");
+    write_atomically(&path, &bytes).map_err(io_error(format!("marking {}", path.display())))?;
+    // A file that cannot be hashed keeps the verdict: it condemns, which is the safe side.
+    let held = hash_file(&dir.join(segment_file(id)), &CancellationToken::new());
+    if held.is_ok_and(|held| held != sha256) {
+        clear_verdict(dir, id)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Withdraw any verdict on segment `id`, once its file holds bytes that were just verified
+/// whole. Whether there was one.
+pub(crate) fn clear_verdict(dir: &Path, id: &str) -> Result<bool, ArtifactError> {
+    let path = verdict_path(dir, id);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(format!("removing {}", path.display()))(error)),
+    }
+    let segments = dir.join(SEGMENTS_DIR);
+    sync_set_dir(&segments).map_err(io_error(format!("flushing {}", segments.display())))?;
+    Ok(true)
 }
 
 /// Read a pointer file: `None` when there is none.

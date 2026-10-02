@@ -1323,6 +1323,141 @@ fn every_publish_is_flushed_before_the_flip_that_names_it() {
     assert_published_in_order(&steps, &dir, "a compaction");
 }
 
+fn damage_last_byte(path: &Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+fn is_corrupt<T>(result: Result<T, SemanticSearchError>) -> bool {
+    matches!(
+        result,
+        Err(SemanticSearchError::VectorStore(
+            VectorStoreError::Corrupted { .. }
+        ))
+    )
+}
+
+/// The review's sequence: a scrub condemns a damaged segment, and installing the release
+/// again — the repair the verdict asks for — succeeded while the verdict, written for the old
+/// bytes, stayed and refused the new ones. Open, info and scrub agree before the repair and
+/// after it.
+#[test]
+fn a_reinstall_clears_the_verdict_on_the_bytes_it_replaced() {
+    let work = TempDir::new("set_verdict");
+    let dir = work.join("vectors");
+    let base = release(&work, &v29(), None);
+    install(&dir, &base).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let segment = dir.join(format!("segments/{id}.oxv"));
+    let damaged = damage_last_byte(&segment);
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+
+    // The verdict names the bytes it condemned.
+    let marker = dir.join(format!("segments/{id}.corrupt"));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).expect("a verdict is JSON");
+    assert_eq!(verdict["sha256"], files::sha256_hex(&damaged));
+
+    // Nothing opens, and open, info and scrub all say so.
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+
+    // The repair: the same release again.
+    install(&dir, &base).unwrap();
+    assert!(
+        !marker.exists(),
+        "the verdict was on bytes the file no longer holds"
+    );
+    let manifest: ReleaseManifest = serde_json::from_str(&base.1).unwrap();
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&segment).unwrap()),
+        manifest.segment.sha256
+    );
+    let generation = SegmentSet::open(&dir).unwrap().generation();
+    let described = info(&dir).unwrap().unwrap();
+    assert_eq!(described.generation, generation);
+    assert!(!described.recovered_from_previous);
+    assert_eq!(
+        scrub(&dir, &CancellationToken::new()).unwrap().generation,
+        generation
+    );
+}
+
+/// A verdict on a delta condemns the generation that holds it, and every reader falls back
+/// alike: open and info to `PREVIOUS`'s generation, and a scrub checks that one. The delta
+/// installed again clears it.
+#[test]
+fn a_condemned_generation_falls_back_alike_for_open_info_and_scrub() {
+    let work = TempDir::new("set_verdict_fallback");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let delta = release(&work, &v30(), Some(&v29()));
+    install(&dir, &delta).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[1].id.clone();
+    damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+    assert!(dir.join(format!("segments/{id}.corrupt")).exists());
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert!(set.info().recovered_from_previous);
+    drop(set);
+    let described = info(&dir).unwrap().unwrap();
+    assert_eq!(
+        (described.generation, described.recovered_from_previous),
+        (1, true)
+    );
+    assert_eq!(
+        scrub(&dir, &CancellationToken::new()).unwrap().generation,
+        1
+    );
+
+    // The set stands at v29 for every reader, and the delta applies there again.
+    let report = install(&dir, &delta).unwrap();
+    assert_eq!((report.generation, report.library_version), (3, 30));
+    assert!(!dir.join(format!("segments/{id}.corrupt")).exists());
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 3);
+    assert_eq!(info(&dir).unwrap().unwrap().generation, 3);
+    assert_eq!(
+        scrub(&dir, &CancellationToken::new()).unwrap().generation,
+        3
+    );
+}
+
+/// A scrub that read a damaged file while an install replaced it would leave a verdict on
+/// bytes the file no longer holds; it withdraws it, so the install's bytes are never
+/// condemned. One on the bytes the file holds stands, and so does a marker that names no
+/// bytes — as every marker before verdicts did.
+#[test]
+fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
+    let work = TempDir::new("set_verdict_race");
+    let dir = work.join("vectors");
+    let base = release(&work, &v29(), None);
+    install(&dir, &base).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let marker = dir.join(format!("segments/{id}.corrupt"));
+
+    assert!(!files::condemn(&dir, &id, &"0".repeat(64), "a block failed").unwrap());
+    assert!(!marker.exists());
+    SegmentSet::open(&dir).unwrap();
+
+    let held = files::sha256_hex(&std::fs::read(dir.join(format!("segments/{id}.oxv"))).unwrap());
+    assert!(files::condemn(&dir, &id, &held, "a block failed").unwrap());
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+
+    std::fs::write(&marker, b"a block failed").unwrap();
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+    install(&dir, &base).unwrap();
+    assert!(!marker.exists());
+    SegmentSet::open(&dir).unwrap();
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);

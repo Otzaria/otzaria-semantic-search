@@ -388,6 +388,8 @@ pub fn compact(
     let segments_dir = dir.join(SEGMENTS_DIR);
     files::sync_set_dir(&segments_dir)
         .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
+    // Bytes just written and checked: a verdict on what the file held before is not on them.
+    files::clear_verdict(dir, &id)?;
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);
     generation.library_release_tag = document.library_release_tag.clone();

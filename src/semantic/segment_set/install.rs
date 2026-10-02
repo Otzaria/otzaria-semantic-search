@@ -20,11 +20,11 @@
 //! 8. **collect garbage**.
 
 use super::files::{
-    encode_links, generation_dir, generation_path, io_error, next_generation, read_pointer,
-    rename_into_place, segment_file, sha256_hex, sync_file, sync_set_dir, write_atomically,
-    write_pointer, Deleted, DerivedFile, Pointer, SetDocument, SetLock, SetSegment, SetStats,
-    CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE, SET_FORMAT, SET_FORMAT_VERSION,
-    STAGING_DIR,
+    clear_verdict, encode_links, generation_dir, generation_path, hash_file, io_error,
+    next_generation, read_pointer, rename_into_place, segment_file, sha256_hex, sync_file,
+    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument,
+    SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE,
+    SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -389,6 +389,14 @@ pub fn install_package(
     }
     sync_set_dir(&segments_dir)
         .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
+    // The file holds the bytes just verified now, so a verdict on the segment — a scrub's, on
+    // bytes it held before: the repair the verdict asked for — no longer stands.
+    if clear_verdict(dir, &manifest.segment_id)? {
+        log::info!(
+            "The scrub verdict on segment {} is withdrawn: it holds the verified release now",
+            manifest.segment_id
+        );
+    }
     let provenance_path = segments_dir.join(format!("{}.package.json", manifest.segment_id));
     write_atomically(&provenance_path, source.manifest_json.as_bytes())
         .map_err(space_or_io(&provenance_path, 0))?;
@@ -882,26 +890,6 @@ impl NewGeneration {
         collect_garbage(dir);
         Ok(document)
     }
-}
-
-/// SHA-256 of a file, read in blocks, cancellably.
-fn hash_file(path: &Path, cancel: &CancellationToken) -> Result<String, SemanticSearchError> {
-    let mut file = File::open(path).map_err(io_error(format!("reading {}", path.display())))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(SemanticSearchError::Cancelled);
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(io_error(format!("reading {}", path.display())))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Copy `from` to `to` in blocks, hashing as it goes; a full filesystem is
