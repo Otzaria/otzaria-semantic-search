@@ -187,6 +187,22 @@ impl SegmentBuilder {
         &self.codec
     }
 
+    /// Encode the vectors with `codec` instead, of the same width, under the identity whose
+    /// digest is `identity_digest` — the codec is part of it: for a codec calibrated on the
+    /// vectors themselves, which are read after the tables are collected.
+    pub fn set_codec(&mut self, codec: Codec, identity_digest: [u8; 32]) -> io::Result<()> {
+        if codec.dim() != self.codec.dim() {
+            return Err(invalid(format!(
+                "the segment's vectors are {} wide, and the codec's {}",
+                self.codec.dim(),
+                codec.dim()
+            )));
+        }
+        self.codec = codec;
+        self.spec.identity_digest = identity_digest;
+        Ok(())
+    }
+
     /// Lay the file out at `path`, which must not exist, write every table, and return the
     /// sink the vectors go through.
     pub fn write(self, path: &Path) -> io::Result<VectorSink> {

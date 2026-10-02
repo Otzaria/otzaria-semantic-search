@@ -295,6 +295,19 @@ impl Warehouse {
             .map(|at| u64::from_le_bytes(entries[at][32..].try_into().expect("8")))
     }
 
+    /// The record holding a vector of a text whose SHA-256 starts with `key` — a segment's
+    /// [`ChunkKey`](crate::semantic::chunk_key::ChunkKey): the index is in digest order,
+    /// so its prefixes are in order too.
+    pub fn find_key(&self, key: &[u8; 16]) -> Option<u64> {
+        let index = self.index.as_ref()?;
+        let entries = index[HEADER..].as_chunks::<ENTRY>().0;
+        let at = entries.partition_point(|entry| entry[..16] < key[..]);
+        entries
+            .get(at)
+            .filter(|entry| entry[..16] == key[..])
+            .map(|entry| u64::from_le_bytes(entry[32..].try_into().expect("8")))
+    }
+
     /// Record `record`'s vector, into `out`.
     pub fn vector(&self, record: u64, out: &mut [f32]) {
         let width = self.width();

@@ -35,7 +35,8 @@ mod tests;
 
 pub use compact::{compact, CompactionPolicy, CompactionReport};
 pub use install::{
-    install_package, ApplyReport, InstallExpectation, InstallSource, ReleaseManifest,
+    install_package, ApplyReport, InstallExpectation, InstallSource, ReleaseFile, ReleaseManifest,
+    ReleaseSegment,
 };
 
 use crate::cancellation::CancellationToken;

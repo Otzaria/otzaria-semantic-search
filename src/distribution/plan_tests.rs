@@ -285,7 +285,10 @@ fn a_ledger_refuses_another_chain_and_damage() {
     let v1 = plan(&dir, "v1", 1, &[(1, A, L1), (2, B, L2)], None, None);
     let at = dir.join("ledger");
     let opened = ledger(&v1, None, &at);
-    let digest = v1.manifest.identity.identity_digest_hex();
+    // The ledger's identity is the release's: the plan's, with the codec's precision.
+    let digest =
+        super::assemble::release_identity(&v1.manifest.identity, &codec()).identity_digest_hex();
+    assert_ne!(digest, v1.manifest.identity.identity_digest_hex());
     let epoch = hex(&codec().params_sha256());
     opened
         .manifest

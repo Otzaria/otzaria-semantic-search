@@ -23,6 +23,7 @@ use crate::distribution::plan::{
 };
 use crate::errors::PackError;
 use crate::semantic::oxv::codec::Codec;
+use crate::semantic::versioning::ModelPackage;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,6 +69,10 @@ pub struct LedgerManifest {
     pub base: BaseRecord,
     /// Bytes of the deltas published on top of that base, through this version.
     pub deltas_since_base: u64,
+    /// The package the chain's passages are embedded with, once a release is assembled:
+    /// a delta's vectors come from a warehouse of the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passage_package: Option<ModelPackage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,7 +596,8 @@ pub fn write_plan_ledger(
         dir,
         plan.manifest.library_version,
         &plan.manifest.library_release_tag,
-        &plan.manifest.identity.identity_digest_hex(),
+        &crate::distribution::assemble::release_identity(&plan.manifest.identity, codec)
+            .identity_digest_hex(),
         codec,
         base,
         deltas_since_base,
@@ -599,6 +605,7 @@ pub fn write_plan_ledger(
         &plan.books,
         previous,
         &classified,
+        None,
     )
 }
 
@@ -617,6 +624,7 @@ pub(crate) fn write_ledger(
     books: &BookList,
     previous: Option<&Ledger>,
     classified: &Classified,
+    passage_package: Option<&ModelPackage>,
 ) -> Result<LedgerManifest, PackError> {
     let mut keys = SortedFileWriter::keys(&dir.join(keys_file_name(library_version)))?;
     let mut new = classified.new_keys.iter().peekable();
@@ -675,6 +683,7 @@ pub(crate) fn write_ledger(
         books: books.names().to_vec(),
         base,
         deltas_since_base,
+        passage_package: passage_package.cloned(),
     };
     write_json(&dir.join(manifest_file_name(library_version)), &manifest)?;
     Ok(manifest)

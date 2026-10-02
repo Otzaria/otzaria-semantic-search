@@ -19,9 +19,11 @@
 //! release manifest an installation takes — so the vectors and the identity that
 //! describes them come from a single pass over a single model. [`shard`] cuts the same
 //! work in two, for a library embedded on machines that never see the corpus.
+pub mod assemble;
 pub mod builder;
 pub mod corpus;
 pub(crate) mod files;
+pub mod gates;
 pub mod importer;
 pub mod ledger;
 pub mod package;
@@ -29,6 +31,8 @@ pub mod plan;
 pub mod shard;
 pub mod warehouse;
 
+#[cfg(test)]
+mod assemble_tests;
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]
