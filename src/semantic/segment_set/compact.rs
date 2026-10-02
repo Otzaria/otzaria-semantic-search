@@ -12,9 +12,7 @@
 //! holds is dropped. Slots are then assigned as a build assigns them: the first time a key
 //! appears it takes the next slot, every later appearance is an extra.
 
-use super::files::{
-    self, io_error, rename_into_place, Durable, SetLock, SetSegment, SEGMENTS_DIR, STAGING_DIR,
-};
+use super::files::{self, io_error, Durable, SetLock, SetSegment, STAGING_DIR};
 use super::install::{full_or_io, NewGeneration};
 use super::{recover, space, SegmentSet, SetInfo};
 use crate::cancellation::CancellationToken;
@@ -375,21 +373,19 @@ pub fn compact(
         }
     }
 
-    // 6. Publish it as a generation of its own.
+    // 6. Publish it as a generation of its own. Its id names its content: a file of that name
+    // already there holds these bytes — the same compaction, done before — or is damage.
     let id = hex(&written.segment_id);
     let file = files::segment_file(&id);
     let target = dir.join(&file);
-    fs::create_dir_all(dir.join(SEGMENTS_DIR)).map_err(io_error(format!(
-        "creating {}",
-        dir.join(SEGMENTS_DIR).display()
-    )))?;
-    rename_into_place(&partial, &target)
-        .map_err(io_error(format!("moving {}", partial.display())))?;
-    let segments_dir = dir.join(SEGMENTS_DIR);
-    files::sync_set_dir(&segments_dir)
-        .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
-    // Bytes just written and checked: a verdict on what the file held before is not on them.
-    files::clear_verdict(dir, &id)?;
+    files::place_segment(
+        dir,
+        &id,
+        &partial,
+        &hex(&written.sha256),
+        cancel,
+        |reason| VectorStoreError::Corrupted { reason }.into(),
+    )?;
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);
     generation.library_release_tag = document.library_release_tag.clone();

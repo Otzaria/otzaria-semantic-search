@@ -5,7 +5,7 @@
 //!   .lock                        held for install, compaction and recovery
 //!   CURRENT                      {"generation":7,"set":"gen-000007/set.json","set_sha256":"…"}
 //!   PREVIOUS                     the generation CURRENT pointed to before the last flip
-//!   segments/<sid>.oxv           immutable segments
+//!   segments/<sid>.oxv           immutable segments: a name never takes other bytes
 //!   segments/<sid>.package.json  the release manifest a segment was installed from
 //!   segments/<sid>.corrupt       a scrub's verdict: the SHA-256 of the bytes that failed
 //!   gen-000007/set.json          one generation: which segments, in which order
@@ -532,6 +532,90 @@ pub(crate) fn condemn(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// The generations a set may still open: those the pointers name and that read — and, when a
+/// pointer does not read or names a generation that does not, every generation on disk that
+/// reads, since any of them may be the one it named.
+pub(crate) fn openable_generations(dir: &Path) -> Vec<SetDocument> {
+    let mut documents = Vec::new();
+    let mut unknown = false;
+    for name in [CURRENT, PREVIOUS] {
+        match read_pointer(dir, name) {
+            Ok(Some(pointer)) => match read_generation(dir, &pointer) {
+                Ok(document) => documents.push(document),
+                Err(_) => unknown = true,
+            },
+            Ok(None) => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if unknown {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(generation) = generation_of(&name) else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(entry.path().join(SET_FILE)) else {
+                continue;
+            };
+            if let Ok(document) = serde_json::from_slice::<SetDocument>(&bytes) {
+                if document.check(generation).is_ok() {
+                    documents.push(document);
+                }
+            }
+        }
+    }
+    documents
+}
+
+/// Put the verified segment at `staged`, whose SHA-256 is `sha256`, in place as
+/// `segments/<id>.oxv` — the one name its id gives it — flush the directory, and withdraw any
+/// verdict on the segment, which was on bytes other than these.
+///
+/// A file of the same bytes already there is kept — mapped by a reader, perhaps — and
+/// `staged` removed. A file of other bytes is replaced only when no generation the set may
+/// still open names `id` with bytes other than `sha256`: then it is damage, or garbage, and
+/// the new bytes are what every generation naming `id` names. Otherwise nothing is changed,
+/// and `refuse` makes the error: a segment id names one content, and the bytes a generation
+/// names are never rewritten. Whether the file was written.
+pub(crate) fn place_segment(
+    dir: &Path,
+    id: &str,
+    staged: &Path,
+    sha256: &str,
+    cancel: &CancellationToken,
+    refuse: impl FnOnce(String) -> SemanticSearchError,
+) -> Result<bool, SemanticSearchError> {
+    let segments = dir.join(SEGMENTS_DIR);
+    fs::create_dir_all(&segments).map_err(io_error(format!("creating {}", segments.display())))?;
+    let target = dir.join(segment_file(id));
+    let written = if target.exists() && hash_file(&target, cancel)? == sha256 {
+        fs::remove_file(staged).map_err(io_error(format!("removing {}", staged.display())))?;
+        false
+    } else {
+        let named = openable_generations(dir).into_iter().find_map(|document| {
+            document
+                .segments
+                .iter()
+                .find(|entry| entry.id == id && entry.sha256 != sha256)
+                .map(|entry| (document.generation, entry.sha256.clone()))
+        });
+        if let Some((generation, named)) = named {
+            return Err(refuse(format!(
+                "segment {id} is in generation {generation} with SHA-256 {named}, and this one's \
+                 is {sha256}: a segment id names one content"
+            )));
+        }
+        rename_into_place(staged, &target)
+            .map_err(io_error(format!("moving {} into place", staged.display())))?;
+        true
+    };
+    sync_set_dir(&segments).map_err(io_error(format!("flushing {}", segments.display())))?;
+    if clear_verdict(dir, id)? {
+        log::info!("The scrub verdict on segment {id} is withdrawn: it holds verified bytes now");
+    }
+    Ok(written)
 }
 
 /// Withdraw any verdict on segment `id`, once its file holds bytes that were just verified

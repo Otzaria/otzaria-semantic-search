@@ -1458,6 +1458,160 @@ fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
     SegmentSet::open(&dir).unwrap();
 }
 
+/// v29's live index with key 2 of id:1 at `line` instead of line 1.
+fn v29_with_key_2_at(line: u32) -> Fixed {
+    let mut books: BTreeMap<String, Vec<(u32, u64)>> = v29()
+        .books
+        .iter()
+        .map(|(book, lines)| {
+            (
+                book.clone(),
+                lines
+                    .iter()
+                    .map(|(hint, k)| (*hint, key(*k).column_value()))
+                    .collect(),
+            )
+        })
+        .collect();
+    for (ordinal, value) in books.get_mut("id:1").unwrap() {
+        if *value == key(2).column_value() {
+            *ordinal = line;
+        }
+    }
+    Fixed { version: 29, books }
+}
+
+/// The review's sequence: two compactions that re-anchor key 2 differently are two
+/// different segments. With an id over the keys alone they shared one file name, the second
+/// replaced the first's file, and falling back to `PREVIOUS` served the second's records.
+#[test]
+fn two_compactions_that_differ_are_two_segments_and_previous_keeps_its_own() {
+    let work = TempDir::new("set_compaction_ids");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let force = CompactionPolicy {
+        force: true,
+        ..CompactionPolicy::default()
+    };
+    compact(
+        &dir,
+        &force,
+        Some(&v29_with_key_2_at(6)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let first = info(&dir).unwrap().unwrap().segments[0].clone();
+    compact(
+        &dir,
+        &force,
+        Some(&v29_with_key_2_at(8)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let second = info(&dir).unwrap().unwrap().segments[0].clone();
+    assert_ne!(first.sha256, second.sha256);
+    assert_ne!(first.id, second.id, "a segment id names its whole content");
+
+    // PREVIOUS's segment is still the file it names, byte for byte, and answers as it did.
+    let held = std::fs::read(dir.join(format!("segments/{}.oxv", first.id))).unwrap();
+    assert_eq!(files::sha256_hex(&held), first.sha256);
+    break_current(&dir, Broken::Garbage);
+    let fallback = SegmentSet::open(&dir).unwrap();
+    assert_eq!(fallback.generation(), 2);
+    let records = &everything(&fallback, 4)[&key(2)].1;
+    assert!(
+        records.contains(&("id:1".to_string(), 6)),
+        "the first compaction's records: {records:?}"
+    );
+}
+
+/// A release under an installed segment's id with other bytes — what an id that does not
+/// name its content allows — is refused, and the installed file and every generation that
+/// names it are left as they were. The bytes a generation names are never rewritten.
+#[test]
+fn a_release_under_an_installed_segments_id_with_other_bytes_is_refused() {
+    let work = TempDir::new("set_impostor");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let installed = dir.join(format!("segments/{id}.oxv"));
+    let held = std::fs::read(&installed).unwrap();
+    let answers = everything(&SegmentSet::open(&dir).unwrap(), 10);
+
+    // v29 with one record moved, its header and its manifest made to claim that id.
+    let mut moved = v29();
+    let lines = moved.books.get_mut("id:3").unwrap();
+    lines.remove(&1);
+    lines.insert(4, 7);
+    let (path, json) = release(&work, &moved, None);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut header = crate::semantic::oxv::format::Header::decode(&bytes).unwrap();
+    header.segment_id = (0..16)
+        .map(|at| u8::from_str_radix(&id[at * 2..at * 2 + 2], 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    bytes[..4096].copy_from_slice(&header.encode());
+    std::fs::write(&path, &bytes).unwrap();
+    let mut manifest: ReleaseManifest = serde_json::from_str(&json).unwrap();
+    manifest.segment_id = id.clone();
+    manifest.segment.sha256 = files::sha256_hex(&bytes);
+    manifest.package_digest = manifest.package().digest();
+
+    match install(&dir, &(path, manifest.to_json())) {
+        Err(SemanticSearchError::Artifact(ArtifactError::ManifestDisagreesWithPayload {
+            reason,
+        })) => assert!(reason.contains(&id), "{reason}"),
+        other => panic!("a release under another segment's id must be refused, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&installed).unwrap(), held);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert_eq!(everything(&set, 10), answers);
+}
+
+/// Compacting a set that is one compacted segment already writes that segment again: the
+/// same bytes, so the same id — and the file in place, mapped by a reader, is kept rather
+/// than replaced.
+#[test]
+fn compacting_again_keeps_the_segment_file_in_place() {
+    let work = TempDir::new("set_compact_again");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let force = CompactionPolicy {
+        force: true,
+        ..CompactionPolicy::default()
+    };
+    compact(&dir, &force, None, &CancellationToken::new()).unwrap();
+    let compacted = info(&dir).unwrap().unwrap().segments[0].clone();
+    let file = dir.join(format!("segments/{}.oxv", compacted.id));
+    let reader = SegmentSet::open(&dir).unwrap();
+    let before = everything(&reader, 11);
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap());
+
+    let report = compact(&dir, &force, None, &CancellationToken::new()).unwrap();
+    assert_eq!(report.generation, 3);
+    let again = info(&dir).unwrap().unwrap().segments[0].clone();
+    assert_eq!(
+        (again.id.as_str(), again.sha256.as_str()),
+        (compacted.id.as_str(), compacted.sha256.as_str())
+    );
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        compacted.sha256
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap()),
+        inode,
+        "the file was kept, not replaced"
+    );
+    assert_eq!(everything(&reader, 11), before);
+    drop(reader);
+    assert_eq!(everything(&SegmentSet::open(&dir).unwrap(), 11), before);
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);

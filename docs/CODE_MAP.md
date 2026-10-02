@@ -431,7 +431,8 @@ otzaria-semantic-search/
     הוא מה שבנייה מבקשת.
   - `writer` — `SegmentBuilder`: הטבלאות קודם, ואז `VectorSink` שמקבל וקטורים בסדר
     ה-slots, ב-buffer, עם CRC לכל block — כך שבנייה בקנה מידה של הספרייה זורמת בזיכרון
-    חסום. `segment_id` דטרמיניסטי.
+    חסום. `segment_id` של שחרור דטרמיניסטי ונשאר כפי שפורסם; ל-segment שנדחס על המכשיר
+    המזהה הוא digest של כל מה שהוא מחזיק (§3.6 של החוזה), ולכן שתי דחיסות שונות — שני שמות.
   - `reader` — `Segment::open` ממפה (memmap2), בודק את ה-header, את ה-CRC של כל section
     קטן ואת העקביות המבנית; `verify_blocks` קורא כל block.
   - `kernel` — מכפלה סקלרית בשלמים: scalar, AVX2 ו-NEON, זהות ביט אחר ביט; שאילתה מוכנה

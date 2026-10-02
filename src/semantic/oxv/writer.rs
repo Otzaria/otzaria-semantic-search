@@ -21,8 +21,8 @@ use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::format::{
     align_up, BookEntry, DirectoryEntry, Header, SectionKind, BLOCK_SIZE, EXTRA_LEN,
-    FLAG_HAS_FOREIGN, FLAG_HAS_TOMBSTONES, FOREIGN_LEN, HAS_EXTRAS, HEADER_LEN, HINT_MASK,
-    SECTION_ALIGN, SECTION_BLOCKSUMMED, SECTION_CRITICAL, VECTORS_ALIGN,
+    FLAG_HAS_FOREIGN, FLAG_HAS_TOMBSTONES, FOREIGN_LEN, HAS_EXTRAS, HEADER_CRC_OFFSET, HEADER_LEN,
+    HINT_MASK, SECTION_ALIGN, SECTION_BLOCKSUMMED, SECTION_CRITICAL, VECTORS_ALIGN,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -63,7 +63,8 @@ pub struct WrittenSegment {
     pub size: u64,
     /// SHA-256 of the whole file.
     pub sha256: [u8; 32],
-    /// The deterministic id the file is installed under — see [`segment_id`].
+    /// The deterministic id the file is installed under: [`segment_id`] for a release, and a
+    /// digest of everything the file holds for a segment compacted on a device.
     pub segment_id: [u8; 16],
     pub spec: SegmentSpec,
     pub counts: PackageCounts,
@@ -376,13 +377,21 @@ impl SegmentBuilder {
             offset += length;
         }
 
-        let segment_id = segment_id(
-            &self.spec.identity_digest,
-            self.spec.kind,
-            self.spec.from_library_version,
-            self.spec.to_library_version,
-            &Sha256::digest(&key_bytes).into(),
-        );
+        // A release's id is the one releases have always been published under. A compacted
+        // segment's is a digest of everything else it holds, known once the last vector is:
+        // see `finish`, and the section digests gathered for it below.
+        let compacted = self.spec.kind == PackageKind::Compacted;
+        let segment_id = if compacted {
+            [0; 16]
+        } else {
+            segment_id(
+                &self.spec.identity_digest,
+                self.spec.kind,
+                self.spec.from_library_version,
+                self.spec.to_library_version,
+                &Sha256::digest(&key_bytes).into(),
+            )
+        };
         let mut flags = Header::kind_flag(self.spec.kind);
         if has_foreign {
             flags |= FLAG_HAS_FOREIGN;
@@ -430,10 +439,20 @@ impl SegmentBuilder {
             &tombstones,
         ];
         let mut header = header;
+        // For a compacted segment's id, every section's SHA-256: the block CRCs', the
+        // vectors' and their scales' once they are known.
+        let mut section_sha256 = compacted.then(|| vec![[0u8; 32]; header.sections.len()]);
         for (index, bytes) in contents.into_iter().enumerate() {
             out.pad_to(header.sections[index].offset)?;
             out.write_all(bytes)?;
             header.sections[index].crc32 = crc32fast::hash(bytes);
+            if let Some(digests) = &mut section_sha256 {
+                digests[index] = Sha256::digest(bytes).into();
+            }
+        }
+        if let Some(digests) = &mut section_sha256 {
+            digests[8] = Sha256::digest(&hint_bytes).into();
+            digests[9] = Sha256::digest(&key_bytes).into();
         }
         // The block checksums of HINTS and KEYS are known now; those of VECTORS when the
         // last vector arrives.
@@ -469,6 +488,8 @@ impl SegmentBuilder {
             block: crc32fast::Hasher::new(),
             in_block: 0,
             block_crcs,
+            vectors_sha256: compacted.then(Sha256::new),
+            section_sha256,
             scratch: Vec::new(),
             scales: has_scales.then(|| Vec::with_capacity(scales_len as usize)),
             clipped: 0,
@@ -490,6 +511,10 @@ pub struct VectorSink {
     block: crc32fast::Hasher,
     in_block: usize,
     block_crcs: Vec<u32>,
+    /// For a compacted segment's id: every section's SHA-256 in directory order, and the
+    /// vectors' as they arrive.
+    section_sha256: Option<Vec<[u8; 32]>>,
+    vectors_sha256: Option<Sha256>,
     scratch: Vec<u8>,
     /// VECTOR_SCALES, for a codec with a scale per vector: written after the last vector.
     scales: Option<Vec<u8>>,
@@ -535,6 +560,9 @@ impl VectorSink {
             )));
         }
         self.out.write_all(encoded)?;
+        if let Some(hasher) = &mut self.vectors_sha256 {
+            hasher.update(encoded);
+        }
         if let (Some(scales), Some(scale)) = (&mut self.scales, scale) {
             scales.extend_from_slice(&scale.to_le_bytes());
         }
@@ -604,6 +632,9 @@ impl VectorSink {
             self.out.write_all(&scales)?;
             self.block_crcs
                 .extend(scales.chunks(BLOCK_SIZE).map(crc32fast::hash));
+            if let Some(digests) = &mut self.section_sha256 {
+                digests[entry] = Sha256::digest(&scales).into();
+            }
         }
         let crc_bytes: Vec<u8> = self
             .block_crcs
@@ -616,6 +647,13 @@ impl VectorSink {
         }
         crc_entry.crc32 = crc32fast::hash(&crc_bytes);
         let crc_offset = crc_entry.offset;
+        if let (Some(mut digests), Some(vectors)) =
+            (self.section_sha256.take(), self.vectors_sha256.take())
+        {
+            digests[7] = Sha256::digest(&crc_bytes).into();
+            digests[10] = vectors.finalize().into();
+            self.header.segment_id = compacted_segment_id(&self.header, &digests);
+        }
 
         let mut file = self
             .out
@@ -652,10 +690,15 @@ impl VectorSink {
     }
 }
 
-/// The id a segment is installed under: SHA-256 over `"oxv-segment-id"`, the identity
-/// digest, the kind, the two library versions and the SHA-256 of its keys, cut to 16
-/// bytes. Deterministic, so the same segment built twice is the same file name, and a
-/// segment applied twice is one segment.
+/// The id a release — a base or a delta — is installed under: SHA-256 over
+/// `"oxv-segment-id"`, the identity digest, the kind, the two library versions and the
+/// SHA-256 of its keys, cut to 16 bytes. Deterministic, so the same segment built twice is
+/// the same file name, and a segment applied twice is one segment.
+///
+/// It is what every published release carries, and stays as it is. It does not cover the
+/// hints or the vectors: two releases of one identity, kind, versions and keys but other
+/// bytes share it, and an install never puts one over the other while a generation names
+/// it (`segment_set::files::place_segment`).
 pub fn segment_id(
     identity_digest: &[u8; 32],
     kind: PackageKind,
@@ -670,6 +713,31 @@ pub fn segment_id(
     hasher.update(from_library_version.to_le_bytes());
     hasher.update(to_library_version.to_le_bytes());
     hasher.update(keys_sha256);
+    let digest = hasher.finalize();
+    digest[..16].try_into().expect("16 bytes")
+}
+
+/// The id a segment compacted on a device is installed under — never published, so free
+/// of what releases carry: the first 16 bytes of SHA-256 over
+/// `"oxv-compacted-segment-id\n"`, the header's CRC-covered bytes (0..4088) with the id
+/// itself zeroed, and the SHA-256 of every section in directory order.
+///
+/// Everything the file holds goes into it but the id, the header's CRC and the zeros between
+/// sections: the identity, the versions and the release tag, the directory with every
+/// section's place and CRC, every section's bytes. So the same compaction done twice has one
+/// id, and two that differ anywhere — a hint re-anchored on another live line — have two,
+/// and one never takes the other's file. `section_sha256` holds a digest per entry of
+/// `header.sections`.
+pub(crate) fn compacted_segment_id(header: &Header, section_sha256: &[[u8; 32]]) -> [u8; 16] {
+    debug_assert_eq!(header.sections.len(), section_sha256.len());
+    let mut unnamed = header.clone();
+    unnamed.segment_id = [0; 16];
+    let mut hasher = Sha256::new();
+    hasher.update(b"oxv-compacted-segment-id\n");
+    hasher.update(&unnamed.encode()[..HEADER_CRC_OFFSET]);
+    for digest in section_sha256 {
+        hasher.update(digest);
+    }
     let digest = hasher.finalize();
     digest[..16].try_into().expect("16 bytes")
 }

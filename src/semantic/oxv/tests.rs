@@ -8,7 +8,7 @@ use super::format::{
 };
 use super::reader::Segment;
 use super::testing::{key, random_books, spec, write_segment, Random, TempDir, TestBook};
-use super::writer::{segment_id, SegmentBuilder};
+use super::writer::{segment_id, SegmentBuilder, SegmentSpec};
 use crate::cancellation::CancellationToken;
 use crate::distribution::package::{PackageCounts, PackageKind};
 use crate::errors::VectorStoreError;
@@ -472,6 +472,98 @@ fn the_writer_refuses_tables_no_reader_could_use() {
     // And the file is never overwritten.
     let builder = SegmentBuilder::new(spec(PackageKind::Base, 0, 30), codec());
     assert!(builder.write(&dir.join("c.oxv")).is_err());
+}
+
+/// The id `docs/ARTIFACT_CONTRACT.md` §3.6 defines for a compacted segment, from the file's
+/// bytes alone: SHA-256 over the domain, the header's CRC-covered bytes with the id zeroed,
+/// and every section's SHA-256 in directory order, cut to 16 bytes.
+fn compacted_id(path: &Path) -> [u8; 16] {
+    let bytes = std::fs::read(path).unwrap();
+    let header = Header::decode(&bytes).unwrap();
+    let mut head = bytes[..4088].to_vec();
+    head[32..48].fill(0);
+    let mut hasher = Sha256::new();
+    hasher.update(b"oxv-compacted-segment-id\n");
+    hasher.update(&head);
+    for entry in &header.sections {
+        let section = &bytes[entry.offset as usize..(entry.offset + entry.length) as usize];
+        hasher.update(Sha256::digest(section));
+    }
+    hasher.finalize()[..16].try_into().unwrap()
+}
+
+/// A compacted segment's id is a digest of everything it holds: the same compaction done
+/// twice is one file name, and one that differs anywhere — one hint, one vector, its release
+/// tag, its library version, its identity — is another. Over the keys alone, as a release's
+/// is, two compactions that re-anchored differently had one name, and the second replaced
+/// the first's file under a generation that still named it.
+#[test]
+fn a_compacted_segments_id_is_a_digest_of_everything_it_holds() {
+    let dir = TempDir::new("compacted_id");
+    let books = random_books(&mut Random(14), 2, 3, DIM, 0);
+    let codec = Codec::i8_sym_dim(vec![0.5; DIM], 1.0).unwrap();
+    let write = |name: &str, spec: SegmentSpec, books: &[TestBook]| {
+        write_segment(&dir.join(name), spec, codec.clone(), books, &[])
+    };
+    let compacted = |to| spec(PackageKind::Compacted, 0, to);
+    let first = write("first.oxv", compacted(30), &books);
+    let again = write("again.oxv", compacted(30), &books);
+    assert_eq!(
+        (first.segment_id, first.sha256),
+        (again.segment_id, again.sha256)
+    );
+
+    let mut moved = books.clone();
+    moved[0].primary[1].1 += 7;
+    let mut nudged = books.clone();
+    nudged[1].primary[0].2[0] = -nudged[1].primary[0].2[0];
+    let mut tagged = compacted(30);
+    tagged.library_release_tag = "v30-20261002000000".to_string();
+    let mut other_identity = compacted(30);
+    other_identity.identity_digest = [7; 32];
+    let others = [
+        write("moved.oxv", compacted(30), &moved),
+        write("nudged.oxv", compacted(30), &nudged),
+        write("tagged.oxv", tagged, &books),
+        write("later.oxv", compacted(31), &books),
+        write("identity.oxv", other_identity, &books),
+    ];
+    for other in &others {
+        assert_ne!(other.sha256, first.sha256, "{}", other.path.display());
+        assert_ne!(
+            other.segment_id,
+            first.segment_id,
+            "{}",
+            other.path.display()
+        );
+    }
+    for written in std::iter::once(&first).chain(&others) {
+        assert_eq!(
+            compacted_id(&written.path),
+            written.segment_id,
+            "{}",
+            written.path.display()
+        );
+        assert_eq!(open(&written.path).segment_id(), written.segment_id);
+    }
+
+    // A release keeps the id releases are published under, over its keys and its place in
+    // the chain alone — whatever its hints.
+    let release = write("release.oxv", spec(PackageKind::Base, 0, 30), &books);
+    let moved_release = write("moved-release.oxv", spec(PackageKind::Base, 0, 30), &moved);
+    let keys: Vec<u8> = books
+        .iter()
+        .flat_map(|book| book.primary.iter().flat_map(|(key, _, _)| key.0))
+        .collect();
+    let published = segment_id(
+        &spec(PackageKind::Base, 0, 30).identity_digest,
+        PackageKind::Base,
+        0,
+        30,
+        &Sha256::digest(&keys).into(),
+    );
+    assert_eq!(release.segment_id, published);
+    assert_eq!(moved_release.segment_id, published);
 }
 
 #[test]

@@ -20,11 +20,11 @@
 //! 8. **collect garbage**.
 
 use super::files::{
-    clear_verdict, encode_links, generation_dir, generation_path, hash_file, io_error,
-    next_generation, read_pointer, rename_into_place, segment_file, sha256_hex, sync_file,
-    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument,
-    SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE,
-    SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
+    encode_links, generation_dir, generation_path, hash_file, io_error, next_generation,
+    place_segment, read_pointer, segment_file, sha256_hex, sync_file, sync_set_dir,
+    write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument, SetLock,
+    SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE, SET_FORMAT,
+    SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -374,29 +374,19 @@ pub fn install_package(
     }
     reached(Step::Staged)?;
 
-    // 4. Move it into the set.
-    let segments_dir = dir.join(SEGMENTS_DIR);
-    fs::create_dir_all(&segments_dir)
-        .map_err(io_error(format!("creating {}", segments_dir.display())))?;
+    // 4. Move it into the set — beside every segment there is, and never over the bytes a
+    // generation names.
     let file = segment_file(&manifest.segment_id);
     let target = dir.join(&file);
-    if target.exists() && hash_file(&target, cancel)? == manifest.segment.sha256 {
-        // The same segment, installed before and still on disk — mapped, perhaps.
-        fs::remove_file(&staged).map_err(io_error(format!("removing {}", staged.display())))?;
-    } else {
-        rename_into_place(&staged, &target)
-            .map_err(io_error(format!("moving {} into place", staged.display())))?;
-    }
-    sync_set_dir(&segments_dir)
-        .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
-    // The file holds the bytes just verified now, so a verdict on the segment — a scrub's, on
-    // bytes it held before: the repair the verdict asked for — no longer stands.
-    if clear_verdict(dir, &manifest.segment_id)? {
-        log::info!(
-            "The scrub verdict on segment {} is withdrawn: it holds the verified release now",
-            manifest.segment_id
-        );
-    }
+    place_segment(
+        dir,
+        &manifest.segment_id,
+        &staged,
+        &manifest.segment.sha256,
+        cancel,
+        |reason| ArtifactError::ManifestDisagreesWithPayload { reason }.into(),
+    )?;
+    let segments_dir = dir.join(SEGMENTS_DIR);
     let provenance_path = segments_dir.join(format!("{}.package.json", manifest.segment_id));
     write_atomically(&provenance_path, source.manifest_json.as_bytes())
         .map_err(space_or_io(&provenance_path, 0))?;
