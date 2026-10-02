@@ -16,9 +16,10 @@
 //! ```
 //!
 //! Every file here is written once, under a temporary name, flushed, and renamed into
-//! place; the two pointer files are the only ones ever replaced, and `std::fs::rename`
-//! replaces atomically on every platform the crate builds for (`MoveFileExW` with
-//! `MOVEFILE_REPLACE_EXISTING` on Windows).
+//! place, and its directory is flushed before a pointer names it — a segment taken from
+//! `incoming/`, which the set did not write, is flushed too; the two pointer files are the
+//! only ones ever replaced, and `std::fs::rename` replaces atomically on every platform the
+//! crate builds for (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows).
 
 use crate::distribution::package::{sync_dir, PackageKind};
 use crate::errors::{ArtifactError, VectorStoreError};
@@ -371,7 +372,60 @@ fn trailer<'a>(bytes: &'a [u8], magic: &[u8; 8], expected_crc: u32) -> Result<&'
     Ok(body)
 }
 
-/// Write `bytes` to `path` under a temporary name, flush, and rename into place.
+/// What the set's code did to make a write durable, in order. Every publish — a segment, a
+/// generation, a pointer — is written, its file flushed, renamed into place and its
+/// directory flushed, and only then does a pointer name it; the tests read the order back
+/// from [`JOURNAL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Durable {
+    /// A file's bytes, flushed.
+    File(PathBuf),
+    /// A file renamed into place at this path.
+    Renamed(PathBuf),
+    /// A directory's entries, flushed.
+    Dir(PathBuf),
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static JOURNAL: std::cell::RefCell<Vec<Durable>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record a step in [`JOURNAL`]; nothing outside a test build.
+#[inline]
+pub(crate) fn note(step: impl FnOnce() -> Durable) {
+    #[cfg(test)]
+    JOURNAL.with(|journal| journal.borrow_mut().push(step()));
+    #[cfg(not(test))]
+    let _ = step;
+}
+
+/// Flush a file the set is about to publish.
+pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
+    file.sync_all()?;
+    note(|| Durable::File(path.to_path_buf()));
+    Ok(())
+}
+
+/// Flush a directory of the set, so what was renamed or created in it survives a power
+/// loss before anything names it.
+pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
+    sync_dir(path)?;
+    note(|| Durable::Dir(path.to_path_buf()));
+    Ok(())
+}
+
+/// Rename a flushed file into place.
+pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)?;
+    note(|| Durable::Renamed(to.to_path_buf()));
+    Ok(())
+}
+
+/// Write `bytes` to `path` under a temporary name, flush, rename into place, and flush the
+/// directory.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension(match path.extension() {
         Some(extension) => format!("{}.tmp", extension.to_string_lossy()),
@@ -380,11 +434,11 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         let mut file = File::create(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        sync_file(&file, &temporary)?;
     }
-    fs::rename(&temporary, path)?;
+    rename_into_place(&temporary, path)?;
     if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
+        sync_set_dir(parent)?;
     }
     Ok(())
 }

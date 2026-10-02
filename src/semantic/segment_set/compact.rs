@@ -12,7 +12,9 @@
 //! holds is dropped. Slots are then assigned as a build assigns them: the first time a key
 //! appears it takes the next slot, every later appearance is an extra.
 
-use super::files::{io_error, SetLock, SetSegment, SEGMENTS_DIR, STAGING_DIR};
+use super::files::{
+    self, io_error, rename_into_place, Durable, SetLock, SetSegment, SEGMENTS_DIR, STAGING_DIR,
+};
 use super::install::{full_or_io, NewGeneration};
 use super::{recover, space, SegmentSet, SetInfo};
 use crate::cancellation::CancellationToken;
@@ -339,6 +341,8 @@ pub fn compact(
             return Err(error);
         }
     };
+    // `VectorSink::finish` flushed it.
+    files::note(|| Durable::File(partial.clone()));
 
     // 5. Re-open it and compare a sample with its sources.
     {
@@ -373,13 +377,17 @@ pub fn compact(
 
     // 6. Publish it as a generation of its own.
     let id = hex(&written.segment_id);
-    let file = super::files::segment_file(&id);
+    let file = files::segment_file(&id);
     let target = dir.join(&file);
     fs::create_dir_all(dir.join(SEGMENTS_DIR)).map_err(io_error(format!(
         "creating {}",
         dir.join(SEGMENTS_DIR).display()
     )))?;
-    fs::rename(&partial, &target).map_err(io_error(format!("moving {}", partial.display())))?;
+    rename_into_place(&partial, &target)
+        .map_err(io_error(format!("moving {}", partial.display())))?;
+    let segments_dir = dir.join(SEGMENTS_DIR);
+    files::sync_set_dir(&segments_dir)
+        .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);
     generation.library_release_tag = document.library_release_tag.clone();

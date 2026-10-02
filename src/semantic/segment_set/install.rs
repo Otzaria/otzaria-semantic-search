@@ -21,9 +21,10 @@
 
 use super::files::{
     encode_links, generation_dir, generation_path, io_error, next_generation, read_pointer,
-    segment_file, sha256_hex, write_atomically, write_pointer, Deleted, DerivedFile, Pointer,
-    SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR,
-    SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
+    rename_into_place, segment_file, sha256_hex, sync_file, sync_set_dir, write_atomically,
+    write_pointer, Deleted, DerivedFile, Pointer, SetDocument, SetLock, SetSegment, SetStats,
+    CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE, SET_FORMAT, SET_FORMAT_VERSION,
+    STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -41,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -335,6 +336,13 @@ pub fn install_package(
             "moving {} into the set",
             source.segment.display()
         )))?;
+        // Written by the caller, who need not have flushed it; it is, before anything names
+        // it. Opened for writing, which Windows needs to flush a file.
+        OpenOptions::new()
+            .write(true)
+            .open(&staged)
+            .and_then(|file| sync_file(&file, &staged))
+            .map_err(io_error(format!("flushing {}", staged.display())))?;
         hash_file(&staged, cancel)?
     } else {
         copy_hashing(source.segment, &staged, manifest.segment.size, cancel)?
@@ -376,10 +384,10 @@ pub fn install_package(
         // The same segment, installed before and still on disk — mapped, perhaps.
         fs::remove_file(&staged).map_err(io_error(format!("removing {}", staged.display())))?;
     } else {
-        fs::rename(&staged, &target)
+        rename_into_place(&staged, &target)
             .map_err(io_error(format!("moving {} into place", staged.display())))?;
     }
-    crate::distribution::package::sync_dir(&segments_dir)
+    sync_set_dir(&segments_dir)
         .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
     let provenance_path = segments_dir.join(format!("{}.package.json", manifest.segment_id));
     write_atomically(&provenance_path, source.manifest_json.as_bytes())
@@ -840,6 +848,9 @@ impl NewGeneration {
         let bytes = serde_json::to_vec_pretty(&document).expect("a set serializes");
         let set_path = path.join(SET_FILE);
         write_atomically(&set_path, &bytes).map_err(space_or_io(&set_path, bytes.len()))?;
+        // The generation's own entry, and `segments/`'s if this created it: durable before a
+        // pointer names them.
+        sync_set_dir(dir).map_err(io_error(format!("flushing {}", dir.display())))?;
         reached(Step::GenerationWritten)?;
 
         let pointer = Pointer {
@@ -925,9 +936,7 @@ fn copy_hashing(
                 .map_err(|error| full_or_io(error, to, size, written))?;
             written += read as u64;
         }
-        target
-            .sync_all()
-            .map_err(|error| full_or_io(error, to, size, written))?;
+        sync_file(&target, to).map_err(|error| full_or_io(error, to, size, written))?;
         Ok(format!("{:x}", hasher.finalize()))
     })();
     if result.is_err() {

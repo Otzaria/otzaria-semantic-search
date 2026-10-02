@@ -1232,6 +1232,97 @@ fn a_delta_over_an_unreadable_current_applies_to_the_generation_that_opens() {
     assert_eq!((set.generation(), set.info().library_version), (3, 30));
 }
 
+/// What `work` did to make its writes durable, in order.
+fn journal_of(work: impl FnOnce()) -> Vec<files::Durable> {
+    files::JOURNAL.with(|journal| journal.borrow_mut().clear());
+    work();
+    files::JOURNAL.with(|journal| journal.borrow_mut().drain(..).collect())
+}
+
+/// The order one publish into `dir` must show: the segment's bytes flushed in `staging/`,
+/// the segment renamed into `segments/` and that directory flushed; the new generation's
+/// `set.json` renamed in, and the set's directory flushed after it — the generation's own
+/// entry; all of it before `CURRENT` is renamed, and the set's directory flushed after.
+fn assert_published_in_order(steps: &[files::Durable], dir: &Path, what: &str) {
+    use files::Durable;
+    let flip = steps
+        .iter()
+        .position(|step| *step == Durable::Renamed(dir.join(CURRENT)))
+        .unwrap_or_else(|| panic!("{what}: no flip in {steps:#?}"));
+    let (staging, segments) = (dir.join(STAGING_DIR), dir.join(SEGMENTS_DIR));
+    let placed = steps
+        .iter()
+        .position(|step| {
+            matches!(step, Durable::Renamed(path)
+                if path.parent() == Some(segments.as_path())
+                    && path.extension().is_some_and(|extension| extension == "oxv"))
+        })
+        .unwrap_or_else(|| panic!("{what}: no segment placed in {steps:#?}"));
+    assert!(
+        steps[..placed].iter().any(
+            |step| matches!(step, Durable::File(path) if path.parent() == Some(staging.as_path()))
+        ),
+        "{what}: the segment's bytes are flushed before it is renamed into place: {steps:#?}"
+    );
+    assert!(
+        steps[placed..flip].contains(&Durable::Dir(segments.clone())),
+        "{what}: segments/ is flushed after the segment lands and before the flip: {steps:#?}"
+    );
+    let generation = steps[..flip]
+        .iter()
+        .rposition(|step| {
+            matches!(step, Durable::Renamed(path)
+                if path.file_name().is_some_and(|name| name == files::SET_FILE))
+        })
+        .unwrap_or_else(|| panic!("{what}: no generation written in {steps:#?}"));
+    assert!(
+        steps[generation..flip].contains(&Durable::Dir(dir.to_path_buf())),
+        "{what}: the set's directory — the new generation's entry — is flushed before the \
+         flip: {steps:#?}"
+    );
+    assert_eq!(
+        steps.get(flip + 1),
+        Some(&Durable::Dir(dir.to_path_buf())),
+        "{what}: and so is the flip"
+    );
+}
+
+/// Every publish writes, flushes the file, renames it into place and flushes the directory,
+/// and only then flips the pointer that names it: a base copied in, a delta taken from
+/// `incoming/` — a file the set did not write, so not yet flushed — and a compaction.
+#[test]
+fn every_publish_is_flushed_before_the_flip_that_names_it() {
+    let work = TempDir::new("set_durable");
+    let dir = work.join("vectors");
+    let steps = journal_of(|| {
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+    });
+    assert_published_in_order(&steps, &dir, "a base, copied");
+
+    let (path, json) = release(&work, &v30(), Some(&v29()));
+    std::fs::create_dir_all(incoming_dir(&dir)).unwrap();
+    let incoming = incoming_dir(&dir).join("download.oxv");
+    std::fs::copy(&path, &incoming).unwrap();
+    let steps = journal_of(|| {
+        install(&dir, &(incoming, json)).unwrap();
+    });
+    assert_published_in_order(&steps, &dir, "a delta, taken from incoming/");
+
+    let steps = journal_of(|| {
+        compact(
+            &dir,
+            &CompactionPolicy {
+                force: true,
+                ..CompactionPolicy::default()
+            },
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    });
+    assert_published_in_order(&steps, &dir, "a compaction");
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
