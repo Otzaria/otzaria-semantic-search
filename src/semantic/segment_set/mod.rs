@@ -46,8 +46,8 @@ use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
 use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::kernel::PreparedQuery;
 use crate::semantic::oxv::reader::Segment;
-use crate::semantic::oxv::scan::{scan, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet};
-use crate::semantic::resolve::VectorHit;
+use crate::semantic::oxv::scan::{scan_with, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet};
+use crate::semantic::resolve::{SlotRef, VectorHit};
 use crate::semantic::versioning::{
     hex, IdentityField, IdentityMismatch, IndexVersion, VectorProvenance,
 };
@@ -291,6 +291,29 @@ impl SegmentSet {
         request: &ScanRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, VectorStoreError> {
+        self.scan_with(query, request, &[], cancel)
+    }
+
+    /// [`Self::scan`], and the vectors of `also` besides: each that is live in this
+    /// generation ([`Self::is_live`]) and holds its key, scored against `query` as the scan
+    /// scores. Of those whose key the scan did not return, the best `request.top_k` are
+    /// merged into its hits in the scan's order — score, then key, then slot — with their
+    /// records ordered as the scan orders a hit's under `request.books`. None of the scan's
+    /// hits gives way to them, so the result holds up to twice `request.top_k` hits. A slot
+    /// that is not live, or holds another key, is passed over; with `also` empty, this is
+    /// [`Self::scan`] exactly.
+    ///
+    /// What lets a host weigh, under a filter, the vectors of texts that moved into an
+    /// admitted book since the set was built — whose records name only the books they were
+    /// in, so the filtered scan never reaches them — at their own scores, without widening
+    /// the scan by the books that hold them.
+    pub fn scan_with(
+        &self,
+        query: &[f32],
+        request: &ScanRequest<'_>,
+        also: &[SlotRef],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, VectorStoreError> {
         let prepared = PreparedQuery::new(query, self.codec())?;
         let views: Vec<ScanSegment<'_>> = self
             .segments
@@ -307,7 +330,7 @@ impl SegmentSet {
             segments: &views,
             reverse_links: &self.reverse,
         };
-        scan(&set, &prepared, request, cancel)
+        scan_with(&set, &prepared, request, also, cancel)
     }
 
     pub fn info(&self) -> &SetInfo {
@@ -341,8 +364,19 @@ impl SegmentSet {
         &self.pointer
     }
 
-    pub(crate) fn segments(&self) -> &[Segment] {
+    /// The generation's segments, oldest first: what a [`VectorHit`]'s and a [`SlotRef`]'s
+    /// `seg` index. Read-only; which of their slots are live is [`Self::is_live`].
+    pub fn segments(&self) -> &[Segment] {
         &self.segments
+    }
+
+    /// Whether `slot` of segment `seg` is live in this generation: within the segment, and
+    /// neither tombstoned nor shipped again by a later delta — a slot a scan may return.
+    pub fn is_live(&self, seg: u16, slot: u32) -> bool {
+        self.segments
+            .get(seg as usize)
+            .is_some_and(|segment| slot < segment.slot_count())
+            && !self.deleted[seg as usize].is_set(slot)
     }
 
     pub(crate) fn deleted(&self) -> &[Deleted] {

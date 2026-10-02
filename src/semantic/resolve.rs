@@ -44,6 +44,19 @@ pub struct VectorHit {
     pub slot: u32,
 }
 
+/// One vector of a generation of the set: where it is — the segment and slot a
+/// [`VectorHit`] names — and the key it holds there.
+///
+/// What a host hands a scan to weigh besides the slots its filter reaches
+/// ([`SegmentSet::scan_with`](crate::semantic::segment_set::SegmentSet::scan_with)). The key
+/// makes a slot of another generation harmless: a slot that does not hold it is passed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlotRef {
+    pub seg: u16,
+    pub slot: u32,
+    pub key: ChunkKey,
+}
+
 /// The most records one hit carries. A boilerplate line can occur thousands of times;
 /// lexical search still finds every one, and a semantic result needs a handful.
 pub const MAX_RECORDS_PER_HIT: usize = 32;

@@ -5,15 +5,16 @@ use super::codec::Codec;
 use super::kernel::{dot_f32, select, PreparedQuery};
 use super::reader::Segment;
 use super::scan::{
-    scan, scan_reporting, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet, LINK_UNRESOLVED,
+    scan, scan_reporting, scan_with, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet,
+    LINK_UNRESOLVED,
 };
 use super::testing::{key, random_books, spec, write_segment, Random, TempDir, TestBook};
 use crate::cancellation::{probe, CancellationToken, SCAN_CHECK_INTERVAL};
 use crate::distribution::package::PackageKind;
 use crate::errors::VectorStoreError;
 use crate::semantic::chunk_key::ChunkKey;
-use crate::semantic::resolve::{BookSet, MAX_RECORDS_PER_HIT};
-use std::collections::HashMap;
+use crate::semantic::resolve::{BookSet, SlotRef, VectorHit, MAX_RECORDS_PER_HIT};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const DIM: usize = 64;
@@ -198,6 +199,16 @@ fn run(
         threads,
     };
     let hits = scan(&set, query, &request, &CancellationToken::new()).unwrap();
+    ranked(fixture, query, hits)
+}
+
+/// Each hit as `(rank, key, seg, slot)`, its score checked against the rank its vector
+/// has for `query` and its key against its slot's.
+fn ranked(
+    fixture: &Fixture,
+    query: &PreparedQuery,
+    hits: Vec<VectorHit>,
+) -> Vec<(i32, ChunkKey, u16, u32)> {
     let (kernel, _) = select();
     hits.into_iter()
         .map(|hit| {
@@ -606,5 +617,274 @@ fn a_scan_on_four_threads_stops_within_two_intervals_of_a_cancel() {
             );
         }
         break;
+    }
+}
+
+/// [`scan_with`] of `fixture` under `request`'s fields, weighing `also` besides.
+fn run_with(
+    fixture: &Fixture,
+    query: &PreparedQuery,
+    top_k: usize,
+    books: Option<&BookSet>,
+    also: &[SlotRef],
+    threads: usize,
+) -> Vec<VectorHit> {
+    let segments = fixture.scan_segments();
+    let set = ScanSet {
+        segments: &segments,
+        reverse_links: &fixture.reverse,
+    };
+    let request = ScanRequest {
+        top_k,
+        books,
+        threads,
+    };
+    scan_with(&set, query, &request, also, &CancellationToken::new()).unwrap()
+}
+
+/// Slot `slot` of segment `seg`, named by the key it holds.
+fn slot_ref(fixture: &Fixture, seg: u16, slot: u32) -> SlotRef {
+    SlotRef {
+        seg,
+        slot,
+        key: fixture.segments[seg as usize].key(slot),
+    }
+}
+
+/// A hit as its bits: score, key, records, segment and slot.
+type HitBits = (u32, ChunkKey, Vec<(String, u32)>, u16, u32);
+
+/// Hits as their bits: a score that differs in its last bit is a different hit.
+fn bits(hits: &[VectorHit]) -> Vec<HitBits> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.score.to_bits(),
+                hit.key,
+                hit.records
+                    .iter()
+                    .map(|record| (record.book.to_string(), record.hint))
+                    .collect(),
+                hit.seg,
+                hit.slot,
+            )
+        })
+        .collect()
+}
+
+/// With nothing to weigh besides, `scan_with` is the scan, bit for bit: every codec, with
+/// and without a filter, for every `k` and at every thread count.
+#[test]
+fn a_scan_with_nothing_besides_is_the_scan_bit_for_bit() {
+    for (seed, codec) in [
+        (51u64, int8 as fn(&[&[f32]]) -> Codec),
+        (52, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+        (53, per_vector),
+    ] {
+        let fixture = Fixture::new(60, 40, seed, codec);
+        let segments = fixture.scan_segments();
+        let set = ScanSet {
+            segments: &segments,
+            reverse_links: &fixture.reverse,
+        };
+        let query =
+            PreparedQuery::new(&Random(seed + 7).unit(DIM), fixture.segments[0].codec()).unwrap();
+        let one: BookSet = ["id:00001"].into_iter().collect();
+        let several: BookSet = ["id:00000", "id:00007", "id:99999"].into_iter().collect();
+        for books in [None, Some(&one), Some(&several)] {
+            for top_k in [0, 1, 10, 500, 5000] {
+                for threads in [1, 2, 3, 8] {
+                    let request = ScanRequest {
+                        top_k,
+                        books,
+                        threads,
+                    };
+                    let plain = scan(&set, &query, &request, &CancellationToken::new()).unwrap();
+                    let with =
+                        scan_with(&set, &query, &request, &[], &CancellationToken::new()).unwrap();
+                    assert_eq!(
+                        bits(&with),
+                        bits(&plain),
+                        "{books:?}, k {top_k}, {threads} threads"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A slot the filter does not reach is weighed at the score, and with the records, a full
+/// scan gives it, and every hit of the filtered scan stays as it was: the result is the
+/// filtered scan's hits and the best `k` of the others, merged in the scan's order.
+#[test]
+fn a_slot_the_filter_does_not_reach_is_weighed_beside_the_filtered_hits() {
+    for (seed, codec) in [(54u64, int8 as fn(&[&[f32]]) -> Codec), (55, per_vector)] {
+        let fixture = Fixture::new(60, 40, seed, codec);
+        let query =
+            PreparedQuery::new(&Random(seed + 7).unit(DIM), fixture.segments[0].codec()).unwrap();
+        let books: BookSet = ["id:00001"].into_iter().collect();
+        // Book 5's slots, and the delta's new book's: no record of the admitted book names
+        // any of them.
+        let also: Vec<SlotRef> = (5 * 40..6 * 40)
+            .map(|slot| slot_ref(&fixture, 0, slot))
+            .chain((1..fixture.segments[1].slot_count()).map(|slot| slot_ref(&fixture, 1, slot)))
+            .collect();
+        let also_keys: HashSet<ChunkKey> = also.iter().map(|slot| slot.key).collect();
+        let everything = run_with(&fixture, &query, usize::MAX >> 8, None, &[], 1);
+        for top_k in [1, 5, 40, 1000] {
+            let filtered = run_with(&fixture, &query, top_k, Some(&books), &[], 1);
+            let merged = run_with(&fixture, &query, top_k, Some(&books), &also, 1);
+            let filtered_keys: HashSet<ChunkKey> = filtered.iter().map(|hit| hit.key).collect();
+
+            let kept: Vec<&VectorHit> = merged
+                .iter()
+                .filter(|hit| filtered_keys.contains(&hit.key))
+                .collect();
+            assert_eq!(
+                kept,
+                filtered.iter().collect::<Vec<_>>(),
+                "k {top_k}: every filtered hit stays, unchanged and in its order"
+            );
+            let weighed: Vec<&VectorHit> = merged
+                .iter()
+                .filter(|hit| !filtered_keys.contains(&hit.key))
+                .collect();
+            let expected: Vec<&VectorHit> = everything
+                .iter()
+                .filter(|hit| also_keys.contains(&hit.key) && !filtered_keys.contains(&hit.key))
+                .take(top_k)
+                .collect();
+            assert_eq!(weighed, expected, "k {top_k}: the best k of the others");
+            assert!(!weighed.is_empty());
+
+            let ranks = ranked(&fixture, &query, merged.clone());
+            assert!(
+                ranks
+                    .windows(2)
+                    .all(|pair| (-pair[0].0, pair[0].1, pair[0].2, pair[0].3)
+                        < (-pair[1].0, pair[1].1, pair[1].2, pair[1].3)),
+                "k {top_k}: in the scan's order"
+            );
+        }
+    }
+}
+
+/// A slot deleted in the set, past its segment's end, in no segment at all, or holding
+/// another key than the one it is named by, is passed over.
+#[test]
+fn a_dead_missing_or_mislabelled_slot_is_passed_over() {
+    let fixture = Fixture::new(20, 30, 56, int8);
+    let query = PreparedQuery::new(&Random(57).unit(DIM), fixture.segments[0].codec()).unwrap();
+    let books: BookSet = ["id:00001"].into_iter().collect();
+    let filtered = run_with(&fixture, &query, 50, Some(&books), &[], 1);
+    let past_end = fixture.segments[0].slot_count();
+    let bad = [
+        // Deleted in the base, and in the delta.
+        slot_ref(&fixture, 0, 3),
+        slot_ref(&fixture, 1, 0),
+        SlotRef {
+            seg: 0,
+            slot: past_end,
+            key: key(0),
+        },
+        SlotRef {
+            seg: 2,
+            slot: 0,
+            key: key(0),
+        },
+        SlotRef {
+            seg: 0,
+            slot: 100,
+            key: fixture.segments[0].key(101),
+        },
+    ];
+    assert_eq!(
+        run_with(&fixture, &query, 50, Some(&books), &bad, 1),
+        filtered
+    );
+
+    // One good slot among them, and only it is added.
+    let mut mixed = bad.to_vec();
+    mixed.push(slot_ref(&fixture, 0, 200));
+    let merged = run_with(&fixture, &query, 50, Some(&books), &mixed, 1);
+    let added: Vec<(u16, u32)> = merged
+        .iter()
+        .filter(|hit| !filtered.contains(hit))
+        .map(|hit| (hit.seg, hit.slot))
+        .collect();
+    assert_eq!(added, [(0, 200)]);
+}
+
+/// A key the filtered scan returned is one hit, as the scan returned it; a slot named
+/// twice is weighed once.
+#[test]
+fn a_key_the_scan_returned_or_one_named_twice_is_one_hit() {
+    let fixture = Fixture::new(20, 30, 58, int8);
+    let query = PreparedQuery::new(&Random(59).unit(DIM), fixture.segments[0].codec()).unwrap();
+    let books: BookSet = ["id:00001"].into_iter().collect();
+    for top_k in [3, 1000] {
+        let filtered = run_with(&fixture, &query, top_k, Some(&books), &[], 1);
+        let returned: Vec<SlotRef> = filtered
+            .iter()
+            .map(|hit| SlotRef {
+                seg: hit.seg,
+                slot: hit.slot,
+                key: hit.key,
+            })
+            .collect();
+        assert_eq!(
+            run_with(&fixture, &query, top_k, Some(&books), &returned, 1),
+            filtered,
+            "k {top_k}"
+        );
+    }
+    let twice = [slot_ref(&fixture, 0, 300), slot_ref(&fixture, 0, 300)];
+    let merged = run_with(&fixture, &query, 1000, Some(&books), &twice, 1);
+    assert_eq!(
+        merged.iter().filter(|hit| hit.key == twice[0].key).count(),
+        1
+    );
+}
+
+/// The merged hits are the same at every thread count, in the scan's total order.
+#[test]
+fn the_merged_hits_are_the_same_at_every_thread_count() {
+    for codec in [int8 as fn(&[&[f32]]) -> Codec, per_vector] {
+        let fixture = Fixture::new(200, 300, 60, codec);
+        let books: BookSet = ["id:00003", "id:00150"].into_iter().collect();
+        let also: Vec<SlotRef> = (0..fixture.segments[0].slot_count())
+            .step_by(7)
+            .map(|slot| slot_ref(&fixture, 0, slot))
+            .chain(
+                (0..fixture.segments[1].slot_count())
+                    .step_by(3)
+                    .map(|slot| slot_ref(&fixture, 1, slot)),
+            )
+            .collect();
+        let mut random = Random(61);
+        for _ in 0..5 {
+            let query = PreparedQuery::new(&random.unit(DIM), fixture.segments[0].codec()).unwrap();
+            let one = run_with(&fixture, &query, 100, Some(&books), &also, 1);
+            assert!(one.len() > 100, "the weighed slots are besides the scan's");
+            let ranks = ranked(&fixture, &query, one.clone());
+            assert!(ranks
+                .windows(2)
+                .all(|pair| (-pair[0].0, pair[0].1, pair[0].2, pair[0].3)
+                    < (-pair[1].0, pair[1].1, pair[1].2, pair[1].3)));
+            for threads in [2, 3, 8] {
+                assert_eq!(
+                    bits(&run_with(
+                        &fixture,
+                        &query,
+                        100,
+                        Some(&books),
+                        &also,
+                        threads
+                    )),
+                    bits(&one),
+                    "{threads} threads"
+                );
+            }
+        }
     }
 }

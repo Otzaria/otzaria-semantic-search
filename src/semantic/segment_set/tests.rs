@@ -6,7 +6,7 @@ use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::scan::ScanRequest;
 use crate::semantic::oxv::testing::{key, spec, write_segment, Random, TempDir, TestBook};
-use crate::semantic::resolve::{BookSet, LiveKeySource, ResolveError};
+use crate::semantic::resolve::{BookSet, LiveKeySource, ResolveError, SlotRef};
 use crate::semantic::versioning::{test_identity, test_provenance, StoreIdentity};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -934,6 +934,82 @@ fn a_filtered_scan_of_a_set_reaches_foreign_records() {
     // id:4 holds key 6 through a foreign record into the base, and key 8 as a slot.
     assert_eq!(keys, BTreeSet::from([key(6), key(8)]));
     assert!(hits.iter().all(|hit| &*hit.records[0].book == "id:4"));
+}
+
+/// Which slots of a generation are live is the set's to say: a tombstoned one is not, nor
+/// one past a segment's end or in no segment. A scan weighs, besides the books it admits,
+/// the live slots it is handed — at the score a full scan gives them — and passes over the
+/// dead ones.
+#[test]
+fn a_set_weighs_the_live_slots_it_is_handed_besides_the_books_it_admits() {
+    let work = TempDir::new("set_scan_with");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.segments().len(), 2);
+    let slot_of = |seg: u16, wanted: u64| -> SlotRef {
+        let segment = &set.segments()[seg as usize];
+        let slot = (0..segment.slot_count())
+            .find(|slot| segment.key(*slot) == key(wanted))
+            .expect("the segment holds the key");
+        SlotRef {
+            seg,
+            slot,
+            key: key(wanted),
+        }
+    };
+    // Key 3 was tombstoned by the delta; key 1 is live in the base, key 8 in the delta.
+    let (gone, one, eight) = (slot_of(0, 3), slot_of(0, 1), slot_of(1, 8));
+    assert!(!set.is_live(gone.seg, gone.slot));
+    assert!(set.is_live(one.seg, one.slot) && set.is_live(eight.seg, eight.slot));
+    assert!(!set.is_live(0, set.segments()[0].slot_count()));
+    assert!(!set.is_live(2, 0));
+
+    let query = Random(11).unit(DIM);
+    let scan = |books: Option<&BookSet>, also: &[SlotRef]| {
+        set.scan_with(
+            &query,
+            &ScanRequest {
+                top_k: 100,
+                books,
+                threads: 1,
+            },
+            also,
+            &CancellationToken::new(),
+        )
+        .unwrap()
+    };
+    let everything = scan(None, &[]);
+    let books: BookSet = ["id:3"].into_iter().collect();
+    let filtered = scan(Some(&books), &[]);
+    let merged = scan(Some(&books), &[gone, one]);
+    assert_eq!(
+        merged
+            .iter()
+            .filter(|hit| hit.key != key(1))
+            .cloned()
+            .collect::<Vec<_>>(),
+        filtered,
+        "the admitted books' hits are as the filtered scan's, and the tombstoned key is not one"
+    );
+    let weighed = merged.iter().find(|hit| hit.key == key(1)).unwrap();
+    let full = everything.iter().find(|hit| hit.key == key(1)).unwrap();
+    assert_eq!(weighed.score.to_bits(), full.score.to_bits());
+    assert_eq!(weighed.records, full.records);
+    assert_eq!(
+        scan(Some(&books), &[]),
+        set.scan(
+            &query,
+            &ScanRequest {
+                top_k: 100,
+                books: Some(&books),
+                threads: 1
+            },
+            &CancellationToken::new()
+        )
+        .unwrap()
+    );
 }
 
 /// v30 and one more line, a new key: what installs after v30 in the tests below.

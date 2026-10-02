@@ -11,6 +11,11 @@
 //! * **a lazy key**: the 16-byte key is read only for a vector good enough to enter the
 //!   top `k`, where it breaks ties.
 //!
+//! A filtered scan can also weigh slots its filter does not reach, named one by one
+//! ([`SegmentSet::scan_with`](crate::semantic::segment_set::SegmentSet::scan_with)): each
+//! is scored as the scan scores, and the best `k` of them are merged into its hits — beside
+//! them, never in their place.
+//!
 //! The ranking is a total order — score, then key, then where the slot is — computed in
 //! integers (the `kernel` module), so the same vectors give the same hits in the same order on
 //! every CPU, at any thread count and in any segment layout. A cancelled token is noticed at
@@ -21,7 +26,7 @@ use crate::errors::VectorStoreError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::kernel::{dot_f32, ordered, select, unordered, DotKernel, PreparedQuery};
 use crate::semantic::oxv::reader::Segment;
-use crate::semantic::resolve::{BookSet, RecordRef, VectorHit, MAX_RECORDS_PER_HIT};
+use crate::semantic::resolve::{BookSet, RecordRef, SlotRef, VectorHit, MAX_RECORDS_PER_HIT};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::AtomicUsize;
@@ -153,12 +158,39 @@ pub(crate) fn scan(
     scan_reporting(set, query, request, cancel, None)
 }
 
+/// [`scan`], and the slots of `also` besides: each that is live and holds its key, scored
+/// as the scan scores. Of those whose key the scan did not return, the best
+/// `request.top_k` are merged into its hits in the scan's order; none of the scan's hits
+/// gives way to them, so the result holds up to twice `request.top_k` hits. A slot past
+/// its segment's end, deleted, or holding another key is passed over. With `also` empty,
+/// exactly [`scan`].
+pub(crate) fn scan_with(
+    set: &ScanSet<'_>,
+    query: &PreparedQuery,
+    request: &ScanRequest<'_>,
+    also: &[SlotRef],
+    cancel: &CancellationToken,
+) -> Result<Vec<VectorHit>, VectorStoreError> {
+    scan_all(set, query, request, also, cancel, None)
+}
+
 /// [`scan`], with each thread's progress — slots visited at its last checkpoint — written
 /// to `progress[thread]` when given. What the cross-thread cancellation test watches.
 pub(crate) fn scan_reporting(
     set: &ScanSet<'_>,
     query: &PreparedQuery,
     request: &ScanRequest<'_>,
+    cancel: &CancellationToken,
+    progress: Option<&[AtomicUsize]>,
+) -> Result<Vec<VectorHit>, VectorStoreError> {
+    scan_all(set, query, request, &[], cancel, progress)
+}
+
+fn scan_all(
+    set: &ScanSet<'_>,
+    query: &PreparedQuery,
+    request: &ScanRequest<'_>,
+    also: &[SlotRef],
     cancel: &CancellationToken,
     progress: Option<&[AtomicUsize]>,
 ) -> Result<Vec<VectorHit>, VectorStoreError> {
@@ -193,6 +225,7 @@ pub(crate) fn scan_reporting(
                 kernel,
             };
             let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, found, also, request.top_k, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
         PreparedQuery::Int8PerVector { q16, inv_scale } => {
@@ -203,11 +236,13 @@ pub(crate) fn scan_reporting(
                 kernel,
             };
             let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, found, also, request.top_k, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
         PreparedQuery::Float { q } => {
             let scorer = Float { q };
             let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, found, also, request.top_k, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
     }
@@ -433,6 +468,56 @@ fn run_shares(
     all.retain(|candidate| seen.insert(candidate.key));
     all.truncate(k);
     Ok(all)
+}
+
+/// `found` — the scan's winners, best first — with the slots of `also` it did not return
+/// merged in: each live slot holding its key, ranked as the scan ranks, the best `k` of them
+/// in the scan's order, once per key. Checked for cancellation as the scan is.
+fn merge_also(
+    set: &ScanSet<'_>,
+    scorer: &impl Scorer,
+    mut found: Vec<Candidate>,
+    also: &[SlotRef],
+    k: usize,
+    cancel: &CancellationToken,
+) -> Result<Vec<Candidate>, VectorStoreError> {
+    if also.is_empty() {
+        return Ok(found);
+    }
+    let returned: HashSet<ChunkKey> = found.iter().map(|candidate| candidate.key).collect();
+    let mut weighed = Vec::new();
+    for (visited, wanted) in also.iter().enumerate() {
+        if visited.is_multiple_of(SCAN_CHECK_INTERVAL) {
+            cancel.scan_checkpoint(visited)?;
+        }
+        let Some(segment) = set.segments.get(wanted.seg as usize) else {
+            continue;
+        };
+        if wanted.slot >= segment.segment.slot_count()
+            || segment.is_deleted(wanted.slot)
+            || returned.contains(&wanted.key)
+            || segment.segment.key(wanted.slot) != wanted.key
+        {
+            continue;
+        }
+        let scale = segment.segment.vector_scale(wanted.slot).unwrap_or(1.0);
+        weighed.push(Candidate {
+            rank: scorer.rank(segment.segment.vector(wanted.slot), scale),
+            key: wanted.key,
+            seg: wanted.seg,
+            slot: wanted.slot,
+        });
+    }
+    weighed.sort_unstable_by(Candidate::best_first);
+    // A key the set holds live twice, or named twice: the better-ranked copy stands, as
+    // in the scan.
+    let mut seen = HashSet::with_capacity(weighed.len());
+    weighed.retain(|candidate| seen.insert(candidate.key));
+    weighed.truncate(k);
+    found.extend(weighed);
+    // A total order, so the merge is the same whatever order either list came in.
+    found.sort_unstable_by(Candidate::best_first);
+    Ok(found)
 }
 
 fn scan_share(
