@@ -11,8 +11,9 @@
 > לדעת לפני קריאת המפה: האינדקס הרשמי נבנה מראש ונפתח read-only, ולכן API האינדוקס
 > שמתואר כאן הוא **פיגום אב-טיפוס** ולא המסלול של האפליקציה; מסלול האפליקציה הוא
 > [`OfficialSemanticIndex`](../src/semantic/official_index.rs), שאין עליו אינדוקס
-> לקרוא; ופורמט ה-payload הוא snapshot לדיסק עם סריקה מלאה — לא ANN, לא mmap ולא
-> הספרייה `zvec`.
+> לקרוא; והווקטורים הרשמיים הם סט של segments בפורמט `.oxv` — int8, ממופים לזיכרון,
+> ממוענים לפי הטקסט שהוטמע — שנסרקים במלואם בחשבון שלמים מדויק, בלי ANN
+> ([`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md)).
 
 ---
 
@@ -24,18 +25,19 @@ otzaria-semantic-search/
 ├── README.md                                # מסמך ראשי ורישיון
 ├── docs/
 │   ├── PRODUCT_CONTRACT.md                 # חוזה המוצר — גובר על כל מסמך אחר
+│   ├── ARTIFACT_CONTRACT.md                # שחרור הווקטורים, פורמט ה-segment, הסט על המכשיר, הזהות
 │   ├── MODEL_DISTRIBUTION.md               # כיצד המודל מגיע למכשיר
 │   ├── CODE_MAP.md                         # מפת קוד זו
 │   └── DEVELOPMENT.md                      # מדריך ארכיטקטורה ופיתוח מקיף
 ├── .github/workflows/
 │   └── ci.yml                              # CI/CD אוטומטי (מטריצת OS, backend inference, שער golden)
 ├── benches/
-│   └── vector_search.rs                    # מדידת latency של VectorStore::search
+│   └── vector_search.rs                    # מדידת latency: VectorStore::search, ועם --store oxv סריקת segment
 ├── tests/
 │   ├── artifact_contract.rs                # זהות הארטיפקט ושער ההתקנה, דרך ה-API הציבורי בלבד
-│   ├── artifact_builder.rs                 # שער הקבלה של S4b: build ב-CLI, בנייה משוחזרת, ומה שנבנה נפתח ועונה
-│   ├── artifact_packer.rs                  # שער הקבלה של S4a: pack/validate ב-CLI, ומה שנארז נפתח ועונה
-│   ├── official_runtime.rs                 # התקנה→פתיחה→שאילתה על ארטיפקט (דורש --features mock-embedding)
+│   ├── artifact_builder.rs                 # שער הקבלה של S4b: build ב-CLI, בנייה משוחזרת, ומה שנבנה מותקן ועונה
+│   ├── official_runtime.rs                 # בנייה→התקנה→פתיחה→שאילתה דרך resolver (דורש --features mock-embedding)
+│   ├── vector_set_scale.rs                 # הסט בקנה מידה של הספרייה (#[ignore], OTZARIA_SCALE_N)
 │   ├── hybrid_integration_test.rs          # בדיקות מקצה לקצה (דורש --features mock-embedding)
 │   └── production_backend_gate.rs          # מאמת שבנייה רגילה מסרבת לייצר embeddings
 └── src/
@@ -54,9 +56,9 @@ otzaria-semantic-search/
     ├── distribution/
     │   ├── package.rs                      # manifest של חבילה + SHA-256 לכל payload
     │   ├── importer.rs                     # התקנה בשני renames, עם שחזור מהפרעה
-    │   ├── builder.rs                      # צד ה-build: קורפוס + מודל → מתכון מוחל, מוטמע ונארז
+    │   ├── builder.rs                      # צד ה-build: קורפוס + מודל → base segment, החבילה ו-release.json
     │   ├── corpus.rs                       # הפורט אל האינדקס הלקסיקלי, ותמלול שלו לשני קבצים
-    │   └── packer.rs                       # צד ה-build: וקטורים מוכנים → ארטיפקט מאומת
+    │   └── shard.rs                        # export_plan / embed_shard / verify_shards: בנייה על מכונות נפרדות
     ├── hybrid/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Hybrid
     │   ├── coordinator.rs                  # מתאם החיפוש ההיברידי הראשי
@@ -68,7 +70,8 @@ otzaria-semantic-search/
     │   └── cache.rs                        # cache תוצאות עם פסילה לפי generation
     ├── semantic/
     │   ├── mod.rs                          # ייצוא רכיבי ה-Semantic
-    │   ├── chunker.rs                      # Anchored Chunking & SHA256 IDs
+    │   ├── chunk_key.rs                    # ChunkKey: SHA-256 של הטקסט המוטמע, 16 בתים — הכתובת של וקטור
+    │   ├── chunker.rs                      # Anchored Chunking; embedded_text ו-chunk_keys על חלון שורות
     │   ├── recipe.rs                       # גרסאות המתכון: chunking, טקסט (כולל תחיליות תפקיד), נרמול
     │   ├── embedding.rs                    # בדיקות התצורה, batching ונרמול
     │   ├── model_package.rs                # נתיב המודל: גרף ONNX או דחייה; החבילה: אימות ו-checksum
@@ -76,11 +79,13 @@ otzaria-semantic-search/
     │   ├── backend.rs                      # חוזה ה-backend ובחירתו
     │   ├── onnx_backend.rs                 # inference אמיתי ל-ONNX (feature `onnx-backend`) — ה-backend היחיד
     │   ├── engine.rs                       # מתאם צד ה-build: chunk → embed → כתיבה
-    │   ├── official_index.rs               # מסלול האפליקציה: פתיחת ארטיפקט מאומת, read-only
+    │   ├── official_index.rs               # מסלול האפליקציה: סט מותקן + מודל, read-only; מחזיר hits
+    │   ├── resolve.rs                      # VectorHit ו-CandidateResolver: הפורט אל השורות החיות של המארח
+    │   ├── oxv/                            # פורמט ה-segment: format, codec, writer, reader, kernel, scan
+    │   ├── segment_set/                    # הסט על המכשיר: install, compact, recover, GC, scrub
     │   ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
-    │   ├── store.rs                        # Vector DB בזיכרון (Pre-normalized + Heap)
-    │   ├── store_backend.rs                # שני חוזים: הקורא שהריצה מקבלת, והכותב של builder
-    │   ├── zevc_store.rs                   # פורמט ה-payload: פותח כותב ופותח read-only; סריקה מלאה, לא ANN
+    │   ├── store.rs                        # Vector DB בזיכרון למסלול הפיתוח (Pre-normalized + Heap)
+    │   ├── store_backend.rs                # שני חוזים למסלול הפיתוח: חיפוש, ומוטציות של אינדוקס
     │   ├── versioning.rs                   # זהות הארטיפקט ודחייה מפורשת לפי שדה
     │   └── types.rs                        # הגדרות טיפוסים ומבני נתונים
     └── telemetry/
@@ -109,8 +114,12 @@ otzaria-semantic-search/
   - `ArtifactError` — דחיית ארטיפקט רשמי: גרסת metadata זרה, זהות חסרה, אי-התאמת זהות
     (עם רשימת השדות), digest שאינו זה שפורסם, payload חסר/לא-רגיל/פגום, שם payload לא
     פורטבילי (עם הסיבה), manifest שאינו מסכים עם ה-payload, יעד התקנה פסול, והתקנה
-    שנקטעה ולא הצליחה להשתחזר. כל וריאנט הוא סירוב, לא התדרדרות — וההבחנה ביניהם קיימת
-    כדי שהאפליקציה תוכל להציג „לא מתאים” לעומת „פגום”, שהם שני תיקונים שונים.
+    שנקטעה ולא הצליחה להשתחזר; ובסט וקטורים — `DeltaDoesNotApply { field, reason }`
+    (פער, חפיפה או epoch אחר) ו-`InsufficientSpace { needed, available }`. כל וריאנט הוא
+    סירוב, לא התדרדרות — וההבחנה ביניהם קיימת כדי שהאפליקציה תוכל להציג „לא מתאים”
+    לעומת „פגום”, שהם שני תיקונים שונים.
+  - `SemanticSearchError::Resolution { reason }` — ה-resolver של המארח לא הצליח לקרוא
+    את האינדקס שלו; `ResolveError::Cancelled` מומר ל-`Cancelled`.
   - `ChunkingError` — שגיאות חלוקת ספר לקטעים.
   - `SemanticSearchError::InvalidRankingParameter` — פרמטר דירוג שהועבר עם חיפוש ואינו
     בטווח (`NaN`, שלילי, מחוץ לתחום), עם שם השדה (`alpha_by_query_type.short`). נדחה לפני
@@ -122,12 +131,13 @@ otzaria-semantic-search/
 * [`src/cancellation.rs`](../src/cancellation.rs)
   - `CancellationToken` — `Arc<AtomicBool>`: `Clone` זול, `Send + Sync`, `cancel()` חד-כיווני
     ו-`is_cancelled()`. חיפוש לכל הקשה: כל שאילתה מלבד האחרונה מתיישנת לפני שהיא מסתיימת,
-    וסריקה מלאה של ארטיפקט בגודל הספרייה אורכת סדר גודל של שנייה.
+    וסריקה מלאה של סט בגודל הספרייה אורכת עשרות מילישניות.
   - נקודות הבדיקה: לפני הכול (לפני שני ה-caches ולפני ה-embedding), אחרי ה-embedding,
     בתוך כל סריקת וקטורים כל `SCAN_CHECK_INTERVAL` (1,024) רשומות, לפני ה-fusion ואחריו.
     1,024 נבחר במדידה: בדיקה היא טעינה אטומית אחת (~ננו-שנייה), רשומה עולה ~180 ns
     ב-256 ממדים ו-~370 ns ב-1,024, ובבנצ'מרק הסריקות נמדדו זהות עם הבדיקות ובלעדיהן.
-    ביטול נקלט תוך 0.2–0.4 ms של סריקה.
+    ביטול נקלט תוך 0.2–0.4 ms של סריקה. בסריקת int8 של segment ‏slot עולה ~19 ns, וכל
+    חוט קולט ביטול תוך כ-20 µs.
   - חיפוש שבוטל אינו נרשם ב-log, אינו מתדרדר לתוצאות לקסיקליות ואינו משאיר דבר: לא
     תוצאה ב-cache, לא embedding ב-cache (שניהם נכתבים רק אחרי נקודת הבדיקה האחרונה) ולא
     רשומת telemetry.
@@ -173,19 +183,29 @@ otzaria-semantic-search/
   - `HybridCoordinator` — מתאם החיפוש הראשי. מריץ חיפוש סמנטי לצד מועמדי BM25, מפעיל ניתוח שאילתא, מיזוג ציונים, קיבוץ, ומבצע Fallback ל-BM25 אם ה-Semantic Engine נכשל.
   - `HybridSearchParams` — פרמטרי חיפוש (גבולות, Offset, Grouping, Filters, Force Mode), ו-`ranking`:
     `RankingProfile` שלם לחיפוש הזה במקום ה-preset, שנבדק ב-`validate()` לפני שמשהו רץ.
-  - `SemanticSide` — איזה אינדקס סמנטי מוגש: `Official` (ארטיפקט מותקן, read-only —
-    מסלול האפליקציה) או `SelfBuilt` (`SemanticEngine`, צד ה-build והאב-טיפוס). הצד
-    הקורא זהה בשניהם, ולכן החיפוש אינו יודע במה הוא מחזיק. כל פעולה בונה עוברת
-    ב-accessor שרק `SelfBuilt` מקיים, ולכן ארטיפקט מותקן נדחה בשם
-    (`ReadOnlyIndex`) — ולא ב-`None`, שמשמעותו „אין אינדקס סמנטי בכלל”.
+  - `SemanticSide` — איזה אינדקס סמנטי מוגש: `Official` (סט וקטורים מותקן, read-only —
+    מסלול האפליקציה) או `SelfBuilt` (`SemanticEngine`, מסלול הפיתוח). `SelfBuilt` מחזיק את
+    ה-metadata של השורות ועונה לבדו; `Official` מחזיר hits — מפתח ורשומות — שה-resolver של
+    המארח קושר לשורות חיות. כל פעולה בונה עוברת ב-accessor שרק `SelfBuilt` מקיים, ולכן סט
+    מותקן נדחה בשם (`ReadOnlyIndex`) — ולא ב-`None`, שמשמעותו „אין אינדקס סמנטי בכלל”.
   - `with_official_index()` — הבנייה של מסלול האפליקציה; `new()` נשאר מסלול ה-build.
   - **שלושת המצבים ממומשים**: `LexicalOnly` אינו נוגע במסלול הסמנטי, `SemanticOnly`
     מזניח את מועמדי BM25 שהועברו, ו-`Hybrid` מתדרדר ל-`LexicalOnly` כשהסמנטי נכשל.
     ה-`alpha` נקבע לפי המצב שרץ בפועל (1.0 / 0.0 / דינמי), כדי שציון ממנוע אחד
     לא יוקטן במשקל של המנוע החסר.
   - כל התדרדרות נראית: `search_mode` הוא המצב שרץ, `fallback_reason` הוא הסיבה.
-  - `search_cancellable()` — מחזיר `Cancelled` מכל מצב, ולעולם אינו מתדרדר ל-BM25:
-    לתוצאות הלקסיקליות אין מי שממתין. `search()` הוא אותה קריאה עם טוקן שאיש אינו מבטל.
+  - `search_cancellable(query, lexical, params, resolver, cancel)` — מחזיר `Cancelled` מכל
+    מצב, ולעולם אינו מתדרדר ל-BM25: לתוצאות הלקסיקליות אין מי שממתין. `search()` הוא אותה
+    קריאה עם `NoResolver` וטוקן שאיש אינו מבטל. בצד `Official`: `admissible_books` →
+    סריקה בספרים האלה → checkpoint → `resolve` → `SemanticCandidate` שכל id, סעיף,
+    `line_hash` ו-facet בו של האינדקס החי. resolver שנכשל הוא כשל סמנטי ככל כשל: החיפוש
+    נשאר עם התוצאות הלקסיקליות ו-`fallback_reason`.
+  - מפתח מטמון השאילתות כולל את `resolver.generation()` ואת הדור של הסט, כי לחיפוש
+    `SemanticOnly` אין קלט לקסיקלי שישתנה עם commit לאינדקס.
+  - המיזוג הוא על `(file_path, line_id)` ולא על ה-id לבדו: אינדקס שעודכן ספר אחר ספר
+    יכול לתת לשני ספרים אותו טווח ids.
+  - `reload_semantic_vectors()` — פותח את הדור ש-`CURRENT` מונה, עם אותו מודל, ומנקה את
+    מטמון השאילתות; `vector_set_info()` מדווח על הסט.
   - חלון המועמדים הסמנטיים חסום ב-`MAX_SEMANTIC_CANDIDATES` (מדווח ב-log כשנחתך).
   - `index_books()` — נועל את ה-engine **פר-ספר** כדי שחיפושים לא ייחסמו לכל אורך
     האינדוקס, ושומר את ה-manifest פעם אחת בסוף: כל שמירה מסריאלזת את כל הרשומות,
@@ -371,8 +391,8 @@ otzaria-semantic-search/
   לצד הגרף — המקום הראשון שהוגדר מכריע, ונתיב שאינו נפתח נדחה ואינו מדולג
   (`resolve_runtime_path`).
 
-* [`src/semantic/store.rs`](../src/semantic/store.rs) — **ה-store שברירת המחדל של
-  המנוע פותחת** (אב-טיפוס ובדיקות; מסלול הריצה פותח ארטיפקט).
+* [`src/semantic/store.rs`](../src/semantic/store.rs) — **ה-store שהמנוע פותח** (מסלול
+  הפיתוח ובדיקות; מסלול האפליקציה פותח סט מותקן).
   - `VectorStore` & `VectorStoreConfig` — מנגנון האחסון והשליפה הוקטורי.
   - **Pre-normalization**: נורמליזציה בוקטורים בעת ההכנסה המאפשרת חישוב דמיון קוסינוס בעזרת Dot Product בלבד ($O(dim)$).
   - **BinaryHeap Top-K**: שליפת $k$ התוצאות המובילות בסיבוכיות $O(N \log k)$ ללא שכפול מטא-דאטה של כל המאגר. שוויון ציונים נשבר לפי `semantic_id` — בלי זה `HashMap` עם סדר איטרציה מקרי היה מחזיר top-k שונה בכל ריצה.
@@ -387,56 +407,76 @@ otzaria-semantic-search/
     `book_vector_count`.
   - `VectorStoreBackend: VectorSearchBackend` — מוסיף `insert_batch`,
     `remove_by_book`, `clear` ו-`commit`. זה מה ש-builder מקבל.
-  - **הפיצול הוא החוזה, לא נוחות:** האפליקציה פותחת ארטיפקט שנבנה במכונה אחרת ואסור
-    לה לכתוב אליו, ולכן היא מחזיקה טיפוס שאין עליו insert לקרוא. זה מונע כתיבה
-    בקומפילציה, ולא בכלל שמישהו צריך לזכור.
+  - **הפיצול הוא החוזה, לא נוחות:** חיפוש מקבל טיפוס שאין עליו insert לקרוא, ולכן
+    read-only הוא תכונה של הטיפוס ולא כלל שמישהו צריך לזכור. מסלול האפליקציה אינו עובר
+    באף אחד מהשניים: הוא פותח סט מותקן, שדבר במכשיר אינו כותב אליו.
   - `SemanticEngine` תלוי בצד הכותב כ-`Box<dyn VectorStoreBackend>`, ולכן בחירת
     ה-backend היא של הקורא (`SemanticEngine::with_store`) ולא קבועה במודול.
 
-* [`src/semantic/zevc_store.rs`](../src/semantic/zevc_store.rs)
-  - **כתיבה דטרמיניסטית:** הרשומות ממוינות לפי `semantic_id` לפני הכתיבה, ו-`book_index.json`
-    הוא `BTreeMap` עם רשימות ממוינות. זו אינה קפדנות: ה-checksums של ה-payload נכנסים
-    ל-`IndexPackage::digest()`, וכתיבה בסדר `HashMap` נתנה לשתי בניות של אותם וקטורים שני
-    digests שונים — כלומר „אותה בנייה מפיקה אותו digest” היה לא נכון מכל סיבה חוץ מזו
-    שתועדה (`created_at`).
-  - הפורמט שבו payload של ארטיפקט נכתב: `vectors.bin` (רשומות `f32` little-endian),
-    `metadata.jsonl` (אובייקט לרשומה, באותו סדר, עם SHA-256 למטא-דאטה ולווקטור)
-    ו-`book_index.json` (כותרת + ספר→ids). השמות חשופים כ-`SNAPSHOT_FILENAMES`, כי
-    הם שמות ה-payload שה-packer חייב לכתוב.
-  - `ZevcStore` — הפותח הכותב, לצד ה-build. `commit()` הוא נקודת השמירה.
-  - `ReadOnlyZevcStore` — התצוגה של מסלול הריצה. ה־constructor שלו מקבל **`VerifiedPackage`
-    ולא נתיב**, וגוזר ממנו את התיקייה, את רוחב הרשומה ואת ה־SHA-256 של כל קובץ: חתימה
-    שמקבלת נתיב ומפת hashes הייתה מאפשרת גם לקוד פנימי עתידי לפתוח תיקייה שאיש לא אימת, או
-    לצרף hashes של חבילה אחרת. מקיים `VectorSearchBackend` בלבד,
-    והרשומות אינן משתנות אחרי הפתיחה — ולכן אין גם lock במסלול השאילתה. שם ה-collection
-    **מאומץ** מה-payload ולא נדרש: הוא אינו חלק מזהות הארטיפקט, ואין לקורא מול מה
-    להשוות אותו.
-  - שניהם קוראים דרך פונקציה אחת, כדי שהבדיקות של הקורא לא ייסחפו ביניהן: גרסת
-    פורמט, ממד, SHA-256 **לכל רשומה** (זה מה שתופס עריכה באותו אורך), אורך מדויק בלי
-    בייטים עודפים, `semantic_id` שאינו כפול, וקטור שיש לו כיוון, ואינדקס הספרים מול
-    המטא-דאטה.
-  - **מה זה לא:** לא הספרייה `zvec`, לא ANN, לא mmap. הפתיחה קוראת כל בייט, מגבבת כל
-    רשומה וטוענת את **כל** הווקטורים ל-`HashMap`; החיפוש סורק את כולם, `O(N·D)`. זו
-    העלות של פורמט בלי אינדקס ובלי גישה עצלה — תכונה של ה-backend, לא של חוזה
-    הארטיפקט — וזאת המדידה של S2b.
+* [`src/semantic/chunk_key.rs`](../src/semantic/chunk_key.rs)
+  - `ChunkKey` — 16 הבתים הראשונים של SHA-256 של הטקסט שהמודל קיבל: הכתובת של וקטור.
+    `to_hex()` שווה ל-`compute_chunk_hash`; `column_value()` הוא 8 הבתים הראשונים, big-endian
+    — מה שעמודת `chunkKey` של האינדקס מחזיקה (0 = שורה שאינה מוטמעת). `KEY_VERSION` 1.
+  - `LineRef` — טקסט השורה וסעיפה; רק *שוויון* סעיפים משנה. `Chunker::embedded_text`
+    ו-`Chunker::chunk_keys` עובדים על חלון שורות, עם ליבה אחת המשותפת ל-`chunk_book`, כדי
+    שהאפליקציה תחשב מפתח של שורה מחמש שורות ולא מהספר כולו.
+
+* [`src/semantic/oxv/`](../src/semantic/oxv/mod.rs) — **פורמט ה-segment.** הפריסה, שדה
+  אחר שדה: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.
+  - `format` — ה-header של 4,096 בתים, ספריית ה-sections, הרשומות בגודל קבוע. הכותב
+    והקורא עוברים דרכו, ולכן אינם יכולים לחלוק על offset.
+  - `codec` — `f32` ו-`i8-sym-dim` (סקלה לכל ממד, `round_half_away`, clamp ל-±127);
+    `calibrate_i8_sym_dim` לוקח קוונטיל מדויק בכלל lower.
+  - `writer` — `SegmentBuilder`: הטבלאות קודם, ואז `VectorSink` שמקבל וקטורים בסדר
+    ה-slots, ב-buffer, עם CRC לכל block — כך שבנייה בקנה מידה של הספרייה זורמת בזיכרון
+    חסום. `segment_id` דטרמיניסטי.
+  - `reader` — `Segment::open` ממפה (memmap2), בודק את ה-header, את ה-CRC של כל section
+    קטן ואת העקביות המבנית; `verify_blocks` קורא כל block.
+  - `kernel` — מכפלה סקלרית בשלמים: scalar, AVX2 ו-NEON, זהות ביט אחר ביט; שאילתה מוכנה
+    כך שאף סכום ביניים אינו גולש. ה-`unsafe` היחיד הוא ה-intrinsics, וכל ליבה נבדקת מול
+    ה-scalar.
+  - `scan` — `scan_segments`: כל slot חי מדורג, על כמה חוטים, תחת מסנן ספרים, `k`
+    הטובים נשמרים בסדר מלא; כפילות מפתח נספרת פעם אחת. `default_scan_threads` — חצי
+    מהליבות, עד שמונה.
+
+* [`src/semantic/segment_set/`](../src/semantic/segment_set/mod.rs) — **הסט על המכשיר.**
+  - `SegmentSet::open` — שחזור כשה-lock פנוי, ואז הדור ש-`CURRENT` מונה, או `PREVIOUS`;
+    `scan`, `info`, `generation`, `identity`.
+  - `install_package` — segment ו-manifest של שחרור, לפי §5.3 של החוזה: אימות, staging,
+    העברה, delta שנפתר במעבר אחד על המפתחות הישנים, דור חדש, החלפת מצביעים, אשפה.
+    `ApplyReport` מדווח, ו-`already_applied` הוא delta שהסט כבר בלע.
+  - `compact` — `CompactionPolicy` מחליטה, `LiveKeySource` מעגן מחדש; `CompactionReport`.
+  - `info(dir)` ו-`scrub(dir)` — בלי מודל: מה מותקן, וקריאת כל block.
+  - `ReleaseManifest` — ה-manifest שמתפרסם לצד segment, ו-`package()` — החבילה שהוא מתאר.
+  - `space` — כמה מקום נשאר: `statvfs` ו-`GetDiskFreeSpaceExW`, שלוש קריאות `unsafe`
+    קטנות במקום תלות.
+
+* [`src/semantic/resolve.rs`](../src/semantic/resolve.rs) — **הפורט אל השורות החיות.**
+  - `VectorHit` (ציון, מפתח, רשומות, segment ו-slot), `RecordRef` (ספר ו-hint) ו-`BookSet`.
+  - `CandidateResolver` — מה שהמארח מממש מעל האינדקס שפתח: `generation`,
+    `admissible_books(filters)` ו-`resolve(hits, filters, cancel)` → `ResolvedLine`.
+    `NoResolver` — חיפוש בלי אינדקס חי מאחוריו; סט רשמי דרכו אינו תורם דבר, ואומר למה.
+  - `LiveKeySource` — מה שדחיסה שואלת: איזה מפתח מחזיקה כל שורה חיה של ספר.
+  - `ResolveError` — `Cancelled`, או `Index { reason }`.
 
 * [`src/semantic/versioning.rs`](../src/semantic/versioning.rs)
-  - `IndexVersion` — זהות הארטיפקט בשלוש קבוצות: `CorpusIdentity` (digest של
-    הספרייה, גרסת קטלוג, `tantivy_schema_version`, `document_id_scheme_version`),
-    `ModelIdentity` (`model_id`, **`model_checksum`**, quantization, backend, ממד,
-    pooling, `max_tokens`, `embedding_text_version`, normalization, chunking) ו-
-    `StoreIdentity` (`backend_id`, `store_format_version`, `vector_precision`).
-    החוזה המלא: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md).
+  - `IndexVersion` — זהות הסט בשלוש קבוצות, 14 שדות: `TextIdentity`
+    (`line_text_version`, `key_version`), `ModelIdentity` — **משפחה**, לא קובץ:
+    `family_id`, `tokenizer_checksum`, ממד, pooling, `max_tokens`,
+    `embedding_text_version`, normalization, `chunking_identity`, ו-`query_packages` —
+    ו-`StoreIdentity` (`backend_id`, `store_format_version`, `vector_precision`).
+    החוזה המלא: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §4.
+  - `query_packages` מושווה ב**שייכות**: ההתקנה מצהירה על החבילה האחת שטענה, וה-checksum
+    שלה חייב להיות ברשימה של הסט. כל השאר בשוויון.
+  - `VectorProvenance` — החבילה שהטמיעה את הקטעים וה-worker שהריץ אותה: נרשם ב-manifest,
+    נכנס ל-digest של החבילה, ואינו מושווה לדבר.
+  - `identity_digest()` — SHA-256 קנוני מעל כל השדות; 32 הבתים שבהם segment, סט
+    ו-manifest אומרים „אותה זהות”.
   - `IdentityField::ALL` — רשימה אחת שההשוואה, ה-digest והודעות הדחייה הולכות לפיה.
     **הכיסוי אינו מובטח על ידי הטיפוס** — `IndexVersion` הוא struct רגיל — אלא על ידי שתי
     בדיקות שנגזרות מה-JSON המסוריאלי: `every_serialized_identity_field_is_comparable`
     (שדה שנשמר ואינו מושווה) ו-`every_serialized_identity_field_is_refused_when_left_unfilled`
     (שדה שוולידציית השלמות שכחה). הוספת שדה בלי וריאנט מפילה את שתיהן.
-  - `library_version` **קטלני כמו כל שדה אחר**, לא „אבחון בלבד”: הערך הצפוי בא מאותו
-    ארטיפקט Tantivy שממנו בא ה-`corpus_id`, ולכן אי-התאמה היא תקלה בצינור ה-build.
-  - `document_id_scheme_version` — גרסה 1 היא `((catalogue_order + 1) << 32) + (ordinal + 1)`,
-    בדיוק כמו `otzaria_search_engine`. הנוסחה מדויקת בכוונה: ה-builder ב-S4 צריך לשחזר
-    אותה, לא לקרב אותה.
   - `mismatches_against()` / `verify_matches()` — **כל** ההבדלים ברשימה טיפוסית
     (`IdentityMismatch`), לא הראשון ולא `bool`: דחייה שהצטמקה ל-`false` היא מה
     שחוזה המוצר קורא לו ניחוש.
@@ -444,7 +484,7 @@ otzaria-semantic-search/
     בתוך ערך זהות — נדחים **לפני** ההשוואה, כי שתי זהויות שלא מולאו משוות שוות זו לזו.
     תו בקרה נדחה גם כדי שהטקסט הקנוני שמאחורי ה-digest יישאר חד-משמעי.
   - כל שדה כאן קטלני: אין „אי-תאימות שדורשת רק chunking מחדש” כמו ב-manifest המקומי,
-    כי במכשיר אין מה לבנות מחדש.
+    כי במכשיר אין מה לבנות מחדש — רק שחרור אחר להוריד.
 
 * [`src/semantic/embedding_cache.rs`](../src/semantic/embedding_cache.rs)
   - `EmbeddingCache` — cache בגודל חסום לווקטורים של טקסטים שהוטמעו, עם החלפה
@@ -476,12 +516,11 @@ otzaria-semantic-search/
   - `SemanticEngine` & `SemanticConfig` — מנוע **צד ה-build**: מאגד את ה-Chunker,
     ה-Runtime, store כותב וה-Manifest. מסלול האפליקציה הוא `official_index.rs`. ה-API
     של האינדוקס שלו (`index_books`) הוא **פיגום אב-טיפוס**: וקטורי הספרייה נבנים רק
-    במכונת ה-build (`build`, `embed-shard`), והאפליקציה פותחת ארטיפקט מוכן read-only דרך
+    במכונת ה-build (`build`, `embed-shard`), והאפליקציה פותחת סט מותקן read-only דרך
     `OfficialSemanticIndex` ומטמיעה רק את השאילתה.
-  - `with_store()` — פתיחה מעל backend שהקורא מספק. זה מה שהופך ריצת אינדוקס למשהו
-    שאפשר לארוז ממנו ארטיפקט: עם store מתמיד הווקטורים שורדים restart. ה-manifest
-    רושם את ה-backend שנפתח **בפועל**, ולכן פתיחה מחדש עם backend אחר היא אי-תאימות
-    מדווחת ולא תשובה מ-store ריק.
+  - `with_store()` — פתיחה מעל backend שהקורא מספק. ה-manifest רושם את ה-backend שנפתח
+    **בפועל**, ולכן פתיחה מחדש עם backend אחר היא אי-תאימות מדווחת ולא תשובה מ-store
+    ריק. ה-backend היחיד שיש כיום הוא ה-`VectorStore` שבזיכרון.
   - `SemanticConfig::validate()` — פוסל קונפיגורציה שלא תעבוד, ובראשה אי-התאמה בין
     `embedding_dim` ל-`store.embedding_dim` (שקודם התגלתה רק באמצע האינדוקס).
   - `open()` — מפייס את ה-manifest מול הקונפיגורציה: שימוש חוזר, גריעת רשומות
@@ -500,27 +539,21 @@ otzaria-semantic-search/
 
 * [`src/semantic/official_index.rs`](../src/semantic/official_index.rs) —
   **מסלול האפליקציה.**
-  - `OfficialSemanticIndex::open()` — הצרכן של `VerifiedPackage`. הסדר כפוי ולא נבחר:
-    recovery של התקנה שנקטעה → טעינת המודל → אימות → פתיחת ה-payload **מהטוקן**.
-    המודל קודם לאימות מפני ש-`model_checksum` ו-`embedding_backend` הם שני שדות זהות
-    שאף ארטיפקט אינו יכול לספק; לכן אי-התאמה עולה טעינת מודל אחת, וההשוואה נשארת
-    במקום אחד.
-  - הזהות מורכבת משלושה מקורות שכל אחד יודע חלק ממנה: **corpus** מ-Tantivy שהקורא
-    פתח, **model** מהקובץ הנטען + המתכון שה-build מממש (`LocalModel`), ו-**store**
-    ממה ש-build הזה יודע לקרוא (`readable_store_identity`). ה-crate אינו ממציא אף
-    אחד מהם.
-  - `verify_counts_against_payload()` — הבדיקה שרק קורא יכול לעשות: `vector_count`
-    הוא מספר הרשומות, `book_count` מספר ה-`source_book_key` הנפרדים. זו ההגדרה
-    שה-packer (S4a) חייב לעמוד בה.
-  - `search()` / `status()` — `status` מדווח `vectors_persisted = true` ו-
-    `needs_full_reindex = None`, ולא כטענה ריקה: ארטיפקט הוא או הנכון או נדחה בפתיחה,
-    ואין במכשיר מה לבנות מחדש.
-  - `LocalModel` — מה שההתקנה **מצהירה**: נתיב, `model_id`, quantization, ממד,
-    pooling, `max_tokens`, ושלוש גרסאות המתכון. הקורא אינו גוזר את השלוש האחרונות —
-    שאילתה אינה עוברת chunking — אבל הן מושוות, כי ארטיפקט שנבנה ממתכון אחר הוא
-    ארטיפקט אחר, והתוצאה תהיה סבירה למראה ושגויה.
-  - **הכתיבה היחידה שיש כאן** היא recovery של ההתקנה: rename של תיקיות שה-importer
-    השאיר, לא נגיעה ב-payload, ובמצב נקי — כלום. `recovery()` מדווח מה נמצא.
+  - `OfficialSemanticIndex::open(OfficialIndexConfig { vectors_dir, text, model,
+    deployment, scan_threads })` — בסדר שבו כל דחייה נוקבת במה שלא הסכים: שחזור → הסט →
+    המודל → הזהות. המודל נטען לפני ההשוואה מפני שה-checksum של החבילה ושל ה-tokenizer
+    שלה הם עובדות שרק ה-runtime יודע.
+  - הזהות הצפויה מורכבת משלושה מקורות: **text** מהאינדקס שהמארח פתח, **model**
+    מהמשפחה המוצהרת (`LocalModel::of_family`) עם החבילה שנטענה, ו-**store** ממה ש-build
+    הזה יודע לקרוא (`readable_store_identity()`: `otzaria-oxv`, 2, `i8-sym-dim`).
+  - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
+    `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
+    `book_count`.
+  - `status` מדווח `vectors_persisted = true` ו-`needs_full_reindex = None`, ולא כטענה
+    ריקה: סט הוא או הנכון או נדחה בפתיחה, ואין במכשיר מה לבנות מחדש.
+  - `LocalModel` — מה שההתקנה **מצהירה**: נתיב, `family_id`, quantization של החבילה,
+    ממד, pooling, `max_tokens` ושלוש גרסאות המתכון. הקורא אינו גוזר את השלוש האחרונות —
+    שאילתה אינה עוברת chunking — אבל הן מושוות, כי סט שנבנה ממתכון אחר הוא סט אחר.
 
 ---
 
@@ -549,13 +582,16 @@ otzaria-semantic-search/
 
 * [`src/telemetry/mod.rs`](../src/telemetry/mod.rs)
   - `SearchTelemetry` — רשומה לשאילתה: סוג שאילתה, מצב שרץ, אסטרטגיה, alpha,
-    ספירות מועמדים, cache, latency (כולל embedding ו-fusion בנפרד) ופרופיל.
-  - `TelemetryCollector` / `TelemetrySnapshot` — אגרגציה thread-safe.
+    ספירות מועמדים, cache, latency (כולל embedding ו-fusion בנפרד) ופרופיל; ולסט רשמי —
+    `semantic_hits`, `semantic_unresolved`, `scan_ms` ו-`resolve_ms`.
+  - `TelemetryCollector` / `TelemetrySnapshot` — אגרגציה thread-safe; ה-snapshot סוכם את
+    `semantic_hits` ואת `semantic_unresolved` — כמה וקטורים לא נמצאה להם שורה חיה.
   - **אין כאן רשת.** אלה מונים בזיכרון התהליך; המאגר אינו שולח דבר לשום שרת.
 
 * [`src/distribution/package.rs`](../src/distribution/package.rs)
-  - `PackageManifest` — `metadata_version` + `IndexVersion` + `created_at` + ספירות
-    ספרים/וקטורים + גודל מוצהר. `metadata_version` נקרא ב-probe **לפני** המסמך, כדי
+  - `PackageManifest` — `metadata_version` (3) + `IndexVersion` + תיאור ה-segment (סוג,
+    מהדורות, תג, ספירות) + `VectorProvenance` + `created_at` + גודל מוצהר. זו החבילה
+    שה-`packageDigest` של manifest השחרור מתאר. `metadata_version` נקרא ב-probe **לפני** המסמך, כדי
     שפורמט זר ידווח על גרסתו ולא ייפול על שגיאת פרסור של שדה בודד.
   - `verify_for_install()` / `verify_for_open()` — שני עומקים, כי אחד מהם רץ בכל עלייה
     של האפליקציה. שניהם: גרסת metadata, שלמות הזהות, הזהות מול ההתקנה, ה-digest המפורסם,
@@ -563,8 +599,8 @@ otzaria-semantic-search/
     בתקציב, ובדיקה שאי אפשר להרשות היא בדיקה שמכבים.
   - `VerificationDepth` + `VerifiedPackage::depth()` — הטוקן נושא **מה נבדק בו**. קורא
     שמדווח „מאומת” בלי להסתכל בזה טוען שה-payload גובב כשאולי רק נעשה עליו `stat`.
-    מה שהעומק הרזה אינו תופס: עריכה באותו אורך בדיוק. זו בדיקה של קורא ה-store, שמאמת
-    SHA-256 לכל רשומה — ושתי בדיקות מתעדות את שני צידי הגבול.
+    מה שהעומק הרזה אינו תופס: עריכה באותו אורך בדיוק. בסט וקטורים זה תפקידם של ה-CRCs
+    של ה-segment — בפתיחה ל-sections הקטנים, וב-scrub לכל block.
   - `digest()` — SHA-256 מעל טקסט קנוני (גרסת metadata, כל שדות הזהות בסדר `ALL`, ספירות,
     גודל, ו-checksum+גודל לכל payload). זה **עוגן האמון**: `payloads.json` נוסע בתוך החבילה,
     ולכן payload שהוחלף יחד עם ה-checksum שלו עובר כל בדיקה פנימית. רק digest שפורסם
@@ -572,11 +608,11 @@ otzaria-semantic-search/
     בייטי JSON, כדי שכתיבה מחדש של ה-metadata בהתקנה לא תשנה אותו; `created_at` מוחרג.
   - `ArtifactExpectation` — `with_published_digest` מול `without_published_digest`. אין
     ברירת מחדל שקטה: מי שמוותר על העוגן קורא לפונקציה ששמה אומר זאת.
-  - `VerifiedPackage` — טוקן שאין לו constructor ציבורי אחר, ו-`OfficialSemanticIndex`
-    מקבל אותו במקום נתיב. „לאמת לפני שנוגעים בווקטורים” הוא לכן תכונה של הטיפוסים.
+  - `VerifiedPackage` — טוקן שאין לו constructor ציבורי אחר: מי שמקבל אותו יודע שהחבילה
+    אומתה, ובאיזה עומק.
   - `verify_integrity()` / `walk_payloads()` — מהלך אחד לשני העומקים, כדי שהבדיקה הזולה
     לא תפסיק בשקט לכסות משהו שהיקרה כן מכסה. ספירות אפס נדחות; ההשוואה מול **תוכן**
-    ה-payload נעשית בקורא (`OfficialSemanticIndex`), כי היא דורשת פורמט store.
+    ה-segment נעשית בהתקנה (`install_package`), כי היא דורשת את הפורמט.
   - `IndexPackage::write()` — מסרב לכתוב metadata שהקורא היה דוחה (זהות חסרה, payload
     חסר, גודל שאינו מסתכם). חבילה שנכתבה „בהצלחה” בלי לאמת היא בדיוק זו שתיכשל אצל
     המשתמש.
@@ -588,7 +624,9 @@ otzaria-semantic-search/
   - `write_and_sync()` / `sync_dir()` — כתיבת metadata עם `fsync`, ושטיפת רשומת התיקייה
     (Unix; ב-Windows אין מקבילה ווה מתועד). בלי זה הפסקת חשמל מבטלת כתיבה שדווחה כהצלחה.
 
-* [`src/distribution/importer.rs`](../src/distribution/importer.rs)
+* [`src/distribution/importer.rs`](../src/distribution/importer.rs) — התקנה של **תיקיית
+  חבילה** שלמה בשני renames. סט הווקטורים אינו מותקן כך — הוא נבנה דור אחר דור
+  ב-`segment_set::install_package` — והמודול נשאר לחבילות שהן תיקייה.
   - `IndexImporter::import()` — אימות **מלא של המקור** לפני שמועתק משהו, העתקה ל-staging
     עם `fsync` לכל קובץ, אימות **שוב על ה-staging** (הכתיבה מגַבּבת מחדש את מה שהועתק),
     ואז ההחלפה. חבילה שתידחה אינה יוצרת תיקיית יעד.
@@ -608,121 +646,62 @@ otzaria-semantic-search/
     אינם מצבים שאפשר לייצר בסידור קבצים, ומסלול התאוששות שלא נבדק הוא זה שייכשל כשיידרש.
   - מסרב שהיעד יהיה תיקיית החבילה או צאצא שלה — ייבוא כזה היה מוחק את המקור.
   - **מה שמחוץ להיקף ומתועד:** שתי התקנות במקביל לאותו target. אין lock.
-  - `OfficialSemanticIndex::open` קורא ל-recovery בעצמו, ולכן מסלול הריצה נכון מעצם
-    מבנהו ולא בזכות סדר קריאות שהקורא זוכר.
   - **מה שאינו כאן:** ה-importer אינו חשוף דרך `OtzariaHybridEngine`, ה-FFI או
-    אוצריא. ההתקנה עצמה עדיין אינה מופעלת מהאפליקציה — זה S5 ו-S6.
+    אוצריא.
 
 * [`src/distribution/corpus.rs`](../src/distribution/corpus.rs) — **הפורט אל האינדקס
-  הלקסיקלי.**
-  - `CorpusIndex` — `identity()`, `expected_line_ids(model)` ו-`line(line_id)`. ה-packer
-    מקבל את זה ולא נתיב, כי Tantivy אינו תלות של ה-crate הזה ואסור שיהיה: האינדקס, הסכמה
+  הלקסיקלי, כפי שבנייה קוראת אותו.**
+  - `CorpusIndex` — `identity()`, `expected_line_ids(model)` ו-`line(line_id)`. בנייה
+    מקבלת את זה ולא נתיב, כי Tantivy אינו תלות של ה-crate הזה ואסור שיהיה: האינדקס, הסכמה
     וסכמת ה-IDs חיים ב-`otzaria_search_engine`.
   - `CorpusBooks` — **צורת** הקורפוס: אילו ספרים יש, ומהו סדר השורות בספר. שורה קצרה
-    שואלת הקשר משכנותיה, ולכן החלת מתכון מחייבת את זה, וגישה לשורה בודדת אינה יכולה
-    להביע זאת. הוא אינו עונה דבר על **תוכן** של שורה — כל שדה שנשמר מגיע מ-`line()`
-    ומשם בלבד, ולכן לשני חצאי הפורט אין דרך לתאר ספר אחרת. המחיר: בנייה קוראת כל שורה
-    פעמיים, והקריאה השנייה היא מה שמוכיח שהקורפוס עדיין אומר את מה שהראשונה הניחה.
-  - **שלוש תוצאות, וכולן העיקר:** זהות ה-corpus נקראת מהאינדקס ולא מוקלדת ליד
-    הווקטורים; כל שדה ברשומה נגזר מהקורפוס — ולכן אין תיאור שני של ספר שיכול להיפרד
-    מהראשון; ו-`expected_line_ids(model)` הופך „ארטיפקט מלא” לטענה שאפשר לבדוק. בלי
-    השלישי, וקטור תקין אחד מתוך שישה מיליון היה מפיק „ארטיפקט רשמי” שכל ספירה, checksum
-    וזהות מסכימים איתו.
-  - **ההשוואה דו-כיוונית.** ID חסר הוא ספרייה שחסרה מעצמה; ID עודף הוא ווקטור לשורה
-    שהמתכון אינו מטמיע — ואותו אף בדיקה אחרת אינה רואה, מפני שה-join שואל אם השורה קיימת
-    בקורפוס ושורה שדולגה בגלל אורך קיימת היטב. נוכחותה אומרת שהווקטורים נוצרו במתכון אחר.
-  - **זו אינה „כל השורות באינדקס”:** מתכון ההטמעה מדלג על שורות קצרות מדי, וארטיפקט
-    שדילג עליהן אינו חסר. לכן הקבוצה נענית בידי מי שמממש את המתכון, ולכן היא מקבלת
-    `ModelIdentity` — בלעדיו אפשר היה לחשב את הקבוצה למתכון אחד ולהצהיר בארטיפקט על אחר.
-    ל-`JsonlCorpus` לבדו: ייצאו בדיוק את השורות שאמורות לקבל וקטור. שתי מגבלות מוצהרות
-    שם — הוא מתעלם מה-`model` (תמלול מתעד מתכון שכבר הופעל), ואינו יכול לייצג שורה
-    שקיימת ואינה מוטמעת, מפני שמפה אחת עונה על שתי השאלות. **שתיהן נעקפות ב-S4b** על ידי
-    עטיפה ב-[`PlannedCorpus`](../src/distribution/builder.rs), שגוזר את הקבוצה מהמתכון
-    ומצמיד אותו ל-`chunking_identity` המוצהר.
-  - `CorpusLine` — בדיוק השדות שרשומה נושאת, פחות השלושה שהצד הסמנטי גוזר
-    (`semantic_id`, `source_doc_key`, `chunk_hash`), ועוד ה-`text` שממנו הווקטור נבנה.
-    הטקסט **אינו** נשמר בארטיפקט; הוא מה שמוכיח שהווקטור שייך לשורה הזאת.
+    שואלת הקשר משכנותיה, ולכן החלת מתכון מחייבת את זה. הוא אינו עונה דבר על **תוכן**
+    של שורה — זה של `line()` בלבד. מקום השורה ברשימה הוא ה-hint שה-segment שומר.
+  - **זהות הקורפוס נקראת מהאינדקס** — מתכון השורות שלו, המהדורה והתג — ולא מוקלדת ליד
+    הווקטורים. מה שנשמר על שורה הוא הספר, המקום והמפתח, ולא שום שדה תיאורי: כל שאר
+    התיאור הוא מה שהאינדקס החי אומר כשתוצאה נפתרת.
+  - **זו אינה „כל השורות באינדקס”:** מתכון ההטמעה מדלג על שורות קצרות מדי, וחבילה
+    שדילגה עליהן אינה חסרה. `BuildPlan` גוזר את הקבוצה מהמתכון.
+  - `CorpusLine` — מה שהאינדקס יודע על שורה, ועוד ה-`text` שממנו הווקטור נבנה. הטקסט
+    **אינו** נשמר בחבילה.
   - `JsonlCorpus` — תמלול לשני קבצים (`identity.json` + `lines.jsonl`), שמאפשר להריץ
-    packer ו-builder בלי Tantivy. **תמלול, לא מקור אמת:** הוא אמין בדיוק כמו מי שכתב
-    אותו, וה-join המחייב הוא זה שמימוש מעל אינדקס חי מבצע. הוא גם **מסיק** את סדר השורות
-    בספר מ-`line_id` עולה — נכון תחת `document_id_scheme_version` 1, שבו החצי התחתון הוא
-    מיקום השורה, ולא ניתן לשחזור תחת סכמה אחרת. הוא גם מחזיק כל שורה בזיכרון — כמו ה-store
-    שהוא מזין, וזאת אותה מדידה של S2b.
+    בנייה בלי Tantivy. **תמלול, לא מקור אמת:** הוא אמין בדיוק כמו מי שכתב אותו. הוא
+    **מסיק** את סדר השורות בספר מ-`line_id` עולה — נכון תחת `document_id_scheme_version` 1,
+    שבו החצי התחתון הוא מיקום השורה — ומחזיק כל שורה בזיכרון.
 
-* [`src/distribution/packer.rs`](../src/distribution/packer.rs) — **צד ה-build (S4a).**
-  - `pack()` — וקטורים מוכנים → ארטיפקט. הסדר כפוי: זהות שלמה → יעד פנוי → בדיקת כל
-    וקטור מול הקורפוס → commit → metadata → `validate_artifact`. שום דבר אינו נוגע בדיסק
-    לפני ה-commit, ולכן דחייה משאירה תיקייה ריקה ואפשר פשוט לחזור על הריצה.
-  - **הקלט הוא `line_id`, וקטור ו*שני* digests.** `source_line_sha256` נבדק מול הקורפוס,
-    ותופס בדיוק כשל אחד: קובץ וקטורים שנסע בשורה אחת מול רשימת ה-IDs. הכשל הזה בלתי נראה
-    אחרת — הספירות מסתדרות, ה-checksums עוברים, וכל תוצאה תהיה שורה שכנה בביטחון מלא.
-  - `embedding_text_sha256` אינו נבדק מול דבר; הוא **נרשם**, כ-`chunk_hash` של הרשומה.
-    הטקסט שהוטמע אינו שורת הקורפוס בכל פעם שהמתכון מוסיף כותרת, שואל הקשר משכן או קוטם,
-    ולכן `chunk_hash` שנגזר מהקורפוס היה מתאר טקסט שדבר לא נבנה ממנו — וה-chunker מגדיר
-    את השדה הזה כ-digest של הטקסט המוטמע. הערך הוא 128 הביטים הראשונים של ה-SHA-256
-    שהוצהר, בדיוק כמו `compute_chunk_hash`, ובדיקה מקבעת את השוויון הזה.
-  - **מה ששני ה-digests אינם מוכיחים:** שהווקטור אכן הופק מהטקסט הזה, מהמודל המוצהר או
-    תחת הנרמול המוצהר. הם בדיקת יישור, לא provenance — יצרן שגיבב את הקורפוס בזמן האריזה
-    מספק את שניהם. כלי שמקבל floats מוגמרים אינו יכול לקבוע יותר מזה, וזה נאמר במפורש.
-    ✅ נסגר ב-S4b במסלול הבנייה — ראו [`builder.rs`](../src/distribution/builder.rs) למטה.
-  - `validate_artifact()` — האימות של הריצה (`verify_for_install`, פריסת payload, פתיחת
-    `ReadOnlyZevcStore`, `verify_counts_against_payload` — **אותן פונקציות**, לא מימוש שני)
-    ועוד שתי בדיקות שרק מכונת build יכולה לעשות: כל רשומה מושווית שדה־שדה למה שהקורפוס
-    אומר על השורה שלה, וקבוצת ה-IDs מושווית ל-`expected_line_ids(model)` **בשני הכיוונים**. חשוף גם לבדו, ולכן
-    הוא עונה על „האם התיקייה הזאת שייכת לקורפוס ולמודל האלה, ומכסה אותו” לארטיפקט שלא
-    נבנה כאן.
-  - `corpus_fields()` — 12 השדות שהקורפוס מכריע, בטבלה אחת ששני הצדדים נמדדים לפיה.
-    `facets` מושווה דרך JSON ולא `join(", ")`, אחרת `["/a, /b"]` ו-`["/a", "/b"]` היו
-    נחשבים זהים. `chunk_hash` הוא היחיד שהקורפוס אינו יכול לענות עליו, ולכן נבדקת רק
-    צורתו — ובדיקה דורשת שכל שדה מסוריאלי יהיה באחת משתי הרשימות, כדי ששדה חדש לא ייכתב
-    לכל ארטיפקט ולא ייבדק בכלל.
-  - `read_vector_inputs()` — הזרמה של שני קבצי הקלט: `f32` little-endian בלי כותרת,
-    ולצידו JSONL באותו סדר. ההצמדה מיקומית, ולכן **שתי** צורות אי-ההתאמה נתפסות: רשומות
-    עודפות נגמרות באמצע וקטור, ורשומות חסרות משאירות בייטים — וזה מדווח בסוף ולא נבלע.
-  - `store` הוא `readable_store_identity()` ולא בחירה של הקורא: packer שכותב פריסה
-    שהריצה שלו אינה יודעת לקרוא מייצר ארטיפקטים לאף אחד.
+* [`src/distribution/shard.rs`](../src/distribution/shard.rs) — **בנייה על מכונות שאינן
+  נפגשות.** `export_plan` מחיל את המתכון על הקורפוס וכותב את הטקסטים המוגמרים
+  (`plan.jsonl`); `embed_shard` מטמיע חלון של רשומות ב-worker שאין לו קורפוס, ובודק את
+  ה-digest של כל טקסט לפני שהוא מטמיע אותו; `verify_shards` בודק כל shard מול ה-plan —
+  plan, מודל, רוחב, חלון, digests, אורכים — ושהחלונות מכסים אותו בדיוק, לפני שנקרא בית;
+  `read_vector_inputs` מזרים זוג קבצים של shard (`f32` little-endian ו-JSONL באותו סדר)
+  ותופס את שתי צורות אי-ההתאמה ביניהם. ה-merge — וקטורים לפי מפתח אל segment — הוא S7.
 
 * [`src/distribution/builder.rs`](../src/distribution/builder.rs) — **צד ה-build (S4b).**
-  - `build()` — קורפוס ומודל → ארטיפקט מאומת. הסדר הוא **עלות ולא טעם**, וכל שלב הוא
-    הדרך הזולה ביותר להיכשל שעדיין זמינה: יעד פנוי → זהות שלמה → מתכון תואם (hash של
-    חמישה מספרים) → טעינת המודל והשוואתו להצהרה → שער backend לא-סמנטי → תכנית → הטמעה
-    ואריזה. שום דבר אינו מגיע לדיסק לפני ה-commit של ה-payload.
-  - **פער ה-provenance של S4a נסגר כאן.** הטקסט שנחתם הוא אותו `String` שנמסר ל-backend,
-    באותו ביטוי — אין מסלול שבו אחד מתאר את השני. `model_checksum`, `embedding_backend`,
-    `embedding_dim`, `pooling` ו-`max_tokens` האפקטיבי **מדווחים על ידי ה-runtime שנטען**
-    ומושווים להצהרה. „מדווחים” ולא „נקראים מהקובץ”, כי אלה אינם אותו סוג עובדה: ה-checksum
-    הוא של הבייטים בדיסק, הרוחב ותקרת ה-tokens הם מה שהמשקלים נושאים, ה-backend id הוא איזה
-    מימוש נבחר, ו-pooling הוא מה שאותו מימוש מבצע.
+  - `build()` — קורפוס ומודל → חבילת base: `segment.oxv`, ה-`manifest.json`
+    וה-`payloads.json` שסביבו, ו-`release.json` — ה-manifest שההתקנה מקבלת — אחרון. הסדר
+    הוא **עלות ולא טעם**: יעד פנוי → זהות שלמה ותג תקין → מתכון תואם → טעינת המודל
+    והשוואתו להצהרה → שער backend לא-סמנטי → תכנית → הטמעה → כיול, כתיבה, חבילה.
+  - הקצאת ה-slots היא של §3.4 בחוזה: ספרים בסדר בתי השם, שורות לפי הסדר, הופעה ראשונה של
+    מפתח לוקחת slot, הופעה בספר אחר היא extra, ורשומה אחת לכל ספר ומפתח. ה-hint הוא מקום
+    השורה בספר.
+  - **ה-provenance נקבע כאן.** הטקסט שממנו המפתח מחושב הוא אותו `String` שנמסר ל-backend.
+    ה-checksum של החבילה (שחייב להיות ב-`query_packages`), של ה-tokenizer, הרוחב,
+    ה-pooling ו-`max_tokens` האפקטיבי **מדווחים על ידי ה-runtime שנטען** ומושווים להצהרה.
+    מה שנשאר הצהרה: `family_id` וה-quantization של כל חבילה.
   - **שלוש גרסאות המתכון אינן תכונות של מודל** אלא של הקוד כאן, ולכן הן **מוכרעות** ולא
-    מושוות — ראו [`recipe.rs`](../src/semantic/recipe.rs). שלושתן על ה**טקסט**:
-    `normalization_version` הוא עיבוד הטקסט לפני המודל, ומופעל על שני צדי ההשוואה; נרמול
-    L2 של הווקטור אינו ממוגרס והוא אינווריאנט של cosine. מה שנשאר הצהרה: `model_id`
-    ו-`model_quantization`.
+    מושוות — ראו [`recipe.rs`](../src/semantic/recipe.rs).
   - **חלון TOCTOU שנשאר פתוח ומוצהר:** ה-checksum מחושב, ואז ה-backend פותח את אותו נתיב
-    שוב. קובץ שהוחלף בין שתי הקריאות ייחתם כאחד ויורץ כאחר. הסגירה היא staging לעותק
-    content-addressed בצינור שמסביב, לא בדיקה נוספת כאן.
-  - `BuildPlan` — קבוצת השורות שהמתכון מטמיע, **לפני שקיים ולו וקטור אחד**. גזירה
-    מהווקטורים שהופקו הייתה הופכת את בדיקת הכיסוי לאישור עצמי: batch שנקטע היה נעלם משני
-    הצדדים בבת אחת. מחזיק מזהים בלבד — הטקסט נגזר שוב במעבר ההטמעה, וזה זול יותר מעותק
-    שני של הקורפוס בזיכרון.
-  - **המתכון מוצמד ואינו מנוחש.** `chunking_identity` הוא hash חד-כיווני, ולכן אי אפשר
-    לשחזר ממנו `ChunkerConfig`. הבנייה מקבלת את התצורה הממשית ודוחה אחת שאינה מה
-    שהארטיפקט יצהיר עליו; בלי זה השדה מתייג מתכון שאיש לא הפעיל.
-  - `PlannedCorpus` — עוטף קורפוס במתכון, ומשנה **רק** את התשובה ל-`expected_line_ids`:
-    „אילו שורות הקורפוס מחזיק” מול „אילו שורות המתכון מטמיע”. הוא גם מסרב לענות למודל
-    שאינו זה שלפיו נבנתה התכנית, אחרת היה מאשר כיסוי למתכון שלא הופעל.
-  - `chunks_for_book()` — מרכיב `BookForIndexing` וקורא ל-`Chunker` **המשותף**. למתכון יש
-    מימוש אחד, ובנייה מפעילה אותו ולא קריאה שנייה שלו. שדות ברמת הספר שנקראים כאן אינם
-    מגיעים לשום מקום שנשמר: ה-packer קורא כל שדה מ-`CorpusIndex::line`.
-  - `PlannedEmbeddings` — iterator ולא `Vec`: ה-packer צורך אחד בכל פעם, ולכן בנייה לעולם
-    אינה מחזיקה עותק שלם שני של ה-payload. מה שהיא כן מחזיקה, ונאמר במפורש: **קטעי ספר אחד
-    ועוד batch אחד של וקטורים.** ספר נחתך בשלמותו מפני שהקשר שכנים דורש את השורות מסביב,
-    ולכן המספר שצריך למדוד הוא הספר הארוך בקורפוס ולא גודל ה-batch. שגיאה ראשונה מסיימת את
-    הזרם — המשך היה מייצר אי-התאמת כיסוי, כלומר תסמין שני ורועש יותר לתקלה שכבר נוקבה
-    בשמה.
+    שוב. הסגירה היא staging לעותק content-addressed בצינור שמסביב.
+  - `BuildPlan` — קבוצת השורות שהמתכון מטמיע, **לפני שקיים ולו וקטור אחד**. מעבר ההטמעה
+    גוזר אותה שוב, ואי-התאמה היא `CoverageMismatch`: הקורפוס השתנה מתחת לבנייה.
+  - **המתכון מוצמד ואינו מנוחש.** `chunking_identity` הוא hash חד-כיווני, ולכן הבנייה
+    מקבלת את התצורה הממשית ודוחה אחת שאינה מה שהזהות מצהירה עליו.
+  - **מה היא מחזיקה:** קטעי ספר אחד, וכל וקטור נבדל כ-`f32` עד הכיול. זה מסלול פיתוח;
+    בניית הספרייה זורמת (S7).
   - **שער ה-backend הלא-סמנטי.** וקטורי hash מושלמים מבנית וריקים ממשמעות, ואף בדיקה
-    מאוחרת אינה יכולה לדעת — לכן הסירוב חייב להיות כאן, במקום שבו ה-backend עוד מזוהה.
-    `allow_non_semantic_backend` הוא `false` בכל דבר שנשלח.
+    מאוחרת אינה יכולה לדעת — לכן הסירוב חייב להיות כאן. `allow_non_semantic_backend` הוא
+    `false` בכל דבר שנשלח.
 
 * [`src/benchmark/mod.rs`](../src/benchmark/mod.rs)
   - `measure()` / `aggregate()` / `QuerySet` / `BenchmarkConfig` — תזמון, אחוזונים
@@ -742,31 +721,22 @@ otzaria-semantic-search/
     כמעודכנת.
   - דורש `--features mock-embedding` (אין backend inference בבנייה רגילה).
 * [`tests/official_runtime.rs`](../tests/official_runtime.rs)
-  - מסלול הריצה הרשמי דרך ה-API הציבורי בלבד, כמו שה-`otzaria_search_engine` יראה
-    אותו: בניית ארטיפקט כמו שה-packer יבנה (ה-store כותב את ה-payload, ואז ה-metadata
-    מתאר אותו), התקנה, פתיחה, ושאילתה שמחזירה את ה-`line_id` שממנו נבנה הווקטור —
-    ב-`SemanticOnly` וב-`Hybrid`. בנוסף: כל פעולה בונה נדחית בשם והארטיפקט אינו משתנה,
-    ופתיחה חוזרת (restart) מחזירה את אותה תשובה בלי לבנות דבר.
+  - מסלול הריצה הרשמי דרך ה-API הציבורי, כמו שה-`otzaria_search_engine` יראה אותו: חבילה
+    שנבנית מקורפוס קטן, מותקנת ונפתחת, ונשאלת דרך ה-coordinator עם `FakeResolver` במקום
+    האינדקס החי — ב-`SemanticOnly` וב-`Hybrid`. ה-ids הם של ה-resolver ולא של הווקטורים;
+    שני ספרים עם אותו id נשארים שתי תוצאות; שורה שהטקסט שלה השתנה אינה מוצגת; המטמון
+    עוקב אחרי הדור של ה-resolver ושל הסט; כל פעולה בונה נדחית בשם והסט אינו משתנה.
   - דורש `--features mock-embedding`.
 * [`tests/artifact_builder.rs`](../tests/artifact_builder.rs)
-  - שער הקבלה של S4b, דרך הבינארי: `build` מקבל קורפוס, מודל ומתכון ומפיק ארטיפקט;
-    `validate` מבסס אותו שוב ומגיע לאותו digest; שתי בניות עם `created_at` שונה מפיקות
-    את אותם בייטים בדיוק. השורה שהמתכון מדלג עליה נעדרת גם מהארטיפקט וגם מכל תוצאה —
-    ובלי `--chunking` אותו ארטיפקט מדווח כ**חסר**, כי התמלול לבדו מדווח על כל שורה
-    שהוא מחזיק.
+  - שער הקבלה של S4b, דרך הבינארי: `build` מקבל קורפוס, מודל ומתכון ומפיק חבילה, שמותקנת
+    מול ה-digest שהבנייה הדפיסה, נפתחת, ומוצאת כל שורה בטקסט של עצמה; שתי בניות עם
+    `created_at` שונה מפיקות את אותו segment. השורה שהמתכון מדלג עליה נעדרת מכל תוצאה.
   - שתי בדיקות רצות ב**בנייה רגילה**: מתכון שאינו המוצהר נדחה לפני שנפתח מודל, ובנייה
-    בלי backend מסרבת במקום להמציא וקטורים. השאר דורש `--features mock-embedding`,
-    כי בנייה **היא** inference.
-* [`tests/artifact_packer.rs`](../tests/artifact_packer.rs)
-  - שער הקבלה של S4a, דרך הבינארי שצינור build באמת מריץ: `pack` הופך קובץ וקטורים
-    לארטיפקט מאומת, `validate` מבסס את אותו הדבר על תיקייה שהוא לא בנה, ושתי הריצות
-    מדווחות את אותו digest. ובצד השני — קלט שבו הווקטורים והמזהים נסעו זה מול זה נדחה
-    בקוד יציאה ובהודעה, ולא נשארת תיקייה.
-  - הבדיקה שמצדיקה את כל השאר: מה שה-packer כתב עובר `IndexImporter`,
-    `OfficialSemanticIndex` ושאילתה — בלי fixture שנבנה ביד באמצע. עד עכשיו „ה-packer
-    כותב את מה שהקורא קורא” לא הייתה טענה שמשהו היה נכשל אם תפסיק להיות נכונה.
-    החלק הזה דורש `--features mock-embedding` (שאילתה צריכה להטמיע); שאר הקובץ רץ
-    בבנייה רגילה, כי אריזה אינה מטמיעה דבר.
+    בלי backend מסרבת במקום להמציא וקטורים. השאר דורש `--features mock-embedding`, ובדיקת
+    המודל האמיתי (`--ignored`) דורשת את `onnx-backend`.
+* [`tests/vector_set_scale.rs`](../tests/vector_set_scale.rs)
+  - `#[ignore]`: סט סינתטי בצורה של ספריית v30 ב-N רשומות (`OTZARIA_SCALE_N`,
+    `OTZARIA_SCALE_DIR`) — כתיבה, התקנה, פתיחה, סריקה, delta ודחיסה, נמדדים.
 * [`tests/artifact_contract.rs`](../tests/artifact_contract.rs)
   - חוזה הארטיפקט מבחוץ: התקנה ואימות חוזר, digest מפורסם מול חבילה עקבית-עם-עצמה,
     שחזור מקריסה בין שני ה-renames, דחייה לפי שם שדה, והפרדת „פגום” מ„לא תואם”.
@@ -780,8 +750,8 @@ otzaria-semantic-search/
     קונפיגורציות features**, כולל `cargo fmt --check`, clippy עם `-D warnings`,
     ואימות קישורי תיעוד (`cargo doc`).
   - job נפרד ל-`onnx-backend` (Linux, macOS ו-Windows) מול ONNX Runtime 1.28.0, ו-job
-    **Golden Vectors** שמריץ את שער ה-parity לשני הגרפים של המודל האמיתי ובונה ומאמת
-    ארטיפקט אמיתי אחד מגרף ה-int8. השער דורש את הסוד `OTZARIA_HF_TOKEN`, וכשהוא חסר הוא
+    **Golden Vectors** שמריץ את שער ה-parity לשני הגרפים של המודל האמיתי, ובונה, מתקין
+    ושואל חבילה אמיתית אחת מגרף ה-int8. השער דורש את הסוד `OTZARIA_HF_TOKEN`, וכשהוא חסר הוא
     נכשל במפורש ולא מדווח דילוג כהצלחה. ראו [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §5.
 
 ## מדידות
@@ -805,6 +775,12 @@ otzaria-semantic-search/
   התקורה בתוך רעש המדידה, ובממד קטן המכונה פשוט לא מבדילה. מה שכן ודאי הוא מבני ולא
   נמדד: `VectorStore::search` מקמפל את המסננים **פעם אחת לשאילתה** ולא פעם לכל וקטור.
 
+  `cargo bench -- --store oxv` כותב segment, ממפה אותו וסורק בחוט אחד, ב-`--threads`
+  ותחת מסנן של 5% מהספרים. על Apple M4, 200,000 וקטורים ב-256: 18.9 ns לווקטור בחוט אחד,
+  0.8 ms על שמונה, 0.2 ms במסנן, פתיחה 0.27 ms. בקנה מידה של הספרייה
+  ([`tests/vector_set_scale.rs`](../tests/vector_set_scale.rs), 6.0M slots): פתיחה 14 ms,
+  סריקה 59 ms בחוט אחד ו-17 ms בעשרה — ראו [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §8.
+
   **חשוב:** ל-`[[bench]]` יש `harness = false`, ולכן `cargo test --all-targets`
   *מריץ* אותו במקום רק לקמפל (בחירה מפורשת של target דורסת `test = false`).
   ה-CI מריץ `cargo test --lib --tests`, וקימפול ה-benchmark נעשה ב-release build.
@@ -819,61 +795,41 @@ cargo test --lib --tests                                           # שער ה-p
 cargo test --lib --tests --features mock-embedding                  # החבילה המלאה
 ```
 
-## בניית ארטיפקט (S4b)
+## בניית חבילת וקטורים (S4b)
 
 ```bash
 OTZARIA_ONNX_RUNTIME=/abs/path/libonnxruntime.dylib \
 cargo run --release --features onnx-backend -- build \
   --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
   --model config/models/meivin-round2-onnx/model.json \
-  --model-file /abs/path/seforim-embed-round2-int8.onnx \
+  --model-file /abs/path/seforim-embed-round2-fp32.onnx \
   --chunking config/models/meivin-round2-onnx/chunking.json \
-  --out ./artifact
+  --out ./package
 ```
 
+* הפלט: `segment.oxv`, `manifest.json`, `payloads.json` ו-`release.json`. ה-SHA-256 של
+  `release.json` שמודפס הוא מה שמתפרסם **מחוץ** לשחרור, ו-`install_package` מקבל את
+  ה-segment ואת ה-manifest מולו.
 * `chunking.json` — `ChunkerConfig`, כלומר המתכון עצמו ולא תיאור שלו:
   `{"min_meaningful_chars": 20, "context_window_lines": 2, "max_chunk_chars": 512,
   "min_embeddable_chars": 5, "chunking_version": 1, "embedding_text_version": 2,
   "normalization_version": 1}` (של זהות הייצור) — כל השדות חובה. הוא חייב לגבב ל-`chunking_identity`
-  שהמודל מצהיר, אחרת הבנייה נדחית — ארטיפקט רושם את ה-hash, ו-hash אינו הפיך למתכון.
-* `--model-file` הוא המודל שממנו נוצרים הווקטורים בפועל: גרף ONNX, והחבילה שלידו. ה-checksum שלו חייב להיות זה שב-`model.json`, וכך גם ה-backend, הרוחב, ה-pooling
-  ותקרת ה-tokens האפקטיבית. `model-checksum --model-file <path>` מדפיס את ה-checksum
-  שצריך להצהיר, את כל קובצי החבילה ואת ה-manifest המדויק — בבנייה רגילה.
+  שהמשפחה מצהירה, אחרת הבנייה נדחית.
+* `--model-file` הוא החבילה שממנה נוצרים הווקטורים בפועל, וה-checksum שלה חייב להיות
+  באחת מ-`query_packages` של `model.json`; היא נרשמת כ-`provenance.passage_package`.
+  `model-checksum --model-file <path>` מדפיס את ה-checksum, את קובצי החבילה ואת
+  ה-manifest המדויק — בבנייה רגילה.
+* `--clip-q` — הקוונטיל שבו מכוילת הסקלה של כל ממד; ברירת המחדל 1 אינה קוטמת דבר ב-base.
 * מי מקבל וקטור **נגזר**: ה-`Chunker` מוחל על הקורפוס לפני כל inference. שורה קצרה מדי
-  מכדי לשאת משמעות מדולגת, וארטיפקט שדילג עליה שלם ולא חסר.
-* דורש backend inference, כי בנייה היא inference. `pack` ו-`validate` אינם.
-
-## אריזת ארטיפקט (S4a)
-
-```bash
-cargo run --release -- pack \
-  --vectors vectors.f32 --records vectors.jsonl \
-  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
-  --model model.json --out ./artifact
-
-cargo run --release -- validate \
-  --artifact ./artifact \
-  --corpus-identity corpus-identity.json --corpus-lines corpus-lines.jsonl \
-  --model model.json --chunking chunking.json
-```
-
-* `vectors.f32` — `f32` little-endian, `מספר_וקטורים × embedding_dim`, בלי כותרת.
-* `vectors.jsonl` — שורה לכל וקטור, **באותו סדר**:
-  `{"line_id": N, "source_line_sha256": "...", "embedding_text_sha256": "..."}`.
-  הראשון הוא SHA-256 של טקסט השורה בקורפוס ונבדק מולו; בלעדיו קובץ וקטורים שנסע בשורה
-  אחת היה נארז בלי תלונה. השני הוא של הטקסט שהוטמע בפועל (אחרי הקשר/קיטום/תחילית
-  תפקיד) ונרשם כ-`chunk_hash` של הרשומה.
+  מכדי לשאת משמעות מדולגת, וחבילה שדילגה עליה שלמה ולא חסרה.
 * `corpus-lines.jsonl` — `{"line_id": N, "source_book_key": ..., "title": ...,
   "reference": ..., "section_id": N, "segment": N, "is_pdf": bool, "line_hash": N,
   "content_hash": N, "facets": [...], "text": "..."}` לכל מסמך.
-* `--chunking` — רשות כאן, חובה ב-`build`. איתו, חוזה הכיסוי הוא **המתכון מוחל על
-  הקורפוס**, והמתכון מוצמד ל-`chunking_identity` המוצהר. בלעדיו הקובץ עצמו הוא חוזה
-  הכיסוי: כל שורה בו חייבת לקבל וקטור, ולכן יש לייצא בדיוק את השורות שאמורות להיות
-  מוטמעות.
-* `model.json` — `ModelIdentity` (ראו [`versioning.rs`](../src/semantic/versioning.rs)).
+* דורש backend inference, כי בנייה היא inference.
 
-שתי הפקודות עובדות ב**בנייה רגילה**: אריזה אינה הופכת טקסט לווקטור, ולכן היא אינה
-דורשת backend inference. ה-`Digest` שמודפס הוא מה שצריך להתפרסם **מחוץ** לארטיפקט —
-בלעדיו אימות מזהה נזק וארטיפקט לא נכון, ולא ארטיפקט שנבנה מחדש בכוונה. שתי אריזות
-נפרדות של אותם וקטורים מפיקות את אותו digest ואת אותם בייטים, וזה מה שהופך פרסום שלו
-למשמעותי.
+## בנייה מפוצלת
+
+`export-plan` מחיל את המתכון במכונה שמחזיקה את הקורפוס, ו-`embed-shard --skip --take`
+מטמיע חלון של ה-plan במכונה שמחזיקה את המודל, ובודק את ה-digest של כל טקסט לפני שהוא
+מטמיע אותו. ה-merge — וקטורים לפי מפתח אל segment של base או של delta — הוא S7; עד אז
+`build` הוא המסלול היחיד שכותב segment.
