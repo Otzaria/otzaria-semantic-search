@@ -50,6 +50,50 @@ pub(crate) fn generation_dir(generation: u64) -> String {
     format!("gen-{generation:06}")
 }
 
+/// The generation an entry of the set directory is, when its name is a generation's.
+pub(crate) fn generation_of(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("gen-")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The number the next generation takes: past every generation a pointer names and every
+/// `gen-` entry in the directory. A new generation never lands on one that exists — a
+/// pointer's, one that only an unreadable pointer could name, or one a crash left — so
+/// writing it removes and overwrites nothing.
+pub(crate) fn next_generation(dir: &Path) -> Result<u64, ArtifactError> {
+    let mut highest = 0u64;
+    for name in [CURRENT, PREVIOUS] {
+        if let Ok(Some(pointer)) = read_pointer(dir, name) {
+            highest = highest.max(pointer.generation);
+        }
+    }
+    let listing = io_error(format!("listing {}", dir.display()));
+    for entry in fs::read_dir(dir).map_err(listing)? {
+        let entry = entry.map_err(io_error(format!("listing {}", dir.display())))?;
+        if let Some(generation) = generation_of(&entry.file_name().to_string_lossy()) {
+            highest = highest.max(generation);
+        }
+    }
+    highest.checked_add(1).ok_or_else(|| ArtifactError::Io {
+        context: format!("{}: no generation number is left", dir.display()),
+        source: io::Error::from(io::ErrorKind::InvalidData),
+    })
+}
+
+/// Point `name` — `CURRENT` or `PREVIOUS` — at a generation, `bytes` being the serialized
+/// [`Pointer`]. A pointer is a file: a directory in its place, which nothing here makes, is
+/// no pointer, and nothing can be renamed over one, so an empty one is removed first.
+pub(crate) fn write_pointer(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let path = dir.join(name);
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        fs::remove_dir(&path)?;
+    }
+    write_atomically(&path, bytes)
+}
+
 pub(crate) fn segment_file(id: &str) -> String {
     format!("{SEGMENTS_DIR}/{id}.oxv")
 }

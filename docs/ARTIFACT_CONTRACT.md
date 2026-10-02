@@ -351,10 +351,15 @@ SHA-256 מעל `"otzaria-vector-identity-v1\n"` ושורת `path=value\n` לכל
    manifest, כל CRC של block. → **Staged**
 5. העברה ל־`segments/`. → **Moved**
 6. delta: מעבר סדרתי אחד על המפתחות של ה־segments הישנים — tombstones ומפתחות שנשלחו מחדש
-   מדליקים ביטי `.del`, ורשומות foreign מוצאות את ה־slots שלהן. כתיבת דור N+1.
-   → **GenerationWritten**
-7. `PREVIOUS` ← הדור הנוכחי. → **PreviousWritten**
-8. `CURRENT` ← דור N+1. → **CurrentFlipped**
+   מדליקים ביטי `.del`, ורשומות foreign מוצאות את ה־slots שלהן. כתיבת דור חדש, שמספרו
+   גבוה מכל דור שעל הדיסק — מזה שמצביע מונה, מזה שרק מצביע שאינו נקרא יכול היה למנות, ומזה
+   שקריסה השאירה — ולכן הוא לעולם אינו נכתב על דור קיים. → **GenerationWritten**
+7. `PREVIOUS` ← הדור שההתקנה נבנתה עליו, זה שהסט נפתח בו: של `CURRENT`, או ב־fallback של
+   `PREVIOUS` עצמו, ואז אין מה לכתוב. כששום דור לא נפתח — מה ש־`CURRENT` מונה, אם הוא נקרא.
+   לעולם לא הבתים של `CURRENT` כמות שהם: `CURRENT` שאינו נקרא היה דורס את המצביע היחיד
+   שעוד נפתח. → **PreviousWritten**
+8. `CURRENT` ← הדור החדש; תיקייה ריקה במקום הקובץ, ששום build אינו יוצר, מוסרת קודם.
+   → **CurrentFlipped**
 9. איסוף אשפה.
 
 base מחליף את הסט כולו.
@@ -365,14 +370,17 @@ base מחליף את הסט כולו.
 |---|---|---|
 | Staged | קובץ ב־`staging/` | שחזור מוחק את `staging/`; הדור הישן נפתח |
 | Moved | segment ש־שום דור אינו מונה | הדור הישן נפתח; האשפה נאספת |
-| GenerationWritten | דור N+1 ששום מצביע אינו מונה | הדור הישן נפתח; האשפה נאספת |
-| PreviousWritten | `PREVIOUS` = `CURRENT` = הדור הישן | הדור הישן נפתח |
-| CurrentFlipped | `CURRENT` = N+1 | הדור החדש נפתח; האשפה נאספת בהזדמנות הבאה |
+| GenerationWritten | דור חדש ששום מצביע אינו מונה | הדור הישן נפתח; האשפה נאספת |
+| PreviousWritten | `PREVIOUS` = הדור שההתקנה נבנתה עליו, `CURRENT` כשהיה | הדור הישן נפתח |
+| CurrentFlipped | `CURRENT` = הדור החדש | הדור החדש נפתח; האשפה נאספת בהזדמנות הבאה |
 
 כל שורה נבדקת בהזרקת קריסה (`CRASH_AT`), ובכל אחת ההתקנה החוזרת מצליחה. מעבר לזה:
 `CURRENT` שאינו נפתח — מצביע פגום, `set.json` שה־SHA-256 שלו אינו תואם, segment שנפגע —
 נופל ל־`PREVIOUS`, ו־`SetInfo::recovered_from_previous` אומר זאת. כששניהם אינם נפתחים
-התוצאה היא `VectorStoreError::Corrupted`.
+התוצאה היא `VectorStoreError::Corrupted`. התקנה ודחיסה נבנות על הדור שהסט נפתח בו, גם
+ב־fallback, וזו שנכשלת — נדחית, מבוטלת או נקטעת בכל שלב — אינה מוחקת ואינה כותבת על אף דור
+קיים: המצביעים נשארים על מה שמנו, וכש־`CURRENT` אינו נקרא ה־fallback ל־`PREVIOUS` נשאר
+כשהיה.
 
 ### 5.5 איסוף אשפה ו־Windows
 

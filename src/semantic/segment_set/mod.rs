@@ -6,8 +6,9 @@
 //! change: each **generation** has its own derived files, a `.del` bitmap per segment (the
 //! slots a later delta tombstoned or shipped again) and a `.links` table per delta (the older
 //! slot each of its foreign records resolves to). `CURRENT` names the live generation and
-//! `PREVIOUS` the one before it; an install or a compaction writes generation N+1 beside N
-//! and flips `CURRENT` in one rename, so a crash at any point leaves one or the other
+//! `PREVIOUS` the one before it; an install or a compaction writes a new generation beside
+//! the old ones — numbered past every one on disk, so it never lands on one — and flips
+//! `CURRENT` in one rename, so a crash at any point leaves one or the other
 //! (`docs/ARTIFACT_CONTRACT.md` has the crash matrix).
 //!
 //! | operation | what it needs | what it changes |
@@ -118,6 +119,8 @@ pub struct ScrubReport {
 /// memory.
 pub struct SegmentSet {
     dir: PathBuf,
+    /// The pointer it was opened through — `CURRENT`'s, or `PREVIOUS`'s on a fallback.
+    pointer: Pointer,
     document: SetDocument,
     segments: Vec<Segment>,
     deleted: Vec<Deleted>,
@@ -276,6 +279,7 @@ impl SegmentSet {
         let info = info_of(&document, &dead, &unresolved, false);
         Ok(Self {
             dir: dir.to_path_buf(),
+            pointer: pointer.clone(),
             document,
             segments,
             deleted,
@@ -335,6 +339,12 @@ impl SegmentSet {
 
     pub(crate) fn document(&self) -> &SetDocument {
         &self.document
+    }
+
+    /// The pointer that names this generation: what `PREVIOUS` takes when a generation is
+    /// built on it.
+    pub(crate) fn pointer(&self) -> &Pointer {
+        &self.pointer
     }
 
     pub(crate) fn segments(&self) -> &[Segment] {

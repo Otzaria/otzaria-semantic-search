@@ -936,6 +936,302 @@ fn a_filtered_scan_of_a_set_reaches_foreign_records() {
     assert!(hits.iter().all(|hit| &*hit.records[0].book == "id:4"));
 }
 
+/// v30 and one more line, a new key: what installs after v30 in the tests below.
+fn v31() -> Library {
+    let mut v31 = v30();
+    v31.version = 31;
+    v31.books.get_mut("id:3").unwrap().insert(5, 31);
+    v31
+}
+
+/// How a pointer file can stop reading: bytes that are no pointer, and — as the review
+/// broke it — a directory where the file should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Broken {
+    Garbage,
+    Directory,
+}
+
+fn break_current(dir: &Path, how: Broken) {
+    let current = dir.join(CURRENT);
+    match std::fs::symlink_metadata(&current) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&current).unwrap(),
+        Ok(_) => std::fs::remove_file(&current).unwrap(),
+        Err(_) => {}
+    }
+    match how {
+        Broken::Garbage => std::fs::write(&current, b"damaged").unwrap(),
+        Broken::Directory => std::fs::create_dir(&current).unwrap(),
+    }
+}
+
+/// `PREVIOUS` and every file of every generation, by path: what "as it was" holds a set to.
+fn on_disk(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == PREVIOUS {
+            files.insert(name, std::fs::read(entry.path()).unwrap());
+        } else if name.starts_with("gen-") {
+            for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+                let path = format!("{name}/{}", file.file_name().to_string_lossy());
+                files.insert(path, std::fs::read(file.path()).unwrap());
+            }
+        }
+    }
+    files
+}
+
+fn previous_generation(dir: &Path) -> u64 {
+    files::read_pointer(dir, PREVIOUS)
+        .unwrap()
+        .expect("a PREVIOUS")
+        .generation
+}
+
+/// The review's sequence: two generations, `CURRENT` broken, the set answering from
+/// `PREVIOUS` — and then an install. Numbered from an unreadable `CURRENT` as from nothing,
+/// it removed the generation `PREVIOUS` names to write its own there, and copied the broken
+/// `CURRENT` over `PREVIOUS` (or failed on the directory); the fallback was gone either way.
+#[test]
+fn an_install_over_a_broken_current_keeps_the_generation_previous_names() {
+    for how in [Broken::Garbage, Broken::Directory] {
+        let work = TempDir::new("set_broken_install");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), None)).unwrap();
+        break_current(&dir, how);
+        let fallback = SegmentSet::open(&dir).unwrap();
+        assert_eq!(
+            (fallback.generation(), fallback.info().library_version),
+            (1, 29),
+            "{how:?}"
+        );
+        assert!(fallback.info().recovered_from_previous, "{how:?}");
+        let answers = everything(&fallback, 8);
+        drop(fallback);
+
+        let report = install(&dir, &release(&work, &v31(), None)).unwrap();
+        assert_eq!(
+            report.generation, 3,
+            "{how:?}: past both generations on disk"
+        );
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(
+            (set.generation(), set.info().library_version),
+            (3, 31),
+            "{how:?}"
+        );
+        assert!(!set.info().recovered_from_previous, "{how:?}");
+        drop(set);
+        assert_eq!(
+            previous_generation(&dir),
+            1,
+            "{how:?}: PREVIOUS names the generation that opened"
+        );
+
+        // And that generation is the fallback it was.
+        break_current(&dir, how);
+        let fallback = SegmentSet::open(&dir).unwrap();
+        assert_eq!(fallback.generation(), 1, "{how:?}");
+        assert_eq!(everything(&fallback, 8), answers, "{how:?}");
+    }
+}
+
+/// Every way an install can fail — refused, cancelled, cut off at any step — over a
+/// `CURRENT` that does not read leaves the set as it found it: the same fallback with the
+/// same answers, and `PREVIOUS` and every generation's files byte for byte.
+#[test]
+fn a_failed_install_over_a_broken_current_leaves_the_set_as_it_was() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Failure {
+        Refused,
+        Cancelled,
+        Crash(Step),
+    }
+    let failures = [
+        Failure::Refused,
+        Failure::Cancelled,
+        Failure::Crash(Step::Staged),
+        Failure::Crash(Step::Moved),
+        Failure::Crash(Step::GenerationWritten),
+        Failure::Crash(Step::PreviousWritten),
+        Failure::Crash(Step::CurrentFlipped),
+    ];
+    for how in [Broken::Garbage, Broken::Directory] {
+        for failure in failures {
+            let work = TempDir::new("set_broken_failure");
+            let dir = work.join("vectors");
+            install(&dir, &release(&work, &v29(), None)).unwrap();
+            install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+            break_current(&dir, how);
+            let answers = everything(&SegmentSet::open(&dir).unwrap(), 9);
+            let before = on_disk(&dir);
+
+            let (path, json) = release(&work, &v31(), None);
+            let mut expect = expectation();
+            let cancel = CancellationToken::new();
+            match failure {
+                Failure::Refused => expect.published_manifest_sha256 = Some("0".repeat(64)),
+                Failure::Cancelled => cancel.cancel(),
+                Failure::Crash(step) => CRASH_AT.with(|crash| crash.set(Some(step))),
+            }
+            let result = install_package(
+                &dir,
+                &InstallSource {
+                    segment: &path,
+                    manifest_json: &json,
+                },
+                &expect,
+                &cancel,
+            );
+            CRASH_AT.with(|crash| crash.set(None));
+            assert!(result.is_err(), "{how:?} {failure:?}: {result:?}");
+
+            let set = SegmentSet::open(&dir)
+                .unwrap_or_else(|error| panic!("{how:?} {failure:?}: the set must open: {error}"));
+            if failure == Failure::Crash(Step::CurrentFlipped) {
+                // The flip is the install: the new generation, with the old fallback behind.
+                assert_eq!((set.generation(), set.info().library_version), (3, 31));
+                drop(set);
+                assert_eq!(previous_generation(&dir), 1, "{how:?}");
+                break_current(&dir, how);
+                let set = SegmentSet::open(&dir).unwrap();
+                assert_eq!(set.generation(), 1, "{how:?}");
+                assert_eq!(everything(&set, 9), answers, "{how:?}");
+                continue;
+            }
+            assert_eq!(set.generation(), 1, "{how:?} {failure:?}");
+            assert!(set.info().recovered_from_previous, "{how:?} {failure:?}");
+            assert_eq!(everything(&set, 9), answers, "{how:?} {failure:?}");
+            drop(set);
+            let after = on_disk(&dir);
+            for (file, bytes) in &before {
+                assert_eq!(
+                    after.get(file),
+                    Some(bytes),
+                    "{how:?} {failure:?}: {file} changed"
+                );
+            }
+        }
+    }
+}
+
+/// A generation only an unreadable pointer could name — or one a crash left where no
+/// collection could prove it dead — is never written into: the next is numbered past them
+/// all.
+#[test]
+fn a_new_generation_is_numbered_past_every_generation_on_disk() {
+    let work = TempDir::new("set_numbering");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let stray = dir.join(files::generation_dir(9));
+    std::fs::create_dir(&stray).unwrap();
+    std::fs::write(stray.join("set.json"), b"what a crash left").unwrap();
+    break_current(&dir, Broken::Garbage);
+
+    let report = install(&dir, &release(&work, &v31(), None)).unwrap();
+    assert_eq!(report.generation, 10);
+    assert_eq!(previous_generation(&dir), 1);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (10, 31));
+}
+
+/// `CURRENT` names a generation that does not open, and the set answers from `PREVIOUS`'s.
+/// An install or a compaction builds on that one; it must neither take the number of the one
+/// `CURRENT` names — removing it while it is named — nor move `PREVIOUS` off the one that
+/// opens.
+#[test]
+fn work_on_a_fallback_never_reuses_the_generation_current_names() {
+    for compaction in [false, true] {
+        let work = TempDir::new("set_fallback_work");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        let delta = release(&work, &v30(), Some(&v29()));
+        install(&dir, &delta).unwrap();
+        let named = dir.join(files::generation_dir(2));
+        let del = std::fs::read_dir(&named)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".del"))
+            .unwrap()
+            .path();
+        let mut bytes = std::fs::read(&del).unwrap();
+        bytes[20] ^= 1;
+        std::fs::write(&del, bytes).unwrap();
+        let fallback = SegmentSet::open(&dir).unwrap();
+        assert!(fallback.info().recovered_from_previous);
+        assert_eq!(fallback.generation(), 1);
+        drop(fallback);
+        let current_names: BTreeMap<String, Vec<u8>> = on_disk(&dir)
+            .into_iter()
+            .filter(|(file, _)| file.starts_with("gen-000002/"))
+            .collect();
+
+        let work_once = || {
+            if compaction {
+                compact(
+                    &dir,
+                    &CompactionPolicy {
+                        force: true,
+                        ..CompactionPolicy::default()
+                    },
+                    None,
+                    &CancellationToken::new(),
+                )
+                .map(|report| report.generation)
+            } else {
+                install(&dir, &delta).map(|report| report.generation)
+            }
+        };
+
+        // Cut off once its generation is written: what CURRENT names is untouched.
+        CRASH_AT.with(|crash| crash.set(Some(Step::GenerationWritten)));
+        let crashed = work_once();
+        CRASH_AT.with(|crash| crash.set(None));
+        assert!(crashed.is_err(), "compaction {compaction}: {crashed:?}");
+        let after = on_disk(&dir);
+        for (file, bytes) in &current_names {
+            assert_eq!(
+                after.get(file),
+                Some(bytes),
+                "compaction {compaction}: {file}"
+            );
+        }
+        assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+
+        // And done: past it, with PREVIOUS still on the generation it was built from — v29,
+        // which a compaction merges as it is and the delta takes to v30.
+        assert_eq!(work_once().unwrap(), 3, "compaction {compaction}");
+        assert_eq!(previous_generation(&dir), 1, "compaction {compaction}");
+        let set = SegmentSet::open(&dir).unwrap();
+        let version = if compaction { 29 } else { 30 };
+        assert_eq!((set.generation(), set.info().library_version), (3, version));
+        assert!(!set.info().recovered_from_previous);
+    }
+}
+
+/// With `CURRENT` unreadable the set is `PREVIOUS`'s generation, to `open` and to `info`
+/// alike; a delta from that generation's version applies to it.
+#[test]
+fn a_delta_over_an_unreadable_current_applies_to_the_generation_that_opens() {
+    let work = TempDir::new("set_broken_delta");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let delta = release(&work, &v30(), Some(&v29()));
+    install(&dir, &delta).unwrap();
+    break_current(&dir, Broken::Garbage);
+    assert_eq!(info(&dir).unwrap().unwrap().library_version, 29);
+
+    let report = install(&dir, &delta).unwrap();
+    assert!(!report.already_applied);
+    assert_eq!((report.generation, report.library_version), (3, 30));
+    assert_eq!(previous_generation(&dir), 1);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (3, 30));
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);

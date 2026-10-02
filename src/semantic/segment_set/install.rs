@@ -13,15 +13,17 @@
 //! 5. **resolve keys**, for a delta: one sequential pass over the older segments' keys marks
 //!    the slots its tombstones and its own slots supersede, and finds where its foreign
 //!    records resolve;
-//! 6. **write generation N+1** — its `.del` and `.links` files and `set.json`;
-//! 7. **flip** — `PREVIOUS` ← `CURRENT`, then `CURRENT`;
+//! 6. **write a new generation**, numbered past every one on disk — its `.del` and `.links`
+//!    files and `set.json`;
+//! 7. **flip** — `PREVIOUS` ← the generation the install was built on, the one the set
+//!    opened at, then `CURRENT`;
 //! 8. **collect garbage**.
 
 use super::files::{
-    encode_links, generation_dir, generation_path, io_error, read_pointer, segment_file,
-    sha256_hex, write_atomically, Deleted, DerivedFile, Pointer, SetDocument, SetLock, SetSegment,
-    SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE, SET_FORMAT,
-    SET_FORMAT_VERSION, STAGING_DIR,
+    encode_links, generation_dir, generation_path, io_error, next_generation, read_pointer,
+    segment_file, sha256_hex, write_atomically, write_pointer, Deleted, DerivedFile, Pointer,
+    SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR,
+    SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -284,10 +286,13 @@ pub fn install_package(
         })?;
     check_manifest(&manifest, expect)?;
 
-    let current = match read_pointer(dir, CURRENT) {
-        Ok(Some(_)) => Some(SegmentSet::open_unlocked(dir)),
-        _ => None,
-    };
+    // The set as `open` sees it — `CURRENT`'s generation, or `PREVIOUS`'s when that one does
+    // not open — whenever either pointer is there to read, or to fail to.
+    let installed = !matches!(
+        (read_pointer(dir, CURRENT), read_pointer(dir, PREVIOUS)),
+        (Ok(None), Ok(None))
+    );
+    let current = installed.then(|| SegmentSet::open_unlocked(dir));
     let current = match (manifest.kind, current) {
         (PackageKind::Delta, None) => {
             return Err(ArtifactError::DeltaDoesNotApply {
@@ -407,8 +412,8 @@ pub fn install_package(
     };
     let resolution = generation.push(entry, &segment, older, cancel)?;
     generation.library_release_tag = manifest.library_release_tag.clone();
-    let previous_generation = current.as_ref().map_or(0, SegmentSet::generation);
-    let document = generation.commit(dir, previous_generation)?;
+    let base = current.as_ref().map(|set| set.pointer().clone());
+    let document = generation.commit(dir, base.as_ref())?;
 
     let bytes_on_disk = document.stats.bytes;
     let info = super::info_of(
@@ -765,20 +770,22 @@ impl NewGeneration {
         Ok(resolution)
     }
 
-    /// Write the generation after `previous` — derived files, then `set.json` — flip the
-    /// pointers to it, and collect garbage. Returns what was written.
+    /// Write a new generation — derived files, then `set.json` — flip the pointers to it, and
+    /// collect garbage. `base` is the generation it was built on: the one the set opened at,
+    /// `CURRENT`'s or, on a fallback, `PREVIOUS`'s; `None` when none opened. Returns what was
+    /// written.
+    ///
+    /// The new generation is numbered past every one on disk, so it is written beside them
+    /// and never over one; nothing that exists is touched before the flip, and a failure at
+    /// any point leaves the pointers naming what they named.
     pub(crate) fn commit(
         mut self,
         dir: &Path,
-        previous: u64,
+        base: Option<&Pointer>,
     ) -> Result<SetDocument, SemanticSearchError> {
-        let generation = previous + 1;
+        let generation = next_generation(dir)?;
         let path = generation_path(dir, generation);
-        if path.exists() {
-            // Left by an attempt that crashed before its flip; nothing names it.
-            fs::remove_dir_all(&path).map_err(io_error(format!("removing {}", path.display())))?;
-        }
-        fs::create_dir_all(&path).map_err(io_error(format!("creating {}", path.display())))?;
+        fs::create_dir(&path).map_err(io_error(format!("creating {}", path.display())))?;
         let mut stats = SetStats::default();
         for ((entry, deleted), links) in self.entries.iter_mut().zip(&self.deleted).zip(&self.links)
         {
@@ -840,14 +847,25 @@ impl NewGeneration {
             set: format!("{}/{SET_FILE}", generation_dir(generation)),
             set_sha256: sha256_hex(&bytes),
         };
-        let current = dir.join(CURRENT);
-        if let Ok(bytes) = fs::read(&current) {
-            let previous = dir.join(PREVIOUS);
-            write_atomically(&previous, &bytes).map_err(space_or_io(&previous, bytes.len()))?;
+        // PREVIOUS: the generation this one was built on, or — when none opened — what
+        // CURRENT names, if it reads. Never CURRENT's bytes as they are: an unreadable
+        // CURRENT would overwrite the one pointer that still opens, and on a fallback
+        // CURRENT names the generation that did not.
+        let previous = match base {
+            Some(base) => Some(base.clone()),
+            None => read_pointer(dir, CURRENT).ok().flatten(),
+        };
+        if let Some(previous) = previous {
+            if read_pointer(dir, PREVIOUS).ok().flatten().as_ref() != Some(&previous) {
+                let bytes = serde_json::to_vec(&previous).expect("a pointer serializes");
+                let path = dir.join(PREVIOUS);
+                write_pointer(dir, PREVIOUS, &bytes).map_err(space_or_io(&path, bytes.len()))?;
+            }
         }
         reached(Step::PreviousWritten)?;
         let bytes = serde_json::to_vec(&pointer).expect("a pointer serializes");
-        write_atomically(&current, &bytes).map_err(space_or_io(&current, bytes.len()))?;
+        let current = dir.join(CURRENT);
+        write_pointer(dir, CURRENT, &bytes).map_err(space_or_io(&current, bytes.len()))?;
         reached(Step::CurrentFlipped)?;
 
         collect_garbage(dir);

@@ -405,9 +405,9 @@ pub fn compact(
         cancel,
     )?;
     drop(segment);
-    let generation_number = set.generation();
+    let base = set.pointer().clone();
     drop(set);
-    let committed = generation.commit(dir, generation_number)?;
+    let committed = generation.commit(dir, Some(&base))?;
     log::info!(
         "Compacted {} ({reason}): {} segment(s) and {slots_before} slot(s) into one of {}, \
          {pruned} record(s) pruned, {refreshed} re-anchored",
