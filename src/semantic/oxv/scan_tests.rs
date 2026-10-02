@@ -553,6 +553,9 @@ fn a_cancelled_scan_stops_at_its_next_checkpoint() {
 /// Cancelled from another thread while four scan, every one of them stops within two
 /// intervals of where it was when the token was cancelled: it notices at its next
 /// checkpoint, and the position it last reported is at most one interval behind it.
+///
+/// On a busy machine the cancelling thread can be descheduled until a worker has all but
+/// finished its share — a run that shows nothing, which is run again.
 #[test]
 fn a_scan_on_four_threads_stops_within_two_intervals_of_a_cancel() {
     let fixture = Fixture::new(200, 1000, 41, int8);
@@ -567,32 +570,41 @@ fn a_scan_on_four_threads_stops_within_two_intervals_of_a_cancel() {
         books: None,
         threads: 4,
     };
-    let progress: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
-    let token = CancellationToken::new();
-    let total = 200 * 1000 + 1000;
+    let share = (200 * 1000 + 1000) / 4;
 
-    let (result, snapshot) = std::thread::scope(|scope| {
-        let scan = scope.spawn(|| scan_reporting(&set, &query, &request, &token, Some(&progress)));
-        let started = std::time::Instant::now();
-        while progress[0].load(Ordering::Relaxed) < 4 * SCAN_CHECK_INTERVAL {
-            assert!(started.elapsed().as_secs() < 60, "the scan never got going");
-            std::thread::yield_now();
+    for attempt in 1.. {
+        let progress: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
+        let token = CancellationToken::new();
+        let (result, snapshot) = std::thread::scope(|scope| {
+            let scan =
+                scope.spawn(|| scan_reporting(&set, &query, &request, &token, Some(&progress)));
+            let started = std::time::Instant::now();
+            while progress[0].load(Ordering::Relaxed) < 4 * SCAN_CHECK_INTERVAL {
+                assert!(started.elapsed().as_secs() < 60, "the scan never got going");
+                std::thread::yield_now();
+            }
+            token.cancel();
+            let snapshot: Vec<usize> = progress.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+            (scan.join().unwrap(), snapshot)
+        });
+        let mid_scan = snapshot
+            .iter()
+            .all(|before| before + 2 * SCAN_CHECK_INTERVAL < share);
+        if !mid_scan {
+            assert!(
+                attempt < 50,
+                "in {attempt} runs the cancel never came mid-scan"
+            );
+            continue;
         }
-        token.cancel();
-        let snapshot: Vec<usize> = progress.iter().map(|p| p.load(Ordering::Relaxed)).collect();
-        (scan.join().unwrap(), snapshot)
-    });
-
-    assert!(matches!(result, Err(VectorStoreError::Cancelled)));
-    for (worker, (counter, before)) in progress.iter().zip(&snapshot).enumerate() {
-        let stopped = counter.load(Ordering::Relaxed);
-        assert!(
-            stopped <= before + 2 * SCAN_CHECK_INTERVAL,
-            "worker {worker} went on from {before} to {stopped}"
-        );
-        assert!(
-            stopped < total / 4,
-            "worker {worker} finished its share despite the cancel"
-        );
+        assert!(matches!(result, Err(VectorStoreError::Cancelled)));
+        for (worker, (counter, before)) in progress.iter().zip(&snapshot).enumerate() {
+            let stopped = counter.load(Ordering::Relaxed);
+            assert!(
+                stopped <= before + 2 * SCAN_CHECK_INTERVAL,
+                "worker {worker} went on from {before} to {stopped}"
+            );
+        }
+        break;
     }
 }
