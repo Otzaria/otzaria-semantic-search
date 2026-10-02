@@ -170,3 +170,64 @@ records) or many; the windows must tile the plan.
 
 Without the plan — the import of a whole-library worker's output — everything but the
 plan's own keys is checked.
+
+## 4. The warehouse
+
+Every vector the build machine ever embedded, as `f32`, keyed by the **full SHA-256** of
+its text. It makes a codec change, a new base and a revived key free of GPU work.
+
+| File | Layout |
+|---|---|
+| `warehouse.json` | `{format: "otzaria-vector-warehouse", version: 1, identity, records, batches}` |
+| `vectors.f32` | `records × dim` little-endian `f32`, append-only |
+| `keys.bin` | `records × 32` bytes, each record's SHA-256, in the same order |
+| `index.bin` | `b"OXVWIDX1"`, `u64` count, then `{sha256 [32], record u64}` ascending by sha256 |
+
+- `identity` is what a vector depends on given its exact text: `family_id`,
+  `tokenizer_checksum`, `embedding_dim`, `pooling`, `max_tokens` — and **one**
+  `passage_package`. A shard of another package is refused: two packages of a family are
+  close, not equal, and a segment must not mix them.
+- `batches` records every add: its first record and count, the digests of what it
+  appended, the plan it was checked against (`null` for an import), the worker and its
+  parity certificate.
+- `warehouse.json` is the commit point. An add appends both data files, writes a new
+  index under a temporary name, renames it, and only then records the new count; the next
+  add truncates whatever a crash left past the count and rebuilds an index that is not the
+  count's.
+- A key the warehouse holds is not added again.
+
+```sh
+otzaria-semantic-search warehouse-add --warehouse <dir> [--create --model <model.json>] \
+    [--passage-quantization fp32] [--plan <plan dir>] --shards <dir> [--shards <dir> …]
+```
+
+With `--plan`, the shards are held to the plan (§3); without it — an import — to
+everything but the plan's own keys.
+
+### Importing a whole-library output
+
+The v30 run on winpc (`$W/out/v30-meivin-r2-fp32/`: `vectors.f32` [6,347,587 × 256],
+`keys.sha256` with 32 raw bytes a row, `manifest.json`, `certificate.json`) is the shard
+layout but for two names. To import it:
+
+```sh
+cd $W/out/v30-meivin-r2-fp32
+ln keys.sha256 keys.bin
+otzaria-semantic-search adopt-shard --dir . \
+    --model config/models/meivin-round2-onnx/model.json --passage-quantization fp32 \
+    --plan-sha256 <the run manifest's plan_sha256> \
+    --worker-name torch_bert --worker-version <the scripts' sha256> \
+    --device "AMD Radeon RX 9060 XT" --ep rocm --mode torch-mixed \
+    --parity-reference "onnxruntime 1.28.0 cpu fp32" --parity-samples 20480 \
+    --parity-min-cosine 0.99999969 --parity-mean-cosine 0.99999986 \
+    --parity-document certificate.json
+otzaria-semantic-search warehouse-add --warehouse /srv/otzaria-vectors/<id8>/warehouse \
+    --create --model config/models/meivin-round2-onnx/model.json \
+    --passage-quantization fp32 --shards .
+```
+
+`adopt-shard` hashes both files and writes `shard-manifest.json` (window 0..records). The
+import then re-reads every row: its digest, its finiteness, its unit norm, and the parity
+rule for a worker that is not ONNX Runtime on a CPU. The worker's own plan was a version 1
+`plan.jsonl`, so its digest is recorded and not compared. The fp32 package checksum in
+`config/models/meivin-round2-onnx/model.json` (`4a4a2ae8…`) is the run's passage package.

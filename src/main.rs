@@ -46,6 +46,9 @@ Commands:
                                       build's plan, split against the release before.
   embed-shard [options]               Embed a window of a plan's embed.jsonl on this CPU,
                                       in one process or several.
+  adopt-shard [options]               Write the v2 manifest of an external worker's output,
+                                      so a warehouse can import it.
+  warehouse-add [options]             Check shards and add their vectors to a warehouse.
   model-checksum --model-file <path>  Validate a model and print the model_checksum an
                                       identity has to declare for it.
 
@@ -88,6 +91,7 @@ Options for 'plan':
   --passage-quantization <q> Which of the family's packages embeds the passages
                              (default: fp32)
   --previous-ledger <dir>    The ledger of the release before; omit for a first base
+  --warehouse <dir>          Leave out of embed.jsonl the texts it holds vectors for
   --out <dir>                Receives records.bin, books.json, embed.jsonl,
                              embed-manifest.json, tombstones.bin and plan-manifest.json
   --created-at <timestamp>   Manifest timestamp (default: now, UTC)
@@ -107,6 +111,30 @@ Options for 'embed-shard':
                              Leftovers from a session that died are overwritten — retrying a
                              window is normal — but a finished shard is not.
   --allow-non-semantic       As for 'build'
+
+Options for 'adopt-shard':
+  --dir <dir>                Holds vectors.f32 and keys.bin (32 raw bytes a record: rename
+                             a worker's keys.sha256); receives shard-manifest.json
+  --model <path>             The family (JSON ModelIdentity)
+  --passage-quantization <q> The package the vectors were embedded with (default: fp32)
+  --plan-sha256 <hex>        The digest of the plan the worker embedded, for the record
+  --worker-name, --worker-version, --device, --ep, --mode
+                             What ran it: mode `onnxruntime` for ONNX Runtime with the
+                             shipped graph, anything else for a re-implementation
+  --parity-reference <text>, --parity-samples <N>, --parity-min-cosine <x>,
+  --parity-mean-cosine <x>, --parity-document <path>
+                             The parity certificate, required unless ep is cpu and mode is
+                             onnxruntime
+
+Options for 'warehouse-add':
+  --warehouse <dir>          The warehouse
+  --create                   Create it if missing, for --model's --passage-quantization
+  --model <path>             With --create: the family
+  --passage-quantization <q> With --create: the package (default: fp32)
+  --plan <dir>               The plan the shards were cut from; without it, an import:
+                             everything but the plan's own keys is checked
+  --shards <dir>             A shard, or a directory holding shards at any depth; repeat
+  --allow-non-semantic       Accept the stand-in's vectors (tests only)
 
 Options for 'model-checksum':
   --model-file <path>        An .onnx graph, its tokenizer.json beside it. No other kind of
@@ -318,6 +346,8 @@ fn main() {
         "build" => run_build(&args),
         "plan" => run_plan(&args),
         "embed-shard" => run_embed_shard(&args),
+        "adopt-shard" => run_adopt_shard(&args),
+        "warehouse-add" => run_warehouse_add(&args),
         "model-checksum" => run_model_checksum(&args),
         "help" | "-h" | "--help" => {
             print_usage();
@@ -452,6 +482,10 @@ fn run_plan(args: &[String]) {
         Ledger::open(Path::new(&dir), None)
             .unwrap_or_else(|error| exit_with("Could not open the previous ledger", error))
     });
+    let warehouse = parse_arg(args, "--warehouse").map(|dir| {
+        otzaria_semantic_search::distribution::warehouse::Warehouse::open(Path::new(&dir))
+            .unwrap_or_else(|error| exit_with("Could not open the warehouse", error))
+    });
     let corpus = load_corpus(args);
     let manifest = plan_from_corpus(
         &corpus,
@@ -461,7 +495,9 @@ fn run_plan(args: &[String]) {
             chunking: read_chunking(&require_arg(args, "--chunking")),
             passage_package,
             previous: previous.as_ref(),
-            warehouse: None,
+            warehouse: warehouse.as_ref().map(|warehouse| {
+                warehouse as &dyn otzaria_semantic_search::distribution::plan::HeldVectors
+            }),
             created_at: parse_arg(args, "--created-at")
                 .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
         },
@@ -610,6 +646,185 @@ fn run_embed_shard(args: &[String]) {
     println!("Dimension:       {}", manifest.dim);
     println!("vectors SHA-256: {}", manifest.vectors_sha256);
     println!("keys SHA-256:    {}", manifest.keys_sha256);
+}
+
+/// Every value of a repeated flag.
+fn parse_args_all(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+/// The package of `model` whose quantization is `--passage-quantization` (default fp32).
+fn passage_package_of(
+    args: &[String],
+    model: &ModelIdentity,
+) -> otzaria_semantic_search::semantic::versioning::ModelPackage {
+    let quantization = parse_arg(args, "--passage-quantization").unwrap_or_else(|| "fp32".into());
+    model
+        .query_packages
+        .iter()
+        .find(|package| package.quantization == quantization)
+        .cloned()
+        .unwrap_or_else(|| {
+            exit_with(
+                "The family has no such package",
+                format!("no {quantization} package among its query packages"),
+            )
+        })
+}
+
+/// Write the v2 shard manifest of an external worker's output.
+fn run_adopt_shard(args: &[String]) {
+    use otzaria_semantic_search::distribution::shard::{
+        ParityCertificate, ShardManifest, WorkerInfo, KEYS_FILE, SHARD_FORMAT,
+        SHARD_FORMAT_VERSION, SHARD_MANIFEST_FILE, VECTORS_FILE,
+    };
+    let dir = PathBuf::from(require_arg(args, "--dir"));
+    let model = read_model(&require_arg(args, "--model"));
+    let passage_package = passage_package_of(args, &model);
+    let digest = |name: &str| {
+        let path = dir.join(name);
+        let length = std::fs::metadata(&path)
+            .unwrap_or_else(|error| exit_with(&format!("Could not read {}", path.display()), error))
+            .len();
+        (length, sha256_file(&path))
+    };
+    let (keys_length, keys_sha256) = digest(KEYS_FILE);
+    let (vectors_length, vectors_sha256) = digest(VECTORS_FILE);
+    let records = keys_length / 32;
+    if keys_length % 32 != 0 || vectors_length != records * u64::from(model.embedding_dim) * 4 {
+        exit_with(
+            "The files do not describe one set of records",
+            format!(
+                "{KEYS_FILE} is {keys_length} bytes and {VECTORS_FILE} {vectors_length}, for                  {}-wide vectors",
+                model.embedding_dim
+            ),
+        );
+    }
+    let float = |flag: &str| {
+        parse_arg(args, flag).map(|value| {
+            value
+                .parse::<f64>()
+                .unwrap_or_else(|_| exit_with(flag, "not a number"))
+        })
+    };
+    let parity = parse_arg(args, "--parity-reference").map(|reference| ParityCertificate {
+        reference,
+        samples: parse_arg(args, "--parity-samples")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| exit_with("--parity-samples", "required with a certificate")),
+        min_cosine: float("--parity-min-cosine")
+            .unwrap_or_else(|| exit_with("--parity-min-cosine", "required with a certificate")),
+        mean_cosine: float("--parity-mean-cosine")
+            .unwrap_or_else(|| exit_with("--parity-mean-cosine", "required with a certificate")),
+        document_sha256: parse_arg(args, "--parity-document")
+            .map(|path| sha256_file(Path::new(&path))),
+    });
+    let manifest = ShardManifest {
+        format: SHARD_FORMAT.to_string(),
+        version: SHARD_FORMAT_VERSION,
+        plan_sha256: require_arg(args, "--plan-sha256"),
+        skip: 0,
+        take: records,
+        records,
+        dim: model.embedding_dim,
+        vectors_sha256,
+        keys_sha256,
+        model,
+        passage_package,
+        worker: WorkerInfo {
+            name: require_arg(args, "--worker-name"),
+            version: require_arg(args, "--worker-version"),
+            device: require_arg(args, "--device"),
+            ep: require_arg(args, "--ep"),
+            mode: require_arg(args, "--mode"),
+        },
+        parity,
+    };
+    std::fs::write(
+        dir.join(SHARD_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("a manifest serializes"),
+    )
+    .unwrap_or_else(|error| exit_with("Could not write the shard manifest", error));
+    println!(
+        "\n=== Adopted {} record(s) in {} ===",
+        records,
+        dir.display()
+    );
+}
+
+/// Add shards to a warehouse, creating it when asked.
+fn run_warehouse_add(args: &[String]) {
+    use otzaria_semantic_search::distribution::shard::{ShardPolicy, SHARD_MANIFEST_FILE};
+    use otzaria_semantic_search::distribution::warehouse::{Warehouse, WarehouseIdentity};
+
+    let dir = PathBuf::from(require_arg(args, "--warehouse"));
+    if args.iter().any(|arg| arg == "--create") && !dir.join("warehouse.json").exists() {
+        let model = read_model(&require_arg(args, "--model"));
+        let package = passage_package_of(args, &model);
+        Warehouse::create(&dir, WarehouseIdentity::of(&model, &package))
+            .unwrap_or_else(|error| exit_with("Could not create the warehouse", error));
+    }
+    fn collect(root: &Path, found: &mut Vec<PathBuf>) {
+        if root.join(SHARD_MANIFEST_FILE).exists() {
+            found.push(root.to_path_buf());
+            return;
+        }
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        entries.sort();
+        for entry in entries.into_iter().filter(|path| path.is_dir()) {
+            collect(&entry, found);
+        }
+    }
+    let mut shards = Vec::new();
+    for root in parse_args_all(args, "--shards") {
+        collect(Path::new(&root), &mut shards);
+    }
+    if shards.is_empty() {
+        exit_with("Nothing to add", "no shard-manifest.json under --shards");
+    }
+    let mut warehouse = Warehouse::open_for_append(&dir)
+        .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    let plan = parse_arg(args, "--plan").map(PathBuf::from);
+    let report = warehouse
+        .add_shards(
+            plan.as_deref(),
+            &shards,
+            &ShardPolicy {
+                allow_non_semantic: args.iter().any(|arg| arg == "--allow-non-semantic"),
+            },
+            utc_timestamp(SystemTime::now()),
+        )
+        .unwrap_or_else(|error| exit_with("The shards were refused", error));
+    println!("\n=== Added to {} ===", dir.display());
+    println!("Shards:          {}", report.shards);
+    println!("Records:         {}", report.records);
+    println!("Added:           {}", report.added);
+    println!("Held already:    {}", report.held);
+    println!("Warehouse:       {} record(s)", report.total);
+}
+
+/// SHA-256 of a file, streamed; exits naming the file when it cannot be read.
+fn sha256_file(path: &Path) -> String {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .unwrap_or_else(|error| exit_with(&format!("Could not read {}", path.display()), error));
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).unwrap_or_else(|error| {
+            exit_with(&format!("Could not read {}", path.display()), error)
+        });
+        if read == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buffer[..read]);
+    }
+    format!("{:x}", sha2::Digest::finalize(hasher))
 }
 
 fn run_build(args: &[String]) {

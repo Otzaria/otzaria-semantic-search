@@ -27,6 +27,7 @@ pub mod ledger;
 pub mod package;
 pub mod plan;
 pub mod shard;
+pub mod warehouse;
 
 #[cfg(test)]
 mod plan_tests;
@@ -34,3 +35,5 @@ mod plan_tests;
 mod shard_tests;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(test)]
+mod warehouse_tests;
