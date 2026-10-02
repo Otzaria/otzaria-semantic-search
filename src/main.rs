@@ -49,6 +49,10 @@ Commands:
   adopt-shard [options]               Write the v2 manifest of an external worker's output,
                                       so a warehouse can import it.
   warehouse-add [options]             Check shards and add their vectors to a warehouse.
+  assemble [options]                  Assemble a base or a delta from a plan and the
+                                      warehouse; with --verify, check gates G1, G5, G7-G10.
+  release-files [options]             List the files a release downloads as, in the shape
+                                      of the updater's patch entries, in its manifest.
   model-checksum --model-file <path>  Validate a model and print the model_checksum an
                                       identity has to declare for it.
 
@@ -135,6 +139,32 @@ Options for 'warehouse-add':
                              everything but the plan's own keys is checked
   --shards <dir>             A shard, or a directory holding shards at any depth; repeat
   --allow-non-semantic       Accept the stand-in's vectors (tests only)
+
+Options for 'assemble':
+  --plan <dir>               The plan
+  --warehouse <dir>          The warehouse, holding every vector the release ships
+  --out <dir>                The release: segment.oxv, manifest.json, payloads.json,
+                             release.json, and this version's ledger
+  --kind <base|delta>        What to assemble; without it, --verify checks the release
+                             already in --out
+  --previous <dir>           The ledger of the release the plan was split against:
+                             required for a delta and for --keep-epoch
+  --previous-version <N>     Its version, when the directory holds several
+  --codec <name>             A base's codec epoch: i8-sym-vec (default), i8-sym-dim, f32
+  --clip-q <q>               For i8-sym-dim: the calibration quantile (default: 1)
+  --keep-epoch               A base in the previous release's codec epoch
+  --created-at <time>        The manifest's createdAt (default: now); the same inputs and
+                             time give the same bytes
+  --built-by <json>          The manifest's builtBy, e.g. {{"runId":"..."}}
+  --verify                   Check the gates and write <out>/gates.json; a failed gate
+                             exits with status 2
+  --samples <N>              G5's sample (default: 20000)
+
+Options for 'release-files':
+  --release <path>           An assembled release.json
+  --files <path>             A file the release downloads as, in order; repeat
+  --compression <name>       How they are compressed (default: zstd)
+  --out <path>               The manifest to write, with its files
 
 Options for 'model-checksum':
   --model-file <path>        An .onnx graph, its tokenizer.json beside it. No other kind of
@@ -348,6 +378,8 @@ fn main() {
         "embed-shard" => run_embed_shard(&args),
         "adopt-shard" => run_adopt_shard(&args),
         "warehouse-add" => run_warehouse_add(&args),
+        "assemble" => run_assemble(&args),
+        "release-files" => run_release_files(&args),
         "model-checksum" => run_model_checksum(&args),
         "help" | "-h" | "--help" => {
             print_usage();
@@ -698,7 +730,8 @@ fn run_adopt_shard(args: &[String]) {
         exit_with(
             "The files do not describe one set of records",
             format!(
-                "{KEYS_FILE} is {keys_length} bytes and {VECTORS_FILE} {vectors_length}, for                  {}-wide vectors",
+                "{KEYS_FILE} is {keys_length} bytes and {VECTORS_FILE} {vectors_length}, \
+                 for {}-wide vectors",
                 model.embedding_dim
             ),
         );
@@ -806,6 +839,170 @@ fn run_warehouse_add(args: &[String]) {
     println!("Added:           {}", report.added);
     println!("Held already:    {}", report.held);
     println!("Warehouse:       {} record(s)", report.total);
+}
+
+fn run_assemble(args: &[String]) {
+    use otzaria_semantic_search::distribution::assemble::{
+        assemble, AssembleRequest, EpochChoice, RELEASE_FILE,
+    };
+    use otzaria_semantic_search::distribution::gates::{verify_release, VerifyRequest, G5_SAMPLES};
+    use otzaria_semantic_search::distribution::ledger::Ledger;
+    use otzaria_semantic_search::distribution::package::PackageKind;
+    use otzaria_semantic_search::distribution::plan::Plan;
+    use otzaria_semantic_search::distribution::warehouse::Warehouse;
+    use otzaria_semantic_search::semantic::oxv::codec::CodecSpec;
+
+    let flag = |name: &str| args.iter().any(|arg| arg == name);
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let plan = Plan::open(Path::new(&require_arg(args, "--plan")))
+        .unwrap_or_else(|error| exit_with("Could not open the plan", error));
+    let warehouse = Warehouse::open(Path::new(&require_arg(args, "--warehouse")))
+        .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    let previous = parse_arg(args, "--previous").map(|dir| {
+        let version = parse_arg(args, "--previous-version").map(|value| {
+            value
+                .parse::<u32>()
+                .unwrap_or_else(|_| exit_with("--previous-version", "not a number"))
+        });
+        Ledger::open(Path::new(&dir), version)
+            .unwrap_or_else(|error| exit_with("Could not open the previous ledger", error))
+    });
+    if let Some(kind) = parse_arg(args, "--kind") {
+        let kind = match kind.as_str() {
+            "base" => PackageKind::Base,
+            "delta" => PackageKind::Delta,
+            other => exit_with("--kind", format!("{other:?} is neither base nor delta")),
+        };
+        let epoch = if flag("--keep-epoch") {
+            EpochChoice::Previous
+        } else {
+            let clip_q = parse_arg(args, "--clip-q").map_or(1.0, |value| {
+                value
+                    .parse::<f32>()
+                    .unwrap_or_else(|_| exit_with("--clip-q", "not a number"))
+            });
+            let name = parse_arg(args, "--codec").unwrap_or_else(|| "i8-sym-vec".to_string());
+            EpochChoice::New(
+                CodecSpec::parse(&name, clip_q).unwrap_or_else(|error| exit_with("--codec", error)),
+            )
+        };
+        let built_by = parse_arg(args, "--built-by").map(|json| {
+            serde_json::from_str(&json).unwrap_or_else(|error| exit_with("--built-by", error))
+        });
+        let report = assemble(&AssembleRequest {
+            plan: &plan,
+            warehouse: &warehouse,
+            kind,
+            previous: previous.as_ref(),
+            epoch,
+            out_dir: out.clone(),
+            created_at: parse_arg(args, "--created-at")
+                .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
+            built_by,
+        })
+        .unwrap_or_else(|error| exit_with("Assembly failed", error));
+        let manifest = &report.manifest;
+        println!("\n=== Assembled {} ===", out.display());
+        println!("Kind:            {:?}", manifest.kind);
+        println!(
+            "Library:         v{} -> v{} ({})",
+            manifest.from_library_version,
+            manifest.to_library_version,
+            manifest.library_release_tag
+        );
+        println!(
+            "Codec:           {}",
+            manifest.identity.store.vector_precision
+        );
+        println!(
+            "Counts:          {} slot(s), {} extra(s), {} foreign, {} tombstone(s), {} book(s)",
+            manifest.counts.slots,
+            manifest.counts.extras,
+            manifest.counts.foreign,
+            manifest.counts.tombstones,
+            manifest.counts.books
+        );
+        println!(
+            "Segment:         {} bytes, SHA-256 {}",
+            manifest.segment.size, manifest.segment.sha256
+        );
+        println!("Package digest:  {}", manifest.package_digest);
+        println!("Manifest SHA-256 {}", report.manifest_sha256);
+        println!(
+            "Clipped:         {} component(s)",
+            report.clipped_components
+        );
+        println!(
+            "Ledger:          v{}, {} key(s), {} pair(s)",
+            report.ledger.library_version, report.ledger.keys.count, report.ledger.pairs.count
+        );
+    } else if !flag("--verify") {
+        exit_with(
+            "Nothing to do",
+            "give --kind to assemble, --verify to check, or both",
+        );
+    } else if !out.join(RELEASE_FILE).exists() {
+        exit_with(
+            "Nothing to verify",
+            format!("{} holds no {RELEASE_FILE}", out.display()),
+        );
+    }
+    if flag("--verify") {
+        let samples = parse_arg(args, "--samples").map_or(G5_SAMPLES, |value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| exit_with("--samples", "not a number"))
+        });
+        let report = verify_release(&VerifyRequest {
+            release_dir: &out,
+            plan: &plan,
+            warehouse: &warehouse,
+            previous: previous.as_ref(),
+            scratch_dir: out.with_extension("g8"),
+            samples,
+        })
+        .unwrap_or_else(|error| exit_with("The release could not be verified", error));
+        std::fs::write(
+            out.join("gates.json"),
+            serde_json::to_vec_pretty(&report).expect("a report serializes"),
+        )
+        .unwrap_or_else(|error| exit_with("Could not write gates.json", error));
+        println!("\n=== Gates ===");
+        for gate in &report.gates {
+            println!(
+                "{:<4} {}  {}",
+                gate.gate,
+                if gate.passed { "pass" } else { "FAIL" },
+                gate.detail
+            );
+        }
+        if !report.passed() {
+            process::exit(2);
+        }
+    }
+}
+
+fn run_release_files(args: &[String]) {
+    use otzaria_semantic_search::distribution::assemble::{asset_stem, release_with_files};
+    let files: Vec<PathBuf> = parse_args_all(args, "--files")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    if files.is_empty() {
+        exit_with("Nothing to list", "give each file with --files");
+    }
+    let (manifest, sha256) = release_with_files(
+        Path::new(&require_arg(args, "--release")),
+        &files,
+        &parse_arg(args, "--compression").unwrap_or_else(|| "zstd".to_string()),
+        Path::new(&require_arg(args, "--out")),
+    )
+    .unwrap_or_else(|error| exit_with("Could not list the files", error));
+    println!("\n=== {} ===", asset_stem(&manifest));
+    for file in &manifest.files {
+        println!("{}  {} bytes  {}", file.file, file.size, file.sha256);
+    }
+    println!("Manifest SHA-256 {sha256}");
 }
 
 /// SHA-256 of a file, streamed; exits naming the file when it cannot be read.
