@@ -306,7 +306,7 @@ mod with_the_backend {
                 to_library_version: 1,
                 library_release_tag: "v1-fixture".to_string(),
             },
-            Codec::i8_sym_dim(vec![1.0; 4], 1.0).unwrap(),
+            Codec::i8_sym_vec(4).unwrap(),
         );
         builder
             .add_book(
