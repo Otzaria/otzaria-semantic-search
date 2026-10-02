@@ -163,8 +163,8 @@ BM25 עדיין עובד
 | builder שמייצר את הווקטורים עצמם | קיים — `build` מחיל את המתכון, מטמיע ומפיק base segment, חבילה ו־`release.json` |
 | צינור הבנייה של הספרייה          | `export-plan` / `embed-shard` קיימים; ה־merge לפי מפתחות, warehouse ו־delta — S7 |
 | חיבור ל־Tantivy חי | **לא קיים כאן** — ה־resolver ועמודת `chunkKey` הם של `otzaria_search_engine` (P1–P4) |
-| Production persistence במסלול הפעיל | קיימת ונמדדה: סט של 6.0M slots נפתח ב־14 ms |
-| אחזור תת־ליניארי (ANN)            | **אין, ואין צורך** (S2b): סריקה מלאה מדויקת ב־int8 — 59 ms בחוט אחד, 17 ms בעשרה, על 6.0M slots |
+| Production persistence במסלול הפעיל | קיימת ונמדדה: סט של 6.0M slots נפתח ב־3.8 ms |
+| אחזור תת־ליניארי (ANN)            | **אין, ואין צורך** (S2b): סריקה מלאה מדויקת ב־int8 — 69 ms בחוט אחד, 17 ms בעשרה, על 6.0M slots |
 | UI סמנטי באוצריא                 | **לא קיים** (S7)           |
 
 הנקודה החשובה ביותר למפתח חדש:
@@ -665,12 +665,12 @@ SegmentSet (segment_set/)       ← מה שהאפליקציה פותחת: סט �
 
 | מדד | ערך |
 |---|---|
-| גודל | 1.662 GB (int8, ממופה — לא נטען ל־RAM) |
-| פתיחה | 14 ms |
-| סריקה חמה | 59 ms בחוט אחד, 17 ms בעשרה |
+| גודל | 1.686 GB (`i8-sym-vec`, ממופה — לא נטען ל־RAM) |
+| פתיחה | 3.8 ms |
+| סריקה חמה | 69 ms בחוט אחד, 17 ms בעשרה |
 | סריקה של 5% מהספרים | 2.5 ms |
-| התקנת base / החלת delta של 6.5% | 4.6 s / 0.41 s |
-| דחיסה | 12.9 s, שיא זיכרון ≈ 0.35 GB |
+| התקנת base / החלת delta של 6.5% | 5.7 s / 0.45 s |
+| דחיסה | 8.8 s, שיא זיכרון ≈ 0.35 GB |
 
 כלומר **אין צורך ב־ANN**: סריקה מלאה מדויקת של int8 עומדת ביעד (≤ 80 ms) עם מרווח, והיא
 דטרמיניסטית — אותו ציון ביט אחר ביט על כל מעבד. אם מחשב חלש לא יעמוד ביעד שלו (≤ 250 ms),
@@ -1409,21 +1409,21 @@ brute-force scan, O(N·D)
 ```
 
 ה־store שבזיכרון (מסלול הפיתוח): 79–132ms לשאילתה על 200k×1024 f32. הסט הרשמי: 18.9 ns
-לווקטור בחוט אחד ב־256 int8 — 59 ms על 6.0M slots, 17 ms בעשרה חוטים.
+לווקטור בחוט אחד ב־256 int8 — 69 ms על 6.0M slots, 17 ms בעשרה חוטים.
 
 ---
 
 ## Persistence במסלול הפעיל
 
 סט מותקן נפתח מחדש אחרי restart ואינו מאונדקס שוב, ופתיחה ממפה את הווקטורים ואינה
-קוראת אותם: 14 ms על 6.0M slots. במסלול הפיתוח ה־store הוא בזיכרון, ושם הווקטורים אינם
+קוראת אותם: 3.8 ms על 6.0M slots. במסלול הפיתוח ה־store הוא בזיכרון, ושם הווקטורים אינם
 שורדים restart.
 
 ---
 
 ## Cold-open ותקציב זיכרון
 
-נמדדו (S2b, למעלה): פתיחה 14 ms, ו־private memory קטן — הווקטורים ממופים, והזיכרון
+נמדדו (S2b, למעלה): פתיחה 3.8 ms, ו־private memory קטן — הווקטורים ממופים, והזיכרון
 שהסריקה נוגעת בו הוא page cache של מערכת ההפעלה. דחיסה, במכשיר ובזמן סרק, מגיעה לשיא
 של ≈ 0.35 GB.
 
@@ -1595,9 +1595,9 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [x] persistence **במסלול שהאפליקציה פותחת** — ארטיפקט מותקן, `vectors_persisted=true` (S2a)
 * [x] מצב official-read-only ללא delete/upsert בזמן ריצה — טיפוס שאין עליו כתיבה (S2a)
 * [x] ה־engine תלוי ב־trait ולא ב־store קונקרטי, וה־manifest רושם את ה־backend שנפתח (S2a)
-* [x] ANN או הוכחה שאין בו צורך (S2b) — אין צורך: 59 ms בחוט אחד ו־17 ms בעשרה על 6.0M
+* [x] ANN או הוכחה שאין בו צורך (S2b) — אין צורך: 69 ms בחוט אחד ו־17 ms בעשרה על 6.0M
   slots, int8 מדויק (`tests/vector_set_scale.rs`)
-* [x] פתיחה, זיכרון וגודל דיסק בקנה מידה של הספרייה (S2b) — 14 ms, ממופה, 1.662 GB
+* [x] פתיחה, זיכרון וגודל דיסק בקנה מידה של הספרייה (S2b) — 3.8 ms, ממופה, 1.686 GB
 * [ ] recall מול f32 על וקטורי הספרייה, ומחשב חלש
 * [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
 * [x] insert/update/delete
@@ -1624,7 +1624,7 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [ ] זיהוי payload שנערך **יחד עם** ה־checksums שלו — רק digest מפורסם מבדיל (S6)
 * [ ] צינור שמפרסם digest, וחתימה (S6)
 * [ ] lock לשתי התקנות במקביל לאותו יעד — מתועד כמחוץ להיקף (S6, אם יידרש)
-* [x] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי — פתיחה 14 ms, התקנה 4.6 s, delta 0.41 s
+* [x] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי — פתיחה 3.8 ms, התקנה 5.7 s, delta 0.45 s
 * [ ] חשיפת ה־importer דרך ה־API / FFI (S5)
 * [ ] `assemble` לפי מפתחות, warehouse ו־delta לצינור הבנייה של הספרייה (S7)
 * [x] builder שמייצר את הווקטורים מקורפוס וממודל, ומחיל את המתכון בעצמו (S4b)
@@ -1746,7 +1746,7 @@ Architecture
      ├── store v2 (oxv segments + segment sets)
      │        ├── ✅ int8 ממופה, ממוען לפי טקסט, סריקה מדויקת        (S2–S3 של store v2)
      │        ├── ✅ התקנה, delta, דחיסה, שחזור, scrub               (S4 של store v2)
-     │        └── ✅ 6.0M slots: פתיחה 14 ms, סריקה 17–59 ms         (S2b)
+     │        └── ✅ 6.0M slots: פתיחה 3.8 ms, סריקה 17–69 ms        (S2b)
      │
      ├── IndexVersion
      │        └── ✅ text / משפחת מודל וחבילות שאילתה / store       (S5 של store v2)
@@ -1947,8 +1947,8 @@ int8 segments that are mapped rather than read, installed base and deltas as gen
 that a crash leaves old or new, and scanned exactly — the same score, bit for bit, on every
 CPU. A scan returns keys and the books and lines they were built at; the host's
 `CandidateResolver` ties them to live lines, so an index commit never shows a vector's line
-under the wrong id. S2b is answered by measurement: at 6.0M slots the set opens in 14 ms
-and a warm scan takes 59 ms on one thread and 17 ms on ten — no ANN.
+under the wrong id. S2b is answered by measurement: at 6.0M slots the set opens in 3.8 ms
+and a warm scan takes 69 ms on one thread and 17 ms on ten — no ANN.
 
 What that leaves, in an order that is not interchangeable:
 
@@ -1990,11 +1990,11 @@ design — it fails loudly rather than serving fake vectors.
 needs. The application's path holds a `SegmentSet`, which nothing on a device writes to.
 
 **Persistent vector database:** 🟢 The application opens an installed vector set: int8
-segments, mapped, opened in 14 ms at 6.0M slots, reopened after a restart without
+segments, mapped, opened in 3.8 ms at 6.0M slots, reopened after a restart without
 indexing. Installs and deltas are generations; a crash leaves the old one or the new.
 
-**ANN retrieval:** 🟢 Not needed (S2b): an exact int8 full scan takes 59 ms on one
-thread and 17 ms on ten at 6.0M slots, 2.5 ms for 5% of the books. A first-pass tier is
+**ANN retrieval:** 🟢 Not needed (S2b): an exact int8 full scan takes 69 ms on one
+thread and 17 ms on ten at 6.0M slots, 3.0 ms for 5% of the books. A first-pass tier is
 reserved in the format, as ancillary sections, if a weak laptop needs one.
 
 **Identity:** 🟢 `IndexVersion` carries the line recipe and the key version, the model

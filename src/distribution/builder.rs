@@ -77,13 +77,15 @@ use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use crate::semantic::official_index::readable_store_identity;
-use crate::semantic::oxv::codec::Codec;
+use crate::semantic::oxv::codec::CodecSpec;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
 use crate::semantic::recipe::EmbeddingRecipe;
 use crate::semantic::segment_set::ReleaseManifest;
 use crate::semantic::types::{BookForIndexing, BookLine, SemanticChunk};
-use crate::semantic::versioning::{EmbeddingWorker, IndexVersion, ModelIdentity, VectorProvenance};
+use crate::semantic::versioning::{
+    EmbeddingWorker, IndexVersion, ModelIdentity, StoreIdentity, VectorProvenance,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
@@ -114,9 +116,10 @@ pub struct BuildRequest {
     pub created_at: String,
     /// Texts per inference call.
     pub batch_size: usize,
-    /// The quantile each dimension's int8 scale is calibrated at — see
-    /// [`Codec::calibrate_i8_sym_dim`]. `1.0` clips nothing the base holds.
-    pub clip_q: f32,
+    /// The codec the segment is written in: `i8-sym-vec` unless a test or a study asks
+    /// otherwise. It is the store identity's `vector_precision`, and the application reads
+    /// the default only.
+    pub codec: CodecSpec,
     /// Permit a backend whose vectors carry no meaning.
     ///
     /// `false` in anything that ships. The deterministic stand-in produces vectors that
@@ -262,9 +265,11 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
     let identity = IndexVersion {
         text: corpus_identity.text.clone(),
         model: request.model.clone(),
-        // Not the caller's: a package in a layout this build cannot read would be a package
-        // for nobody.
-        store: readable_store_identity(),
+        // The layout this build reads, in the codec asked for.
+        store: StoreIdentity {
+            vector_precision: request.codec.name().to_string(),
+            ..readable_store_identity()
+        },
     };
     identity.validate_complete()?;
     crate::distribution::package::validate_release_tag(&corpus_identity.library_release_tag)?;
@@ -285,11 +290,12 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
 
     let dim = request.model.embedding_dim as usize;
     let vectors: Vec<&[f32]> = assembled.vectors.chunks_exact(dim).collect();
-    let codec = Codec::calibrate_i8_sym_dim(&vectors, request.clip_q).map_err(|reason| {
-        PackError::MalformedInput {
-            reason: format!("the int8 codec cannot be calibrated: {reason}"),
-        }
-    })?;
+    let codec = request
+        .codec
+        .build(dim, &vectors)
+        .map_err(|reason| PackError::MalformedInput {
+            reason: format!("the codec cannot be built: {reason}"),
+        })?;
 
     let root = &request.output_path;
     std::fs::create_dir_all(root).map_err(io_error(format!("creating {}", root.display())))?;
@@ -882,7 +888,7 @@ mod tests {
             chunking,
             created_at: "2026-08-08T00:00:00Z".to_string(),
             batch_size: 2,
-            clip_q: 1.0,
+            codec: CodecSpec::default(),
             allow_non_semantic_backend: true,
         }
     }
@@ -1452,7 +1458,7 @@ mod tests {
         let counts = report.manifest.counts;
         assert_eq!((counts.books, counts.slots, counts.extras), (2, 3, 0));
         assert_eq!(report.manifest.to_library_version, 30);
-        assert_eq!(report.clipped_components, 0, "clip_q 1 clips nothing");
+        assert_eq!(report.clipped_components, 0, "i8-sym-vec clips nothing");
         assert_eq!(
             report.manifest.provenance.passage_package.checksum, checksum,
             "the package that embedded the passages is on record"

@@ -16,7 +16,7 @@
 use otzaria_semantic_search::cancellation::CancellationToken;
 use otzaria_semantic_search::distribution::package::PackageKind;
 use otzaria_semantic_search::semantic::chunk_key::{ChunkKey, KEY_VERSION};
-use otzaria_semantic_search::semantic::oxv::codec::Codec;
+use otzaria_semantic_search::semantic::oxv::codec::{Codec, CodecSpec};
 use otzaria_semantic_search::semantic::oxv::scan::ScanRequest;
 use otzaria_semantic_search::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
 use otzaria_semantic_search::semantic::resolve::BookSet;
@@ -70,6 +70,15 @@ fn chunk_key(key: u64) -> ChunkKey {
     ChunkKey(bytes)
 }
 
+/// `i8-sym-vec`, or what `OTZARIA_SCALE_CODEC` names (`i8-sym-dim` calibrates at 0.9999).
+fn codec_spec() -> CodecSpec {
+    CodecSpec::parse(
+        &std::env::var("OTZARIA_SCALE_CODEC").unwrap_or_else(|_| "i8-sym-vec".to_string()),
+        0.9999,
+    )
+    .unwrap()
+}
+
 fn identity() -> IndexVersion {
     IndexVersion {
         text: TextIdentity {
@@ -93,7 +102,7 @@ fn identity() -> IndexVersion {
         store: StoreIdentity {
             backend_id: STORE_BACKEND_ID.to_string(),
             store_format_version: 2,
-            vector_precision: "i8-sym-dim".to_string(),
+            vector_precision: codec_spec().name().to_string(),
         },
     }
 }
@@ -237,7 +246,8 @@ fn a_library_scale_set_installs_scans_applies_and_compacts() {
         vector(index as u64, vector_out);
     }
     let refs: Vec<&[f32]> = sample.iter().map(Vec::as_slice).collect();
-    let codec = Codec::calibrate_i8_sym_dim(&refs, 0.9999).unwrap();
+    let codec = codec_spec().build(DIM, &refs).unwrap();
+    println!("codec {}", codec.name());
     drop(sample);
 
     let name = |book: u64| format!("id:{book:05}");

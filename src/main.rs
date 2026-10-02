@@ -70,8 +70,11 @@ Options for 'build':
                              and release.json — the manifest an installation is handed
                              with the segment
   --batch <N>                Texts per inference call (default: 32)
-  --clip-q <q>               The quantile each dimension's int8 scale is calibrated at,
-                             in (0, 1] (default: 1, which clips nothing the base holds)
+  --codec <name>             i8-sym-vec (default: an int8 scale per vector), i8-sym-dim
+                             (a scale per dimension, calibrated) or f32. The application
+                             reads the default only
+  --clip-q <q>               For i8-sym-dim: the quantile each dimension's scale is
+                             calibrated at, in (0, 1] (default: 1, which clips nothing)
   --created-at <timestamp>   Manifest timestamp (default: now, UTC)
   --allow-non-semantic       Write a package from a backend whose vectors mean nothing.
                              For tests only: such a package passes every check here and
@@ -627,11 +630,15 @@ fn run_build(args: &[String]) {
             batch_size: parse_arg(args, "--batch")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(32),
-            clip_q: parse_arg(args, "--clip-q").map_or(1.0, |value| {
-                value
-                    .parse()
-                    .unwrap_or_else(|_| exit_with("--clip-q", "not a number"))
-            }),
+            codec: otzaria_semantic_search::semantic::oxv::codec::CodecSpec::parse(
+                &parse_arg(args, "--codec").unwrap_or_else(|| "i8-sym-vec".to_string()),
+                parse_arg(args, "--clip-q").map_or(1.0, |value| {
+                    value
+                        .parse()
+                        .unwrap_or_else(|_| exit_with("--clip-q", "not a number"))
+                }),
+            )
+            .unwrap_or_else(|error| exit_with("--codec", error)),
             allow_non_semantic_backend: args.iter().any(|arg| arg == "--allow-non-semantic"),
         },
         &corpus,

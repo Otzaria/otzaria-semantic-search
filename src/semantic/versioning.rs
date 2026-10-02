@@ -649,7 +649,7 @@ pub(crate) fn test_identity() -> IndexVersion {
         store: StoreIdentity {
             backend_id: "otzaria-oxv".to_string(),
             store_format_version: 2,
-            vector_precision: "i8-sym-dim".to_string(),
+            vector_precision: "i8-sym-vec".to_string(),
         },
     }
 }
@@ -1093,7 +1093,7 @@ mod tests {
 
         let identity = sample_identity();
         let rendered = identity.to_string();
-        for fragment in ["text", "model", "store", "1024", "in-graph", "i8-sym-dim"] {
+        for fragment in ["text", "model", "store", "1024", "in-graph", "i8-sym-vec"] {
             assert!(
                 rendered.contains(fragment),
                 "{fragment} missing from Display"

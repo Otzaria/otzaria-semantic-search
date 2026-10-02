@@ -113,8 +113,8 @@ Two things the diagram deliberately does not show:
   int8 segments addressed by the text each vector was embedded from, mapped rather than
   read — and scans every vector exactly, in integers, the same score on every CPU. A scan
   returns keys and the books and lines they were built at; the host's `CandidateResolver`
-  ties them to its live lines. At 6.0M slots the set opens in 14 ms and a warm scan takes
-  59 ms on one thread, 17 ms on ten — no ANN ([`docs/ARTIFACT_CONTRACT.md`](docs/ARTIFACT_CONTRACT.md)).
+  ties them to its live lines. At 6.0M slots the set opens in 3.8 ms and a warm scan takes
+  69 ms on one thread, 17 ms on ten — no ANN ([`docs/ARTIFACT_CONTRACT.md`](docs/ARTIFACT_CONTRACT.md)).
 - **The FFI boundary** — this crate stays an `rlib`. The native library, the
   `flutter_rust_bridge` bindings and Tantivy hydration live in
   `otzaria_search_engine`, which depends on this crate. Nothing in Otzaria reaches the
@@ -218,7 +218,7 @@ otzaria-semantic-search/
 | **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **Volatile**: the development path's store |
 | **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorSearchBackend`, `VectorStoreBackend` | The development path's store, split in two on purpose: a search is handed the read side and so has no `insert` to call |
 | **Chunk Keys** | [`src/semantic/chunk_key.rs`](src/semantic/chunk_key.rs) | `ChunkKey`, `KEY_VERSION`, `LineRef` | A vector's address: the first 16 bytes of the SHA-256 of the text it was embedded from. `column_value` is what the host's index stores per line |
-| **Segment Format** | [`src/semantic/oxv/`](src/semantic/oxv/mod.rs) | `SegmentBuilder`, `Segment`, `Codec`, `scan_segments` | `.oxv` segments: int8 vectors (`i8-sym-dim`), keys and hints per slot, records apart from vectors; a streaming writer, a mapped reader checked by CRC, and an exact integer scan — scalar, AVX2 and NEON, bit-identical |
+| **Segment Format** | [`src/semantic/oxv/`](src/semantic/oxv/mod.rs) | `SegmentBuilder`, `Segment`, `Codec`, `scan_segments` | `.oxv` segments: int8 vectors with a scale each (`i8-sym-vec`, the default; `i8-sym-dim` and `f32` too), keys and hints per slot, records apart from vectors; a streaming writer, a mapped reader checked by CRC, and an exact integer scan — scalar, AVX2 and NEON, bit-identical |
 | **Vector Sets** | [`src/semantic/segment_set/`](src/semantic/segment_set/mod.rs) | `SegmentSet`, `install_package`, `compact`, `scrub`, `ReleaseManifest` | The installed set: a base and deltas as generations behind `CURRENT`/`PREVIOUS`, every crash point recoverable, compaction, garbage collection that waits for Windows to unmap |
 | **Resolver Port** | [`src/semantic/resolve.rs`](src/semantic/resolve.rs) | `VectorHit`, `CandidateResolver`, `ResolvedLine`, `NoResolver` | What a scan returns — a key and where it was built — and the host's port that ties it to the lines its live index holds now |
 | **Official Read Path** | [`src/semantic/official_index.rs`](src/semantic/official_index.rs) | `OfficialSemanticIndex`, `OfficialIndexConfig`, `LocalModel` | Recovers, opens the set, loads the model, holds the set's identity to the installation's; returns hits, reloads a new generation in place, and refuses every build-side operation by name |
@@ -268,7 +268,7 @@ store under all of it; the resolver over a live index, and S5–S8, land in
 │ [✔] S0  Product contract alignment (this section, and the docs around it)        │
 │ [ ] S1  Representation quality & dimension/precision decision                    │
 │ [✔] S2a Read-only runtime path: the artifact's reader, read/write store split    │
-│ [✔] S2b Scale: 6.0M slots open in 14 ms, scan in 17–59 ms — no ANN              │
+│ [✔] S2b Scale: 6.0M slots open in 3.8 ms, scan in 17–69 ms — no ANN             │
 │ [✔] S3  Artifact contract: identity, two depths, recoverable install, reader     │
 │ [✔] S4a Packer (since replaced by store v2's segments, built by key)             │
 │ [~] S4b Builder: corpus + model → embeddings → artifact. Live Tantivy remains    │
@@ -286,7 +286,7 @@ store under all of it; the resolver over a live index, and S5–S8, land in
    - Choose 1024/512/256/128 dimensions and f32/f16/int8 on measured Recall@K, MRR and nDCG — the size arithmetic (~23.1 GiB at f32/1024 for 6.1M lines) is why this matters.
    - Freeze `embedding_text_version`, dimension, precision, `max_tokens`, pooling and normalization into the index identity.
 2. **Scale measurement (S2b)** — answered: at 6.4M records (6.0M slots) a set opens in
-   14 ms and an exact int8 scan takes 59 ms on one thread and 17 ms on ten, so there is no
+   3.8 ms and an exact int8 scan takes 69 ms on one thread and 17 ms on ten, so there is no
    ANN. Still to measure: recall against exact f32 on the library's own vectors, and a weak
    laptop.
 3. **Official artifact contract (S3) and its reader (S2a)** — identity, two verification

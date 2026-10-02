@@ -242,13 +242,20 @@ impl SegmentBuilder {
 
         let vector_bytes = self.codec.bytes_per_vector() as u64;
         let vectors_len = u64::from(slot_count) * vector_bytes;
+        let scales_len = if self.codec.has_vector_scales() {
+            u64::from(slot_count) * 4
+        } else {
+            0
+        };
         let blocks = |len: u64| len.div_ceil(BLOCK_SIZE as u64);
-        let crc_count =
-            blocks(hint_bytes.len() as u64) + blocks(key_bytes.len() as u64) + blocks(vectors_len);
+        let crc_count = blocks(hint_bytes.len() as u64)
+            + blocks(key_bytes.len() as u64)
+            + blocks(vectors_len)
+            + blocks(scales_len);
 
         // The layout: small metadata first, vectors last.
         let fixed = |kind: SectionKind| kind.fixed_elem_size().expect("a fixed-size section");
-        let plan: [(SectionKind, u32, u64, u64, bool); 11] = [
+        let mut plan: Vec<(SectionKind, u32, u64, u64, bool)> = vec![
             (
                 SectionKind::Books,
                 fixed(SectionKind::Books),
@@ -321,6 +328,17 @@ impl SegmentBuilder {
                 true,
             ),
         ];
+        // A codec with a scale per vector keeps them apart from the codes, after them, so
+        // the rows of VECTORS stay `dim` bytes and aligned.
+        if self.codec.has_vector_scales() {
+            plan.push((
+                SectionKind::VectorScales,
+                4,
+                scales_len,
+                u64::from(slot_count),
+                true,
+            ));
+        }
         let mut offset = HEADER_LEN as u64;
         let mut sections = Vec::with_capacity(plan.len());
         for (kind, elem_size, length, elem_count, blocksummed) in plan {
@@ -415,6 +433,7 @@ impl SegmentBuilder {
         out.write_all(&key_bytes)?;
         out.pad_to(header.sections[10].offset)?;
 
+        let has_scales = self.codec.has_vector_scales();
         let counts = PackageCounts {
             books: header.book_count,
             slots: header.slot_count,
@@ -435,6 +454,7 @@ impl SegmentBuilder {
             in_block: 0,
             block_crcs,
             scratch: Vec::new(),
+            scales: has_scales.then(|| Vec::with_capacity(scales_len as usize)),
             clipped: 0,
         })
     }
@@ -455,12 +475,36 @@ pub struct VectorSink {
     in_block: usize,
     block_crcs: Vec<u32>,
     scratch: Vec<u8>,
+    /// VECTOR_SCALES, for a codec with a scale per vector: written after the last vector.
+    scales: Option<Vec<u8>>,
     clipped: u64,
 }
 
 impl VectorSink {
-    /// The next slot's vector, already encoded in the segment's codec.
+    /// The next slot's vector, already encoded in a codec with no scale per vector.
     pub fn push(&mut self, encoded: &[u8]) -> io::Result<()> {
+        self.push_encoded(encoded, None)
+    }
+
+    /// The next slot's vector, already encoded, with its own scale for a codec that has
+    /// one per vector — `None` for any other.
+    pub fn push_encoded(&mut self, encoded: &[u8], scale: Option<f32>) -> io::Result<()> {
+        match (&self.scales, scale) {
+            (Some(_), Some(scale)) if scale.is_finite() && scale >= 0.0 => {}
+            (Some(_), _) => {
+                return Err(invalid(format!(
+                    "codec {} needs each vector's scale, finite and not negative",
+                    self.codec.name()
+                )))
+            }
+            (None, Some(_)) => {
+                return Err(invalid(format!(
+                    "codec {} has no scale per vector",
+                    self.codec.name()
+                )))
+            }
+            (None, None) => {}
+        }
         if encoded.len() != self.codec.bytes_per_vector() {
             return Err(invalid(format!(
                 "a vector of this codec is {} bytes, and this one is {}",
@@ -475,6 +519,9 @@ impl VectorSink {
             )));
         }
         self.out.write_all(encoded)?;
+        if let (Some(scales), Some(scale)) = (&mut self.scales, scale) {
+            scales.extend_from_slice(&scale.to_le_bytes());
+        }
         let mut rest = encoded;
         while !rest.is_empty() {
             let take = rest.len().min(BLOCK_SIZE - self.in_block);
@@ -502,8 +549,9 @@ impl VectorSink {
         }
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.resize(self.codec.bytes_per_vector(), 0);
-        self.clipped += self.codec.encode(vector, &mut scratch) as u64;
-        let pushed = self.push(&scratch);
+        let encoded = self.codec.encode(vector, &mut scratch);
+        self.clipped += encoded.clipped as u64;
+        let pushed = self.push_encoded(&scratch, encoded.scale);
         self.scratch = scratch;
         pushed
     }
@@ -528,6 +576,18 @@ impl VectorSink {
         }
         if self.in_block > 0 {
             self.block_crcs.push(self.block.clone().finalize());
+        }
+        if let Some(scales) = self.scales.take() {
+            let entry = self
+                .header
+                .sections
+                .iter()
+                .position(|entry| entry.kind == SectionKind::VectorScales.code())
+                .expect("a codec with scales lays out their section");
+            self.out.pad_to(self.header.sections[entry].offset)?;
+            self.out.write_all(&scales)?;
+            self.block_crcs
+                .extend(scales.chunks(BLOCK_SIZE).map(crc32fast::hash));
         }
         let crc_bytes: Vec<u8> = self
             .block_crcs

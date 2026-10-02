@@ -300,7 +300,7 @@ fn build_and_install(
             chunking: ChunkerConfig::default(),
             created_at: "2026-10-01T00:00:00Z".to_string(),
             batch_size: 2,
-            clip_q: 1.0,
+            codec: otzaria_semantic_search::semantic::oxv::codec::CodecSpec::default(),
             allow_non_semantic_backend: true,
         },
         &JsonlCorpus::load(&identity_path, &lines_path).unwrap(),

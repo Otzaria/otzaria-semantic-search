@@ -160,14 +160,69 @@ fn the_f32_codec_stores_the_vector_exactly() {
     let segment = open(&path);
     let mut decoded = vec![0f32; DIM];
     for (slot, (_, _, vector)) in books.iter().flat_map(|b| b.primary.iter()).enumerate() {
-        segment
-            .codec()
-            .decode(segment.vector(slot as u32), &mut decoded);
+        segment.codec().decode(
+            segment.vector(slot as u32),
+            segment.vector_scale(slot as u32),
+            &mut decoded,
+        );
         assert_eq!(&decoded, vector);
     }
 }
 
 /// Sections past 1 MiB are cut into several blocks, each with its own CRC.
+/// `i8-sym-vec`: every slot's scale is the one its vector encoded with, in VECTOR_SCALES
+/// after the codes; each vector decodes to within half a step of itself; and a flipped
+/// byte among the scales is a block CRC that fails.
+#[test]
+fn a_scale_per_vector_is_stored_apart_and_checked_by_block() {
+    let dir = TempDir::new("per_vector");
+    let mut random = Random(9);
+    let books = random_books(&mut random, 4, 300, DIM, 0);
+    let codec = Codec::i8_sym_vec(DIM).unwrap();
+    let path = dir.join("base.oxv");
+    write_segment(
+        &path,
+        spec(PackageKind::Base, 0, 30),
+        codec.clone(),
+        &books,
+        &[],
+    );
+    let segment = open(&path);
+    let scales = section(&segment_header(&path), SectionKind::VectorScales);
+    let vectors = section(&segment_header(&path), SectionKind::Vectors);
+    assert_eq!(scales.elem_count, 1200);
+    assert!(
+        scales.offset > vectors.offset,
+        "the scales follow the codes"
+    );
+    let (mut codes, mut decoded) = (vec![0u8; DIM], vec![0f32; DIM]);
+    for (slot, (_, _, vector)) in books.iter().flat_map(|b| b.primary.iter()).enumerate() {
+        let scale = codec.encode(vector, &mut codes).scale;
+        assert_eq!(segment.vector_scale(slot as u32), scale);
+        assert_eq!(segment.vector(slot as u32), codes.as_slice());
+        segment
+            .codec()
+            .decode(segment.vector(slot as u32), scale, &mut decoded);
+        for (value, original) in decoded.iter().zip(vector) {
+            assert!((value - original).abs() <= scale.unwrap() / 2.0 + 1e-7);
+        }
+    }
+    segment
+        .verify_blocks(&CancellationToken::new(), |_| {})
+        .unwrap();
+    drop(segment);
+
+    flip(&path, scales.offset + 17);
+    let damaged = open(&path);
+    assert!(damaged
+        .verify_blocks(&CancellationToken::new(), |_| {})
+        .is_err());
+}
+
+fn segment_header(path: &Path) -> Header {
+    Header::decode(&std::fs::read(path).unwrap()).unwrap()
+}
+
 #[test]
 fn a_segment_of_several_blocks_verifies_block_by_block() {
     let dir = TempDir::new("blocks");

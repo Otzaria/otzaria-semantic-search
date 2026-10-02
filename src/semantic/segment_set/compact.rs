@@ -153,7 +153,7 @@ pub fn compact(
     };
 
     let codec = set.codec().clone();
-    let width = codec.bytes_per_vector() as u64;
+    let width = codec.bytes_per_vector() as u64 + if codec.has_vector_scales() { 4 } else { 0 };
     let estimate = info.slots_live * (width + 20) + (64 << 10);
     let needed = (estimate as f64 * policy.min_free_space_factor) as u64;
     if let Some(available) = space::available(dir) {
@@ -325,7 +325,8 @@ pub fn compact(
             if index % 4096 == 0 && cancel.is_cancelled() {
                 return Err(SemanticSearchError::Cancelled);
             }
-            sink.push(segments[*seg as usize].vector(*slot))
+            let source = &segments[*seg as usize];
+            sink.push_encoded(source.vector(*slot), source.vector_scale(*slot))
                 .map_err(|error| full_or_io(error, &partial, needed, index as u64 * width))?;
         }
         sink.finish()
@@ -357,6 +358,7 @@ pub fn compact(
             let (seg, source) = order[slot];
             let original = &segments[seg as usize];
             if output.vector(slot as u32) != original.vector(source)
+                || output.vector_scale(slot as u32) != original.vector_scale(source)
                 || output.key(slot as u32) != original.key(source)
             {
                 return Err(VectorStoreError::Corrupted {

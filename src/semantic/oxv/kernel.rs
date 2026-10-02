@@ -12,6 +12,12 @@
 //! The first bound keeps every `q16` inside `i16`; the second keeps `Σ |q16 · v|` — at most
 //! `127 · Σ|q16|`, rounding included — inside `i32`. A score is then `acc · (1 / t)`.
 //!
+//! An `i8-sym-vec` component stands for `v_d · s`, with `s` the vector's own scale, so a
+//! query scores it as `s · Σ q_d · v_d`: the query is quantized as it is — `w = q` — under
+//! the same two bounds, which hold whatever `s` is, and the score is `s · acc · (1 / t)`.
+//! The scale is applied in `f32` after the integer sum, in that order on every CPU, so the
+//! score is the same number everywhere.
+//!
 //! **Every kernel computes the same integer.** Integer addition is associative, so the
 //! scalar loop, AVX2's `madd` and NEON's `mlal` reach the same `acc` whatever order they add
 //! in, on every CPU — and wrapping, should the bound ever be wrong, wraps them all alike.
@@ -31,8 +37,19 @@ pub(crate) type DotKernel = fn(&[i16], &[u8]) -> i32;
 /// A query, prepared once for the codec epoch of the set it scans.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PreparedQuery {
-    Int8 { q16: Box<[i16]>, inv_scale: f32 },
-    Float { q: Box<[f32]> },
+    /// For `i8-sym-dim`: the scales folded in.
+    Int8 {
+        q16: Box<[i16]>,
+        inv_scale: f32,
+    },
+    /// For `i8-sym-vec`: each vector's scale applied to its sum.
+    Int8PerVector {
+        q16: Box<[i16]>,
+        inv_scale: f32,
+    },
+    Float {
+        q: Box<[f32]>,
+    },
 }
 
 impl PreparedQuery {
@@ -45,23 +62,37 @@ impl PreparedQuery {
             });
         }
         Ok(match codec.scales() {
-            None => Self::Float { q: query.into() },
             Some(scales) => {
-                let (q16, inv_scale) = quantize_query(query, scales);
+                let weights = query
+                    .iter()
+                    .zip(scales)
+                    .map(|(q, s)| f64::from(*q) * f64::from(*s) / 127.0)
+                    .collect();
+                let (q16, inv_scale) = quantize_query(weights);
                 Self::Int8 { q16, inv_scale }
             }
+            None if codec.has_vector_scales() => {
+                let (q16, inv_scale) =
+                    quantize_query(query.iter().map(|q| f64::from(*q)).collect());
+                Self::Int8PerVector { q16, inv_scale }
+            }
+            None => Self::Float { q: query.into() },
         })
+    }
+
+    /// The width of the query.
+    pub(crate) fn dim(&self) -> usize {
+        match self {
+            Self::Int8 { q16, .. } | Self::Int8PerVector { q16, .. } => q16.len(),
+            Self::Float { q } => q.len(),
+        }
     }
 }
 
-/// `q16` and `1 / t`, per the module documentation. In `f64`, then checked in integers: the
-/// bound is the guarantee, so it is verified rather than trusted to the rounding of `t`.
-fn quantize_query(query: &[f32], scales: &[f32]) -> (Box<[i16]>, f32) {
-    let w: Vec<f64> = query
-        .iter()
-        .zip(scales)
-        .map(|(q, s)| f64::from(*q) * f64::from(*s) / 127.0)
-        .collect();
+/// `q16` and `1 / t` for the weights `w`, per the module documentation. In `f64`, then
+/// checked in integers: the bound is the guarantee, so it is verified rather than trusted
+/// to the rounding of `t`.
+fn quantize_query(w: Vec<f64>) -> (Box<[i16]>, f32) {
     let max = w.iter().fold(0.0f64, |max, x| max.max(x.abs()));
     let sum: f64 = w.iter().map(|x| x.abs()).sum();
     if !(max > 0.0 && max.is_finite() && sum.is_finite()) {
@@ -401,6 +432,83 @@ mod tests {
             let int8 = dot_scalar(&q16, &bytes) as f32 * inv_scale;
             assert!((int8 - exact).abs() < 0.02, "{int8} vs {exact}");
         }
+    }
+
+    /// `i8-sym-vec`: the query is quantized as it is, under the same bound, and a score is
+    /// the vector's scale times the exact integer sum — the same `f32` from every kernel,
+    /// and the cosine of the decoded vector to the precision a 16-bit query carries; the
+    /// cosine of the vector itself to the precision of its 8-bit codes.
+    #[test]
+    fn a_per_vector_score_is_the_same_on_every_kernel_and_tracks_the_cosine() {
+        let dim = 256;
+        let codec = Codec::i8_sym_vec(dim).unwrap();
+        let mut random = Random(24);
+        let mut queries: Vec<Vec<f32>> = (0..10).map(|_| random.unit(dim)).collect();
+        queries.push({
+            let mut q = vec![1e-4f32; dim];
+            q[3] = 1.0;
+            q
+        });
+        let vectors: Vec<Vec<f32>> = (0..200).map(|_| random.unit(dim)).collect();
+        let mut codes = vec![0u8; dim];
+        for query in &queries {
+            let PreparedQuery::Int8PerVector { q16, inv_scale } =
+                PreparedQuery::new(query, &codec).unwrap()
+            else {
+                panic!("a per-vector codec prepares a per-vector query");
+            };
+            let bound: i64 = q16.iter().map(|q| i64::from(q.unsigned_abs()) * 127).sum();
+            assert!(bound <= i64::from(i32::MAX), "bound {bound}");
+            let worst: Vec<u8> = q16
+                .iter()
+                .map(|q| (if *q < 0 { -127i8 } else { 127 }) as u8)
+                .collect();
+            for vector in vectors
+                .iter()
+                .map(Vec::as_slice)
+                .chain([worst_vector(&worst)].iter().map(Vec::as_slice))
+            {
+                let scale = codec.encode(vector, &mut codes).scale.unwrap();
+                let scores: Vec<u32> = available()
+                    .into_iter()
+                    .map(|(kernel, _)| {
+                        ((kernel(&q16, &codes) as f32 * scale) * inv_scale).to_bits()
+                    })
+                    .collect();
+                assert!(
+                    scores.windows(2).all(|pair| pair[0] == pair[1]),
+                    "{scores:?}"
+                );
+                let score = f32::from_bits(scores[0]);
+                let mut decoded = vec![0f32; dim];
+                codec.decode(&codes, Some(scale), &mut decoded);
+                let of_decoded: f64 = query
+                    .iter()
+                    .zip(&decoded)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum();
+                let exact: f64 = query
+                    .iter()
+                    .zip(vector)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum();
+                assert!(
+                    (f64::from(score) - of_decoded).abs() < 2e-3,
+                    "{score} vs {of_decoded}"
+                );
+                assert!(
+                    (f64::from(score) - exact).abs() < 0.02,
+                    "{score} vs {exact}"
+                );
+            }
+        }
+    }
+
+    /// A unit vector whose codes are `codes`: what the worst case looks like as floats.
+    fn worst_vector(codes: &[u8]) -> Vec<f32> {
+        let raw: Vec<f32> = codes.iter().map(|byte| f32::from(*byte as i8)).collect();
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.iter().map(|x| x / norm).collect()
     }
 
     #[test]

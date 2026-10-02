@@ -167,10 +167,10 @@ pub(crate) fn scan_reporting(
         return Ok(Vec::new());
     }
     for segment in set.segments {
-        if segment.segment.codec().dim() != query_dim(query) {
+        if segment.segment.codec().dim() != query.dim() {
             return Err(VectorStoreError::DimensionMismatch {
                 store_dim: segment.segment.codec().dim() as u32,
-                vector_dim: query_dim(query) as u32,
+                vector_dim: query.dim() as u32,
             });
         }
     }
@@ -195,6 +195,16 @@ pub(crate) fn scan_reporting(
             let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
             Ok(hits(set, found, request, &scorer))
         }
+        PreparedQuery::Int8PerVector { q16, inv_scale } => {
+            let (kernel, _) = select();
+            let scorer = Int8PerVector {
+                q16,
+                inv_scale: *inv_scale,
+                kernel,
+            };
+            let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
+            Ok(hits(set, found, request, &scorer))
+        }
         PreparedQuery::Float { q } => {
             let scorer = Float { q };
             let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
@@ -203,16 +213,10 @@ pub(crate) fn scan_reporting(
     }
 }
 
-fn query_dim(query: &PreparedQuery) -> usize {
-    match query {
-        PreparedQuery::Int8 { q16, .. } => q16.len(),
-        PreparedQuery::Float { q } => q.len(),
-    }
-}
-
-/// How one codec turns a stored vector into a rank and a rank back into a score.
+/// How one codec turns a stored vector — and its own scale, for a codec with one — into a
+/// rank, and a rank back into a score.
 trait Scorer: Sync {
-    fn rank(&self, vector: &[u8]) -> i32;
+    fn rank(&self, vector: &[u8], scale: f32) -> i32;
     fn score(&self, rank: i32) -> f32;
 }
 
@@ -224,12 +228,31 @@ struct Int8<'a> {
 
 impl Scorer for Int8<'_> {
     #[inline]
-    fn rank(&self, vector: &[u8]) -> i32 {
+    fn rank(&self, vector: &[u8], _scale: f32) -> i32 {
         (self.kernel)(self.q16, vector)
     }
 
     fn score(&self, rank: i32) -> f32 {
         rank as f32 * self.inv_scale
+    }
+}
+
+/// `i8-sym-vec`: the exact integer sum, then the vector's scale, in `f32` — one product,
+/// the same on every CPU — and the rank is that float's order.
+struct Int8PerVector<'a> {
+    q16: &'a [i16],
+    inv_scale: f32,
+    kernel: DotKernel,
+}
+
+impl Scorer for Int8PerVector<'_> {
+    #[inline]
+    fn rank(&self, vector: &[u8], scale: f32) -> i32 {
+        ordered((self.kernel)(self.q16, vector) as f32 * scale)
+    }
+
+    fn score(&self, rank: i32) -> f32 {
+        unordered(rank) * self.inv_scale
     }
 }
 
@@ -239,7 +262,7 @@ struct Float<'a> {
 
 impl Scorer for Float<'_> {
     #[inline]
-    fn rank(&self, vector: &[u8]) -> i32 {
+    fn rank(&self, vector: &[u8], _scale: f32) -> i32 {
         ordered(dot_f32(self.q, vector))
     }
 
@@ -427,27 +450,77 @@ fn scan_share(
         let width = segment.segment.codec().bytes_per_vector();
         let vectors = &segment.segment.vector_bytes()
             [piece.start as usize * width..piece.end as usize * width];
-        for (offset, vector) in vectors.chunks_exact(width).enumerate() {
-            if visited.is_multiple_of(SCAN_CHECK_INTERVAL) {
-                if let Some(progress) = progress {
-                    progress.store(visited, std::sync::atomic::Ordering::Relaxed);
-                }
-                cancel.scan_checkpoint(visited)?;
+        let scan = Pass {
+            segment,
+            scorer,
+            piece,
+            cancel,
+            progress,
+        };
+        // One loop per kind, so the per-vector one reads its scales in step with the codes
+        // and the others read nothing.
+        match segment.segment.vector_scale_bytes() {
+            Some(scales) => {
+                let scales = scales[piece.start as usize * 4..piece.end as usize * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes));
+                scan.run(vectors.chunks_exact(width), scales, &mut top, &mut visited)?;
             }
-            visited += 1;
-            let slot = piece.start + offset as u32;
-            if segment.is_deleted(slot) {
-                continue;
-            }
-            top.offer(scorer.rank(vector), piece.seg, slot, || {
-                segment.segment.key(slot)
-            });
+            None => scan.run(
+                vectors.chunks_exact(width),
+                std::iter::repeat(1.0),
+                &mut top,
+                &mut visited,
+            )?,
         }
     }
     if let Some(progress) = progress {
         progress.store(visited, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(top)
+}
+
+/// One piece of a share, scanned.
+struct Pass<'p, 's, S> {
+    segment: &'p ScanSegment<'s>,
+    scorer: &'p S,
+    piece: &'p Piece,
+    cancel: &'p CancellationToken,
+    progress: Option<&'p AtomicUsize>,
+}
+
+impl<S: Scorer> Pass<'_, '_, S> {
+    #[inline]
+    fn run<'v>(
+        &self,
+        vectors: impl Iterator<Item = &'v [u8]>,
+        scales: impl Iterator<Item = f32>,
+        top: &mut TopK,
+        visited: &mut usize,
+    ) -> Result<(), VectorStoreError> {
+        for (offset, (vector, scale)) in vectors.zip(scales).enumerate() {
+            if visited.is_multiple_of(SCAN_CHECK_INTERVAL) {
+                if let Some(progress) = self.progress {
+                    progress.store(*visited, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.cancel.scan_checkpoint(*visited)?;
+            }
+            *visited += 1;
+            let slot = self.piece.start + offset as u32;
+            if self.segment.is_deleted(slot) {
+                continue;
+            }
+            top.offer(
+                self.scorer.rank(vector, scale),
+                self.piece.seg,
+                slot,
+                || self.segment.segment.key(slot),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One vector in the running: its rank, its key and where it is.

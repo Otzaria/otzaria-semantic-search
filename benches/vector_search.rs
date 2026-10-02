@@ -45,6 +45,8 @@ struct Options {
     top_k: usize,
     queries: usize,
     store: String,
+    /// For `--store oxv`: `i8-sym-vec` (the default), `i8-sym-dim` or `f32`.
+    codec: String,
     threads: usize,
     dir: Option<std::path::PathBuf>,
 }
@@ -59,6 +61,7 @@ impl Default for Options {
             top_k: 40,
             queries: 50,
             store: "memory".to_string(),
+            codec: "i8-sym-vec".to_string(),
             threads: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
             dir: None,
         }
@@ -84,6 +87,7 @@ fn parse_options() -> Options {
             "--queries" => options.queries = parsed("--queries"),
             "--threads" => options.threads = parsed("--threads"),
             "--store" => options.store = value.cloned().unwrap_or_default(),
+            "--codec" => options.codec = value.cloned().unwrap_or_default(),
             "--dir" => options.dir = value.map(std::path::PathBuf::from),
             // cargo bench passes its own flags; ignore what is not ours.
             _ => {
@@ -177,7 +181,6 @@ fn oxv(options: Options) {
     use otzaria_semantic_search::cancellation::CancellationToken;
     use otzaria_semantic_search::distribution::package::PackageKind;
     use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
-    use otzaria_semantic_search::semantic::oxv::codec::Codec;
     use otzaria_semantic_search::semantic::oxv::reader::Segment;
     use otzaria_semantic_search::semantic::oxv::scan::{scan_segments, ScanRequest};
     use otzaria_semantic_search::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
@@ -190,10 +193,12 @@ fn oxv(options: Options) {
         queries,
         threads,
         dir,
+        codec,
         ..
     } = options;
+    let codec_name = codec.as_str();
     const BOOKS: usize = 5_000;
-    println!("otzaria-semantic-search — vector search benchmark, oxv segment (i8-sym-dim)");
+    println!("otzaria-semantic-search — vector search benchmark, oxv segment ({codec_name})");
     println!("  vectors: {vectors}\n  dim:     {dim}\n  top_k:   {top_k}\n  queries: {queries}");
 
     let unit = |seed: usize| {
@@ -203,7 +208,9 @@ fn oxv(options: Options) {
     };
     let sample: Vec<Vec<f32>> = (0..vectors.min(20_000)).map(unit).collect();
     let refs: Vec<&[f32]> = sample.iter().map(Vec::as_slice).collect();
-    let codec = Codec::calibrate_i8_sym_dim(&refs, 0.9999).expect("calibration");
+    let codec = otzaria_semantic_search::semantic::oxv::codec::CodecSpec::parse(codec_name, 0.9999)
+        .and_then(|spec| spec.build(dim, &refs))
+        .expect("the codec");
 
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("otzaria_bench_oxv"));
     let _ = std::fs::remove_dir_all(&dir);

@@ -153,6 +153,9 @@ impl Fixture {
                 let vector = segment.vector(slot);
                 let rank = match query {
                     PreparedQuery::Int8 { q16, .. } => kernel(q16, vector),
+                    PreparedQuery::Int8PerVector { q16, .. } => super::kernel::ordered(
+                        kernel(q16, vector) as f32 * segment.vector_scale(slot).unwrap(),
+                    ),
                     PreparedQuery::Float { q } => super::kernel::ordered(dot_f32(q, vector)),
                 };
                 all.push((rank, segment.key(slot), seg as u16, slot));
@@ -171,6 +174,10 @@ impl Fixture {
 
 fn int8(vectors: &[&[f32]]) -> Codec {
     Codec::calibrate_i8_sym_dim(vectors, 1.0).unwrap()
+}
+
+fn per_vector(vectors: &[&[f32]]) -> Codec {
+    Codec::i8_sym_vec(vectors[0].len()).unwrap()
 }
 
 fn run(
@@ -201,6 +208,14 @@ fn run(
                     assert_eq!(hit.score, rank as f32 * inv_scale);
                     rank
                 }
+                PreparedQuery::Int8PerVector { q16, inv_scale } => {
+                    let scale = fixture.segments[hit.seg as usize]
+                        .vector_scale(hit.slot)
+                        .unwrap();
+                    let product = kernel(q16, vector) as f32 * scale;
+                    assert_eq!(hit.score, product * inv_scale);
+                    super::kernel::ordered(product)
+                }
                 PreparedQuery::Float { q } => {
                     assert_eq!(hit.score, dot_f32(q, vector));
                     super::kernel::ordered(hit.score)
@@ -219,6 +234,7 @@ fn the_top_k_is_the_head_of_a_full_sort() {
     for (seed, codec) in [
         (31u64, int8 as fn(&[&[f32]]) -> Codec),
         (32, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+        (37, per_vector),
     ] {
         let fixture = Fixture::new(40, 50, seed, codec);
         let mut random = Random(seed + 100);
@@ -288,7 +304,12 @@ fn equal_scores_are_ordered_by_key() {
 /// in the same order, with the same records.
 #[test]
 fn one_thread_and_eight_return_the_same_hits() {
-    let fixture = Fixture::new(200, 300, 33, int8);
+    for codec in [int8 as fn(&[&[f32]]) -> Codec, per_vector] {
+        threads_agree(Fixture::new(200, 300, 33, codec));
+    }
+}
+
+fn threads_agree(fixture: Fixture) {
     let segments = fixture.scan_segments();
     let set = ScanSet {
         segments: &segments,
@@ -394,9 +415,11 @@ fn a_hit_carries_every_record_of_its_key_admitted_books_first() {
     // record in the delta's book id:00002 at hint 900. A query equal to its vector puts it
     // first.
     let mut decoded = vec![0f32; DIM];
-    fixture.segments[0]
-        .codec()
-        .decode(fixture.segments[0].vector(0), &mut decoded);
+    fixture.segments[0].codec().decode(
+        fixture.segments[0].vector(0),
+        fixture.segments[0].vector_scale(0),
+        &mut decoded,
+    );
     let norm = decoded.iter().map(|x| x * x).sum::<f32>().sqrt();
     let query: Vec<f32> = decoded.iter().map(|x| x / norm).collect();
     let query = PreparedQuery::new(&query, fixture.segments[0].codec()).unwrap();

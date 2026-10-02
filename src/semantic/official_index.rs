@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-/// The store this build reads: `otzaria-oxv` segments, format 2, in the `i8-sym-dim` codec.
+/// The store this build reads: `otzaria-oxv` segments, format 2, in the `i8-sym-vec` codec.
 ///
 /// What the installation *requires*, not something read out of the set: a set in another
 /// codec or format is a rejection naming `store.vector_precision` or
@@ -51,7 +51,7 @@ pub fn readable_store_identity() -> StoreIdentity {
     StoreIdentity {
         backend_id: STORE_BACKEND_ID.to_string(),
         store_format_version: SEGMENT_FORMAT_VERSION,
-        vector_precision: "i8-sym-dim".to_string(),
+        vector_precision: "i8-sym-vec".to_string(),
     }
 }
 
@@ -511,7 +511,7 @@ mod tests {
                 },
                 created_at: "2026-10-01T00:00:00Z".to_string(),
                 batch_size: 2,
-                clip_q: 1.0,
+                codec: crate::semantic::oxv::codec::CodecSpec::default(),
                 allow_non_semantic_backend: true,
             },
             &JsonlCorpus::load(&identity_path, &lines_path).unwrap(),

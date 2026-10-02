@@ -425,8 +425,10 @@ otzaria-semantic-search/
   אחר שדה: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.
   - `format` — ה-header של 4,096 בתים, ספריית ה-sections, הרשומות בגודל קבוע. הכותב
     והקורא עוברים דרכו, ולכן אינם יכולים לחלוק על offset.
-  - `codec` — `f32` ו-`i8-sym-dim` (סקלה לכל ממד, `round_half_away`, clamp ל-±127);
-    `calibrate_i8_sym_dim` לוקח קוונטיל מדויק בכלל lower.
+  - `codec` — `i8-sym-vec`, ברירת המחדל (סקלה לכל וקטור, `s = max|x|/127`, הקודים
+    ב-`VECTORS` והסקלות ב-`VECTOR_SCALES`), `i8-sym-dim` (סקלה לכל ממד, `round_half_away`,
+    clamp ל-±127; `calibrate_i8_sym_dim` לוקח קוונטיל מדויק בכלל lower) ו-`f32`; `CodecSpec`
+    הוא מה שבנייה מבקשת.
   - `writer` — `SegmentBuilder`: הטבלאות קודם, ואז `VectorSink` שמקבל וקטורים בסדר
     ה-slots, ב-buffer, עם CRC לכל block — כך שבנייה בקנה מידה של הספרייה זורמת בזיכרון
     חסום. `segment_id` דטרמיניסטי.
@@ -545,7 +547,7 @@ otzaria-semantic-search/
     שלה הם עובדות שרק ה-runtime יודע.
   - הזהות הצפויה מורכבת משלושה מקורות: **text** מהאינדקס שהמארח פתח, **model**
     מהמשפחה המוצהרת (`LocalModel::of_family`) עם החבילה שנטענה, ו-**store** ממה ש-build
-    הזה יודע לקרוא (`readable_store_identity()`: `otzaria-oxv`, 2, `i8-sym-dim`).
+    הזה יודע לקרוא (`readable_store_identity()`: `otzaria-oxv`, 2, `i8-sym-vec`).
   - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
     `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
     `book_count`.
@@ -778,8 +780,9 @@ otzaria-semantic-search/
   `cargo bench -- --store oxv` כותב segment, ממפה אותו וסורק בחוט אחד, ב-`--threads`
   ותחת מסנן של 5% מהספרים. על Apple M4, 200,000 וקטורים ב-256: 18.9 ns לווקטור בחוט אחד,
   0.8 ms על שמונה, 0.2 ms במסנן, פתיחה 0.27 ms. בקנה מידה של הספרייה
-  ([`tests/vector_set_scale.rs`](../tests/vector_set_scale.rs), 6.0M slots): פתיחה 14 ms,
-  סריקה 59 ms בחוט אחד ו-17 ms בעשרה — ראו [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §8.
+  ([`tests/vector_set_scale.rs`](../tests/vector_set_scale.rs), 6.0M slots, `i8-sym-vec`):
+  פתיחה 3.8 ms, סריקה 69 ms בחוט אחד ו-17 ms בעשרה — ראו
+  [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §8.
 
   **חשוב:** ל-`[[bench]]` יש `harness = false`, ולכן `cargo test --all-targets`
   *מריץ* אותו במקום רק לקמפל (בחירה מפורשת של target דורסת `test = false`).

@@ -51,6 +51,8 @@ pub struct Segment {
     hints: Range<usize>,
     keys: Range<usize>,
     vectors: Range<usize>,
+    /// VECTOR_SCALES, for a codec with a scale per vector.
+    scales: Option<Range<usize>>,
     extras: Range<usize>,
     extras_by_slot: Range<usize>,
     foreign: Range<usize>,
@@ -227,11 +229,6 @@ impl Segment {
         let by_slot_entry = optional(SectionKind::ExtrasBySlot, header.extra_count)?;
         let foreign_entry = optional(SectionKind::Foreign, header.foreign_count)?;
         let tombstones_entry = optional(SectionKind::Tombstones, header.tombstone_count)?;
-        if let Some(scales) = sections.get(&SectionKind::VectorScales) {
-            if scales.length > 0 {
-                return Err("it carries per-vector scales, which no codec here reads".into());
-            }
-        }
 
         for (entry, kind, expected) in [
             (
@@ -290,6 +287,34 @@ impl Segment {
                 codec.bytes_per_vector()
             ));
         }
+        let scales_entry = match (
+            codec.has_vector_scales(),
+            sections.get(&SectionKind::VectorScales),
+        ) {
+            (true, Some(entry)) => {
+                if entry.elem_count != header.slot_count || !entry.is_blocksummed() {
+                    return Err(format!(
+                        "VECTOR_SCALES holds {} scale(s) for {} slot(s), or is not covered by \
+                         block CRCs",
+                        entry.elem_count, header.slot_count
+                    ));
+                }
+                Some(*entry)
+            }
+            (true, None) => {
+                return Err(format!(
+                    "codec {} keeps a scale per vector, and it has no VECTOR_SCALES",
+                    codec.name()
+                ))
+            }
+            (false, Some(entry)) if entry.length > 0 => {
+                return Err(format!(
+                    "it carries per-vector scales, which codec {} does not read",
+                    codec.name()
+                ))
+            }
+            (false, _) => None,
+        };
 
         let blocksummed: Vec<(SectionKind, Range<usize>)> = header
             .sections
@@ -388,6 +413,7 @@ impl Segment {
             hints: range(&hints_entry),
             keys: range(&keys_entry),
             vectors: range(&vectors_entry),
+            scales: scales_entry.as_ref().map(range),
             extras: range(&extras_entry),
             extras_by_slot: range(&by_slot_entry),
             foreign: range(&foreign_entry),
@@ -599,6 +625,20 @@ impl Segment {
         let width = self.codec.bytes_per_vector();
         let at = self.vectors.start + slot as usize * width;
         &self.map[at..at + width]
+    }
+
+    /// Slot `slot`'s own scale, for a codec with one per vector.
+    pub fn vector_scale(&self, slot: u32) -> Option<f32> {
+        let scales = self.scales.as_ref()?;
+        let at = scales.start + slot as usize * 4;
+        Some(f32::from_le_bytes(
+            self.map[at..at + 4].try_into().expect("four bytes"),
+        ))
+    }
+
+    /// Every slot's scale, little-endian `f32`s in slot order, for a codec with them.
+    pub fn vector_scale_bytes(&self) -> Option<&[u8]> {
+        self.scales.as_ref().map(|scales| &self.map[scales.clone()])
     }
 
     /// Every encoded vector, in slot order.

@@ -55,9 +55,7 @@ fn vector_of(key: u64) -> Vec<f32> {
 }
 
 fn codec() -> Codec {
-    let sample: Vec<Vec<f32>> = (0..200).map(vector_of).collect();
-    let refs: Vec<&[f32]> = sample.iter().map(Vec::as_slice).collect();
-    Codec::calibrate_i8_sym_dim(&refs, 1.0).unwrap()
+    Codec::i8_sym_vec(DIM).unwrap()
 }
 
 fn identity() -> IndexVersion {
@@ -66,7 +64,7 @@ fn identity() -> IndexVersion {
     identity.store = StoreIdentity {
         backend_id: STORE_BACKEND_ID.to_string(),
         store_format_version: 2,
-        vector_precision: "i8-sym-dim".to_string(),
+        vector_precision: "i8-sym-vec".to_string(),
     };
     identity
 }

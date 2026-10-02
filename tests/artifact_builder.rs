@@ -578,7 +578,7 @@ fn the_real_model_builds_a_package_that_installs_and_answers() {
             chunking: chunking.clone(),
             created_at: "2026-08-09T00:00:00Z".to_string(),
             batch_size: 4,
-            clip_q: 1.0,
+            codec: otzaria_semantic_search::semantic::oxv::codec::CodecSpec::default(),
             // Real inference: the gate this flag exists for must stay shut.
             allow_non_semantic_backend: false,
         },
