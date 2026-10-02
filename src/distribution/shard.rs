@@ -1,7 +1,7 @@
 //! Splitting one build across machines that never meet.
 //!
 //! [`build`](super::builder::build) does the whole job in one process: read the corpus,
-//! apply the recipe, embed, pack. That is the right shape when one machine has both the
+//! apply the recipe, embed, write the segment. That is the right shape when one machine has both the
 //! corpus and the arithmetic, and the wrong one for the library, where the corpus lives on
 //! a build machine and the inference is spread over rented machines that see it for a few
 //! hours and are then destroyed.
@@ -11,8 +11,12 @@
 //! ```text
 //! export_plan    corpus + recipe -> plan.jsonl          build machine, no model
 //! embed_shard    a slice of plan  -> vectors + records  worker, no corpus
-//! pack           all the vectors  -> artifact           build machine, full verification
+//! verify_shards  every shard      -> checked streams    build machine
 //! ```
+//!
+//! What the build machine makes of the checked streams — vectors keyed by the text they
+//! were built from, written as a segment — is the assembler's business, and
+//! [`read_vector_inputs`] is how it reads them.
 //!
 //! **The recipe is applied exactly once, here.** A worker is handed finished strings, not
 //! a corpus and a configuration, which is what makes it impossible for two workers on
@@ -20,9 +24,9 @@
 //! and it is why a shard boundary cannot cut a context window: the windows were already
 //! resolved when the plan was written.
 //!
-//! **A shard is a range of records, not a range of ids.** [`pack`](super::packer::pack)
-//! compares the *set* of ids it was given against the recipe's expected set and sorts
-//! internally, so shards merge by concatenation in any order. Sharding by id would demand
+//! **A shard is a range of records, not a range of ids.** A vector is addressed by the
+//! text it was built from, never by where it was written, so shards merge by
+//! concatenation in any order. Sharding by id would demand
 //! the plan be written in ascending id order, which would demand it be sorted, which would
 //! demand the whole thing in memory — 5.9 million passages of text — to buy nothing.
 //!
@@ -36,21 +40,46 @@
 //! (`docs/ONNX_BACKEND.md` §0).
 //!
 //! **What each side can check, it checks.** The worker cannot recompute
-//! `source_line_sha256`; it has no corpus, and that digest is the packer's business at
-//! merge time. It *can* recompute `embedding_text_sha256`, so it does, on every record —
-//! see [`PackError::PlanTextChanged`]. What neither side can check alone, `pack` checks
-//! afterwards against the corpus, unchanged from S4a.
+//! `source_line_sha256`; it has no corpus, and that digest is the build machine's business
+//! at merge time. It *can* recompute `embedding_text_sha256`, so it does, on every record —
+//! see [`PackError::PlanTextChanged`]. What neither side can check alone is checked at the
+//! merge, against the corpus.
 
 use crate::distribution::builder::{chunks_for_book, ensure_recipe_matches};
 use crate::distribution::corpus::CorpusBooks;
-use crate::distribution::packer::{VectorInput, VectorInputRecord};
 use crate::errors::PackError;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::EmbeddingRuntime;
 use crate::semantic::versioning::ModelIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+/// One ready-made vector and the line it belongs to.
+#[derive(Debug, Clone)]
+pub struct VectorInput {
+    /// The global document id the vector describes, in the corpus's own id scheme.
+    pub line_id: u64,
+    /// SHA-256 of the **corpus line's** text as the producer read it, in 64 lowercase hex
+    /// digits; the build machine's to check against the corpus at the merge.
+    pub source_line_sha256: String,
+    /// SHA-256 of the text that was actually **embedded** — after whatever prefixing,
+    /// neighbour context and truncation the recipe applies. Its first 16 bytes are the
+    /// vector's [`ChunkKey`](crate::semantic::chunk_key::ChunkKey), and it equals the
+    /// corpus line's digest only when the recipe embedded the line unchanged.
+    pub embedding_text_sha256: String,
+    pub vector: Vec<f32>,
+}
+
+/// One line of the records file that accompanies a raw vector file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorInputRecord {
+    pub line_id: u64,
+    pub source_line_sha256: String,
+    pub embedding_text_sha256: String,
+}
 
 /// One line's work, as the build machine hands it to the machine that embeds it.
 ///
@@ -148,9 +177,9 @@ pub fn export_plan(
         let resolved = resolve_books(corpus, chunking, batch, width)?;
         for (line_ids, body) in resolved {
             for line_id in line_ids {
-                // Two books claiming one line, or one book listing it twice. The packer
-                // would reject it later as a duplicate; saying so here names the recipe's
-                // input instead of the vector stream, which is where the fault is.
+                // Two books claiming one line, or one book listing it twice. Embedded, it
+                // would be two records of one line; saying so here names the recipe's input
+                // instead of the vector stream, which is where the fault is.
                 if !seen.insert(line_id) {
                     return Err(PackError::DuplicateLineId { line_id });
                 }
@@ -419,16 +448,424 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Stream the two input files as [`VectorInput`]s.
+///
+/// The vectors file is `vector_count × embedding_dim` little-endian `f32`s with no header
+/// — what a producer gets from dumping an array — and the records file is one
+/// [`VectorInputRecord`] per line, in the same order. Two files rather than one document
+/// because the floats are the bulk and JSON is the wrong container for them.
+///
+/// The pairing is positional, so the two ways it can be wrong are both caught: a records
+/// file longer than the vectors file runs out of bytes mid-record, and a shorter one
+/// leaves bytes over, which is reported when the iterator ends rather than ignored.
+pub fn read_vector_inputs(
+    vectors_path: &Path,
+    records_path: &Path,
+    embedding_dim: u32,
+) -> Result<impl Iterator<Item = Result<VectorInput, PackError>>, PackError> {
+    let open = |path: &Path| -> Result<File, PackError> {
+        File::open(path).map_err(|source| PackError::Io {
+            context: format!("reading {}", path.display()),
+            source,
+        })
+    };
+
+    // Before the arithmetic below, which divides by it. A model identity that declares no
+    // dimension is refused by `validate_complete` — but a caller reads the dimension out
+    // of that identity to call this, and reaching a division by zero on the way to a good
+    // error message is not a way to report anything.
+    if embedding_dim == 0 {
+        return Err(PackError::MalformedInput {
+            reason: "the model identity declares an embedding_dim of 0, so there is no \
+                     record width to read the vectors at"
+                .to_string(),
+        });
+    }
+
+    let vectors = open(vectors_path)?;
+    let record_bytes = embedding_dim as u64 * 4;
+    let length = vectors
+        .metadata()
+        .map_err(|source| PackError::Io {
+            context: format!("inspecting {}", vectors_path.display()),
+            source,
+        })?
+        .len();
+    if length % record_bytes != 0 {
+        return Err(PackError::MalformedInput {
+            reason: format!(
+                "{} holds {length} bytes, which is not a whole number of {embedding_dim}-\
+                 dimensional f32 vectors ({record_bytes} bytes each)",
+                vectors_path.display()
+            ),
+        });
+    }
+
+    Ok(VectorInputReader {
+        records: BufReader::new(open(records_path)?).lines(),
+        vectors: BufReader::new(vectors),
+        vectors_path: vectors_path.to_path_buf(),
+        records_path: records_path.to_path_buf(),
+        embedding_dim: embedding_dim as usize,
+        line_number: 0,
+        done: false,
+    })
+}
+
+struct VectorInputReader {
+    records: io::Lines<BufReader<File>>,
+    vectors: BufReader<File>,
+    vectors_path: PathBuf,
+    records_path: PathBuf,
+    embedding_dim: usize,
+    /// Lines of the records file consumed so far, across calls. A per-call counter looked
+    /// right and named every fault "line 1", which is worse than no line number at all.
+    line_number: usize,
+    done: bool,
+}
+
+impl VectorInputReader {
+    fn read_one(&mut self, line: &str, number: usize) -> Result<VectorInput, PackError> {
+        let record: VectorInputRecord =
+            serde_json::from_str(line).map_err(|error| PackError::MalformedInput {
+                reason: format!(
+                    "{} line {number} is not a vector record: {error}",
+                    self.records_path.display()
+                ),
+            })?;
+
+        let mut bytes = vec![0u8; self.embedding_dim * 4];
+        self.vectors
+            .read_exact(&mut bytes)
+            .map_err(|error| PackError::MalformedInput {
+                reason: format!(
+                    "{} has no vector for record {number} (line_id {}): {error}",
+                    self.vectors_path.display(),
+                    record.line_id
+                ),
+            })?;
+
+        let vector = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| f32::from_le_bytes(*value))
+            .collect();
+
+        Ok(VectorInput {
+            line_id: record.line_id,
+            source_line_sha256: record.source_line_sha256,
+            embedding_text_sha256: record.embedding_text_sha256,
+            vector,
+        })
+    }
+
+    /// Vectors left over once the records are exhausted, which means the two files
+    /// describe different numbers of records.
+    fn refuse_trailing_vectors(&mut self) -> Option<Result<VectorInput, PackError>> {
+        let mut trailing = [0u8; 1];
+        match self.vectors.read(&mut trailing) {
+            Ok(0) => None,
+            Ok(_) => Some(Err(PackError::MalformedInput {
+                reason: format!(
+                    "{} holds more vectors than {} has records",
+                    self.vectors_path.display(),
+                    self.records_path.display()
+                ),
+            })),
+            Err(source) => Some(Err(PackError::Io {
+                context: format!("reading {}", self.vectors_path.display()),
+                source,
+            })),
+        }
+    }
+}
+
+impl Iterator for VectorInputReader {
+    type Item = Result<VectorInput, PackError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            self.line_number += 1;
+            let item = match self.records.next() {
+                None => self.refuse_trailing_vectors(),
+                Some(Err(source)) => Some(Err(PackError::Io {
+                    context: format!("reading {}", self.records_path.display()),
+                    source,
+                })),
+                Some(Ok(line)) if line.trim().is_empty() => continue,
+                Some(Ok(line)) => {
+                    let number = self.line_number;
+                    Some(self.read_one(&line, number))
+                }
+            };
+            // Nothing after a fault is meaningful: the two files are read in lockstep, so
+            // one bad record leaves every later pairing off by one.
+            if !matches!(item, Some(Ok(_))) {
+                self.done = true;
+            }
+            return item;
+        }
+    }
+}
+
+/// One shard's vectors and the records that pair with them, already opened.
+pub type ShardStreams = (Box<dyn Read>, Box<dyn BufRead>);
+
+/// Every shard's manifest, checked against the plan they claim to cover.
+///
+/// A merge that opened `vectors.f32` and `records.jsonl` directly, without reading
+/// `shard-manifest.json`, once believed counts and digests nobody checked: a shard from
+/// another export, a corrupted vector that stayed finite, or two shards covering one
+/// window and none covering another all merged cleanly.
+///
+/// What is checked, per shard: the plan it was cut from, its model *and* the width that
+/// model declares, that it wrote exactly the records its window asked for, that
+/// `vectors.f32` holds that many vectors and `records.jsonl` that many records, and that
+/// both files hash to what its own manifest recorded. Then, across shards: the windows
+/// tile `[0, total)` exactly — no hole, no overlap.
+///
+/// Nothing in [`ShardReport`] is read and then ignored. `take` and `embedding_dim` were,
+/// for a while, and a manifest field nobody compares is a field that can say anything.
+///
+/// Every one of those is checked before a byte is copied, which is the point of doing it
+/// here rather than leaving it to the merge: a merge writes as it reads, so a shard it
+/// refuses halfway has already put output on disk.
+///
+/// # Errors
+///
+/// [`PackError::MalformedInput`], naming the shard and what disagreed.
+pub fn verify_shards(
+    shards: &[(std::path::PathBuf, ShardReport)],
+    plan_sha256: &str,
+    model: &ModelIdentity,
+    total: usize,
+) -> Result<Vec<ShardStreams>, PackError> {
+    // A release where no embedding text changed needs no inference at all: every vector is
+    // already held and there are no shard directories. That is the cheapest path there
+    // is, and refusing an empty set unconditionally made it the one path that could not
+    // run.
+    if total == 0 {
+        return if shards.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(PackError::MalformedInput {
+                reason: format!(
+                    "{} shard(s) were produced for a plan that needs no embedding",
+                    shards.len()
+                ),
+            })
+        };
+    }
+    if shards.is_empty() {
+        return Err(PackError::NoVectors);
+    }
+    // Path, window, and the two handles that were hashed. Ordering happens after every
+    // shard has been checked, so a refusal never depends on which one came first.
+    let mut checked: Vec<(usize, usize, &std::path::Path, std::fs::File, std::fs::File)> =
+        Vec::with_capacity(shards.len());
+
+    for (dir, manifest) in shards {
+        let named = dir.display();
+        if manifest.plan_sha256 != plan_sha256 {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named} was embedded from plan {} and this build's plan is {plan_sha256}",
+                    manifest.plan_sha256
+                ),
+            });
+        }
+        if manifest.model != *model {
+            return Err(PackError::MalformedInput {
+                reason: format!("{named} was embedded by a different model identity"),
+            });
+        }
+        // The width the worker actually got back from its backend, against the width the
+        // model promises. A merge strides through both files by this number, so a shard
+        // that disagrees would be read at the wrong offset from its first vector on.
+        if manifest.embedding_dim != model.embedding_dim as usize {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named} holds {}-wide vectors and the model declares {}",
+                    manifest.embedding_dim, model.embedding_dim
+                ),
+            });
+        }
+        // The window, held to the plan. `read_plan` skips and takes over *records*, so a
+        // shard covers exactly what remains of the plan after its skip, capped by its take
+        // — and a shard that stopped early is a truncated session, not a short window.
+        let remaining =
+            total
+                .checked_sub(manifest.skip)
+                .ok_or_else(|| PackError::MalformedInput {
+                    reason: format!(
+                        "{named} starts at {} and the plan holds {total} record(s)",
+                        manifest.skip
+                    ),
+                })?;
+        let owed = manifest.take.min(remaining);
+        if manifest.records != owed {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named} was given {} record(s) from {} and wrote {}",
+                    owed, manifest.skip, manifest.records
+                ),
+            });
+        }
+        // Opened once, hashed through the handle, rewound, and carried out of here. The
+        // caller cannot reopen by path, so the file that was checked is the file that is
+        // read.
+        let open = |file: &str, declared: &str| -> Result<(std::fs::File, usize), PackError> {
+            let mut handle = std::fs::File::open(dir.join(file)).map_err(read_error)?;
+            let (actual, lines) = sha256_and_lines(&mut handle)?;
+            if actual != declared {
+                return Err(PackError::MalformedInput {
+                    reason: format!(
+                        "{named}/{file} hashes to {actual} and its manifest declares {declared}"
+                    ),
+                });
+            }
+            handle.seek(SeekFrom::Start(0)).map_err(read_error)?;
+            Ok((handle, lines))
+        };
+        let (vectors, _) = open("vectors.f32", &manifest.vectors_sha256)?;
+        let (records, lines) = open("records.jsonl", &manifest.records_sha256)?;
+        // The count a merge will actually pair with vectors, from the pass that hashed
+        // the file. A shard with three vectors, a manifest saying three, and two records in
+        // it used to reach the merge — which copied part of its output before noticing.
+        if lines != manifest.records {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named}/records.jsonl holds {lines} record(s) and its manifest declares {}",
+                    manifest.records
+                ),
+            });
+        }
+        // Through the handle that was hashed, before a byte is copied: a file of the wrong
+        // length would otherwise surface as a merge running out of vectors halfway.
+        let owed_bytes = (manifest.records as u64)
+            .checked_mul(manifest.embedding_dim as u64)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| PackError::MalformedInput {
+                reason: format!(
+                    "{named} declares {} vectors of {} floats, which is no file",
+                    manifest.records, manifest.embedding_dim
+                ),
+            })?;
+        let length = vectors.metadata().map_err(read_error)?.len();
+        if length != owed_bytes {
+            return Err(PackError::MalformedInput {
+                reason: format!(
+                    "{named}/vectors.f32 is {length} bytes and {} vector(s) of {} floats \
+                     are {owed_bytes}",
+                    manifest.records, manifest.embedding_dim
+                ),
+            });
+        }
+        checked.push((
+            manifest.skip,
+            manifest.records,
+            dir.as_path(),
+            vectors,
+            records,
+        ));
+    }
+
+    checked.sort_by_key(|(skip, records, dir, _, _)| (*skip, *records, *dir));
+    let mut covered = 0usize;
+    for (skip, records, dir, _, _) in &checked {
+        if *skip != covered {
+            return Err(PackError::MalformedInput {
+                reason: if *skip > covered {
+                    format!(
+                        "records {covered}..{skip} are covered by no shard; {} starts at {skip}",
+                        dir.display()
+                    )
+                } else {
+                    format!(
+                        "{} starts at {skip} and records up to {covered} are already covered",
+                        dir.display()
+                    )
+                },
+            });
+        }
+        covered = covered
+            .checked_add(*records)
+            .ok_or_else(|| PackError::MalformedInput {
+                reason: format!("the shards claim more records than a count can hold: {covered}"),
+            })?;
+    }
+    if covered != total {
+        return Err(PackError::MalformedInput {
+            reason: format!("the shards cover {covered} record(s) and the plan holds {total}"),
+        });
+    }
+
+    Ok(checked
+        .into_iter()
+        .map(|(_, _, _, vectors, records)| {
+            (
+                Box::new(std::io::BufReader::new(vectors)) as Box<dyn Read>,
+                Box::new(std::io::BufReader::new(records)) as Box<dyn BufRead>,
+            )
+        })
+        .collect())
+}
+
+/// The digest and the number of non-empty lines, from one pass over the bytes.
+///
+/// Both facts come from the same read because the second one is not optional: the digest
+/// says the file is the file its manifest describes, and the count says how many vectors
+/// a merge will pair with it. Hashing without counting left that to be discovered
+/// mid-merge, with output already written.
+///
+/// "Non-empty" is the same test [`read_vector_inputs`] applies when it walks the records —
+/// a line of nothing but whitespace is skipped there and not counted here.
+fn sha256_and_lines(file: &mut impl Read) -> Result<(String, usize), PackError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut lines = 0usize;
+    let mut has_content = false;
+    loop {
+        let read = file.read(&mut buffer).map_err(read_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                lines += usize::from(has_content);
+                has_content = false;
+            } else if !byte.is_ascii_whitespace() {
+                has_content = true;
+            }
+        }
+    }
+    // A last line with no newline after it is still a line.
+    lines += usize::from(has_content);
+    Ok((format!("{:x}", hasher.finalize()), lines))
+}
+
+fn read_error(error: std::io::Error) -> PackError {
+    PackError::Corpus {
+        reason: error.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::builder::{build, BuildRequest, PlannedCorpus};
+    use crate::distribution::builder::{build, BuildRequest, SEGMENT_FILENAME};
     use crate::distribution::corpus::CorpusIdentity;
     use crate::distribution::corpus::{CorpusLine, CorpusLineRecord, JsonlCorpus};
-    use crate::distribution::packer::{pack, read_vector_inputs, PackRequest};
     use crate::semantic::backend::Pooling;
+    use crate::semantic::chunk_key::ChunkKey;
     use crate::semantic::embedding::{mock, EmbeddingConfig};
     use crate::semantic::model_package::validate_model;
+    use crate::semantic::oxv::reader::Segment;
     use crate::semantic::versioning::ModelPackage;
     use std::path::PathBuf;
 
@@ -560,13 +997,13 @@ mod tests {
 
     /// The whole claim of this module, as one comparison.
     ///
-    /// If a build cut into shards and reassembled is not byte-for-byte the artifact one
-    /// process would have produced, then the split changed the product — and every
-    /// argument about which machine runs which step is worthless. The digest covers the
-    /// vectors and every stored record, and `created_at` is fixed on both sides because
-    /// it is deliberately excluded from it.
+    /// If a vector embedded in a shard is not the vector one process would have stored for
+    /// the same text, then the split changed the product — and every argument about which
+    /// machine runs which step is worthless. Each sharded vector, encoded with the codec
+    /// the one-process build calibrated, is compared byte for byte with the slot the build
+    /// stored for its key.
     #[test]
-    fn a_sharded_build_reassembles_into_the_artifact_one_process_would_have_written() {
+    fn a_sharded_embedding_produces_the_vectors_one_process_stores() {
         let dir = TempDir::new("equivalence");
         let corpus = corpus(&dir);
         let chunking = ChunkerConfig::default();
@@ -580,8 +1017,8 @@ mod tests {
                 model: model.clone(),
                 chunking: chunking.clone(),
                 created_at: "2026-08-09T00:00:00Z".to_string(),
-                collection_name: "chunks".to_string(),
                 batch_size: 2,
+                clip_q: 1.0,
                 allow_non_semantic_backend: true,
             },
             &corpus,
@@ -592,7 +1029,7 @@ mod tests {
         let mut sink = std::fs::File::create(&plan_path).unwrap();
         let plan = export_plan(&corpus, &chunking, &model, &mut sink).unwrap();
         assert_eq!(
-            plan.records, whole.vector_count as usize,
+            plan.records, whole.planned_lines,
             "the plan and the build must agree on which lines get a vector"
         );
 
@@ -624,32 +1061,30 @@ mod tests {
         );
         drop((vectors, records));
 
-        let planned = PlannedCorpus::new(&corpus, &chunking, &model).unwrap();
-        // What the single-process build records about itself: the package it loaded, and
-        // the backend that ran it.
-        let provenance = crate::semantic::versioning::VectorProvenance {
-            passage_package: model.query_packages[0].clone(),
-            worker: crate::semantic::versioning::EmbeddingWorker {
-                backend: runtime.backend_id().unwrap().to_string(),
-                device: "cpu".to_string(),
-            },
-        };
-        let merged = pack(
-            PackRequest {
-                output_path: dir.0.join("merged"),
-                model: model.clone(),
-                provenance,
-                created_at: "2026-08-09T00:00:00Z".to_string(),
-                collection_name: "chunks".to_string(),
-            },
-            read_vector_inputs(&vectors_path, &records_path, DIM).unwrap(),
-            &planned,
-        )
-        .unwrap();
-
+        let segment = Segment::open(&whole.output_path.join(SEGMENT_FILENAME)).unwrap();
+        let slots: std::collections::HashMap<ChunkKey, u32> = (0..segment.slot_count())
+            .map(|slot| (segment.key(slot), slot))
+            .collect();
+        let mut encoded = vec![0u8; segment.codec().bytes_per_vector()];
+        let mut compared = 0;
+        for input in read_vector_inputs(&vectors_path, &records_path, DIM).unwrap() {
+            let input = input.unwrap();
+            let key = ChunkKey::from_hex(&input.embedding_text_sha256[..32]).unwrap();
+            let slot = slots[&key];
+            segment.codec().encode(&input.vector, &mut encoded);
+            assert_eq!(
+                encoded,
+                segment.vector(slot),
+                "line {}: a sharded vector must be the one a single-process build stores",
+                input.line_id
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, plan.records);
         assert_eq!(
-            merged.digest, whole.digest,
-            "a sharded build must produce the artifact a single-process build produces"
+            slots.len(),
+            plan.records - 1,
+            "the text two books share is one slot"
         );
     }
 
@@ -702,7 +1137,7 @@ mod tests {
         }
 
         // A worker embeds it unchanged — its digest check passes on the prefixed text —
-        // and the merge packs and verifies it against the corpus.
+        // and one process builds the same plan.
         let runtime = runtime_for(&model_path);
         let (mut vectors, mut records) = (Vec::new(), Vec::new());
         let report = embed_shard(
@@ -724,14 +1159,14 @@ mod tests {
                 model: v2_model.clone(),
                 chunking: v2_chunking.clone(),
                 created_at: "2026-08-09T00:00:00Z".to_string(),
-                collection_name: "chunks".to_string(),
                 batch_size: 2,
+                clip_q: 1.0,
                 allow_non_semantic_backend: true,
             },
             &corpus,
         )
         .unwrap();
-        assert_eq!(built.vector_count as usize, v2.len());
+        assert_eq!(built.planned_lines, v2.len());
     }
 
     /// A cap that ends a passage on a space: the plan hands the worker version 2's text
@@ -788,11 +1223,8 @@ mod tests {
         }
     }
 
-    /// A shard that never ran is a hole, and `pack` is what has to see it.
-    ///
-    /// Deliberately checked here rather than trusted from S4a: the whole reason a shard
-    /// may be re-run in isolation is that a lost one is detectable, and this is the
-    /// statement of that.
+    /// A shard that never ran is a hole, and the merge's check of the shards is what has
+    /// to see it — a set of shards short of the plan is internally perfect.
     #[test]
     fn a_missing_shard_is_refused_at_the_merge() {
         let dir = TempDir::new("hole");
@@ -806,14 +1238,14 @@ mod tests {
         let plan = export_plan(&corpus, &chunking, &model, &mut sink).unwrap();
         drop(sink);
 
+        // Every record but the last one, in one shard directory.
         let runtime = runtime_for(&model_path);
-        let vectors_path = dir.0.join("vectors.f32");
-        let records_path = dir.0.join("records.jsonl");
-        let mut vectors = std::fs::File::create(&vectors_path).unwrap();
-        let mut records = std::fs::File::create(&records_path).unwrap();
-        // Every record but the last one.
+        let shard = dir.0.join("shard-0");
+        std::fs::create_dir_all(&shard).unwrap();
+        let mut vectors = std::fs::File::create(shard.join("vectors.f32")).unwrap();
+        let mut records = std::fs::File::create(shard.join("records.jsonl")).unwrap();
         let file = std::io::BufReader::new(std::fs::File::open(&plan_path).unwrap());
-        embed_shard(
+        let report = embed_shard(
             read_plan(file, 0, plan.records - 1),
             ("plan".to_string(), 0, plan.records - 1),
             &model,
@@ -825,22 +1257,14 @@ mod tests {
         .unwrap();
         drop((vectors, records));
 
-        let planned = PlannedCorpus::new(&corpus, &chunking, &model).unwrap();
-        let outcome = pack(
-            PackRequest {
-                output_path: dir.0.join("merged"),
-                model: model.clone(),
-                provenance: crate::semantic::versioning::test_provenance(),
-                created_at: "2026-08-09T00:00:00Z".to_string(),
-                collection_name: "chunks".to_string(),
-            },
-            read_vector_inputs(&vectors_path, &records_path, DIM).unwrap(),
-            &planned,
-        );
-        match outcome {
-            Err(PackError::CoverageMismatch { .. }) => {}
-            Ok(_) => panic!("a merge missing a shard must not produce an artifact"),
-            Err(other) => panic!("expected a coverage mismatch, got {other:?}"),
+        let shards = [(shard, report)];
+        assert!(verify_shards(&shards, "plan", &model, plan.records - 1).is_ok());
+        match verify_shards(&shards, "plan", &model, plan.records) {
+            Err(PackError::MalformedInput { reason }) => {
+                assert!(reason.contains("cover 4 record(s)"), "{reason}")
+            }
+            Ok(_) => panic!("a merge missing a shard must be refused"),
+            Err(other) => panic!("expected a refusal naming the coverage, got {other:?}"),
         }
     }
 
@@ -879,6 +1303,406 @@ mod tests {
             }
             Ok(_) => panic!("text that is not what its digest names must not be embedded"),
             Err(other) => panic!("expected PlanTextChanged, got {other:?}"),
+        }
+    }
+
+    /// The two files a shard is, read back — and the checks a merge makes on a set of them.
+    mod streams {
+        use super::super::*;
+        use super::TempDir;
+        use crate::semantic::chunker::ChunkerConfig;
+        use crate::semantic::versioning::ModelPackage;
+
+        const DIM: u32 = 8;
+        const GENESIS: &str = "otzaria/tanach/genesis.txt";
+        const BERACHOT: &str = "otzaria/mishna/berachot.txt";
+
+        const LINES: [(u64, &str, &str); 3] = [
+            (4_294_967_297, GENESIS, "בראשית ברא אלהים את השמים ואת הארץ"),
+            (4_294_967_298, GENESIS, "ויאמר אלהים יהי אור ויהי אור"),
+            (8_589_934_593, BERACHOT, "מאימתי קורין את שמע בערבית"),
+        ];
+
+        /// A deterministic vector that differs per text, so a misplaced one is visible.
+        fn input(line_id: u64, text: &str) -> VectorInput {
+            let digest = Sha256::digest(text.as_bytes());
+            VectorInput {
+                line_id,
+                source_line_sha256: sha256_hex(text.as_bytes()),
+                embedding_text_sha256: sha256_hex(text.as_bytes()),
+                vector: (0..DIM)
+                    .map(|i| f32::from(digest[i as usize]) + 1.0)
+                    .collect(),
+            }
+        }
+
+        fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
+            ModelIdentity {
+                family_id: "otzaria-embedding-v1".to_string(),
+                tokenizer_checksum: crate::semantic::embedding::mock::stub_tokenizer_checksum(),
+                query_packages: vec![ModelPackage {
+                    checksum: checksum.to_string(),
+                    quantization: "int8".to_string(),
+                }],
+                embedding_dim: 2,
+                pooling: "in-graph".to_string(),
+                max_tokens: 512,
+                embedding_text_version: 1,
+                normalization_version: 1,
+                chunking_identity: chunking.identity(),
+            }
+        }
+
+        fn vectors_of(values: &[[f32; 2]]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+                .collect()
+        }
+
+        /// Write the two files a producer emits, and return their paths.
+        fn write_inputs(dir: &TempDir, name: &str, inputs: &[VectorInput]) -> (PathBuf, PathBuf) {
+            let vectors_path = dir.0.join(format!("{name}.f32"));
+            let records_path = dir.0.join(format!("{name}.jsonl"));
+
+            let mut bytes = Vec::new();
+            let mut records = String::new();
+            for input in inputs {
+                for value in &input.vector {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                records.push_str(&format!(
+                    "{}\n",
+                    serde_json::to_string(&VectorInputRecord {
+                        line_id: input.line_id,
+                        source_line_sha256: input.source_line_sha256.clone(),
+                        embedding_text_sha256: input.embedding_text_sha256.clone(),
+                    })
+                    .unwrap()
+                ));
+            }
+            std::fs::write(&vectors_path, bytes).unwrap();
+            std::fs::write(&records_path, records).unwrap();
+            (vectors_path, records_path)
+        }
+
+        #[test]
+        fn the_input_files_stream_back_the_records_that_were_written() {
+            let dir = TempDir::new("input_round_trip");
+            let written: Vec<VectorInput> = LINES
+                .iter()
+                .map(|(line_id, _, text)| input(*line_id, text))
+                .collect();
+            let (vectors_path, records_path) = write_inputs(&dir, "good", &written);
+
+            let read: Vec<VectorInput> = read_vector_inputs(&vectors_path, &records_path, DIM)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+
+            assert_eq!(read.len(), written.len());
+            for (read, written) in read.iter().zip(&written) {
+                assert_eq!(read.line_id, written.line_id);
+                assert_eq!(read.source_line_sha256, written.source_line_sha256);
+                assert_eq!(read.embedding_text_sha256, written.embedding_text_sha256);
+                assert_eq!(read.vector, written.vector);
+            }
+        }
+
+        /// The pairing is positional, so both ways of losing alignment have to be caught —
+        /// and neither is visible from one file alone.
+        #[test]
+        fn input_files_that_describe_different_numbers_of_records_are_refused() {
+            let dir = TempDir::new("input_lengths");
+            let written: Vec<VectorInput> = LINES
+                .iter()
+                .map(|(line_id, _, text)| input(*line_id, text))
+                .collect();
+            let (vectors_path, records_path) = write_inputs(&dir, "base", &written);
+
+            // One record too few: bytes are left over when the records run out.
+            let short_records = dir.0.join("short.jsonl");
+            let text = std::fs::read_to_string(&records_path).unwrap();
+            std::fs::write(
+                &short_records,
+                format!("{}\n", text.lines().take(2).collect::<Vec<_>>().join("\n")),
+            )
+            .unwrap();
+            let verdict: Vec<Result<VectorInput, PackError>> =
+                read_vector_inputs(&vectors_path, &short_records, DIM)
+                    .unwrap()
+                    .collect();
+            match verdict.last() {
+                Some(Err(PackError::MalformedInput { reason })) => {
+                    assert!(reason.contains("more vectors"), "{reason}")
+                }
+                other => panic!("leftover vectors must be refused, got {other:?}"),
+            }
+
+            // One record too many: the vector file runs out mid-record.
+            let long_records = dir.0.join("long.jsonl");
+            std::fs::write(
+                &long_records,
+                format!("{text}{}", text.lines().next().unwrap()),
+            )
+            .unwrap();
+            let verdict: Vec<Result<VectorInput, PackError>> =
+                read_vector_inputs(&vectors_path, &long_records, DIM)
+                    .unwrap()
+                    .collect();
+            match verdict.last() {
+                Some(Err(PackError::MalformedInput { reason })) => {
+                    assert!(reason.contains("no vector for record"), "{reason}")
+                }
+                other => panic!("a missing vector must be refused, got {other:?}"),
+            }
+
+            // A vector file that is not a whole number of records is refused before a byte of
+            // it is paired with anything.
+            let ragged = dir.0.join("ragged.f32");
+            let mut bytes = std::fs::read(&vectors_path).unwrap();
+            bytes.push(0);
+            std::fs::write(&ragged, bytes).unwrap();
+            match read_vector_inputs(&ragged, &records_path, DIM).map(|_| ()) {
+                Err(PackError::MalformedInput { reason }) => {
+                    assert!(reason.contains("whole number"), "{reason}")
+                }
+                other => panic!("a ragged vector file must be refused, got {other:?}"),
+            }
+        }
+
+        /// A build log names the line to fix. The counter therefore has to survive between
+        /// calls to `next` — a per-call one reported every fault as line 1.
+        #[test]
+        fn a_malformed_record_is_reported_against_the_line_it_is_on() {
+            let dir = TempDir::new("input_line_number");
+            let written: Vec<VectorInput> = LINES
+                .iter()
+                .map(|(line_id, _, text)| input(*line_id, text))
+                .collect();
+            let (vectors_path, records_path) = write_inputs(&dir, "base", &written);
+
+            // Break the third record, leaving the first two well formed.
+            let text = std::fs::read_to_string(&records_path).unwrap();
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            lines[2] = "{ not a record".to_string();
+            std::fs::write(&records_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let verdict: Vec<Result<VectorInput, PackError>> =
+                read_vector_inputs(&vectors_path, &records_path, DIM)
+                    .unwrap()
+                    .collect();
+            assert_eq!(verdict.len(), 3, "the reader stops at the first fault");
+            match verdict.last() {
+                Some(Err(PackError::MalformedInput { reason })) => {
+                    assert!(reason.contains("line 3"), "{reason}")
+                }
+                other => panic!("a malformed record must be refused, got {other:?}"),
+            }
+        }
+
+        /// Every one of these merged cleanly while the manifests were decoration: the floats
+        /// are re-normalised at the merge, and the id set can still come out complete.
+        #[test]
+        fn shards_that_do_not_tile_this_plan_are_refused() {
+            let dir = TempDir::new("shards");
+            let model = model_for(&"ab".repeat(32), &ChunkerConfig::default());
+            let write = |name: &str,
+                         skip: usize,
+                         records: usize,
+                         plan: &str,
+                         model: &ModelIdentity| {
+                let at = dir.0.join(name);
+                std::fs::create_dir_all(&at).unwrap();
+                let vectors = vectors_of(&vec![[1.0, 1.0]; records]);
+                let body: String = (0..records)
+                    .map(|i| {
+                        format!("{{\"line_id\":{i},\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"d\"}}\n")
+                    })
+                    .collect();
+                std::fs::write(at.join("vectors.f32"), &vectors).unwrap();
+                std::fs::write(at.join("records.jsonl"), &body).unwrap();
+                (
+                    at,
+                    ShardReport {
+                        plan_sha256: plan.to_string(),
+                        skip,
+                        take: records,
+                        records,
+                        embedding_dim: 2,
+                        vectors_sha256: sha256_hex(&vectors),
+                        records_sha256: sha256_hex(body.as_bytes()),
+                        model: model.clone(),
+                    },
+                )
+            };
+
+            let a = write("a", 0, 2, "plan", &model);
+            let b = write("b", 2, 2, "plan", &model);
+            assert!(verify_shards(&[a.clone(), b.clone()], "plan", &model, 4).is_ok());
+
+            // A hole: nothing covers records 2..4.
+            let far = write("far", 4, 2, "plan", &model);
+            expect_reason(
+                verify_shards(&[a.clone(), far], "plan", &model, 6),
+                "covered by no shard",
+            );
+
+            // An overlap: two shards claim the same window.
+            let again = write("again", 0, 2, "plan", &model);
+            expect_reason(
+                verify_shards(&[a.clone(), again], "plan", &model, 4),
+                "already covered",
+            );
+
+            // A shard of another export, with a window of exactly the right shape.
+            let foreign = write("foreign", 2, 2, "other-plan", &model);
+            expect_reason(
+                verify_shards(&[a.clone(), foreign], "plan", &model, 4),
+                "and this build's plan is",
+            );
+
+            // A shard embedded by another model.
+            let other_model = ModelIdentity {
+                family_id: "another/model@0000000".to_string(),
+                ..model.clone()
+            };
+            let mixed = write("mixed", 2, 2, "plan", &other_model);
+            expect_reason(
+                verify_shards(&[a.clone(), mixed], "plan", &model, 4),
+                "different model identity",
+            );
+
+            // A bit flipped in a vector, leaving it finite — which a merge would have
+            // normalised and accepted.
+            let flipped = write("flipped", 2, 2, "plan", &model);
+            std::fs::write(
+                flipped.0.join("vectors.f32"),
+                vectors_of(&[[1.0, 1.0], [2.0, 2.0]]),
+            )
+            .unwrap();
+            expect_reason(
+                verify_shards(&[a.clone(), flipped], "plan", &model, 4),
+                "hashes to",
+            );
+
+            // Short of the plan.
+            expect_reason(
+                verify_shards(&[a, b], "plan", &model, 6),
+                "cover 4 record(s)",
+            );
+        }
+
+        /// A manifest field nobody compares is a field that can say anything. Every shard
+        /// below is internally consistent — both digests match its own two files — and every
+        /// one of them is refused, because the *plan* says something else.
+        #[test]
+        fn a_shard_manifest_that_disagrees_with_the_plan_is_refused() {
+            let dir = TempDir::new("fields");
+            let model = model_for(&"ab".repeat(32), &ChunkerConfig::default());
+            // `vectors` vectors and `lines` records on disk, hashed honestly, with a manifest
+            // the caller then bends one field of.
+            let write = |name: &str,
+                         vectors: usize,
+                         lines: usize,
+                         bend: &dyn Fn(&mut ShardReport)| {
+                let at = dir.0.join(name);
+                std::fs::create_dir_all(&at).unwrap();
+                let floats = vectors_of(&vec![[1.0, 1.0]; vectors]);
+                let body: String = (0..lines)
+                    .map(|i| format!("{{\"line_id\":{i},\"source_line_sha256\":\"s\",\"embedding_text_sha256\":\"d\"}}\n"))
+                    .collect();
+                std::fs::write(at.join("vectors.f32"), &floats).unwrap();
+                std::fs::write(at.join("records.jsonl"), &body).unwrap();
+                let mut manifest = ShardReport {
+                    plan_sha256: "plan".to_string(),
+                    skip: 0,
+                    take: lines,
+                    records: lines,
+                    embedding_dim: 2,
+                    vectors_sha256: sha256_hex(&floats),
+                    records_sha256: sha256_hex(body.as_bytes()),
+                    model: model.clone(),
+                };
+                bend(&mut manifest);
+                vec![(at, manifest)]
+            };
+
+            // A width the model does not declare. `assemble` strides by this number, so every
+            // vector after the first would be read from the middle of its neighbour.
+            expect_reason(
+                verify_shards(
+                    &write("wide", 2, 2, &|m| m.embedding_dim = 4),
+                    "plan",
+                    &model,
+                    2,
+                ),
+                "holds 4-wide vectors and the model declares 2",
+            );
+
+            // A session that stopped early: the window asked for four records and two came
+            // back. Nothing else in the set would notice, because this shard is the whole set.
+            expect_reason(
+                verify_shards(&write("short", 2, 2, &|m| m.take = 4), "plan", &model, 4),
+                "was given 4 record(s) from 0 and wrote 2",
+            );
+
+            // A window that begins past the end of the plan.
+            expect_reason(
+                verify_shards(&write("beyond", 2, 2, &|m| m.skip = 8), "plan", &model, 4),
+                "starts at 8 and the plan holds 4",
+            );
+
+            // A record lost from the file its own manifest counted: three vectors, three
+            // declared, two written. Both digests honest.
+            expect_reason(
+                verify_shards(
+                    &write("missing", 3, 2, &|m| {
+                        m.records = 3;
+                        m.take = 3;
+                    }),
+                    "plan",
+                    &model,
+                    3,
+                ),
+                "records.jsonl holds 2 record(s) and its manifest declares 3",
+            );
+
+            // And one too many, which is the same defect from the other side: the merge would
+            // have paired the third record with the first vector of whatever came next.
+            expect_reason(
+                verify_shards(&write("extra", 2, 3, &|m| m.records = 2), "plan", &model, 2),
+                "records.jsonl holds 3 record(s) and its manifest declares 2",
+            );
+
+            // Three records, three lines, and a vectors file holding two — every digest
+            // honest. Before the length check this reached `assemble` and ran out of floats
+            // halfway through the merge.
+            expect_reason(
+                verify_shards(
+                    &write("truncated", 2, 3, &|m| m.records = 3),
+                    "plan",
+                    &model,
+                    3,
+                ),
+                "is 16 bytes and 3 vector(s) of 2 floats are 24",
+            );
+
+            // The same shard, honest about all of it, is accepted.
+            assert!(verify_shards(&write("whole", 2, 2, &|_| {}), "plan", &model, 2).is_ok());
+        }
+
+        fn expect_reason<T>(outcome: Result<T, PackError>, expected: &str) {
+            match outcome {
+                Err(error) => {
+                    let text = error.to_string();
+                    assert!(
+                        text.contains(expected),
+                        "expected {expected:?}, got {text:?}"
+                    );
+                }
+                Ok(_) => panic!("expected a refusal"),
+            }
         }
     }
 }

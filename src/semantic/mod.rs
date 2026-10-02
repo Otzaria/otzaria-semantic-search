@@ -72,4 +72,3 @@ pub mod store;
 pub mod store_backend;
 pub mod types;
 pub mod versioning;
-pub mod zevc_store;

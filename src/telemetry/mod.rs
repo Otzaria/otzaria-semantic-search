@@ -21,6 +21,14 @@ pub struct SearchTelemetry {
     pub fusion_latency_ms: u64,
     pub confidence: Option<f32>,
     pub profile: String,
+    /// Vectors the scan of an official vector set returned.
+    pub semantic_hits: u32,
+    /// Of those, how many resolved to no live line.
+    pub semantic_unresolved: u32,
+    /// Time in the vector scan, for an official vector set.
+    pub scan_ms: Option<u64>,
+    /// Time the host's resolver took to tie the hits to live lines.
+    pub resolve_ms: Option<u64>,
 }
 
 /// A snapshot of aggregated telemetry metrics.
@@ -33,6 +41,13 @@ pub struct TelemetrySnapshot {
     pub avg_latency_ms: f64,
     pub cache_hit_rate: f64,
     pub strategy_distribution: HashMap<String, u64>,
+    /// Vectors official-set scans returned, over every search.
+    #[serde(default)]
+    pub semantic_hits: u64,
+    /// Of those, the ones the host's resolver tied to no live line: text that changed or
+    /// went since the vectors were built.
+    #[serde(default)]
+    pub semantic_unresolved: u64,
 }
 
 /// Thread-safe collector for aggregating search telemetry.
@@ -42,6 +57,8 @@ pub struct TelemetryCollector {
     cache_misses: AtomicU64,
     embedding_calls: AtomicU64,
     total_latency_us: AtomicU64,
+    semantic_hits: AtomicU64,
+    semantic_unresolved: AtomicU64,
     strategy_counts: Mutex<HashMap<String, u64>>,
 }
 
@@ -59,6 +76,8 @@ impl TelemetryCollector {
             cache_misses: AtomicU64::new(0),
             embedding_calls: AtomicU64::new(0),
             total_latency_us: AtomicU64::new(0),
+            semantic_hits: AtomicU64::new(0),
+            semantic_unresolved: AtomicU64::new(0),
             strategy_counts: Mutex::new(HashMap::new()),
         }
     }
@@ -82,6 +101,10 @@ impl TelemetryCollector {
         let latency_us = telemetry.latency_ms.saturating_mul(1000);
         self.total_latency_us
             .fetch_add(latency_us, Ordering::Relaxed);
+        self.semantic_hits
+            .fetch_add(u64::from(telemetry.semantic_hits), Ordering::Relaxed);
+        self.semantic_unresolved
+            .fetch_add(u64::from(telemetry.semantic_unresolved), Ordering::Relaxed);
 
         // Update strategy counts
         if let Ok(mut counts) = self.strategy_counts.lock() {
@@ -124,6 +147,8 @@ impl TelemetryCollector {
             avg_latency_ms,
             cache_hit_rate,
             strategy_distribution,
+            semantic_hits: self.semantic_hits.load(Ordering::Relaxed),
+            semantic_unresolved: self.semantic_unresolved.load(Ordering::Relaxed),
         }
     }
 
@@ -134,6 +159,8 @@ impl TelemetryCollector {
         self.cache_misses.store(0, Ordering::Relaxed);
         self.embedding_calls.store(0, Ordering::Relaxed);
         self.total_latency_us.store(0, Ordering::Relaxed);
+        self.semantic_hits.store(0, Ordering::Relaxed);
+        self.semantic_unresolved.store(0, Ordering::Relaxed);
 
         if let Ok(mut counts) = self.strategy_counts.lock() {
             counts.clear();
@@ -166,6 +193,10 @@ mod tests {
             fusion_latency_ms: 1,
             confidence: None,
             profile: "Balanced".into(),
+            semantic_hits: 0,
+            semantic_unresolved: 0,
+            scan_ms: None,
+            resolve_ms: None,
         }
     }
 

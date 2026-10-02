@@ -105,16 +105,28 @@ fn the_target_condition_is_spelled_identically_everywhere() {
     )
 ))]
 mod with_the_backend {
-    use otzaria_semantic_search::errors::{ArtifactError, EmbeddingError, SemanticSearchError};
+    use otzaria_semantic_search::cancellation::CancellationToken;
+    use otzaria_semantic_search::distribution::package::PackageKind;
+    use otzaria_semantic_search::errors::{EmbeddingError, SemanticSearchError};
     use otzaria_semantic_search::semantic::backend::{select_backend, Pooling};
+    use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
     use otzaria_semantic_search::semantic::embedding::{
         EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime,
     };
     use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
+    use otzaria_semantic_search::semantic::model_package::validate_model;
     use otzaria_semantic_search::semantic::official_index::{
-        LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
+        readable_store_identity, LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
+    };
+    use otzaria_semantic_search::semantic::oxv::codec::Codec;
+    use otzaria_semantic_search::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
+    use otzaria_semantic_search::semantic::segment_set::{
+        install_package, InstallExpectation, InstallSource, ReleaseManifest,
     };
     use otzaria_semantic_search::semantic::store::VectorStoreConfig;
+    use otzaria_semantic_search::semantic::versioning::{
+        EmbeddingWorker, IndexVersion, ModelIdentity, ModelPackage, TextIdentity, VectorProvenance,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -213,34 +225,127 @@ mod with_the_backend {
         }
     }
 
-    /// The application's path for the fixture package, with no artifact installed. The
-    /// model is loaded before the artifact is read, so how opening fails says how far the
-    /// model got.
+    /// The model half of what [`official_config`] declares for the fixture package.
+    fn local_model(model_path: PathBuf) -> LocalModel {
+        LocalModel {
+            model_path,
+            family_id: "onnx-fixture@0".to_string(),
+            model_quantization: "fp32".to_string(),
+            embedding_dim: 4,
+            pooling: "in-graph".to_string(),
+            max_tokens: 32,
+            embedding_text_version: 2,
+            normalization_version: 1,
+            // Any recipe's, so long as the set declares the same one.
+            chunking_identity: otzaria_semantic_search::semantic::chunker::ChunkerConfig {
+                embedding_text_version: 2,
+                ..Default::default()
+            }
+            .identity(),
+        }
+    }
+
+    /// The application's path for the fixture package, over a one-vector set installed
+    /// for it. The set opens before the model loads, so with a set in place how opening
+    /// fails says how far the model got.
     fn official_config(
         dir: &TempDir,
         model_path: PathBuf,
         deployment: EmbeddingDeployment,
     ) -> OfficialIndexConfig {
+        let vectors_dir = dir.0.join("vectors");
+        install_fixture_set(&vectors_dir, &model_path);
         OfficialIndexConfig {
-            artifact_path: dir.0.join("no-artifact-installed"),
-            text:
-                otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
-                    1,
-                ),
-            model: LocalModel {
-                model_path,
-                family_id: "onnx-fixture@0".to_string(),
-                model_quantization: "fp32".to_string(),
-                embedding_dim: 4,
-                pooling: "in-graph".to_string(),
-                max_tokens: 32,
-                embedding_text_version: 2,
-                normalization_version: 1,
-                chunking_identity: 0,
-            },
+            vectors_dir,
+            text: TextIdentity::with_line_text_version(1),
+            model: local_model(model_path),
             deployment,
-            published_digest: None,
+            scan_threads: None,
         }
+    }
+
+    /// A set of one vector, under the identity [`official_config`] declares — written by
+    /// the public segment writer, and installed as a release is.
+    fn install_fixture_set(vectors_dir: &Path, model_path: &Path) {
+        let package = validate_model(model_path).unwrap();
+        let tokenizer = package
+            .files()
+            .iter()
+            .find(|file| file.relpath == "tokenizer.json")
+            .unwrap()
+            .sha256
+            .clone();
+        let fp32 = ModelPackage {
+            checksum: package.checksum().to_string(),
+            quantization: "fp32".to_string(),
+        };
+        let local = local_model(model_path.to_path_buf());
+        let identity = IndexVersion {
+            text: TextIdentity::with_line_text_version(1),
+            model: ModelIdentity {
+                family_id: local.family_id,
+                tokenizer_checksum: tokenizer,
+                embedding_dim: local.embedding_dim,
+                pooling: local.pooling,
+                max_tokens: local.max_tokens,
+                embedding_text_version: local.embedding_text_version,
+                normalization_version: local.normalization_version,
+                chunking_identity: local.chunking_identity,
+                query_packages: vec![fp32.clone()],
+            },
+            store: readable_store_identity(),
+        };
+
+        let staging = vectors_dir.with_extension("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut builder = SegmentBuilder::new(
+            SegmentSpec {
+                kind: PackageKind::Base,
+                identity_digest: identity.identity_digest(),
+                from_library_version: 0,
+                to_library_version: 1,
+                library_release_tag: "v1-fixture".to_string(),
+            },
+            Codec::i8_sym_dim(vec![1.0; 4], 1.0).unwrap(),
+        );
+        builder
+            .add_book(
+                "fixture",
+                &[(ChunkKey::of("[PASSAGE] the fox"), 0)],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let codec_params_sha256 = builder.codec().params_sha256();
+        let mut sink = builder.write(&staging.join("segment.oxv")).unwrap();
+        sink.push_f32(&[1.0, 0.0, 0.0, 0.0]).unwrap();
+        let written = sink.finish().unwrap();
+        let manifest = ReleaseManifest::for_segment(
+            &written,
+            &identity,
+            codec_params_sha256,
+            VectorProvenance {
+                passage_package: fp32,
+                worker: EmbeddingWorker {
+                    backend: "onnxruntime-sentence-v1".to_string(),
+                    device: "cpu".to_string(),
+                },
+            },
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        install_package(
+            vectors_dir,
+            &InstallSource {
+                segment: &written.path,
+                manifest_json: &manifest.to_json(),
+            },
+            &InstallExpectation {
+                identity,
+                published_manifest_sha256: None,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
     }
 
     /// The real table, not the stand-in: an `.onnx` path reaches `OnnxBackend` through
@@ -486,17 +591,14 @@ mod with_the_backend {
             engine.status().embedding_backend.as_deref(),
             Some("onnxruntime-sentence-v1")
         );
-        // ...and so does the application's path, which loads the model before it reads the
-        // artifact: with none installed, what is missing is the artifact, not the runtime.
-        match OfficialSemanticIndex::open(official_config(&dir, model.clone(), deployment)) {
-            Err(SemanticSearchError::Artifact(ArtifactError::MetadataUnusable {
-                path, ..
-            })) => {
-                assert!(path.ends_with("manifest.json"), "{path}");
-            }
-            Err(other) => panic!("expected the artifact to be what is missing, got {other}"),
-            Ok(_) => panic!("opened an artifact that is not there"),
-        }
+        // ...and so does the application's path, which opens its set and then loads the
+        // model with the same deployment.
+        let index = OfficialSemanticIndex::open(official_config(&dir, model.clone(), deployment))
+            .expect("OfficialIndexConfig::deployment reaches the backend");
+        assert_eq!(
+            index.status().embedding_backend.as_deref(),
+            Some("onnxruntime-sentence-v1")
+        );
 
         // One runtime per process: a different path now is refused, naming both.
         let other = fixture("tokenizer.json");

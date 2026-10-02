@@ -5,18 +5,12 @@
 //! is **not persistent**, which [`VectorStore::is_persistent`] reports so callers
 //! never treat a stale manifest as a populated index.
 //!
-//! The official path does not use this backend: it opens an installed artifact through
-//! [`ReadOnlyZevcStore`](crate::semantic::zevc_store::ReadOnlyZevcStore), which persists
-//! and cannot be written to. This one is what
-//! [`SemanticEngine::open`](crate::semantic::engine::SemanticEngine::open) starts from —
-//! the prototype and test default — and any backend can take its place through
-//! [`SemanticEngine::with_store`](crate::semantic::engine::SemanticEngine::with_store).
-//!
-//! Whether the official backend also needs to be *approximate* is a question the S2b
-//! measurement answers — a full scan may or may not fit the latency and memory budget
-//! once the dimension and precision are chosen in S1.
-//! [`VectorSearchBackend`](crate::semantic::store_backend::VectorSearchBackend) is the
-//! seam either answer slots into.
+//! The official path does not use this backend: it opens an installed vector set — int8
+//! segments, mapped and read-only — through
+//! [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex). This
+//! one is what [`SemanticEngine::open`](crate::semantic::engine::SemanticEngine::open)
+//! starts from — the development and test path — and any backend can take its place
+//! through [`SemanticEngine::with_store`](crate::semantic::engine::SemanticEngine::with_store).
 
 use crate::cancellation::{CancellationToken, SCAN_CHECK_INTERVAL};
 use crate::errors::VectorStoreError;

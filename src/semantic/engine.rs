@@ -2388,139 +2388,14 @@ mod tests {
 
     // ── the backend is a choice, not a constant ──
 
-    fn zevc_config_for(config: &SemanticConfig) -> crate::semantic::zevc_store::ZevcStoreConfig {
-        crate::semantic::zevc_store::ZevcStoreConfig {
-            db_path: config.store.db_path.clone(),
-            embedding_dim: config.embedding_dim,
-            collection_name: config.store.collection_name.clone(),
-            auto_persist: false,
-        }
-    }
-
-    fn zevc_store(config: &SemanticConfig) -> Box<dyn VectorStoreBackend> {
-        Box::new(
-            crate::semantic::zevc_store::ZevcStore::open_or_create(zevc_config_for(config))
-                .unwrap(),
-        )
-    }
-
-    /// The builder half of what S2a splits: handed a persistent backend, an indexing run
-    /// produces something a restart can still read — which is the precondition for an
-    /// artifact being packable from it at all.
-    #[test]
-    fn an_engine_over_a_persistent_backend_keeps_its_vectors_across_a_reopen() {
-        let dir = TempDir::new("persistent_backend");
-        let config = config_at(&dir);
-
-        {
-            let mut engine =
-                SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
-            assert_eq!(
-                engine.index_book(&three_line_book()).unwrap(),
-                IndexOutcome::Indexed { chunks: 3 }
-            );
-            let status = engine.status();
-            assert!(status.vectors_persisted);
-            assert_eq!(status.vector_count, 3);
-        }
-
-        let engine = SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
-        let status = engine.status();
-        assert_eq!(status.vector_count, 3, "the vectors survived the restart");
-        assert_eq!(
-            status.indexed_book_count, 1,
-            "so the manifest's record of them is not stale and must be kept"
-        );
-        assert!(status.needs_full_reindex.is_none());
-        assert!(engine
-            .diff_against_tantivy(&HashMap::from([(
-                "otzaria/tanach/genesis.txt".to_string(),
-                111u64
-            )]))
-            .is_up_to_date());
-    }
-
-    /// Where the runtime lives is a deployment fact, not identity: an index built under one
-    /// deployment reopens under another — the model loaded again and the manifest compared
-    /// in full — as current, and the manifest never records the path.
-    #[test]
-    fn a_changed_deployment_leaves_the_index_current() {
-        let dir = TempDir::new("deployment_not_identity");
-        let config = config_at(&dir);
-        let deployed_at = |folder: &str| SemanticConfig {
-            deployment: EmbeddingDeployment {
-                onnx_runtime: Some(dir.path().join(folder).join("onnxruntime.dll")),
-            },
-            ..config.clone()
-        };
-
-        {
-            let mut engine =
-                SemanticEngine::with_store(deployed_at("build-machine"), zevc_store(&config))
-                    .unwrap();
-            engine.load_model().unwrap();
-            assert_eq!(
-                engine.index_book(&three_line_book()).unwrap(),
-                IndexOutcome::Indexed { chunks: 3 }
-            );
-        }
-
-        let mut engine =
-            SemanticEngine::with_store(deployed_at("device"), zevc_store(&config)).unwrap();
-        engine.load_model().unwrap();
-        assert!(
-            engine.incompatibilities().is_empty(),
-            "{:?}",
-            engine.incompatibilities()
-        );
-        let status = engine.status();
-        assert!(status.needs_full_reindex.is_none());
-        assert_eq!(status.vector_count, 3);
-        assert!(engine
-            .diff_against_tantivy(&HashMap::from([(
-                "otzaria/tanach/genesis.txt".to_string(),
-                111u64
-            )]))
-            .is_up_to_date());
-
-        let manifest =
-            std::fs::read_to_string(config.root_dir.join("semantic_manifest.json")).unwrap();
-        for folder in ["build-machine", "device", "onnxruntime.dll"] {
-            assert!(!manifest.contains(folder), "{manifest}");
-        }
-    }
-
-    /// The manifest records the backend that is actually open. Without that, reopening a
-    /// persisted index with the volatile backend would answer every query from an empty
-    /// store while the manifest still called the books indexed.
-    #[test]
-    fn reopening_a_persisted_index_with_another_backend_is_an_incompatibility() {
-        let dir = TempDir::new("backend_swap");
-        let config = config_at(&dir);
-
-        {
-            let mut engine =
-                SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
-            engine.index_book(&three_line_book()).unwrap();
-        }
-
-        let engine = SemanticEngine::open(config).unwrap();
-        let reason = engine
-            .status()
-            .needs_full_reindex
-            .expect("a backend swap must be reported");
-        assert!(reason.contains("Vector backend"), "{reason}");
-        assert!(engine.search("בריאה", 5, None).is_err());
-    }
-
     #[test]
     fn a_backend_whose_dimension_disagrees_with_the_model_is_refused() {
         let dir = TempDir::new("backend_dim");
         let config = config_at(&dir);
 
-        let mut narrower = zevc_config_for(&config);
+        let mut narrower = config.store.clone();
         narrower.embedding_dim = config.embedding_dim / 2;
-        let store = crate::semantic::zevc_store::ZevcStore::open_or_create(narrower).unwrap();
+        let store = VectorStore::open_or_create(narrower).unwrap();
 
         // Mapped to a describable value: an engine is not `Debug`, and a panic message
         // reading "got true" says nothing about what went wrong.

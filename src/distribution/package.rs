@@ -70,8 +70,8 @@ pub const PAYLOADS_FILENAME: &str = "payloads.json";
 ///
 /// The size is not decoration and not redundant with the checksum. It is what
 /// [`IndexPackage::verify_for_open`] can check without reading the file, and it has to be
-/// **per payload**: a package holding three files — which `ZevcStore` already does — can
-/// otherwise lose bytes from one and gain them in another while the total stays right.
+/// **per payload**: a package holding several files can otherwise lose bytes from one
+/// and gain them in another while the total stays right.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayloadDescriptor {
     /// SHA-256 of the file, as 64 hex digits.
@@ -599,9 +599,8 @@ impl IndexPackage {
                     payload: payload.clone(),
                 });
             }
-            // Per payload, not only in the total: with more than one file — and
-            // `ZevcStore` already writes three — bytes lost from one and gained by another
-            // leave the sum untouched.
+            // Per payload, not only in the total: with more than one file, bytes lost
+            // from one and gained by another leave the sum untouched.
             if metadata.len() != declared.size_bytes {
                 return Err(ArtifactError::ManifestDisagreesWithPayload {
                     reason: format!(

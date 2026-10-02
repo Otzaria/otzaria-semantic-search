@@ -647,9 +647,9 @@ pub(crate) fn test_identity() -> IndexVersion {
         },
         model: test_model_identity(),
         store: StoreIdentity {
-            backend_id: "zevc-persistent-v1".to_string(),
-            store_format_version: 1,
-            vector_precision: "f32".to_string(),
+            backend_id: "otzaria-oxv".to_string(),
+            store_format_version: 2,
+            vector_precision: "i8-sym-dim".to_string(),
         },
     }
 }
@@ -740,7 +740,7 @@ mod tests {
             (F::StoreBackendId, |v| {
                 v.store.backend_id = "mmap-flat-v1".to_string()
             }),
-            (F::StoreFormatVersion, |v| v.store.store_format_version = 2),
+            (F::StoreFormatVersion, |v| v.store.store_format_version = 3),
             (F::VectorPrecision, |v| {
                 v.store.vector_precision = "int8".to_string()
             }),
@@ -1093,7 +1093,7 @@ mod tests {
 
         let identity = sample_identity();
         let rendered = identity.to_string();
-        for fragment in ["text", "model", "store", "1024", "in-graph", "f32"] {
+        for fragment in ["text", "model", "store", "1024", "in-graph", "i8-sym-dim"] {
             assert!(
                 rendered.contains(fragment),
                 "{fragment} missing from Display"
