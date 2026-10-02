@@ -7,7 +7,8 @@
 //! the copy is checksummed afresh.
 //!
 //! The records are gathered book by book in name order, deduplicated to one per book and
-//! key (the newest segment's), and — when the live index holds the same library version as
+//! key (the newest segment's, at the first line that holds it), and — when the live index
+//! holds the same library version as
 //! the set — re-anchored on the lines that hold each key today, through [`LiveKeySource`]:
 //! a hint moves to the live line closest to it, and a record whose key the book no longer
 //! holds is dropped. Slots are then assigned as a build assigns them: the first time a key
@@ -194,7 +195,8 @@ pub fn compact(
             }
         }
     }
-    live_slots.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    // Total: a key a segment holds live twice — the format allows it — keeps its first slot.
+    live_slots.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     live_slots.dedup_by(|later, earlier| later.0 == earlier.0);
     let mut new_slot = vec![UNASSIGNED; live_slots.len()];
 
@@ -268,8 +270,10 @@ pub fn compact(
             }
         }
         start = end;
-        // One record per book and key, the newest segment's.
-        records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
+        // One record per book and key: the newest segment's, at the first line that holds
+        // the key — a segment may hold a key twice in one book, and the order is total, so
+        // which record stays is the rule's and not the sort's.
+        records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)).then(a.1.cmp(&b.1)));
         records.dedup_by(|later, earlier| later.0 == earlier.0);
 
         if refresh {

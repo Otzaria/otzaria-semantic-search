@@ -1714,6 +1714,44 @@ fn compaction_verifies_what_it_copies() {
     assert!(is_corrupt(info(&dir)));
 }
 
+/// "A record is a book and a key", and its hint the first line that holds the key: a book
+/// that holds one key twice in one segment — the format allows it — keeps the lower hint
+/// when it is compacted, whatever order its records came in.
+#[test]
+fn compaction_keeps_the_first_line_of_a_key_a_book_holds_twice() {
+    let work = TempDir::new("set_compact_twice");
+    let dir = work.join("vectors");
+    let mut book = TestBook::named("id:1");
+    book.primary = vec![(key(1), 5, vector_of(1)), (key(2), 6, vector_of(2))];
+    // Key 1 again, at a lower line of the same book.
+    book.extras = vec![(2, 0)];
+    let mut spec = spec(PackageKind::Base, 0, 29);
+    spec.identity_digest = identity().identity_digest();
+    let path = work.join("twice.oxv");
+    let written = write_segment(&path, spec, codec(), &[book], &[]);
+    let manifest = ReleaseManifest::for_segment(
+        &written,
+        &identity(),
+        codec().params_sha256(),
+        test_provenance(),
+        "2026-10-02T00:00:00Z".to_string(),
+    );
+    install(&dir, &(path, manifest.to_json())).unwrap();
+
+    compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let hits = everything(&SegmentSet::open(&dir).unwrap(), 12);
+    assert_eq!(hits[&key(1)].1, BTreeSet::from([("id:1".to_string(), 2)]));
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
