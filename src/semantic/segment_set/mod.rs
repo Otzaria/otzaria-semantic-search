@@ -306,7 +306,8 @@ impl SegmentSet {
     /// What lets a host weigh, under a filter, the vectors of texts that moved into an
     /// admitted book since the set was built — whose records name only the books they were
     /// in, so the filtered scan never reaches them — at their own scores, without widening
-    /// the scan by the books that hold them.
+    /// the scan by the books that hold them. See
+    /// [`CandidateResolver::unreached`](crate::semantic::resolve::CandidateResolver::unreached).
     pub fn scan_with(
         &self,
         query: &[f32],

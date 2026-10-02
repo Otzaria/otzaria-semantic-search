@@ -10,6 +10,12 @@
 //!
 //! The coordinator fuses on what the resolver returns, so every id, section, line hash and
 //! facet a result carries is the live index's, never the vectors'.
+//!
+//! A filtered scan reads only the vectors with a record in a book the filter admits. A text
+//! that moved into an admitted book since the set was built has records that name only the
+//! books it was in, so the resolver, which knows where it is now, names its vector instead
+//! ([`CandidateResolver::unreached`]), and the scan weighs it besides the ones it reaches —
+//! at its own score, never in place of one of them.
 
 use crate::cancellation::CancellationToken;
 use crate::semantic::chunk_key::ChunkKey;
@@ -47,9 +53,9 @@ pub struct VectorHit {
 /// One vector of a generation of the set: where it is — the segment and slot a
 /// [`VectorHit`] names — and the key it holds there.
 ///
-/// What a host hands a scan to weigh besides the slots its filter reaches
-/// ([`SegmentSet::scan_with`](crate::semantic::segment_set::SegmentSet::scan_with)). The key
-/// makes a slot of another generation harmless: a slot that does not hold it is passed over.
+/// What a host hands back for a scan to weigh besides the slots its filter reaches
+/// ([`CandidateResolver::unreached`]). The key makes a slot of another generation harmless:
+/// a slot that does not hold it is passed over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotRef {
     pub seg: u16,
@@ -167,6 +173,29 @@ pub trait CandidateResolver: Send + Sync {
         filters: Option<&SearchFilters>,
         cancel: &CancellationToken,
     ) -> Result<Vec<ResolvedLine>, ResolveError>;
+
+    /// The vectors a scan of the books [`Self::admissible_books`] returned for `filters`
+    /// does not reach, though live lines of those books hold their texts: texts that moved
+    /// or were copied into an admitted book since the set was built, whose records name only
+    /// books the filter does not admit. Slots of the set's generation `set_generation`.
+    ///
+    /// Asked only of a search `admissible_books` restricted. Each slot returned is scored
+    /// against the query as the scan scores, and the best of them are merged into the scan's
+    /// hits at their own scores — none of the scan's hits gives way to them — and handed to
+    /// [`Self::resolve`] with the rest; see
+    /// [`SegmentSet::scan_with`](crate::semantic::segment_set::SegmentSet::scan_with). A slot
+    /// that is not live in that generation, or does not hold its key, is passed over.
+    ///
+    /// The default is none: a scan of the admitted books alone, as before there was a way
+    /// to say otherwise.
+    fn unreached(
+        &self,
+        _filters: Option<&SearchFilters>,
+        _set_generation: u64,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<SlotRef>, ResolveError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The resolver of a search with no live index behind it: it admits every book and
