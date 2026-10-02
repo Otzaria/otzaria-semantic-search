@@ -1681,6 +1681,39 @@ fn a_generation_names_each_segment_once_and_each_file_by_its_segment() {
     )));
 }
 
+/// Compaction copies vectors byte for byte into a segment it checksums afresh: damage in a
+/// source it never read whole would be written under CRCs that agree with it, past any scrub.
+/// It reads every block of every source first, and one that fails is condemned as a scrub
+/// condemns it; nothing is written.
+#[test]
+fn compaction_verifies_what_it_copies() {
+    let work = TempDir::new("set_compact_damage");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let damaged = damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+    SegmentSet::open(&dir).expect("opening reads no vector block");
+
+    let result = compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    );
+    assert!(is_corrupt(result));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(format!("segments/{id}.corrupt"))).unwrap())
+            .unwrap();
+    assert_eq!(verdict["sha256"], files::sha256_hex(&damaged));
+    assert!(!dir.join(files::generation_dir(3)).exists());
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);

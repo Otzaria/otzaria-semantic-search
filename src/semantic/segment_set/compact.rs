@@ -3,7 +3,8 @@
 //! Every delta adds about 6% to a set and leaves the vectors it superseded in place, so a
 //! set grows; compaction writes the live part of it again as one segment and drops the
 //! rest. Nothing is embedded: vectors are copied byte for byte, which is why every segment
-//! of a set shares one codec epoch.
+//! of a set shares one codec epoch — and every block is verified before it is copied, since
+//! the copy is checksummed afresh.
 //!
 //! The records are gathered book by book in name order, deduplicated to one per book and
 //! key (the newest segment's), and — when the live index holds the same library version as
@@ -123,8 +124,14 @@ const UNASSIGNED: u32 = u32::MAX;
 /// on the lines that hold their keys today. The set is locked throughout; the new
 /// generation replaces the old in one flip, and the old segments go with the garbage.
 ///
-/// Cancellable between books and at every 1 MiB written; a cancelled or failed compaction
-/// leaves the set as it was and its partial output is removed.
+/// Every block of every segment is read and checked against its CRC first: the bytes are
+/// copied, and their CRCs computed again, so a damaged source would otherwise pass its
+/// damage on where no scrub can find it. A source that fails is condemned, as
+/// [`scrub`](super::scrub) condemns it, and the compaction returns
+/// [`VectorStoreError::Corrupted`].
+///
+/// Cancellable at every block read, between books and at every 1 MiB written; a cancelled
+/// or failed compaction leaves the set as it was and its partial output is removed.
 pub fn compact(
     dir: &Path,
     policy: &CompactionPolicy,
@@ -159,6 +166,20 @@ pub fn compact(
     if let Some(available) = space::available(dir) {
         if available < needed {
             return Err(ArtifactError::InsufficientSpace { needed, available }.into());
+        }
+    }
+
+    // 0. Every block of every source. What is copied lands under CRCs computed afresh, so
+    // damage copied from a block no scrub has read would be past every scrub after it; a
+    // source that fails is condemned as a scrub condemns it, and nothing is written.
+    for (segment, entry) in set.segments().iter().zip(&set.document().segments) {
+        if let Err(error) = segment.verify_blocks(cancel, |_| {}) {
+            if let VectorStoreError::Corrupted { reason } = &error {
+                let failed = files::sha256_hex(segment.file_bytes());
+                files::condemn(dir, &entry.id, &failed, reason)?;
+                log::error!("Compaction of {}: {reason}", dir.display());
+            }
+            return Err(error.into());
         }
     }
 
