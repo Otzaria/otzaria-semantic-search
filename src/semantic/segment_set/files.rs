@@ -100,6 +100,18 @@ pub(crate) fn segment_file(id: &str) -> String {
     format!("{SEGMENTS_DIR}/{id}.oxv")
 }
 
+/// Whether `id` is a segment id — 32 lowercase hex digits, as [`hex`] writes one. An id names
+/// files — `segments/<id>.oxv`, a generation's `<id>.del` — so nothing else may stand for
+/// one.
+///
+/// [`hex`]: crate::semantic::versioning::hex
+pub(crate) fn is_segment_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// What `CURRENT` and `PREVIOUS` hold: a generation, and the digest of its `set.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Pointer {
@@ -191,7 +203,28 @@ impl SetDocument {
         if self.segments.is_empty() {
             return Err("it names no segment".to_string());
         }
+        let mut ids = std::collections::BTreeSet::new();
         for (index, segment) in self.segments.iter().enumerate() {
+            // Its id names its files, in segments/ and in the generation's directory.
+            if !is_segment_id(&segment.id) {
+                return Err(format!("segment {index}'s id {:?} is not one", segment.id));
+            }
+            if !ids.insert(&segment.id) {
+                return Err(format!("segment {} is in it twice", segment.id));
+            }
+            let named = |file: &DerivedFile, extension: &str| {
+                file.file == format!("{}.{extension}", segment.id)
+            };
+            if !named(&segment.del, "del")
+                || segment
+                    .links
+                    .as_ref()
+                    .is_some_and(|links| !named(links, "links"))
+            {
+                return Err(format!(
+                    "segment {index}'s derived files are not named by its id"
+                ));
+            }
             let first = index == 0;
             if first == (segment.kind == PackageKind::Delta) {
                 return Err(format!(

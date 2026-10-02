@@ -20,11 +20,11 @@
 //! 8. **collect garbage**.
 
 use super::files::{
-    encode_links, generation_dir, generation_path, hash_file, io_error, next_generation,
-    place_segment, read_pointer, segment_file, sha256_hex, sync_file, sync_set_dir,
-    write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument, SetLock,
-    SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE, SET_FORMAT,
-    SET_FORMAT_VERSION, STAGING_DIR,
+    encode_links, generation_dir, generation_path, hash_file, io_error, is_segment_id,
+    next_generation, place_segment, read_pointer, segment_file, sha256_hex, sync_file,
+    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument,
+    SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE,
+    SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -481,6 +481,14 @@ fn check_manifest(
             ),
         });
     }
+    // The id names files — in staging/ and segments/ — before the segment's own is read.
+    if !is_segment_id(&manifest.segment_id) {
+        return Err(ArtifactError::UnsafePayloadName {
+            name: manifest.segment_id.clone(),
+            reason: "a segment id is 32 lowercase hex digits, and the name of its files"
+                .to_string(),
+        });
+    }
     manifest.identity.validate_complete()?;
     manifest.identity.verify_matches(&expect.identity)?;
     if manifest.identity_digest != manifest.identity.identity_digest_hex() {
@@ -694,6 +702,13 @@ impl NewGeneration {
         cancel: &CancellationToken,
     ) -> Result<Resolution, SemanticSearchError> {
         debug_assert_eq!(older.len(), self.entries.len());
+        // One `.del` and one `.links` per id in the generation's directory.
+        if self.entries.iter().any(|older| older.id == entry.id) {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!("segment {} is in the generation already", entry.id),
+            }
+            .into());
+        }
         let mut resolution = Resolution::default();
         let foreign = segment.foreign_count();
         let mut links = vec![

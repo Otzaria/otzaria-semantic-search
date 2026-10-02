@@ -1612,6 +1612,75 @@ fn compacting_again_keeps_the_segment_file_in_place() {
     assert_eq!(everything(&SegmentSet::open(&dir).unwrap(), 11), before);
 }
 
+/// A release manifest comes with a download, and its segment id names files — in staging/
+/// and segments/ — before anything compares it with the segment's own. One that is not 32
+/// lowercase hex digits is refused before it names any: `../../escape` wrote the segment's
+/// copy outside the set.
+#[test]
+fn a_segment_id_that_is_not_one_names_no_file() {
+    let work = TempDir::new("set_unsafe_id");
+    let dir = work.join("vectors");
+    let (path, json) = release(&work, &v29(), None);
+    for id in [
+        "../../escape",
+        "../escape",
+        "ABCDEF0123456789ABCDEF0123456789",
+        "",
+    ] {
+        let mut manifest: ReleaseManifest = serde_json::from_str(&json).unwrap();
+        manifest.segment_id = id.to_string();
+        match install(&dir, &(path.clone(), manifest.to_json())) {
+            Err(SemanticSearchError::Artifact(ArtifactError::UnsafePayloadName {
+                name, ..
+            })) => assert_eq!(name, id),
+            other => panic!("{id:?} must be refused as a name, got {other:?}"),
+        }
+        assert!(!work.join("escape.oxv").exists(), "{id:?}");
+        assert!(!dir.join("escape.oxv").exists(), "{id:?}");
+    }
+    install(&dir, &(path, json)).unwrap();
+}
+
+/// A generation's derived files are named by its segments' ids, in one directory: an id
+/// twice would be two segments over one `.del`, and a file named for another segment — or
+/// for no segment, outside the directory — another segment's bitmap. A generation that says
+/// so is refused, and one being assembled takes no segment twice.
+#[test]
+fn a_generation_names_each_segment_once_and_each_file_by_its_segment() {
+    let work = TempDir::new("set_names");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let pointer = files::read_pointer(&dir, CURRENT).unwrap().unwrap();
+    let document = files::read_generation(&dir, &pointer).unwrap();
+    assert_eq!(document.check(2), Ok(()));
+
+    let mut twice = document.clone();
+    twice.segments.push(twice.segments[1].clone());
+    assert!(twice.check(2).unwrap_err().contains("twice"));
+    let mut misnamed = document.clone();
+    misnamed.segments[0].del.file = format!("{}.del", misnamed.segments[1].id);
+    assert!(misnamed.check(2).is_err());
+    let mut escaping = document.clone();
+    escaping.segments[1].links.as_mut().unwrap().file = "../gen-000001/x.links".to_string();
+    assert!(escaping.check(2).is_err());
+    let mut not_an_id = document;
+    not_an_id.segments[1].id = "../x".to_string();
+    not_an_id.segments[1].file = files::segment_file("../x");
+    assert!(not_an_id.check(2).is_err());
+
+    let set = SegmentSet::open(&dir).unwrap();
+    let mut generation = install::NewGeneration::from_set(&set);
+    let entry = set.document().segments[1].clone();
+    let segment = crate::semantic::oxv::reader::Segment::open(&dir.join(&entry.file)).unwrap();
+    assert!(is_corrupt(generation.push(
+        entry,
+        &segment,
+        set.segments(),
+        &CancellationToken::new()
+    )));
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
