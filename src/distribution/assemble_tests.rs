@@ -299,6 +299,127 @@ fn assembly_is_deterministic() {
     }
 }
 
+/// A release's segment id, and every file assembly writes for it with its SHA-256.
+type Assembled = (&'static str, [(&'static str, &'static str); 7]);
+
+/// What bc4c854 assembled from [`v1`] as a base, and from [`v2`] as a delta on it.
+const BC4C854_BASE: Assembled = (
+    "7b771ad67ebad7eb17cc7b56b4caa32d",
+    [
+        (
+            "ledger-v1.keys",
+            "b027fcfc70d4bc88593ed5ba42c4c94fee4c87eb907ff19b73c4b21900a322cb",
+        ),
+        (
+            "ledger-v1.manifest.json",
+            "f0a2eca82de1fadb5daba2425b323af70f1edce71b5ded9794b6d8a962645071",
+        ),
+        (
+            "manifest.json",
+            "ed8e7cec23717a78ac7b89fd26f8197f89a97f589ce60750e8600f3a5a89bc2f",
+        ),
+        (
+            "pairs-v1.bin",
+            "059dfa5b51b0d2d89aaf2d0e3d0f0be41a4fbddf549f779f8e4d4b2f34e3c199",
+        ),
+        (
+            "payloads.json",
+            "8270a9cc329904ac3f6a294bbc9cdfed35eb07bc481581931679c02ee69573b5",
+        ),
+        (
+            "release.json",
+            "6c6ee9007b4cc1a60bcdd313ac72d8b834c59676e1fec1c6b73ce39ff1b04a22",
+        ),
+        (
+            "segment.oxv",
+            "52cc9ed4cbbd2604c7c363e2917a97d8846561b35d93694c9ff20abfdb59999c",
+        ),
+    ],
+);
+const BC4C854_DELTA: Assembled = (
+    "d6f92436ce0d73e54cd11882f857072b",
+    [
+        (
+            "ledger-v2.keys",
+            "30f923e6e514e09d0867bd59968ec877624607a289ada06978c63a057b01da2d",
+        ),
+        (
+            "ledger-v2.manifest.json",
+            "4d90e5a4a5d201bd67ee5a2a9d521179e2f17b35ebfc5de0762789f826fe55ae",
+        ),
+        (
+            "manifest.json",
+            "493e77609c85cebd9e529d29e7db9db585d94b2bcb3b055f7567d5cf1ec3b5b1",
+        ),
+        (
+            "pairs-v2.bin",
+            "885c640eb222b3e2de481c09cf8caa3c7921df9e8960caf29798809557aac8f7",
+        ),
+        (
+            "payloads.json",
+            "0217cefa78a539abbb819d5daf41e92b92b3c50aed7286b54cf51b747cd6dc9a",
+        ),
+        (
+            "release.json",
+            "30a6709b6bfabd69578396c3c7bb41f929fb3e72afda8518f8504090e53935d5",
+        ),
+        (
+            "segment.oxv",
+            "1a6eae0b0b557526a35d9afafa7c03be3983f4c5a7646650ee380a38810feea2",
+        ),
+    ],
+);
+
+/// What assembly writes is what it wrote at bc4c854, which assembled the published v30 and
+/// which the library's build still runs: every file of a base and of a delta, byte for byte,
+/// and the segment ids they install under. And this revision's installer takes them and
+/// opens the set they make.
+#[test]
+fn a_release_is_assembled_into_the_bytes_bc4c854_assembled() {
+    use sha2::{Digest, Sha256};
+    let machine = Machine::new("assemble_bc4c854");
+    let p1 = machine.plan("p1", 1, &v1(), None);
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base1");
+    let ledger1 = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    let p2 = machine.plan("p2", 2, &v2(), Some(&ledger1));
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger1), NEW, "delta2");
+
+    // File by file, the bytes bc4c854 wrote.
+    for (report, (id, files)) in [(&base, BC4C854_BASE), (&delta, BC4C854_DELTA)] {
+        let kind = report.manifest.kind;
+        assert_eq!(report.manifest.segment_id, id, "{kind}");
+        let mut written: Vec<String> = std::fs::read_dir(&report.out_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        written.sort();
+        assert_eq!(written, files.map(|(name, _)| name), "{kind}");
+        for (name, sha256) in files {
+            let bytes = std::fs::read(report.out_dir.join(name)).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&bytes)),
+                sha256,
+                "{kind} {name}"
+            );
+        }
+    }
+
+    let set = simulate_device(
+        &machine.dir.join("device"),
+        &[&base.out_dir, &delta.out_dir],
+    )
+    .unwrap();
+    assert_eq!(set.generation(), 2);
+    let ids: Vec<&str> = set
+        .info()
+        .segments
+        .iter()
+        .map(|segment| segment.id.as_str())
+        .collect();
+    assert_eq!(ids, [BC4C854_BASE.0, BC4C854_DELTA.0]);
+    assert!(coverage(&set, &p2).complete());
+}
+
 /// `i8-sym-dim` is calibrated on the slots' vectors exactly as the in-memory calibration
 /// takes it, and G1 holds its clip rate to 1e-4.
 #[test]

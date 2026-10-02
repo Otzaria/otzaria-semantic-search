@@ -6,8 +6,9 @@
 //! change: each **generation** has its own derived files, a `.del` bitmap per segment (the
 //! slots a later delta tombstoned or shipped again) and a `.links` table per delta (the older
 //! slot each of its foreign records resolves to). `CURRENT` names the live generation and
-//! `PREVIOUS` the one before it; an install or a compaction writes generation N+1 beside N
-//! and flips `CURRENT` in one rename, so a crash at any point leaves one or the other
+//! `PREVIOUS` the one before it; an install or a compaction writes a new generation beside
+//! the old ones — numbered past every one on disk, so it never lands on one — and flips
+//! `CURRENT` in one rename, so a crash at any point leaves one or the other
 //! (`docs/ARTIFACT_CONTRACT.md` has the crash matrix).
 //!
 //! | operation | what it needs | what it changes |
@@ -118,6 +119,8 @@ pub struct ScrubReport {
 /// memory.
 pub struct SegmentSet {
     dir: PathBuf,
+    /// The pointer it was opened through — `CURRENT`'s, or `PREVIOUS`'s on a fallback.
+    pointer: Pointer,
     document: SetDocument,
     segments: Vec<Segment>,
     deleted: Vec<Deleted>,
@@ -214,16 +217,10 @@ impl SegmentSet {
         let mut segments = Vec::with_capacity(document.segments.len());
         let mut deleted = Vec::with_capacity(document.segments.len());
         let mut links = Vec::with_capacity(document.segments.len());
+        if let Some(reason) = condemnation(dir, &document) {
+            return Err(corrupted(reason).into());
+        }
         for entry in &document.segments {
-            let marker = dir.join(SEGMENTS_DIR).join(format!("{}.corrupt", entry.id));
-            if marker.exists() {
-                return Err(corrupted(format!(
-                    "segment {} failed a scrub ({}); the set has to be installed again",
-                    entry.id,
-                    fs::read_to_string(&marker).unwrap_or_default().trim()
-                ))
-                .into());
-            }
             let segment = Segment::open(&dir.join(&entry.file))?;
             check_segment(&document, entry, &segment)?;
             let del_path = generation.join(&entry.del.file);
@@ -276,6 +273,7 @@ impl SegmentSet {
         let info = info_of(&document, &dead, &unresolved, false);
         Ok(Self {
             dir: dir.to_path_buf(),
+            pointer: pointer.clone(),
             document,
             segments,
             deleted,
@@ -337,6 +335,12 @@ impl SegmentSet {
         &self.document
     }
 
+    /// The pointer that names this generation: what `PREVIOUS` takes when a generation is
+    /// built on it.
+    pub(crate) fn pointer(&self) -> &Pointer {
+        &self.pointer
+    }
+
     pub(crate) fn segments(&self) -> &[Segment] {
         &self.segments
     }
@@ -348,6 +352,20 @@ impl SegmentSet {
     pub(crate) fn links(&self) -> &[Vec<Link>] {
         &self.links
     }
+}
+
+/// Why a scrub's verdict condemns `document`, if one does: a verdict on any of its segments.
+/// `open` and `info` both ask, before reading a segment, so they refuse — and fall back —
+/// alike.
+fn condemnation(dir: &Path, document: &SetDocument) -> Option<String> {
+    document.segments.iter().find_map(|entry| {
+        files::read_verdict(dir, &entry.id).map(|verdict| {
+            format!(
+                "segment {} failed a scrub ({}); the set has to be installed again",
+                entry.id, verdict.reason
+            )
+        })
+    })
 }
 
 /// The segment is the one its generation names: id, identity, codec epoch, size, slots,
@@ -434,7 +452,9 @@ fn info_of(
 /// What is installed at `dir`, without opening a segment: `None` when nothing is.
 ///
 /// Reads the pointers and the generation they name, and the derived files' counts as the
-/// generation declares them; nothing is cleaned up, and nothing is mapped.
+/// generation declares them; nothing is cleaned up, and nothing is mapped. A generation a
+/// scrub's verdict condemns is passed over for `PREVIOUS`'s, as [`SegmentSet::open`] passes
+/// it over.
 pub fn info(dir: &Path) -> Result<Option<SetInfo>, SemanticSearchError> {
     let current = read_pointer(dir, CURRENT);
     let previous = read_pointer(dir, PREVIOUS);
@@ -455,27 +475,37 @@ pub fn info(dir: &Path) -> Result<Option<SetInfo>, SemanticSearchError> {
             .collect();
         info_of(document, &dead, &unresolved, recovered)
     };
-    if let Ok(Some(pointer)) = &current {
-        if let Ok(document) = read_generation(dir, pointer) {
-            return Ok(Some(declared(&document, false)));
+    let usable = |pointer: &Result<Option<Pointer>, String>| -> Result<SetDocument, String> {
+        let pointer = match pointer {
+            Ok(Some(pointer)) => pointer,
+            Ok(None) => return Err("there is none".to_string()),
+            Err(reason) => return Err(reason.clone()),
+        };
+        let document = read_generation(dir, pointer)?;
+        match condemnation(dir, &document) {
+            Some(reason) => Err(reason),
+            None => Ok(document),
         }
-    }
-    if let Ok(Some(pointer)) = &previous {
-        if let Ok(document) = read_generation(dir, pointer) {
-            return Ok(Some(declared(&document, true)));
-        }
+    };
+    let first = match usable(&current) {
+        Ok(document) => return Ok(Some(declared(&document, false))),
+        Err(reason) => reason,
+    };
+    if let Ok(document) = usable(&previous) {
+        return Ok(Some(declared(&document, true)));
     }
     Err(corrupted(format!(
-        "{}: neither CURRENT nor PREVIOUS names a generation that can be read",
+        "{}: neither CURRENT nor PREVIOUS names a generation that can be read: {first}",
         dir.display()
     ))
     .into())
 }
 
 /// Read every block of every segment of the live generation and check its CRC — the check
-/// opening leaves out, run on demand. A segment that fails is marked
-/// (`segments/<id>.corrupt`), so every later open refuses it rather than serving it, and the
-/// scrub returns [`VectorStoreError::Corrupted`].
+/// opening leaves out, run on demand. A segment that fails is condemned by a verdict
+/// (`segments/<id>.corrupt`) naming the SHA-256 of the bytes that failed, so every later open
+/// and [`info()`] pass its generation over rather than serve it, until an install writes or
+/// verifies the segment again; and the scrub returns [`VectorStoreError::Corrupted`].
 pub fn scrub(dir: &Path, cancel: &CancellationToken) -> Result<ScrubReport, SemanticSearchError> {
     let started = std::time::Instant::now();
     let set = SegmentSet::open(dir)?;
@@ -483,10 +513,18 @@ pub fn scrub(dir: &Path, cancel: &CancellationToken) -> Result<ScrubReport, Sema
     for (segment, entry) in set.segments.iter().zip(&set.document.segments) {
         if let Err(error) = segment.verify_blocks(cancel, |block| bytes += block) {
             if let VectorStoreError::Corrupted { reason } = &error {
-                let marker = dir.join(SEGMENTS_DIR).join(format!("{}.corrupt", entry.id));
-                files::write_atomically(&marker, reason.as_bytes())
-                    .map_err(io_error(format!("marking {}", marker.display())))?;
-                log::error!("Scrub of {}: {reason}", dir.display());
+                // The bytes that failed are the ones mapped, whatever the path holds now.
+                let failed = files::sha256_hex(segment.file_bytes());
+                if files::condemn(dir, &entry.id, &failed, reason)? {
+                    log::error!("Scrub of {}: {reason}", dir.display());
+                } else {
+                    log::warn!(
+                        "Scrub of {}: {reason} — in bytes segment {} no longer holds, so its \
+                         verdict is withdrawn",
+                        dir.display(),
+                        entry.id
+                    );
+                }
             }
             return Err(error.into());
         }
@@ -544,12 +582,17 @@ pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
 /// Remove generations neither pointer names and segments only they used. Best effort: a
 /// file that cannot be removed — mapped by a reader, on Windows — is left for the next
 /// call, and a pointer that cannot be read stops the collection altogether, since what it
-/// names cannot be known.
+/// names cannot be known. So does `PREVIOUS` without `CURRENT`, which no flip leaves: what
+/// `CURRENT` named, if it named anything, cannot be known either.
 pub(crate) fn collect_garbage(dir: &Path) {
+    let pointers = [read_pointer(dir, CURRENT), read_pointer(dir, PREVIOUS)];
+    if matches!(pointers, [Ok(None), Ok(Some(_))]) {
+        return;
+    }
     let mut live_generations = BTreeSet::new();
     let mut live_segments = BTreeSet::new();
-    for name in [CURRENT, PREVIOUS] {
-        match read_pointer(dir, name) {
+    for pointer in pointers {
+        match pointer {
             Ok(Some(pointer)) => match read_generation(dir, &pointer) {
                 Ok(document) => {
                     live_generations.insert(generation_dir(pointer.generation));

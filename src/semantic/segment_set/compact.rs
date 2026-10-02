@@ -3,16 +3,18 @@
 //! Every delta adds about 6% to a set and leaves the vectors it superseded in place, so a
 //! set grows; compaction writes the live part of it again as one segment and drops the
 //! rest. Nothing is embedded: vectors are copied byte for byte, which is why every segment
-//! of a set shares one codec epoch.
+//! of a set shares one codec epoch — and every block is verified before it is copied, since
+//! the copy is checksummed afresh.
 //!
 //! The records are gathered book by book in name order, deduplicated to one per book and
-//! key (the newest segment's), and — when the live index holds the same library version as
+//! key (the newest segment's, at the first line that holds it), and — when the live index
+//! holds the same library version as
 //! the set — re-anchored on the lines that hold each key today, through [`LiveKeySource`]:
 //! a hint moves to the live line closest to it, and a record whose key the book no longer
 //! holds is dropped. Slots are then assigned as a build assigns them: the first time a key
 //! appears it takes the next slot, every later appearance is an extra.
 
-use super::files::{io_error, SetLock, SetSegment, SEGMENTS_DIR, STAGING_DIR};
+use super::files::{self, io_error, Durable, SetLock, SetSegment, STAGING_DIR};
 use super::install::{full_or_io, NewGeneration};
 use super::{recover, space, SegmentSet, SetInfo};
 use crate::cancellation::CancellationToken;
@@ -123,8 +125,14 @@ const UNASSIGNED: u32 = u32::MAX;
 /// on the lines that hold their keys today. The set is locked throughout; the new
 /// generation replaces the old in one flip, and the old segments go with the garbage.
 ///
-/// Cancellable between books and at every 1 MiB written; a cancelled or failed compaction
-/// leaves the set as it was and its partial output is removed.
+/// Every block of every segment is read and checked against its CRC first: the bytes are
+/// copied, and their CRCs computed again, so a damaged source would otherwise pass its
+/// damage on where no scrub can find it. A source that fails is condemned, as
+/// [`scrub`](super::scrub) condemns it, and the compaction returns
+/// [`VectorStoreError::Corrupted`].
+///
+/// Cancellable at every block read, between books and at every 1 MiB written; a cancelled
+/// or failed compaction leaves the set as it was and its partial output is removed.
 pub fn compact(
     dir: &Path,
     policy: &CompactionPolicy,
@@ -162,6 +170,20 @@ pub fn compact(
         }
     }
 
+    // 0. Every block of every source. What is copied lands under CRCs computed afresh, so
+    // damage copied from a block no scrub has read would be past every scrub after it; a
+    // source that fails is condemned as a scrub condemns it, and nothing is written.
+    for (segment, entry) in set.segments().iter().zip(&set.document().segments) {
+        if let Err(error) = segment.verify_blocks(cancel, |_| {}) {
+            if let VectorStoreError::Corrupted { reason } = &error {
+                let failed = files::sha256_hex(segment.file_bytes());
+                files::condemn(dir, &entry.id, &failed, reason)?;
+                log::error!("Compaction of {}: {reason}", dir.display());
+            }
+            return Err(error.into());
+        }
+    }
+
     // 1. Every live slot, by key, the newest segment's copy first.
     let segments = set.segments();
     let deleted = set.deleted();
@@ -173,7 +195,8 @@ pub fn compact(
             }
         }
     }
-    live_slots.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    // Total: a key a segment holds live twice — the format allows it — keeps its first slot.
+    live_slots.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
     live_slots.dedup_by(|later, earlier| later.0 == earlier.0);
     let mut new_slot = vec![UNASSIGNED; live_slots.len()];
 
@@ -247,8 +270,10 @@ pub fn compact(
             }
         }
         start = end;
-        // One record per book and key, the newest segment's.
-        records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
+        // One record per book and key: the newest segment's, at the first line that holds
+        // the key — a segment may hold a key twice in one book, and the order is total, so
+        // which record stays is the rule's and not the sort's.
+        records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)).then(a.1.cmp(&b.1)));
         records.dedup_by(|later, earlier| later.0 == earlier.0);
 
         if refresh {
@@ -339,6 +364,8 @@ pub fn compact(
             return Err(error);
         }
     };
+    // `VectorSink::finish` flushed it.
+    files::note(|| Durable::File(partial.clone()));
 
     // 5. Re-open it and compare a sample with its sources.
     {
@@ -371,15 +398,19 @@ pub fn compact(
         }
     }
 
-    // 6. Publish it as a generation of its own.
+    // 6. Publish it as a generation of its own. Its id names its content: a file of that name
+    // already there holds these bytes — the same compaction, done before — or is damage.
     let id = hex(&written.segment_id);
-    let file = super::files::segment_file(&id);
+    let file = files::segment_file(&id);
     let target = dir.join(&file);
-    fs::create_dir_all(dir.join(SEGMENTS_DIR)).map_err(io_error(format!(
-        "creating {}",
-        dir.join(SEGMENTS_DIR).display()
-    )))?;
-    fs::rename(&partial, &target).map_err(io_error(format!("moving {}", partial.display())))?;
+    files::place_segment(
+        dir,
+        &id,
+        &partial,
+        &hex(&written.sha256),
+        cancel,
+        |reason| VectorStoreError::Corrupted { reason }.into(),
+    )?;
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);
     generation.library_release_tag = document.library_release_tag.clone();
@@ -405,9 +436,9 @@ pub fn compact(
         cancel,
     )?;
     drop(segment);
-    let generation_number = set.generation();
+    let base = set.pointer().clone();
     drop(set);
-    let committed = generation.commit(dir, generation_number)?;
+    let committed = generation.commit(dir, Some(&base))?;
     log::info!(
         "Compacted {} ({reason}): {} segment(s) and {slots_before} slot(s) into one of {}, \
          {pruned} record(s) pruned, {refreshed} re-anchored",

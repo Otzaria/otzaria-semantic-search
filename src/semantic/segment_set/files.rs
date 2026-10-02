@@ -5,9 +5,9 @@
 //!   .lock                        held for install, compaction and recovery
 //!   CURRENT                      {"generation":7,"set":"gen-000007/set.json","set_sha256":"…"}
 //!   PREVIOUS                     the generation CURRENT pointed to before the last flip
-//!   segments/<sid>.oxv           immutable segments
+//!   segments/<sid>.oxv           immutable segments: a name never takes other bytes
 //!   segments/<sid>.package.json  the release manifest a segment was installed from
-//!   segments/<sid>.corrupt       a scrub's verdict on a segment
+//!   segments/<sid>.corrupt       a scrub's verdict: the SHA-256 of the bytes that failed
 //!   gen-000007/set.json          one generation: which segments, in which order
 //!   gen-000007/<sid>.del         which slots of a segment are dead in that generation
 //!   gen-000007/<sid>.links       where a delta's foreign records resolve, in that generation
@@ -16,18 +16,20 @@
 //! ```
 //!
 //! Every file here is written once, under a temporary name, flushed, and renamed into
-//! place; the two pointer files are the only ones ever replaced, and `std::fs::rename`
-//! replaces atomically on every platform the crate builds for (`MoveFileExW` with
-//! `MOVEFILE_REPLACE_EXISTING` on Windows).
+//! place, and its directory is flushed before a pointer names it — a segment taken from
+//! `incoming/`, which the set did not write, is flushed too; the two pointer files are the
+//! only ones ever replaced, and `std::fs::rename` replaces atomically on every platform the
+//! crate builds for (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows).
 
+use crate::cancellation::CancellationToken;
 use crate::distribution::package::{sync_dir, PackageKind};
-use crate::errors::{ArtifactError, VectorStoreError};
+use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
 use crate::semantic::oxv::scan::{Link, LINK_UNRESOLVED};
 use crate::semantic::versioning::{IndexVersion, VectorProvenance};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const CURRENT: &str = "CURRENT";
@@ -50,8 +52,64 @@ pub(crate) fn generation_dir(generation: u64) -> String {
     format!("gen-{generation:06}")
 }
 
+/// The generation an entry of the set directory is, when its name is a generation's.
+pub(crate) fn generation_of(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("gen-")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The number the next generation takes: past every generation a pointer names and every
+/// `gen-` entry in the directory. A new generation never lands on one that exists — a
+/// pointer's, one that only an unreadable pointer could name, or one a crash left — so
+/// writing it removes and overwrites nothing.
+pub(crate) fn next_generation(dir: &Path) -> Result<u64, ArtifactError> {
+    let mut highest = 0u64;
+    for name in [CURRENT, PREVIOUS] {
+        if let Ok(Some(pointer)) = read_pointer(dir, name) {
+            highest = highest.max(pointer.generation);
+        }
+    }
+    let listing = io_error(format!("listing {}", dir.display()));
+    for entry in fs::read_dir(dir).map_err(listing)? {
+        let entry = entry.map_err(io_error(format!("listing {}", dir.display())))?;
+        if let Some(generation) = generation_of(&entry.file_name().to_string_lossy()) {
+            highest = highest.max(generation);
+        }
+    }
+    highest.checked_add(1).ok_or_else(|| ArtifactError::Io {
+        context: format!("{}: no generation number is left", dir.display()),
+        source: io::Error::from(io::ErrorKind::InvalidData),
+    })
+}
+
+/// Point `name` — `CURRENT` or `PREVIOUS` — at a generation, `bytes` being the serialized
+/// [`Pointer`]. A pointer is a file: a directory in its place, which nothing here makes, is
+/// no pointer, and nothing can be renamed over one, so an empty one is removed first.
+pub(crate) fn write_pointer(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let path = dir.join(name);
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        fs::remove_dir(&path)?;
+    }
+    write_atomically(&path, bytes)
+}
+
 pub(crate) fn segment_file(id: &str) -> String {
     format!("{SEGMENTS_DIR}/{id}.oxv")
+}
+
+/// Whether `id` is a segment id — 32 lowercase hex digits, as [`hex`] writes one. An id names
+/// files — `segments/<id>.oxv`, a generation's `<id>.del` — so nothing else may stand for
+/// one.
+///
+/// [`hex`]: crate::semantic::versioning::hex
+pub(crate) fn is_segment_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// What `CURRENT` and `PREVIOUS` hold: a generation, and the digest of its `set.json`.
@@ -145,7 +203,28 @@ impl SetDocument {
         if self.segments.is_empty() {
             return Err("it names no segment".to_string());
         }
+        let mut ids = std::collections::BTreeSet::new();
         for (index, segment) in self.segments.iter().enumerate() {
+            // Its id names its files, in segments/ and in the generation's directory.
+            if !is_segment_id(&segment.id) {
+                return Err(format!("segment {index}'s id {:?} is not one", segment.id));
+            }
+            if !ids.insert(&segment.id) {
+                return Err(format!("segment {} is in it twice", segment.id));
+            }
+            let named = |file: &DerivedFile, extension: &str| {
+                file.file == format!("{}.{extension}", segment.id)
+            };
+            if !named(&segment.del, "del")
+                || segment
+                    .links
+                    .as_ref()
+                    .is_some_and(|links| !named(links, "links"))
+            {
+                return Err(format!(
+                    "segment {index}'s derived files are not named by its id"
+                ));
+            }
             let first = index == 0;
             if first == (segment.kind == PackageKind::Delta) {
                 return Err(format!(
@@ -327,7 +406,60 @@ fn trailer<'a>(bytes: &'a [u8], magic: &[u8; 8], expected_crc: u32) -> Result<&'
     Ok(body)
 }
 
-/// Write `bytes` to `path` under a temporary name, flush, and rename into place.
+/// What the set's code did to make a write durable, in order. Every publish — a segment, a
+/// generation, a pointer — is written, its file flushed, renamed into place and its
+/// directory flushed, and only then does a pointer name it; the tests read the order back
+/// from [`JOURNAL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Durable {
+    /// A file's bytes, flushed.
+    File(PathBuf),
+    /// A file renamed into place at this path.
+    Renamed(PathBuf),
+    /// A directory's entries, flushed.
+    Dir(PathBuf),
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static JOURNAL: std::cell::RefCell<Vec<Durable>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record a step in [`JOURNAL`]; nothing outside a test build.
+#[inline]
+pub(crate) fn note(step: impl FnOnce() -> Durable) {
+    #[cfg(test)]
+    JOURNAL.with(|journal| journal.borrow_mut().push(step()));
+    #[cfg(not(test))]
+    let _ = step;
+}
+
+/// Flush a file the set is about to publish.
+pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
+    file.sync_all()?;
+    note(|| Durable::File(path.to_path_buf()));
+    Ok(())
+}
+
+/// Flush a directory of the set, so what was renamed or created in it survives a power
+/// loss before anything names it.
+pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
+    sync_dir(path)?;
+    note(|| Durable::Dir(path.to_path_buf()));
+    Ok(())
+}
+
+/// Rename a flushed file into place.
+pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)?;
+    note(|| Durable::Renamed(to.to_path_buf()));
+    Ok(())
+}
+
+/// Write `bytes` to `path` under a temporary name, flush, rename into place, and flush the
+/// directory.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension(match path.extension() {
         Some(extension) => format!("{}.tmp", extension.to_string_lossy()),
@@ -336,17 +468,201 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         let mut file = File::create(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        sync_file(&file, &temporary)?;
     }
-    fs::rename(&temporary, path)?;
+    rename_into_place(&temporary, path)?;
     if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
+        sync_set_dir(parent)?;
     }
     Ok(())
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// SHA-256 of a file, read in blocks, cancellably.
+pub(crate) fn hash_file(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<String, SemanticSearchError> {
+    let mut file = File::open(path).map_err(io_error(format!("reading {}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(SemanticSearchError::Cancelled);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(io_error(format!("reading {}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// `segments/<id>.corrupt`: a scrub's verdict on the bytes a segment file held when it read
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Verdict {
+    /// SHA-256 of the file that failed: the bytes condemned, and no others. Empty for a
+    /// marker that names none — one written before verdicts did, or one that does not read
+    /// as a verdict — which condemns whatever the file holds.
+    pub sha256: String,
+    /// What failed.
+    pub reason: String,
+}
+
+pub(crate) fn verdict_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(SEGMENTS_DIR).join(format!("{id}.corrupt"))
+}
+
+/// The verdict on segment `id`, if there is one. Opening cannot hash a segment, so a verdict
+/// stands until what replaces or verifies the segment's bytes withdraws it: an install, or
+/// the scrub that wrote it ([`condemn`]).
+pub(crate) fn read_verdict(dir: &Path, id: &str) -> Option<Verdict> {
+    let path = verdict_path(dir, id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(Verdict {
+                sha256: String::new(),
+                reason: format!("{} could not be read: {error}", path.display()),
+            })
+        }
+    };
+    Some(serde_json::from_slice(&bytes).unwrap_or_else(|_| Verdict {
+        sha256: String::new(),
+        reason: String::from_utf8_lossy(&bytes).trim().to_string(),
+    }))
+}
+
+/// Condemn segment `id`: a verdict naming `sha256` — the bytes a scrub read and found
+/// damaged — and `reason`. The file is then hashed again, and a verdict on bytes it no longer
+/// holds is withdrawn at once: an install replaced the file while the scrub read the old one,
+/// and its bytes were never judged. Whether the verdict stands.
+pub(crate) fn condemn(
+    dir: &Path,
+    id: &str,
+    sha256: &str,
+    reason: &str,
+) -> Result<bool, SemanticSearchError> {
+    let path = verdict_path(dir, id);
+    let verdict = Verdict {
+        sha256: sha256.to_string(),
+        reason: reason.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&verdict).expect("a verdict serializes");
+    write_atomically(&path, &bytes).map_err(io_error(format!("marking {}", path.display())))?;
+    // A file that cannot be hashed keeps the verdict: it condemns, which is the safe side.
+    let held = hash_file(&dir.join(segment_file(id)), &CancellationToken::new());
+    if held.is_ok_and(|held| held != sha256) {
+        clear_verdict(dir, id)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The generations a set may still open: those the pointers name and that read — and, when a
+/// pointer does not read or names a generation that does not, every generation on disk that
+/// reads, since any of them may be the one it named.
+pub(crate) fn openable_generations(dir: &Path) -> Vec<SetDocument> {
+    let mut documents = Vec::new();
+    let mut unknown = false;
+    for name in [CURRENT, PREVIOUS] {
+        match read_pointer(dir, name) {
+            Ok(Some(pointer)) => match read_generation(dir, &pointer) {
+                Ok(document) => documents.push(document),
+                Err(_) => unknown = true,
+            },
+            Ok(None) => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if unknown {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(generation) = generation_of(&name) else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(entry.path().join(SET_FILE)) else {
+                continue;
+            };
+            if let Ok(document) = serde_json::from_slice::<SetDocument>(&bytes) {
+                if document.check(generation).is_ok() {
+                    documents.push(document);
+                }
+            }
+        }
+    }
+    documents
+}
+
+/// Put the verified segment at `staged`, whose SHA-256 is `sha256`, in place as
+/// `segments/<id>.oxv` — the one name its id gives it — flush the directory, and withdraw any
+/// verdict on the segment, which was on bytes other than these.
+///
+/// A file of the same bytes already there is kept — mapped by a reader, perhaps — and
+/// `staged` removed. A file of other bytes is replaced only when no generation the set may
+/// still open names `id` with bytes other than `sha256`: then it is damage, or garbage, and
+/// the new bytes are what every generation naming `id` names. Otherwise nothing is changed,
+/// and `refuse` makes the error: a segment id names one content, and the bytes a generation
+/// names are never rewritten. Whether the file was written.
+pub(crate) fn place_segment(
+    dir: &Path,
+    id: &str,
+    staged: &Path,
+    sha256: &str,
+    cancel: &CancellationToken,
+    refuse: impl FnOnce(String) -> SemanticSearchError,
+) -> Result<bool, SemanticSearchError> {
+    let segments = dir.join(SEGMENTS_DIR);
+    fs::create_dir_all(&segments).map_err(io_error(format!("creating {}", segments.display())))?;
+    let target = dir.join(segment_file(id));
+    let written = if target.exists() && hash_file(&target, cancel)? == sha256 {
+        fs::remove_file(staged).map_err(io_error(format!("removing {}", staged.display())))?;
+        false
+    } else {
+        let named = openable_generations(dir).into_iter().find_map(|document| {
+            document
+                .segments
+                .iter()
+                .find(|entry| entry.id == id && entry.sha256 != sha256)
+                .map(|entry| (document.generation, entry.sha256.clone()))
+        });
+        if let Some((generation, named)) = named {
+            return Err(refuse(format!(
+                "segment {id} is in generation {generation} with SHA-256 {named}, and this one's \
+                 is {sha256}: a segment id names one content"
+            )));
+        }
+        rename_into_place(staged, &target)
+            .map_err(io_error(format!("moving {} into place", staged.display())))?;
+        true
+    };
+    sync_set_dir(&segments).map_err(io_error(format!("flushing {}", segments.display())))?;
+    if clear_verdict(dir, id)? {
+        log::info!("The scrub verdict on segment {id} is withdrawn: it holds verified bytes now");
+    }
+    Ok(written)
+}
+
+/// Withdraw any verdict on segment `id`, once its file holds bytes that were just verified
+/// whole. Whether there was one.
+pub(crate) fn clear_verdict(dir: &Path, id: &str) -> Result<bool, ArtifactError> {
+    let path = verdict_path(dir, id);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(format!("removing {}", path.display()))(error)),
+    }
+    let segments = dir.join(SEGMENTS_DIR);
+    sync_set_dir(&segments).map_err(io_error(format!("flushing {}", segments.display())))?;
+    Ok(true)
 }
 
 /// Read a pointer file: `None` when there is none.

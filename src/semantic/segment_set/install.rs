@@ -13,15 +13,18 @@
 //! 5. **resolve keys**, for a delta: one sequential pass over the older segments' keys marks
 //!    the slots its tombstones and its own slots supersede, and finds where its foreign
 //!    records resolve;
-//! 6. **write generation N+1** — its `.del` and `.links` files and `set.json`;
-//! 7. **flip** — `PREVIOUS` ← `CURRENT`, then `CURRENT`;
+//! 6. **write a new generation**, numbered past every one on disk — its `.del` and `.links`
+//!    files and `set.json`;
+//! 7. **flip** — `PREVIOUS` ← the generation the install was built on, the one the set
+//!    opened at, then `CURRENT`;
 //! 8. **collect garbage**.
 
 use super::files::{
-    encode_links, generation_dir, generation_path, io_error, read_pointer, segment_file,
-    sha256_hex, write_atomically, Deleted, DerivedFile, Pointer, SetDocument, SetLock, SetSegment,
-    SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE, SET_FORMAT,
-    SET_FORMAT_VERSION, STAGING_DIR,
+    encode_links, generation_dir, generation_path, hash_file, io_error, is_segment_id,
+    next_generation, place_segment, read_pointer, segment_file, sha256_hex, sync_file,
+    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument,
+    SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE,
+    SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -39,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -284,10 +287,13 @@ pub fn install_package(
         })?;
     check_manifest(&manifest, expect)?;
 
-    let current = match read_pointer(dir, CURRENT) {
-        Ok(Some(_)) => Some(SegmentSet::open_unlocked(dir)),
-        _ => None,
-    };
+    // The set as `open` sees it — `CURRENT`'s generation, or `PREVIOUS`'s when that one does
+    // not open — whenever either pointer is there to read, or to fail to.
+    let installed = !matches!(
+        (read_pointer(dir, CURRENT), read_pointer(dir, PREVIOUS)),
+        (Ok(None), Ok(None))
+    );
+    let current = installed.then(|| SegmentSet::open_unlocked(dir));
     let current = match (manifest.kind, current) {
         (PackageKind::Delta, None) => {
             return Err(ArtifactError::DeltaDoesNotApply {
@@ -330,6 +336,13 @@ pub fn install_package(
             "moving {} into the set",
             source.segment.display()
         )))?;
+        // Written by the caller, who need not have flushed it; it is, before anything names
+        // it. Opened for writing, which Windows needs to flush a file.
+        OpenOptions::new()
+            .write(true)
+            .open(&staged)
+            .and_then(|file| sync_file(&file, &staged))
+            .map_err(io_error(format!("flushing {}", staged.display())))?;
         hash_file(&staged, cancel)?
     } else {
         copy_hashing(source.segment, &staged, manifest.segment.size, cancel)?
@@ -361,21 +374,19 @@ pub fn install_package(
     }
     reached(Step::Staged)?;
 
-    // 4. Move it into the set.
-    let segments_dir = dir.join(SEGMENTS_DIR);
-    fs::create_dir_all(&segments_dir)
-        .map_err(io_error(format!("creating {}", segments_dir.display())))?;
+    // 4. Move it into the set — beside every segment there is, and never over the bytes a
+    // generation names.
     let file = segment_file(&manifest.segment_id);
     let target = dir.join(&file);
-    if target.exists() && hash_file(&target, cancel)? == manifest.segment.sha256 {
-        // The same segment, installed before and still on disk — mapped, perhaps.
-        fs::remove_file(&staged).map_err(io_error(format!("removing {}", staged.display())))?;
-    } else {
-        fs::rename(&staged, &target)
-            .map_err(io_error(format!("moving {} into place", staged.display())))?;
-    }
-    crate::distribution::package::sync_dir(&segments_dir)
-        .map_err(io_error(format!("flushing {}", segments_dir.display())))?;
+    place_segment(
+        dir,
+        &manifest.segment_id,
+        &staged,
+        &manifest.segment.sha256,
+        cancel,
+        |reason| ArtifactError::ManifestDisagreesWithPayload { reason }.into(),
+    )?;
+    let segments_dir = dir.join(SEGMENTS_DIR);
     let provenance_path = segments_dir.join(format!("{}.package.json", manifest.segment_id));
     write_atomically(&provenance_path, source.manifest_json.as_bytes())
         .map_err(space_or_io(&provenance_path, 0))?;
@@ -407,8 +418,8 @@ pub fn install_package(
     };
     let resolution = generation.push(entry, &segment, older, cancel)?;
     generation.library_release_tag = manifest.library_release_tag.clone();
-    let previous_generation = current.as_ref().map_or(0, SegmentSet::generation);
-    let document = generation.commit(dir, previous_generation)?;
+    let base = current.as_ref().map(|set| set.pointer().clone());
+    let document = generation.commit(dir, base.as_ref())?;
 
     let bytes_on_disk = document.stats.bytes;
     let info = super::info_of(
@@ -468,6 +479,14 @@ fn check_manifest(
                  {RELEASE_FORMAT_VERSION}",
                 manifest.format, manifest.format_version
             ),
+        });
+    }
+    // The id names files — in staging/ and segments/ — before the segment's own is read.
+    if !is_segment_id(&manifest.segment_id) {
+        return Err(ArtifactError::UnsafePayloadName {
+            name: manifest.segment_id.clone(),
+            reason: "a segment id is 32 lowercase hex digits, and the name of its files"
+                .to_string(),
         });
     }
     manifest.identity.validate_complete()?;
@@ -683,6 +702,13 @@ impl NewGeneration {
         cancel: &CancellationToken,
     ) -> Result<Resolution, SemanticSearchError> {
         debug_assert_eq!(older.len(), self.entries.len());
+        // One `.del` and one `.links` per id in the generation's directory.
+        if self.entries.iter().any(|older| older.id == entry.id) {
+            return Err(VectorStoreError::Corrupted {
+                reason: format!("segment {} is in the generation already", entry.id),
+            }
+            .into());
+        }
         let mut resolution = Resolution::default();
         let foreign = segment.foreign_count();
         let mut links = vec![
@@ -765,20 +791,22 @@ impl NewGeneration {
         Ok(resolution)
     }
 
-    /// Write the generation after `previous` — derived files, then `set.json` — flip the
-    /// pointers to it, and collect garbage. Returns what was written.
+    /// Write a new generation — derived files, then `set.json` — flip the pointers to it, and
+    /// collect garbage. `base` is the generation it was built on: the one the set opened at,
+    /// `CURRENT`'s or, on a fallback, `PREVIOUS`'s; `None` when none opened. Returns what was
+    /// written.
+    ///
+    /// The new generation is numbered past every one on disk, so it is written beside them
+    /// and never over one; nothing that exists is touched before the flip, and a failure at
+    /// any point leaves the pointers naming what they named.
     pub(crate) fn commit(
         mut self,
         dir: &Path,
-        previous: u64,
+        base: Option<&Pointer>,
     ) -> Result<SetDocument, SemanticSearchError> {
-        let generation = previous + 1;
+        let generation = next_generation(dir)?;
         let path = generation_path(dir, generation);
-        if path.exists() {
-            // Left by an attempt that crashed before its flip; nothing names it.
-            fs::remove_dir_all(&path).map_err(io_error(format!("removing {}", path.display())))?;
-        }
-        fs::create_dir_all(&path).map_err(io_error(format!("creating {}", path.display())))?;
+        fs::create_dir(&path).map_err(io_error(format!("creating {}", path.display())))?;
         let mut stats = SetStats::default();
         for ((entry, deleted), links) in self.entries.iter_mut().zip(&self.deleted).zip(&self.links)
         {
@@ -833,6 +861,9 @@ impl NewGeneration {
         let bytes = serde_json::to_vec_pretty(&document).expect("a set serializes");
         let set_path = path.join(SET_FILE);
         write_atomically(&set_path, &bytes).map_err(space_or_io(&set_path, bytes.len()))?;
+        // The generation's own entry, and `segments/`'s if this created it: durable before a
+        // pointer names them.
+        sync_set_dir(dir).map_err(io_error(format!("flushing {}", dir.display())))?;
         reached(Step::GenerationWritten)?;
 
         let pointer = Pointer {
@@ -840,39 +871,30 @@ impl NewGeneration {
             set: format!("{}/{SET_FILE}", generation_dir(generation)),
             set_sha256: sha256_hex(&bytes),
         };
-        let current = dir.join(CURRENT);
-        if let Ok(bytes) = fs::read(&current) {
-            let previous = dir.join(PREVIOUS);
-            write_atomically(&previous, &bytes).map_err(space_or_io(&previous, bytes.len()))?;
+        // PREVIOUS: the generation this one was built on, or — when none opened — what
+        // CURRENT names, if it reads. Never CURRENT's bytes as they are: an unreadable
+        // CURRENT would overwrite the one pointer that still opens, and on a fallback
+        // CURRENT names the generation that did not.
+        let previous = match base {
+            Some(base) => Some(base.clone()),
+            None => read_pointer(dir, CURRENT).ok().flatten(),
+        };
+        if let Some(previous) = previous {
+            if read_pointer(dir, PREVIOUS).ok().flatten().as_ref() != Some(&previous) {
+                let bytes = serde_json::to_vec(&previous).expect("a pointer serializes");
+                let path = dir.join(PREVIOUS);
+                write_pointer(dir, PREVIOUS, &bytes).map_err(space_or_io(&path, bytes.len()))?;
+            }
         }
         reached(Step::PreviousWritten)?;
         let bytes = serde_json::to_vec(&pointer).expect("a pointer serializes");
-        write_atomically(&current, &bytes).map_err(space_or_io(&current, bytes.len()))?;
+        let current = dir.join(CURRENT);
+        write_pointer(dir, CURRENT, &bytes).map_err(space_or_io(&current, bytes.len()))?;
         reached(Step::CurrentFlipped)?;
 
         collect_garbage(dir);
         Ok(document)
     }
-}
-
-/// SHA-256 of a file, read in blocks, cancellably.
-fn hash_file(path: &Path, cancel: &CancellationToken) -> Result<String, SemanticSearchError> {
-    let mut file = File::open(path).map_err(io_error(format!("reading {}", path.display())))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(SemanticSearchError::Cancelled);
-        }
-        let read = file
-            .read(&mut buffer)
-            .map_err(io_error(format!("reading {}", path.display())))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Copy `from` to `to` in blocks, hashing as it goes; a full filesystem is
@@ -907,9 +929,7 @@ fn copy_hashing(
                 .map_err(|error| full_or_io(error, to, size, written))?;
             written += read as u64;
         }
-        target
-            .sync_all()
-            .map_err(|error| full_or_io(error, to, size, written))?;
+        sync_file(&target, to).map_err(|error| full_or_io(error, to, size, written))?;
         Ok(format!("{:x}", hasher.finalize()))
     })();
     if result.is_err() {

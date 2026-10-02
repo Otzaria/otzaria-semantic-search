@@ -23,7 +23,8 @@ pub(crate) const MAX_SECTIONS: usize = 32;
 
 const DIRECTORY_OFFSET: usize = 224;
 const DIRECTORY_ENTRY_LEN: usize = 40;
-const HEADER_CRC_OFFSET: usize = 4088;
+/// Where the header's CRC is, which covers every byte before it.
+pub(crate) const HEADER_CRC_OFFSET: usize = 4088;
 const RELEASE_TAG_OFFSET: usize = 160;
 pub(crate) const RELEASE_TAG_LEN: usize = 64;
 

@@ -936,6 +936,847 @@ fn a_filtered_scan_of_a_set_reaches_foreign_records() {
     assert!(hits.iter().all(|hit| &*hit.records[0].book == "id:4"));
 }
 
+/// v30 and one more line, a new key: what installs after v30 in the tests below.
+fn v31() -> Library {
+    let mut v31 = v30();
+    v31.version = 31;
+    v31.books.get_mut("id:3").unwrap().insert(5, 31);
+    v31
+}
+
+/// How a pointer file can stop reading: bytes that are no pointer, and — as the review
+/// broke it — a directory where the file should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Broken {
+    Garbage,
+    Directory,
+}
+
+fn break_current(dir: &Path, how: Broken) {
+    let current = dir.join(CURRENT);
+    match std::fs::symlink_metadata(&current) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&current).unwrap(),
+        Ok(_) => std::fs::remove_file(&current).unwrap(),
+        Err(_) => {}
+    }
+    match how {
+        Broken::Garbage => std::fs::write(&current, b"damaged").unwrap(),
+        Broken::Directory => std::fs::create_dir(&current).unwrap(),
+    }
+}
+
+/// `PREVIOUS` and every file of every generation, by path: what "as it was" holds a set to.
+fn on_disk(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == PREVIOUS {
+            files.insert(name, std::fs::read(entry.path()).unwrap());
+        } else if name.starts_with("gen-") {
+            for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+                let path = format!("{name}/{}", file.file_name().to_string_lossy());
+                files.insert(path, std::fs::read(file.path()).unwrap());
+            }
+        }
+    }
+    files
+}
+
+fn previous_generation(dir: &Path) -> u64 {
+    files::read_pointer(dir, PREVIOUS)
+        .unwrap()
+        .expect("a PREVIOUS")
+        .generation
+}
+
+/// The review's sequence: two generations, `CURRENT` broken, the set answering from
+/// `PREVIOUS` — and then an install. Numbered from an unreadable `CURRENT` as from nothing,
+/// it removed the generation `PREVIOUS` names to write its own there, and copied the broken
+/// `CURRENT` over `PREVIOUS` (or failed on the directory); the fallback was gone either way.
+#[test]
+fn an_install_over_a_broken_current_keeps_the_generation_previous_names() {
+    for how in [Broken::Garbage, Broken::Directory] {
+        let work = TempDir::new("set_broken_install");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), None)).unwrap();
+        break_current(&dir, how);
+        let fallback = SegmentSet::open(&dir).unwrap();
+        assert_eq!(
+            (fallback.generation(), fallback.info().library_version),
+            (1, 29),
+            "{how:?}"
+        );
+        assert!(fallback.info().recovered_from_previous, "{how:?}");
+        let answers = everything(&fallback, 8);
+        drop(fallback);
+
+        let report = install(&dir, &release(&work, &v31(), None)).unwrap();
+        assert_eq!(
+            report.generation, 3,
+            "{how:?}: past both generations on disk"
+        );
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(
+            (set.generation(), set.info().library_version),
+            (3, 31),
+            "{how:?}"
+        );
+        assert!(!set.info().recovered_from_previous, "{how:?}");
+        drop(set);
+        assert_eq!(
+            previous_generation(&dir),
+            1,
+            "{how:?}: PREVIOUS names the generation that opened"
+        );
+
+        // And that generation is the fallback it was.
+        break_current(&dir, how);
+        let fallback = SegmentSet::open(&dir).unwrap();
+        assert_eq!(fallback.generation(), 1, "{how:?}");
+        assert_eq!(everything(&fallback, 8), answers, "{how:?}");
+    }
+}
+
+/// Every way an install can fail — refused, cancelled, cut off at any step — over a
+/// `CURRENT` that does not read leaves the set as it found it: the same fallback with the
+/// same answers, and `PREVIOUS` and every generation's files byte for byte.
+#[test]
+fn a_failed_install_over_a_broken_current_leaves_the_set_as_it_was() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Failure {
+        Refused,
+        Cancelled,
+        Crash(Step),
+    }
+    let failures = [
+        Failure::Refused,
+        Failure::Cancelled,
+        Failure::Crash(Step::Staged),
+        Failure::Crash(Step::Moved),
+        Failure::Crash(Step::GenerationWritten),
+        Failure::Crash(Step::PreviousWritten),
+        Failure::Crash(Step::CurrentFlipped),
+    ];
+    for how in [Broken::Garbage, Broken::Directory] {
+        for failure in failures {
+            let work = TempDir::new("set_broken_failure");
+            let dir = work.join("vectors");
+            install(&dir, &release(&work, &v29(), None)).unwrap();
+            install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+            break_current(&dir, how);
+            let answers = everything(&SegmentSet::open(&dir).unwrap(), 9);
+            let before = on_disk(&dir);
+
+            let (path, json) = release(&work, &v31(), None);
+            let mut expect = expectation();
+            let cancel = CancellationToken::new();
+            match failure {
+                Failure::Refused => expect.published_manifest_sha256 = Some("0".repeat(64)),
+                Failure::Cancelled => cancel.cancel(),
+                Failure::Crash(step) => CRASH_AT.with(|crash| crash.set(Some(step))),
+            }
+            let result = install_package(
+                &dir,
+                &InstallSource {
+                    segment: &path,
+                    manifest_json: &json,
+                },
+                &expect,
+                &cancel,
+            );
+            CRASH_AT.with(|crash| crash.set(None));
+            assert!(result.is_err(), "{how:?} {failure:?}: {result:?}");
+
+            let set = SegmentSet::open(&dir)
+                .unwrap_or_else(|error| panic!("{how:?} {failure:?}: the set must open: {error}"));
+            if failure == Failure::Crash(Step::CurrentFlipped) {
+                // The flip is the install: the new generation, with the old fallback behind.
+                assert_eq!((set.generation(), set.info().library_version), (3, 31));
+                drop(set);
+                assert_eq!(previous_generation(&dir), 1, "{how:?}");
+                break_current(&dir, how);
+                let set = SegmentSet::open(&dir).unwrap();
+                assert_eq!(set.generation(), 1, "{how:?}");
+                assert_eq!(everything(&set, 9), answers, "{how:?}");
+                continue;
+            }
+            assert_eq!(set.generation(), 1, "{how:?} {failure:?}");
+            assert!(set.info().recovered_from_previous, "{how:?} {failure:?}");
+            assert_eq!(everything(&set, 9), answers, "{how:?} {failure:?}");
+            drop(set);
+            let after = on_disk(&dir);
+            for (file, bytes) in &before {
+                assert_eq!(
+                    after.get(file),
+                    Some(bytes),
+                    "{how:?} {failure:?}: {file} changed"
+                );
+            }
+        }
+    }
+}
+
+/// A generation only an unreadable pointer could name — or one a crash left where no
+/// collection could prove it dead — is never written into: the next is numbered past them
+/// all.
+#[test]
+fn a_new_generation_is_numbered_past_every_generation_on_disk() {
+    let work = TempDir::new("set_numbering");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let stray = dir.join(files::generation_dir(9));
+    std::fs::create_dir(&stray).unwrap();
+    std::fs::write(stray.join("set.json"), b"what a crash left").unwrap();
+    break_current(&dir, Broken::Garbage);
+
+    let report = install(&dir, &release(&work, &v31(), None)).unwrap();
+    assert_eq!(report.generation, 10);
+    assert_eq!(previous_generation(&dir), 1);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (10, 31));
+}
+
+/// `CURRENT` names a generation that does not open, and the set answers from `PREVIOUS`'s.
+/// An install or a compaction builds on that one; it must neither take the number of the one
+/// `CURRENT` names — removing it while it is named — nor move `PREVIOUS` off the one that
+/// opens.
+#[test]
+fn work_on_a_fallback_never_reuses_the_generation_current_names() {
+    for compaction in [false, true] {
+        let work = TempDir::new("set_fallback_work");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        let delta = release(&work, &v30(), Some(&v29()));
+        install(&dir, &delta).unwrap();
+        let named = dir.join(files::generation_dir(2));
+        let del = std::fs::read_dir(&named)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".del"))
+            .unwrap()
+            .path();
+        let mut bytes = std::fs::read(&del).unwrap();
+        bytes[20] ^= 1;
+        std::fs::write(&del, bytes).unwrap();
+        let fallback = SegmentSet::open(&dir).unwrap();
+        assert!(fallback.info().recovered_from_previous);
+        assert_eq!(fallback.generation(), 1);
+        drop(fallback);
+        let current_names: BTreeMap<String, Vec<u8>> = on_disk(&dir)
+            .into_iter()
+            .filter(|(file, _)| file.starts_with("gen-000002/"))
+            .collect();
+
+        let work_once = || {
+            if compaction {
+                compact(
+                    &dir,
+                    &CompactionPolicy {
+                        force: true,
+                        ..CompactionPolicy::default()
+                    },
+                    None,
+                    &CancellationToken::new(),
+                )
+                .map(|report| report.generation)
+            } else {
+                install(&dir, &delta).map(|report| report.generation)
+            }
+        };
+
+        // Cut off once its generation is written: what CURRENT names is untouched.
+        CRASH_AT.with(|crash| crash.set(Some(Step::GenerationWritten)));
+        let crashed = work_once();
+        CRASH_AT.with(|crash| crash.set(None));
+        assert!(crashed.is_err(), "compaction {compaction}: {crashed:?}");
+        let after = on_disk(&dir);
+        for (file, bytes) in &current_names {
+            assert_eq!(
+                after.get(file),
+                Some(bytes),
+                "compaction {compaction}: {file}"
+            );
+        }
+        assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+
+        // And done: past it, with PREVIOUS still on the generation it was built from — v29,
+        // which a compaction merges as it is and the delta takes to v30.
+        assert_eq!(work_once().unwrap(), 3, "compaction {compaction}");
+        assert_eq!(previous_generation(&dir), 1, "compaction {compaction}");
+        let set = SegmentSet::open(&dir).unwrap();
+        let version = if compaction { 29 } else { 30 };
+        assert_eq!((set.generation(), set.info().library_version), (3, version));
+        assert!(!set.info().recovered_from_previous);
+    }
+}
+
+/// With `CURRENT` unreadable the set is `PREVIOUS`'s generation, to `open` and to `info`
+/// alike; a delta from that generation's version applies to it.
+#[test]
+fn a_delta_over_an_unreadable_current_applies_to_the_generation_that_opens() {
+    let work = TempDir::new("set_broken_delta");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let delta = release(&work, &v30(), Some(&v29()));
+    install(&dir, &delta).unwrap();
+    break_current(&dir, Broken::Garbage);
+    assert_eq!(info(&dir).unwrap().unwrap().library_version, 29);
+
+    let report = install(&dir, &delta).unwrap();
+    assert!(!report.already_applied);
+    assert_eq!((report.generation, report.library_version), (3, 30));
+    assert_eq!(previous_generation(&dir), 1);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (3, 30));
+}
+
+/// What `work` did to make its writes durable, in order.
+fn journal_of(work: impl FnOnce()) -> Vec<files::Durable> {
+    files::JOURNAL.with(|journal| journal.borrow_mut().clear());
+    work();
+    files::JOURNAL.with(|journal| journal.borrow_mut().drain(..).collect())
+}
+
+/// The order one publish into `dir` must show: the segment's bytes flushed in `staging/`,
+/// the segment renamed into `segments/` and that directory flushed; the new generation's
+/// `set.json` renamed in, and the set's directory flushed after it — the generation's own
+/// entry; all of it before `CURRENT` is renamed, and the set's directory flushed after.
+fn assert_published_in_order(steps: &[files::Durable], dir: &Path, what: &str) {
+    use files::Durable;
+    let flip = steps
+        .iter()
+        .position(|step| *step == Durable::Renamed(dir.join(CURRENT)))
+        .unwrap_or_else(|| panic!("{what}: no flip in {steps:#?}"));
+    let (staging, segments) = (dir.join(STAGING_DIR), dir.join(SEGMENTS_DIR));
+    let placed = steps
+        .iter()
+        .position(|step| {
+            matches!(step, Durable::Renamed(path)
+                if path.parent() == Some(segments.as_path())
+                    && path.extension().is_some_and(|extension| extension == "oxv"))
+        })
+        .unwrap_or_else(|| panic!("{what}: no segment placed in {steps:#?}"));
+    assert!(
+        steps[..placed].iter().any(
+            |step| matches!(step, Durable::File(path) if path.parent() == Some(staging.as_path()))
+        ),
+        "{what}: the segment's bytes are flushed before it is renamed into place: {steps:#?}"
+    );
+    assert!(
+        steps[placed..flip].contains(&Durable::Dir(segments.clone())),
+        "{what}: segments/ is flushed after the segment lands and before the flip: {steps:#?}"
+    );
+    let generation = steps[..flip]
+        .iter()
+        .rposition(|step| {
+            matches!(step, Durable::Renamed(path)
+                if path.file_name().is_some_and(|name| name == files::SET_FILE))
+        })
+        .unwrap_or_else(|| panic!("{what}: no generation written in {steps:#?}"));
+    assert!(
+        steps[generation..flip].contains(&Durable::Dir(dir.to_path_buf())),
+        "{what}: the set's directory — the new generation's entry — is flushed before the \
+         flip: {steps:#?}"
+    );
+    assert_eq!(
+        steps.get(flip + 1),
+        Some(&Durable::Dir(dir.to_path_buf())),
+        "{what}: and so is the flip"
+    );
+}
+
+/// Every publish writes, flushes the file, renames it into place and flushes the directory,
+/// and only then flips the pointer that names it: a base copied in, a delta taken from
+/// `incoming/` — a file the set did not write, so not yet flushed — and a compaction.
+#[test]
+fn every_publish_is_flushed_before_the_flip_that_names_it() {
+    let work = TempDir::new("set_durable");
+    let dir = work.join("vectors");
+    let steps = journal_of(|| {
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+    });
+    assert_published_in_order(&steps, &dir, "a base, copied");
+
+    let (path, json) = release(&work, &v30(), Some(&v29()));
+    std::fs::create_dir_all(incoming_dir(&dir)).unwrap();
+    let incoming = incoming_dir(&dir).join("download.oxv");
+    std::fs::copy(&path, &incoming).unwrap();
+    let steps = journal_of(|| {
+        install(&dir, &(incoming, json)).unwrap();
+    });
+    assert_published_in_order(&steps, &dir, "a delta, taken from incoming/");
+
+    let steps = journal_of(|| {
+        compact(
+            &dir,
+            &CompactionPolicy {
+                force: true,
+                ..CompactionPolicy::default()
+            },
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    });
+    assert_published_in_order(&steps, &dir, "a compaction");
+}
+
+fn damage_last_byte(path: &Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+fn is_corrupt<T>(result: Result<T, SemanticSearchError>) -> bool {
+    matches!(
+        result,
+        Err(SemanticSearchError::VectorStore(
+            VectorStoreError::Corrupted { .. }
+        ))
+    )
+}
+
+/// The review's sequence: a scrub condemns a damaged segment, and installing the release
+/// again — the repair the verdict asks for — succeeded while the verdict, written for the old
+/// bytes, stayed and refused the new ones. Open, info and scrub agree before the repair and
+/// after it.
+#[test]
+fn a_reinstall_clears_the_verdict_on_the_bytes_it_replaced() {
+    let work = TempDir::new("set_verdict");
+    let dir = work.join("vectors");
+    let base = release(&work, &v29(), None);
+    install(&dir, &base).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let segment = dir.join(format!("segments/{id}.oxv"));
+    let damaged = damage_last_byte(&segment);
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+
+    // The verdict names the bytes it condemned.
+    let marker = dir.join(format!("segments/{id}.corrupt"));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).expect("a verdict is JSON");
+    assert_eq!(verdict["sha256"], files::sha256_hex(&damaged));
+
+    // Nothing opens, and open, info and scrub all say so.
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+
+    // The repair: the same release again.
+    install(&dir, &base).unwrap();
+    assert!(
+        !marker.exists(),
+        "the verdict was on bytes the file no longer holds"
+    );
+    let manifest: ReleaseManifest = serde_json::from_str(&base.1).unwrap();
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&segment).unwrap()),
+        manifest.segment.sha256
+    );
+    let generation = SegmentSet::open(&dir).unwrap().generation();
+    let described = info(&dir).unwrap().unwrap();
+    assert_eq!(described.generation, generation);
+    assert!(!described.recovered_from_previous);
+    assert_eq!(
+        scrub(&dir, &CancellationToken::new()).unwrap().generation,
+        generation
+    );
+}
+
+/// A verdict on a delta condemns the generation that holds it, and every reader falls back
+/// alike: open and info to `PREVIOUS`'s generation, and a scrub checks that one. The delta
+/// installed again clears it.
+#[test]
+fn a_condemned_generation_falls_back_alike_for_open_info_and_scrub() {
+    let work = TempDir::new("set_verdict_fallback");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let delta = release(&work, &v30(), Some(&v29()));
+    install(&dir, &delta).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[1].id.clone();
+    damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+    assert!(dir.join(format!("segments/{id}.corrupt")).exists());
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert!(set.info().recovered_from_previous);
+    drop(set);
+    let described = info(&dir).unwrap().unwrap();
+    assert_eq!(
+        (described.generation, described.recovered_from_previous),
+        (1, true)
+    );
+    assert_eq!(
+        scrub(&dir, &CancellationToken::new()).unwrap().generation,
+        1
+    );
+
+    // The set stands at v29 for every reader, and the delta applies there again.
+    let report = install(&dir, &delta).unwrap();
+    assert_eq!((report.generation, report.library_version), (3, 30));
+    assert!(!dir.join(format!("segments/{id}.corrupt")).exists());
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 3);
+    assert_eq!(info(&dir).unwrap().unwrap().generation, 3);
+    assert_eq!(
+        scrub(&dir, &CancellationToken::new()).unwrap().generation,
+        3
+    );
+}
+
+/// A scrub that read a damaged file while an install replaced it would leave a verdict on
+/// bytes the file no longer holds; it withdraws it, so the install's bytes are never
+/// condemned. One on the bytes the file holds stands, and so does a marker that names no
+/// bytes — as every marker before verdicts did.
+#[test]
+fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
+    let work = TempDir::new("set_verdict_race");
+    let dir = work.join("vectors");
+    let base = release(&work, &v29(), None);
+    install(&dir, &base).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let marker = dir.join(format!("segments/{id}.corrupt"));
+
+    assert!(!files::condemn(&dir, &id, &"0".repeat(64), "a block failed").unwrap());
+    assert!(!marker.exists());
+    SegmentSet::open(&dir).unwrap();
+
+    let held = files::sha256_hex(&std::fs::read(dir.join(format!("segments/{id}.oxv"))).unwrap());
+    assert!(files::condemn(&dir, &id, &held, "a block failed").unwrap());
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+
+    std::fs::write(&marker, b"a block failed").unwrap();
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+    install(&dir, &base).unwrap();
+    assert!(!marker.exists());
+    SegmentSet::open(&dir).unwrap();
+}
+
+/// v29's live index with key 2 of id:1 at `line` instead of line 1.
+fn v29_with_key_2_at(line: u32) -> Fixed {
+    let mut books: BTreeMap<String, Vec<(u32, u64)>> = v29()
+        .books
+        .iter()
+        .map(|(book, lines)| {
+            (
+                book.clone(),
+                lines
+                    .iter()
+                    .map(|(hint, k)| (*hint, key(*k).column_value()))
+                    .collect(),
+            )
+        })
+        .collect();
+    for (ordinal, value) in books.get_mut("id:1").unwrap() {
+        if *value == key(2).column_value() {
+            *ordinal = line;
+        }
+    }
+    Fixed { version: 29, books }
+}
+
+/// The review's sequence: two compactions that re-anchor key 2 differently are two
+/// different segments. With an id over the keys alone they shared one file name, the second
+/// replaced the first's file, and falling back to `PREVIOUS` served the second's records.
+#[test]
+fn two_compactions_that_differ_are_two_segments_and_previous_keeps_its_own() {
+    let work = TempDir::new("set_compaction_ids");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let force = CompactionPolicy {
+        force: true,
+        ..CompactionPolicy::default()
+    };
+    compact(
+        &dir,
+        &force,
+        Some(&v29_with_key_2_at(6)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let first = info(&dir).unwrap().unwrap().segments[0].clone();
+    compact(
+        &dir,
+        &force,
+        Some(&v29_with_key_2_at(8)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let second = info(&dir).unwrap().unwrap().segments[0].clone();
+    assert_ne!(first.sha256, second.sha256);
+    assert_ne!(first.id, second.id, "a segment id names its whole content");
+
+    // PREVIOUS's segment is still the file it names, byte for byte, and answers as it did.
+    let held = std::fs::read(dir.join(format!("segments/{}.oxv", first.id))).unwrap();
+    assert_eq!(files::sha256_hex(&held), first.sha256);
+    break_current(&dir, Broken::Garbage);
+    let fallback = SegmentSet::open(&dir).unwrap();
+    assert_eq!(fallback.generation(), 2);
+    let records = &everything(&fallback, 4)[&key(2)].1;
+    assert!(
+        records.contains(&("id:1".to_string(), 6)),
+        "the first compaction's records: {records:?}"
+    );
+}
+
+/// A release under an installed segment's id with other bytes — what an id that does not
+/// name its content allows — is refused, and the installed file and every generation that
+/// names it are left as they were. The bytes a generation names are never rewritten.
+#[test]
+fn a_release_under_an_installed_segments_id_with_other_bytes_is_refused() {
+    let work = TempDir::new("set_impostor");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let installed = dir.join(format!("segments/{id}.oxv"));
+    let held = std::fs::read(&installed).unwrap();
+    let answers = everything(&SegmentSet::open(&dir).unwrap(), 10);
+
+    // v29 with one record moved, its header and its manifest made to claim that id.
+    let mut moved = v29();
+    let lines = moved.books.get_mut("id:3").unwrap();
+    lines.remove(&1);
+    lines.insert(4, 7);
+    let (path, json) = release(&work, &moved, None);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut header = crate::semantic::oxv::format::Header::decode(&bytes).unwrap();
+    header.segment_id = (0..16)
+        .map(|at| u8::from_str_radix(&id[at * 2..at * 2 + 2], 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    bytes[..4096].copy_from_slice(&header.encode());
+    std::fs::write(&path, &bytes).unwrap();
+    let mut manifest: ReleaseManifest = serde_json::from_str(&json).unwrap();
+    manifest.segment_id = id.clone();
+    manifest.segment.sha256 = files::sha256_hex(&bytes);
+    manifest.package_digest = manifest.package().digest();
+
+    match install(&dir, &(path, manifest.to_json())) {
+        Err(SemanticSearchError::Artifact(ArtifactError::ManifestDisagreesWithPayload {
+            reason,
+        })) => assert!(reason.contains(&id), "{reason}"),
+        other => panic!("a release under another segment's id must be refused, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&installed).unwrap(), held);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert_eq!(everything(&set, 10), answers);
+}
+
+/// Compacting a set that is one compacted segment already writes that segment again: the
+/// same bytes, so the same id — and the file in place, mapped by a reader, is kept rather
+/// than replaced.
+#[test]
+fn compacting_again_keeps_the_segment_file_in_place() {
+    let work = TempDir::new("set_compact_again");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let force = CompactionPolicy {
+        force: true,
+        ..CompactionPolicy::default()
+    };
+    compact(&dir, &force, None, &CancellationToken::new()).unwrap();
+    let compacted = info(&dir).unwrap().unwrap().segments[0].clone();
+    let file = dir.join(format!("segments/{}.oxv", compacted.id));
+    let reader = SegmentSet::open(&dir).unwrap();
+    let before = everything(&reader, 11);
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap());
+
+    let report = compact(&dir, &force, None, &CancellationToken::new()).unwrap();
+    assert_eq!(report.generation, 3);
+    let again = info(&dir).unwrap().unwrap().segments[0].clone();
+    assert_eq!(
+        (again.id.as_str(), again.sha256.as_str()),
+        (compacted.id.as_str(), compacted.sha256.as_str())
+    );
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        compacted.sha256
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap()),
+        inode,
+        "the file was kept, not replaced"
+    );
+    assert_eq!(everything(&reader, 11), before);
+    drop(reader);
+    assert_eq!(everything(&SegmentSet::open(&dir).unwrap(), 11), before);
+}
+
+/// A release manifest comes with a download, and its segment id names files — in staging/
+/// and segments/ — before anything compares it with the segment's own. One that is not 32
+/// lowercase hex digits is refused before it names any: `../../escape` wrote the segment's
+/// copy outside the set.
+#[test]
+fn a_segment_id_that_is_not_one_names_no_file() {
+    let work = TempDir::new("set_unsafe_id");
+    let dir = work.join("vectors");
+    let (path, json) = release(&work, &v29(), None);
+    for id in [
+        "../../escape",
+        "../escape",
+        "ABCDEF0123456789ABCDEF0123456789",
+        "",
+    ] {
+        let mut manifest: ReleaseManifest = serde_json::from_str(&json).unwrap();
+        manifest.segment_id = id.to_string();
+        match install(&dir, &(path.clone(), manifest.to_json())) {
+            Err(SemanticSearchError::Artifact(ArtifactError::UnsafePayloadName {
+                name, ..
+            })) => assert_eq!(name, id),
+            other => panic!("{id:?} must be refused as a name, got {other:?}"),
+        }
+        assert!(!work.join("escape.oxv").exists(), "{id:?}");
+        assert!(!dir.join("escape.oxv").exists(), "{id:?}");
+    }
+    install(&dir, &(path, json)).unwrap();
+}
+
+/// A generation's derived files are named by its segments' ids, in one directory: an id
+/// twice would be two segments over one `.del`, and a file named for another segment — or
+/// for no segment, outside the directory — another segment's bitmap. A generation that says
+/// so is refused, and one being assembled takes no segment twice.
+#[test]
+fn a_generation_names_each_segment_once_and_each_file_by_its_segment() {
+    let work = TempDir::new("set_names");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let pointer = files::read_pointer(&dir, CURRENT).unwrap().unwrap();
+    let document = files::read_generation(&dir, &pointer).unwrap();
+    assert_eq!(document.check(2), Ok(()));
+
+    let mut twice = document.clone();
+    twice.segments.push(twice.segments[1].clone());
+    assert!(twice.check(2).unwrap_err().contains("twice"));
+    let mut misnamed = document.clone();
+    misnamed.segments[0].del.file = format!("{}.del", misnamed.segments[1].id);
+    assert!(misnamed.check(2).is_err());
+    let mut escaping = document.clone();
+    escaping.segments[1].links.as_mut().unwrap().file = "../gen-000001/x.links".to_string();
+    assert!(escaping.check(2).is_err());
+    let mut not_an_id = document;
+    not_an_id.segments[1].id = "../x".to_string();
+    not_an_id.segments[1].file = files::segment_file("../x");
+    assert!(not_an_id.check(2).is_err());
+
+    let set = SegmentSet::open(&dir).unwrap();
+    let mut generation = install::NewGeneration::from_set(&set);
+    let entry = set.document().segments[1].clone();
+    let segment = crate::semantic::oxv::reader::Segment::open(&dir.join(&entry.file)).unwrap();
+    assert!(is_corrupt(generation.push(
+        entry,
+        &segment,
+        set.segments(),
+        &CancellationToken::new()
+    )));
+}
+
+/// Compaction copies vectors byte for byte into a segment it checksums afresh: damage in a
+/// source it never read whole would be written under CRCs that agree with it, past any scrub.
+/// It reads every block of every source first, and one that fails is condemned as a scrub
+/// condemns it; nothing is written.
+#[test]
+fn compaction_verifies_what_it_copies() {
+    let work = TempDir::new("set_compact_damage");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let damaged = damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+    SegmentSet::open(&dir).expect("opening reads no vector block");
+
+    let result = compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    );
+    assert!(is_corrupt(result));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(format!("segments/{id}.corrupt"))).unwrap())
+            .unwrap();
+    assert_eq!(verdict["sha256"], files::sha256_hex(&damaged));
+    assert!(!dir.join(files::generation_dir(3)).exists());
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+    assert!(is_corrupt(info(&dir)));
+}
+
+/// "A record is a book and a key", and its hint the first line that holds the key: a book
+/// that holds one key twice in one segment — the format allows it — keeps the lower hint
+/// when it is compacted, whatever order its records came in.
+#[test]
+fn compaction_keeps_the_first_line_of_a_key_a_book_holds_twice() {
+    let work = TempDir::new("set_compact_twice");
+    let dir = work.join("vectors");
+    let mut book = TestBook::named("id:1");
+    book.primary = vec![(key(1), 5, vector_of(1)), (key(2), 6, vector_of(2))];
+    // Key 1 again, at a lower line of the same book.
+    book.extras = vec![(2, 0)];
+    let mut spec = spec(PackageKind::Base, 0, 29);
+    spec.identity_digest = identity().identity_digest();
+    let path = work.join("twice.oxv");
+    let written = write_segment(&path, spec, codec(), &[book], &[]);
+    let manifest = ReleaseManifest::for_segment(
+        &written,
+        &identity(),
+        codec().params_sha256(),
+        test_provenance(),
+        "2026-10-02T00:00:00Z".to_string(),
+    );
+    install(&dir, &(path, manifest.to_json())).unwrap();
+
+    compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let hits = everything(&SegmentSet::open(&dir).unwrap(), 12);
+    assert_eq!(hits[&key(1)].1, BTreeSet::from([("id:1".to_string(), 2)]));
+}
+
+/// `PREVIOUS` without `CURRENT` is no state a flip leaves — a crash between removing a
+/// directory where `CURRENT` should be and writing the pointer is one way there — and what
+/// `CURRENT` named cannot be known: no collection runs until a `CURRENT` is written again,
+/// and then the generations neither pointer names go.
+#[test]
+fn garbage_waits_while_current_is_missing() {
+    let work = TempDir::new("set_no_current");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let delta = info(&dir).unwrap().unwrap().segments[1].id.clone();
+    std::fs::remove_file(dir.join(CURRENT)).unwrap();
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert!(set.info().recovered_from_previous);
+    drop(set);
+    assert!(dir.join(files::generation_dir(2)).exists());
+    assert!(dir.join(format!("segments/{delta}.oxv")).exists());
+
+    install(&dir, &release(&work, &v31(), None)).unwrap();
+    assert_eq!(previous_generation(&dir), 1);
+    assert!(!dir.join(files::generation_dir(2)).exists());
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
