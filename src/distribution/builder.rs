@@ -334,9 +334,14 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
     let manifest_path = root.join(RELEASE_MANIFEST_FILENAME);
     let partial = root.join(format!("{RELEASE_MANIFEST_FILENAME}.partial"));
     (|| {
-        std::fs::write(&partial, json.as_bytes())?;
-        std::fs::File::open(&partial)?.sync_all()?;
-        std::fs::rename(&partial, &manifest_path)
+        // Flushed through the handle that wrote it: Windows refuses to flush a handle
+        // opened only for reading.
+        let mut file = std::fs::File::create(&partial)?;
+        io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&partial, &manifest_path)?;
+        crate::distribution::package::sync_dir(root)
     })()
     .map_err(io_error(format!("writing {}", manifest_path.display())))?;
 
