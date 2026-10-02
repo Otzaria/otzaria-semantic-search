@@ -93,6 +93,8 @@ fn records_round_trip_and_refuse_disorder_and_damage() {
     assert_eq!(read.iter().collect::<Vec<_>>(), records);
     assert_eq!(read.get(2).key().to_hex(), hex(&key(L3)));
 
+    // Windows refuses to write a file while a mapping of it is open.
+    drop(read);
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.truncate(bytes.len() - 1);
     std::fs::write(&path, &bytes).unwrap();
@@ -178,11 +180,13 @@ fn a_plan_keys_every_line_and_embeds_each_text_once() {
     assert_eq!(warm.manifest.counts.revived, 1);
 
     // A records file that is not the one the manifest names is refused.
-    let path = first.dir.join(RECORDS_FILE);
+    let plan_dir = first.dir.clone();
+    let path = plan_dir.join(RECORDS_FILE);
+    drop(first);
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[20] ^= 1;
     std::fs::write(&path, bytes).unwrap();
-    assert!(Plan::open(&first.dir).is_err());
+    assert!(Plan::open(&plan_dir).is_err());
 }
 
 /// The split of a release against the one before it: what is held already, what ships as
@@ -305,6 +309,7 @@ fn a_ledger_refuses_another_chain_and_damage() {
     assert_eq!(opened.codec().unwrap().params(), codec().params());
 
     let keys = at.join(super::ledger::keys_file_name(1));
+    drop(opened);
     let mut bytes = std::fs::read(&keys).unwrap();
     bytes[16] ^= 1;
     std::fs::write(&keys, bytes).unwrap();
