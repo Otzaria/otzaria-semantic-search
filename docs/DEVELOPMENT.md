@@ -136,7 +136,7 @@ BM25 עדיין עובד
 | VectorStore abstraction          | קיים                       |
 | `VectorStoreBackend` trait       | קיים; **ה־engine עדיין אינו תלוי בו** |
 | In-memory vector store           | ממומש — וזה מה שה־engine פותח |
-| `ZevcStore` (snapshot לדיסק)     | ממומש ונבדק, **לא מחובר**; סריקה מלאה, לא ANN, לא `zvec` |
+| סט וקטורים רשמי (`.oxv`)          | ממומש — segments של int8 ממופים לזיכרון, ממוענים לפי הטקסט; התקנה, delta, דחיסה, שחזור, scrub ([`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md)) |
 | Cosine search                    | ממומש                      |
 | Metadata filtering               | ממומש (facets שטוחים + חלוקת ממדים כמו במנוע הלקסיקלי) |
 | זיהוי שינוי ב-PDF                | ממומש כאשר הקורא מספק source revision סמכותי + metadata; גודל+mtime לבדם אינם קנוניים |
@@ -157,14 +157,14 @@ BM25 עדיין עובד
 | כתיבת manifest באינדוקס מלא      | פעם אחת בסוף (לא פר-ספר) |
 | Rust API seam ל-Flutter/FFI      | קיים; bindings אמיתיים נבנים ב־`otzaria_search_engine` |
 | חבילת אינדקס + התקנה              | ממומשים ומאמתים במלואם (`distribution`), עם שחזור התקנה שנקטעה ו־`fsync`; **לא חשופים ב־API** |
-| מסלול ריצה read-only              | ממומש — `OfficialSemanticIndex` פותח ארטיפקט מאומת מעל store שאין עליו כתיבה; **לא חשוף ב־FFI** (S5) |
-| עוגן אמון לארטיפקט               | המכניזם קיים (digest מפורסם); **אין מי שמפרסם ואין חתימה** (S6) |
-| זהות ארטיפקט (`IndexVersion`)     | מלאה — corpus/Tantivy/ID scheme/מודל+checksum/store; נדחית לפי שדה, ומסלול הריצה קורא לה בפתיחה |
-| packer של הארטיפקט הרשמי         | קיים — `pack`/`validate` מקבלים וקטורים מוכנים ומצרפים אותם לקורפוס דרך פורט (S4a) |
-| builder שמייצר את הווקטורים עצמם | קיים — `build` מחיל את המתכון על הקורפוס, מטמיע ואורז במעבר אחד על מודל אחד (S4b) |
-| חיבור ל־Tantivy חי | **לא קיים** — `CorpusIndex`/`CorpusBooks` מעל אינדקס חי הם יתרת S4b, ב־`otzaria_search_engine` |
-| Production persistence במסלול הפעיל | קיימת — ארטיפקט מותקן נפתח מחדש אחרי restart בלי לאנדקס; **לא נמדדה בקנה מידה** (S2b) |
-| אחזור תת־ליניארי (ANN)            | **אין** (סריקה מלאה בלבד, והפתיחה טוענת הכול ל־RAM); האם נדרש — הכרעת S2b לפי מדידה |
+| מסלול ריצה read-only              | ממומש — `OfficialSemanticIndex` פותח סט מותקן ומחזיר hits; ה־`CandidateResolver` של המארח קושר אותם לשורות חיות |
+| עוגן אמון לשחרור                 | המכניזם קיים (SHA-256 של ה־manifest, מפורסם בנפרד); **אין מי שמפרסם ואין חתימה** |
+| זהות (`IndexVersion`)             | מלאה — מתכון השורות ומפתח / משפחת המודל וחבילות השאילתה / store; נדחית לפי שדה |
+| builder שמייצר את הווקטורים עצמם | קיים — `build` מחיל את המתכון, מטמיע ומפיק base segment, חבילה ו־`release.json` |
+| צינור הבנייה של הספרייה          | קיים (POC) — `plan` / `embed-shard` / `warehouse-add` / `assemble --verify` (S7) |
+| חיבור ל־Tantivy חי | **לא קיים כאן** — ה־resolver ועמודת `chunkKey` הם של `otzaria_search_engine` (P1–P4) |
+| Production persistence במסלול הפעיל | קיימת ונמדדה: סט של 6.0M slots נפתח ב־3.8 ms |
+| אחזור תת־ליניארי (ANN)            | **אין, ואין צורך** (S2b): סריקה מלאה מדויקת ב־int8 — 69 ms בחוט אחד, 17 ms בעשרה, על 6.0M slots |
 | UI סמנטי באוצריא                 | **לא קיים** (S7)           |
 
 הנקודה החשובה ביותר למפתח חדש:
@@ -172,12 +172,10 @@ BM25 עדיין עובד
 > **זהו כרגע skeleton ארכיטקטוני עובד חלקית, לא מנוע semantic production-complete.**
 >
 > מה שכן ממומש באמת: inference אמיתי מול המודל, שלושת מצבי החיפוש, fusion עם פרופילים,
-> caches, telemetry, אריזה והתקנה מאומתות, חוזה זהות שקושר את הארטיפקט ל־corpus מסוים,
-> ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`. מה שחסר כדי שיהיה מוצר:
-> ומסלול ריצה read-only שפותח ארטיפקט כזה ומחזיר `line_id`, וכלי צד־build שמייצר ארטיפקט
-> כזה — מווקטורים מוכנים, או מקורפוס ומודל — ומאמת אותו מול הקורפוס. מה שחסר כדי שיהיה
-> מוצר: מדידה של אותו מסלול בקנה מידה (S2b), חיבור הפורט ל־Tantivy חי (יתרת S4b),
-> והפעלה באפליקציה (S5–S7).
+> caches, telemetry, סט וקטורים ממוען־תוכן עם התקנה, delta, דחיסה ושחזור, חוזה זהות
+> שקושר אותו למתכון ולמשפחת המודל, ומסלול ריצה read-only שסורק אותו ומחזיר מפתחות
+> ורשומות. מה שחסר כדי שיהיה מוצר: ה־resolver מעל Tantivy חי ועמודת `chunkKey`
+> (P1–P4), צינור הבנייה והפרסום של הספרייה (S7, L1, U1), והפעלה באפליקציה (A1).
 
 ## מה השתנה ב־PR הראשון (Correctness baseline)
 
@@ -638,45 +636,47 @@ chunks
 ## שני ה־stores שקיימים בקוד
 
 ```text
-VectorStore (store.rs)          ← זה מה שה-engine פותח היום
+VectorStore (store.rs)          ← מה שה-engine פותח: מסלול הפיתוח
   └── RwLock<HashMap<String, StoredVectorRecord>>
       + RwLock<HashMap<String, Vec<String>>>   (מפתחות לפי ספר)
   is_persistent() == false — ומצהיר על כך, כדי שה-manifest לא ישקר
 
-ZevcStore (zevc_store.rs)       ← קיים, נבדק, לא מחובר
-  └── snapshots לדיסק: payload לכל ספר, SHA-256 למטא-דאטה ולווקטורים,
-      פתיחה מחדש שמאמתת checksums
-  is_persistent() == true
+SegmentSet (segment_set/)       ← מה שהאפליקציה פותחת: סט וקטורים רשמי
+  └── segments של .oxv, ממופים: int8, מפתח של 16 בתים ו-hint לכל slot;
+      דורות, deltas, דחיסה, שחזור — docs/ARTIFACT_CONTRACT.md
 ```
-
-**מה ש־`ZevcStore` אינו:** אינו הספרייה `zvec`, אינו ANN, אינו mmap. הפתיחה טוענת את
-**כל** הווקטורים ל־`HashMap` והחיפוש סורק את כולם ב־`O(N·D)` — אותה סיבוכיות בדיוק כמו
-ה־store בזיכרון. מה שהוא כן פותר: הווקטורים שורדים restart, והשלמות שלהם נבדקת.
-
-### מה שנעשה ב־S2a
 
 ```text
-צד ה-build:            SemanticEngine ──▶ dyn VectorStoreBackend  (insert/remove/clear/commit)
-                                            ├── in-memory   (ברירת מחדל, בדיקות)
-                                            └── ZevcStore   (כדי שיהיה ממה לארוז)
+מסלול הפיתוח:     SemanticEngine ──▶ dyn VectorStoreBackend  (insert/remove/clear/commit)
+                                       └── VectorStore (בזיכרון)
 
-מסלול האפליקציה:  OfficialSemanticIndex ──▶ dyn VectorSearchBackend (search/count בלבד)
-                                            └── ReadOnlyZevcStore
+מסלול האפליקציה:  OfficialSemanticIndex ──▶ SegmentSet ──▶ VectorHit (מפתח + רשומות)
+                                                              │
+                  HybridCoordinator ──▶ CandidateResolver של המארח ──▶ שורות חיות
 ```
 
-הפיצול הוא מה שהופך „ללא delete/upsert בזמן ריצה” מכלל למאפיין של הטיפוס: לטיפוס
-שהאפליקציה מחזיקה **אין** פעולת כתיבה לקרוא. `open` מקבל `VerifiedPackage` ולא נתיב,
-ולכן גם „לאמת לפני שנוגעים בווקטורים” אינו סדר קריאות שמישהו זוכר.
+לסט אין פעולת כתיבה במסלול השאילתה: הוא משתנה רק בהתקנה ובדחיסה, תחת lock, דור אחר דור.
 
-### מה שנשאר ל־S2b — המדידה
+### S2b — נענתה
 
-`ZevcStore` הוא baseline נכונות, לא פתרון סקייל: הפתיחה קוראת כל בייט, מגבבת כל רשומה
-וטוענת את כל הווקטורים ל־RAM. צריך למדוד ב־1M וב־6M רשומות: cold-open, p50/p95/p99,
-peak RSS וגודל דיסק. ANN אמיתי על הדיסק נכנס רק אם המדידה מוכיחה שסריקה מלאה אינה
-עומדת בתקציב — ולא מפני ש"ANN" נשמע מהיר יותר. פתיחה שטוענת את כל הווקטורים ל־RAM
-אינה קבילה אלא אם מדידה מראה שהיא עומדת בתקציב בכל היעדים.
+השאלה הייתה אם סריקה מלאה עומדת בתקציב בקנה מידה של הספרייה, או שנדרש ANN. התשובה,
+במדידה (Apple M4, [`tests/vector_set_scale.rs`](../tests/vector_set_scale.rs), 6.4M רשומות,
+6.0M slots, 7,765 ספרים, 256 ממדים):
 
-`VectorSearchBackend` הוא ה־seam שכל תשובה כזאת נכנסת אליו, בלי לשכתב את מסלול הריצה.
+| מדד | ערך |
+|---|---|
+| גודל | 1.686 GB (`i8-sym-vec`, ממופה — לא נטען ל־RAM) |
+| פתיחה | 3.8 ms |
+| סריקה חמה | 69 ms בחוט אחד, 17 ms בעשרה |
+| סריקה של 5% מהספרים | 2.5 ms |
+| התקנת base / החלת delta של 6.5% | 5.7 s / 0.45 s |
+| דחיסה | 8.8 s, שיא זיכרון ≈ 0.35 GB |
+
+כלומר **אין צורך ב־ANN**: סריקה מלאה מדויקת של int8 עומדת ביעד (≤ 80 ms) עם מרווח, והיא
+דטרמיניסטית — אותו ציון ביט אחר ביט על כל מעבד. אם מחשב חלש לא יעמוד ביעד שלו (≤ 250 ms),
+הפורמט שומר מקום לשכבת סינון ראשונה (`TIER0_SIGN`, `TIER0_PQ`) כ־sections מסוג ancillary,
+בלי לשבור קוראים קיימים. מה שעוד לא נמדד: recall מול f32 על וקטורי הספרייה האמיתיים,
+ומחשב חלש.
 
 ---
 
@@ -707,12 +707,9 @@ N = מספר הווקטורים
 D = 256 (ממד המודל)
 ```
 
-זה נכון לשני ה־stores: גם `ZevcStore` סורק את כולם. הוא מוסיף persistence, לא אחזור
-תת־ליניארי.
-
-**האם זו הארכיטקטורה הסופית — לא ידוע, ומכוון שלא ידוע.** ההכרעה תלויה במדידה של S2b
-ובממד/דיוק שייבחרו ב־S1: 6.1 מיליון וקטורים ב־128 ממדים int8 הם ~0.72 GiB, וב־1024
-ממדים f32 הם ~23.1 GiB. אלה שני עולמות שונים לחלוטין לשאלה "האם סריקה מלאה קבילה".
+זה נכון לשני ה־stores, והוכרע כארכיטקטורה (S2b, למעלה): ב־256 ממדים int8 הסט של
+הספרייה הוא ~1.66 GB ממופים, והסריקה המלאה שלו — בשלמים, על כמה חוטים — אורכת עשרות
+מילישניות.
 
 ---
 
@@ -777,9 +774,8 @@ status()
 > ברקע, אין progress stream ואין cancel/resume — ראו [`PRODUCT_CONTRACT.md`](PRODUCT_CONTRACT.md) §4.
 > הזרימה כאן היא מה ש־[`builder.rs`](../src/distribution/builder.rs) מפעיל, ספר אחד בכל
 > פעם, דרך אותו `Chunker` עצמו — ומעל אינדקס Tantivy סופי, כשהפורט ימומש מעליו.
-> **שימו לב שזה אינו המסלול של ה־packer:** [`packer.rs`](../src/distribution/packer.rs)
-> אינו מחלק לקטעים ואינו מטמיע — הוא מקבל וקטורים מוכנים. הזרימה הזאת היא מה שמייצר
-> אותם לפני שהם מגיעים אליו.
+> בנייה מפוצלת ([`shard.rs`](../src/distribution/shard.rs)) מחילה את אותו מתכון ב־`export_plan`,
+> ומעבירה ל־worker טקסטים מוגמרים בלבד.
 
 ה־flow הנוכחי:
 
@@ -1412,28 +1408,24 @@ bad input
 brute-force scan, O(N·D)
 ```
 
-נמדד: 79–132ms לשאילתה על 200k×1024 (min/max באותה ריצה, אותה מכונה; לפני S2a נמדדו
-84–208ms על אותו קוד פחות הקצאת ה־`String` לכל רשומה שהוסרה שם — הפער בין שתי המדידות
-בתוך רעש המכונה, ואין לייחס אותו כולו לשינוי). בהערכה **ליניארית** — לא במדידה — זה
-~2.4s על 6.1 מיליון שורות באותו ממד ודיוק. זה מספר
-שמחייב או ממד/דיוק קטנים יותר (S1), או backend אחזור אחר (S2b) — ולא אופטימיזציה נקודתית.
+ה־store שבזיכרון (מסלול הפיתוח): 79–132ms לשאילתה על 200k×1024 f32. הסט הרשמי: 18.9 ns
+לווקטור בחוט אחד ב־256 int8 — 69 ms על 6.0M slots, 17 ms בעשרה חוטים.
 
 ---
 
 ## Persistence במסלול הפעיל
 
-ארטיפקט מותקן נפתח מחדש אחרי restart ואינו מאונדקס שוב — זה נסגר ב־S2a. מה שנשאר:
-הפתיחה טוענת את **כל** הווקטורים ל־RAM ומגבבת כל רשומה, ולזה אין תקציב נמדד. S2b.
-במסלול צד ה־build ברירת המחדל היא ה־store שבזיכרון, ושם הווקטורים אכן אינם שורדים
-restart — אלא אם הקורא נותן backend מתמיד ל־`with_store`.
+סט מותקן נפתח מחדש אחרי restart ואינו מאונדקס שוב, ופתיחה ממפה את הווקטורים ואינה
+קוראת אותם: 3.8 ms על 6.0M slots. במסלול הפיתוח ה־store הוא בזיכרון, ושם הווקטורים אינם
+שורדים restart.
 
 ---
 
 ## Cold-open ותקציב זיכרון
 
-לא נמדדו בכלל בקנה מידה של הספרייה. `cargo bench` מודד חיפוש, לא פתיחה. אלה מספרים
-שחייבים להיות בשער הקבלה של S2b, כי הם מה שקובע אם ארטיפקט של מיליוני שורות בכלל
-נפתח על מכשיר של משתמש — והפתיחה הנוכחית קוראת כל בייט ומגבבת כל רשומה.
+נמדדו (S2b, למעלה): פתיחה 3.8 ms, ו־private memory קטן — הווקטורים ממופים, והזיכרון
+שהסריקה נוגעת בו הוא page cache של מערכת ההפעלה. דחיסה, במכשיר ובזמן סרק, מגיעה לשיא
+של ≈ 0.35 GB.
 
 ---
 
@@ -1480,10 +1472,10 @@ inference אמיתי דרך ONNX Runtime: ה־tokenizer של החבילה, pooli
 | שלב | מאיפה מתחילים בקוד |
 |---|---|
 | **S1** — ייצוג, ממד ודיוק | [`chunker.rs`](../src/semantic/chunker.rs) (טקסט ההטמעה) ו־[`benchmark/`](../src/benchmark/) (המדידה). התוצר מקפיא שדות בזהות האינדקס |
-| **S2a** — מסלול ריצה read-only | ✅ [`official_index.rs`](../src/semantic/official_index.rs) פותח `VerifiedPackage` מעל [`ReadOnlyZevcStore`](../src/semantic/zevc_store.rs), והחוזה פוצל ל־[read/write](../src/semantic/store_backend.rs) |
-| **S2b** — סקייל ומדידה | למדוד את [`ZevcStore`](../src/semantic/zevc_store.rs) ב־1M/6M: cold-open, p50/p95/p99, peak RSS, דיסק. ANN נכנס רק אם המדידה מחייבת |
+| **S2a** — מסלול ריצה read-only | ✅ [`official_index.rs`](../src/semantic/official_index.rs); מאז store v2 — מעל [`SegmentSet`](../src/semantic/segment_set/mod.rs) |
+| **S2b** — סקייל ומדידה | ✅ נענתה: סריקה מלאה מדויקת של int8, בלי ANN — §„S2b — נענתה” ו־[`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §8 |
 | **S3** — חוזה ארטיפקט | ✅ הזהות והאימות ב־[`versioning.rs`](../src/semantic/versioning.rs) וב־[`package.rs`](../src/distribution/package.rs); מה שנשאר הוא חשיפת [`IndexImporter`](../src/distribution/importer.rs) ב־API |
-| **S4a** — packer לווקטורים מוכנים | ✅ [`packer.rs`](../src/distribution/packer.rs) מעל הפורט ב־[`corpus.rs`](../src/distribution/corpus.rs). הקלט הוא `line_id` + וקטור + digest של טקסט השורה; כל שאר המטא־דאטה מגיע מהקורפוס |
+| **S4a** — packer לווקטורים מוכנים | הוחלף ב־store v2: וקטורים לפי מפתח אל segment, ב־`assemble` של צינור הבנייה (S7) |
 | **S4b** — embeddings | ✅ [`builder.rs`](../src/distribution/builder.rs): המתכון מוחל על הקורפוס, קבוצת הכיסוי נקבעת לפני ה־inference, וזהות המודל נבדקת מול הקובץ שנטען |
 | **S4b** — Tantivy חי | לממש `CorpusIndex` ו־`CorpusBooks` מעל האינדקס הסופי ב־`otzaria_search_engine`, ולהעביר אותם ל־`build` |
 
@@ -1537,10 +1529,10 @@ Flutter צריך לדבר מול API יציב.
 
 ---
 
-## ❌ לא להניח ש־backend מתמיד כבר מחובר
+## ❌ לא להניח שמסלול הפיתוח מתמיד
 
-`ZevcStore` קיים ונבדק, אבל `SemanticEngine::open()` פותח את ה־store בזיכרון. ובנוסף:
-`ZevcStore` אינו ANN, אינו mmap ואינו הספרייה `zvec` — הוא סורק את כל הווקטורים.
+`SemanticEngine::open()` פותח את ה־store שבזיכרון, והווקטורים שלו אינם שורדים restart.
+מה שמתמיד הוא הסט הרשמי, ש־`OfficialSemanticIndex` פותח.
 
 ---
 
@@ -1599,15 +1591,14 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 
 ### Vector Store
 
-* [x] persistence — קיים ב־`ZevcStore`
+* [x] persistence — סט וקטורים רשמי, segments ממופים
 * [x] persistence **במסלול שהאפליקציה פותחת** — ארטיפקט מותקן, `vectors_persisted=true` (S2a)
 * [x] מצב official-read-only ללא delete/upsert בזמן ריצה — טיפוס שאין עליו כתיבה (S2a)
 * [x] ה־engine תלוי ב־trait ולא ב־store קונקרטי, וה־manifest רושם את ה־backend שנפתח (S2a)
-* [ ] ANN או הוכחה שאין בו צורך (S2b) — נמדד: 79–132ms לשאילתה על 200k×1024 (min/max
-  באותה ריצה), כלומר ~2.4s בקנה מידה של הספרייה **בהערכה ליניארית**, לא במדידה
-  (`cargo bench`)
-* [ ] cold-open, peak RSS וגודל דיסק ב־1M וב־6M רשומות (S2b) — הפתיחה קוראת כל בייט,
-  מגבבת כל רשומה וטוענת הכול ל־RAM
+* [x] ANN או הוכחה שאין בו צורך (S2b) — אין צורך: 69 ms בחוט אחד ו־17 ms בעשרה על 6.0M
+  slots, int8 מדויק (`tests/vector_set_scale.rs`)
+* [x] פתיחה, זיכרון וגודל דיסק בקנה מידה של הספרייה (S2b) — 3.8 ms, ממופה, 1.686 GB
+* [ ] recall מול f32 על וקטורי הספרייה, ומחשב חלש
 * [x] reopen אחרי restart — עקבי (רשומות ספרים לא שורדות backend נדיף)
 * [x] insert/update/delete
 * [x] filtering
@@ -1633,9 +1624,9 @@ Semantic Search לא ייחשב production-ready רק כאשר הקוד מתקמ
 * [ ] זיהוי payload שנערך **יחד עם** ה־checksums שלו — רק digest מפורסם מבדיל (S6)
 * [ ] צינור שמפרסם digest, וחתימה (S6)
 * [ ] lock לשתי התקנות במקביל לאותו יעד — מתועד כמחוץ להיקף (S6, אם יידרש)
-* [ ] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי (S2b/S8)
+* [x] תקציב זמן נמדד לפתיחה ולהתקנה בגודל ייצוגי — פתיחה 3.8 ms, התקנה 5.7 s, delta 0.45 s
 * [ ] חשיפת ה־importer דרך ה־API / FFI (S5)
-* [x] packer שמפיק ארטיפקט מווקטורים מוכנים, ומצרף כל אחד לשורה שלו בקורפוס (S4a)
+* [x] `assemble` לפי מפתחות, warehouse ו־delta לצינור הבנייה של הספרייה (S7, POC)
 * [x] builder שמייצר את הווקטורים מקורפוס וממודל, ומחיל את המתכון בעצמו (S4b)
 * [ ] מימוש `CorpusIndex`/`CorpusBooks` מעל Tantivy הסופי (יתרת S4b)
 
@@ -1752,19 +1743,19 @@ Architecture
      ├── EmbeddingRuntime + backend contract
      │        └── ✅ inference אמיתי קיים (feature)
      │
-     ├── store contract (read / write)
-     │        ├── ✅ הריצה מקבלת צד קורא בלבד, וה-engine תלוי ב-trait (S2a)
-     │        └── אין ANN/mmap, וסקייל 6M לא נמדד                  (S2b)
+     ├── store v2 (oxv segments + segment sets)
+     │        ├── ✅ int8 ממופה, ממוען לפי טקסט, סריקה מדויקת        (S2–S3 של store v2)
+     │        ├── ✅ התקנה, delta, דחיסה, שחזור, scrub               (S4 של store v2)
+     │        └── ✅ 6.0M slots: פתיחה 3.8 ms, סריקה 17–69 ms        (S2b)
      │
      ├── IndexVersion
-     │        └── ✅ זהות corpus / Tantivy / ID / מודל / store מלאה  (S3)
+     │        └── ✅ text / משפחת מודל וחבילות שאילתה / store       (S5 של store v2)
      │
-     └── distribution (package + importer)
-              ├── ✅ שער אימות מלא, דחייה לפי שדה                   (S3)
-              ├── ✅ קורא שמפעיל אותו: OfficialSemanticIndex        (S2a)
-              ├── ✅ כותב: packer + פורט אל הקורפוס                  (S4a)
-              ├── ✅ builder: מתכון → embeddings → ארטיפקט           (S4b)
-              └── אין Tantivy חי, ואין חשיפה ב-FFI                  (S4b, S5)
+     └── distribution
+              ├── ✅ builder: מתכון → embeddings → base segment       (S4b)
+              ├── ✅ plan / embed-shard                              (S4b, S7)
+              ├── ✅ assemble לפי מפתחות, warehouse, delta          (S7)
+              └── resolver מעל Tantivy חי, FFI                      (P1–P4)
 ```
 
 זה דווקא מצב טוב יחסית: החוזים במקום, וכל פער הוא חיבור או הרחבה ולא שכתוב.
@@ -1785,19 +1776,21 @@ Architecture
    ↓
    5. S1 — quality dataset → dimension & precision decision
    ↓
-   6. S2b — scale measurement at 1M and 6M, then the ANN decision
+✅ 6. S2b — scale measured at 6.4M records: an exact int8 full scan, no ANN
    ↓
 ✅ 7. S3 — artifact identity contract & recoverable install (זהות, אימות בשני עומקים,
       עוגן digest)
    ↓
 ✅ 7a. S2a — read-only runtime path: the artifact's reader, and read/write split
    ↓
-✅ 7b. S4a — packer for ready-made vectors, joined to the corpus
+✅ 7b. S4a — packer for ready-made vectors (since replaced by store v2)
    ↓
-✅ 7c. S4b — the builder: corpus + model → embeddings → a verified artifact
+✅ 7c. S4b — the builder: corpus + model → embeddings → a base segment
    ↓
-   8. S4b — a CorpusIndex/CorpusBooks over the final Tantivy index
-             (otzaria_search_engine)
+✅ 7d. store v2 — content-addressed int8 segments, sets, hits and a resolver
+   ↓
+   8. the resolver and the chunkKey column over the final Tantivy index
+             (otzaria_search_engine, P1–P4); the library's build (S7)
    ↓
    9. S5 — repin, open/install API, FFI            (otzaria_search_engine)
    ↓
@@ -1909,9 +1902,13 @@ src/
 │   ├── onnx_backend.rs   → real inference (feature `onnx-backend`), the only backend
 │   ├── engine.rs         → semantic orchestration
 │   ├── manifest.rs       → index compatibility + state
-│   ├── store.rs          → in-memory vector store (the active one)
+│   ├── store.rs          → in-memory vector store (the development path)
 │   ├── store_backend.rs  → VectorStoreBackend contract
-│   ├── zevc_store.rs     → disk snapshots, full scan, not wired
+│   ├── chunk_key.rs      → ChunkKey: the address of a vector, SHA-256 of its text
+│   ├── oxv/              → the segment format, its codecs and the exact int8 scan
+│   ├── segment_set/      → the installed set: install, apply, compact, recover, GC
+│   ├── resolve.rs        → VectorHit and the CandidateResolver port
+│   ├── official_index.rs → the application's path: a set and a model, read-only
 │   ├── versioning.rs     → IndexVersion identity
 │   └── types.rs          → semantic domain types
 │
@@ -1930,10 +1927,10 @@ src/
 │
 ├── distribution/
 │   ├── package.rs        → package manifest + payload checksums
-│   ├── importer.rs       → staged install + interruption recovery
-│   │                        (its reader lives in semantic/official_index.rs)
+│   ├── importer.rs       → staged install of a package directory + recovery
 │   ├── corpus.rs         → the port onto the lexical index (CorpusIndex)
-│   └── packer.rs         → ready-made vectors → a verified artifact
+│   ├── builder.rs        → corpus + model → a base segment and its release
+│   └── shard.rs          → export_plan / embed_shard / verify_shards
 │
 ├── telemetry/            → in-process counters (no network)
 └── benchmark/            → timing & percentile helpers
@@ -1943,41 +1940,30 @@ src/
 
 # 47. The Most Important Next Task
 
-### Reach the app (the rest of S4b, then S5), then decide the representation (S1) and measure the store (S2b).
+### Reach the app: the resolver over the live index (P1–P4), then the library's build (S7).
 
-Three tasks this section used to name are **done**. Real inference runs behind
-`--features onnx-backend` — ONNX Runtime, the only backend since GGUF and llama.cpp were
-removed after `62f0c44` — verified against committed golden vectors. The read-only
-runtime path exists: the artifact has a reader, the store contract is split so the
-application holds a type with no write on it, and an installed artifact reopens after a
-restart without indexing anything (S2a). And the packer exists (S4a): ready-made vectors
-plus a corpus port produce a verified artifact, and every record is joined back to the
-line it claims — so the artifact the reader opens is now one a tool wrote, not one a test
-assembled by hand.
+Store v2 is in place: vectors are addressed by the text they were embedded from, stored as
+int8 segments that are mapped rather than read, installed base and deltas as generations
+that a crash leaves old or new, and scanned exactly — the same score, bit for bit, on every
+CPU. A scan returns keys and the books and lines they were built at; the host's
+`CandidateResolver` ties them to live lines, so an index commit never shows a vector's line
+under the wrong id. S2b is answered by measurement: at 6.0M slots the set opens in 3.8 ms
+and a warm scan takes 69 ms on one thread and 17 ms on ten — no ANN.
 
 What that leaves, in an order that is not interchangeable:
 
 ```text
-S4b a CorpusIndex/CorpusBooks over the live Tantivy index — the embeddings
-        themselves now come out of `distribution::builder`
+P1–P4 the chunkKey column, the book directory and LiveResolver, open/install/compact
+      through the FFI                                        (otzaria_search_engine)
         ↓
-S5  repin, open/install API, FFI — the app reaches the reader that already exists
+S7    the library's build: plan by key, the f32 warehouse, assemble a base or a delta
         ↓
-S1  labelled rabbinic query set
+L1/U1 publish vectors-<tag> releases; plan the updates on the device
         ↓
-    Recall@K / MRR / nDCG per representation and per dimension
-        ↓
-    frozen: embedding_text_version, dim, precision, max_tokens, pooling, norm
-        ↓
-S2b measured at 1M and 6M: cold-open, p50/p95/p99, peak RSS, disk
-        ↓
-    ANN on disk only if the measurement demands it
+      recall@10/@50 against exact f32 on the library's vectors; a weak laptop
 ```
 
-Measuring the store before S1 means choosing a storage strategy without knowing
-whether the vectors are 0.72 GiB or 23.1 GiB — a 32× spread that decides the answer
-for you. Neither decision changes the artifact contract: the dimension, the precision
-and the store format are **fields in the manifest**, not constants in this crate.
+---
 
 ---
 
@@ -1999,44 +1985,31 @@ and the store format are **fields in the manifest**, not constants in this crate
 backend, verified against golden vectors. A default build still has no backend at all, by
 design — it fails loudly rather than serving fake vectors.
 
-**Vector abstraction:** 🟢 Split in two: `VectorSearchBackend` is what the runtime
-gets, `VectorStoreBackend` adds the mutations a builder needs. The engine depends on
-the second as a trait object; the application holds the first.
+**Vector abstraction:** 🟢 The development path's store is split in two —
+`VectorSearchBackend` for a search, `VectorStoreBackend` adds the mutations indexing
+needs. The application's path holds a `SegmentSet`, which nothing on a device writes to.
 
-**Persistent vector database:** 🟢 The application path opens an installed artifact
-through `ReadOnlyZevcStore`: it persists, it reopens after a restart without indexing,
-and it reports `vectors_persisted = true` because that is now true. 🟡 What is not
-proven is the cost — opening reads every byte, hashes every record and holds every
-vector in RAM.
+**Persistent vector database:** 🟢 The application opens an installed vector set: int8
+segments, mapped, opened in 3.8 ms at 6.0M slots, reopened after a restart without
+indexing. Installs and deltas are generations; a crash leaves the old one or the new.
 
-**ANN retrieval:** 🔴 Missing — and both stores scan everything. Brute force measures
-79–132ms per query over 200k×1024 on one machine (`cargo bench` prints
-min/median/max; the spread is the machine, not the code). Extrapolated linearly, that
-is ~2.4s over the 6,058,210-line library — an extrapolation, not a measurement.
-Whether ANN is needed at all is an S2b decision that depends on the S1 dimension
-choice.
+**ANN retrieval:** 🟢 Not needed (S2b): an exact int8 full scan takes 69 ms on one
+thread and 17 ms on ten at 6.0M slots, 3.0 ms for 5% of the books. A first-pass tier is
+reserved in the format, as ancillary sections, if a weak laptop needs one.
 
-**Artifact identity:** 🟢 `IndexVersion` carries corpus digest, library version,
-Tantivy schema version, id-scheme version, model file checksum, inference backend,
-dimension, precision, pooling, token cap, embedding-text version, normalization,
-chunking and store format version. Every field is compared and every mismatch is
-named (`docs/ARTIFACT_CONTRACT.md`).
+**Identity:** 🟢 `IndexVersion` carries the line recipe and the key version, the model
+family — tokenizer, dimension, pooling, token cap, text recipe, normalization, chunking —
+with the query packages it accepts, and the store format. Every field is compared, the
+packages by membership, and every mismatch is named (`docs/ARTIFACT_CONTRACT.md`).
 
-**Artifact authenticity:** 🟡 A published digest can be required and is checked, and
-declining one has an explicit name — but nothing publishes it yet and there is no
-signature. A package that arrived over a network is currently verified against damage,
-not against forgery.
+**Authenticity:** 🟡 A published manifest digest can be required and is checked — but
+nothing publishes it yet and there is no signature. A release installed without one is
+verified against damage and the wrong release, not against forgery.
 
-**Packaging & install:** 🟡 Verification is complete and tested at two depths — full
-hashing for install, metadata plus presence for open — and the install recovers from
-both crash windows, flushes what it writes, and is tested with injected rename
-failures. A runtime path now calls it: `OfficialSemanticIndex::open` takes the verified
-token, checks the manifest's counts against the payload's content, and catches a
-same-length edit that the cheap depth cannot see. A packer now produces one, joining every
-vector to the corpus line it names before it writes and re-checking the whole artifact
-afterwards. What is missing: none of it is exposed through the FFI, the corpus it joins
-against is a transcription rather than a live Tantivy index, and no timing budget has been
-measured.
+**Install & recovery:** 🟢 Every byte is checked at install, the cheap structures at
+open, and every block by a scrub; crash injection after each install step leaves the old
+generation or the new, and a damaged `CURRENT` falls back to `PREVIOUS`. What is missing:
+none of it is exposed through the FFI yet (P4).
 
 **Hybrid fusion:** 🟢 Implemented — weighted / RRF / adaptive, chosen by profile
 

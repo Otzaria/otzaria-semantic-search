@@ -164,6 +164,8 @@ pub struct EmbeddingRuntime {
     /// The model's `model_checksum`, computed by [`Self::load`] — see
     /// [`Self::model_checksum`] for what it covers per format.
     model_checksum: Option<String>,
+    /// SHA-256 of the package's `tokenizer.json`, read by the same validation.
+    tokenizer_checksum: Option<String>,
 }
 
 impl EmbeddingRuntime {
@@ -182,6 +184,7 @@ impl EmbeddingRuntime {
             deployment,
             backend: None,
             model_checksum: None,
+            tokenizer_checksum: None,
         }
     }
 
@@ -203,7 +206,14 @@ impl EmbeddingRuntime {
         // checksum that names them all.
         let validated = validate_model(&self.config.model_path)?;
         let backend = select_backend_for(&self.config, &self.deployment)?;
-        self.adopt(backend, Some(validated.checksum().to_string()))
+        let tokenizer = validated
+            .files()
+            .iter()
+            .find(|file| file.relpath == crate::semantic::model_package::ONNX_TOKENIZER_FILE)
+            .map(|file| file.sha256.clone());
+        self.adopt(backend, Some(validated.checksum().to_string()))?;
+        self.tokenizer_checksum = tokenizer;
+        Ok(())
     }
 
     /// Install a backend after checking it agrees with this configuration.
@@ -310,6 +320,13 @@ impl EmbeddingRuntime {
         self.model_checksum.as_deref()
     }
 
+    /// SHA-256 of the loaded package's `tokenizer.json`, or `None` before a successful
+    /// load — the half of a model family's identity a package can be checked against
+    /// directly: two packages of one family share their tokenizer byte for byte.
+    pub fn tokenizer_checksum(&self) -> Option<&str> {
+        self.tokenizer_checksum.as_deref()
+    }
+
     /// Convenience wrapper over [`Self::embed_batch`]; indexing should call the
     /// batch form directly so the backend sees whole batches.
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
@@ -388,6 +405,63 @@ impl EmbeddingRuntime {
     pub fn batch_size(&self) -> usize {
         self.config.batch_size.max(1)
     }
+}
+
+/// What a CPU worker records as its device: the architecture, and — where the ONNX backend
+/// is compiled — the int8 kernels ONNX Runtime gives this CPU and whether the backend makes
+/// them exact (the x86 gate), so a shard says which products its vectors came from.
+pub fn cpu_description() -> String {
+    let arch = std::env::consts::ARCH;
+    match onnx_int8_kernels() {
+        Some(kernels) => format!("cpu {arch}: {kernels}"),
+        None => format!("cpu {arch}"),
+    }
+}
+
+#[cfg(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+))]
+fn onnx_int8_kernels() -> Option<String> {
+    Some(crate::semantic::onnx_backend::cpu_int8_kernels())
+}
+
+#[cfg(not(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+)))]
+fn onnx_int8_kernels() -> Option<String> {
+    None
 }
 
 /// L2-normalize a vector in place after checking it can be compared at all.
@@ -774,6 +848,12 @@ pub mod mock {
     /// A `tokenizer.json` in the shape of a Hugging Face tokenizer, and a whole JSON
     /// object — which is all the validator asks of it.
     pub const STUB_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"[CLS]":1,"[SEP]":2,"[QUERY]":3,"[PASSAGE]":4},"unk_token":"[UNK]"}}"#;
+
+    /// SHA-256 of [`STUB_TOKENIZER_JSON`]: the tokenizer checksum of every stub package.
+    pub fn stub_tokenizer_checksum() -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(STUB_TOKENIZER_JSON.as_bytes()))
+    }
 
     /// Write a minimal valid ONNX package into `dir` — [`onnx::stub_graph`] as
     /// `model.onnx`, and [`STUB_TOKENIZER_JSON`] beside it — and return the graph's path,

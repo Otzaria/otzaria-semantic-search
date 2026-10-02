@@ -1,15 +1,21 @@
-# Meivin Round 2 (ONNX), int8 — the default
+# Meivin Round 2 (ONNX) — the model family, int8 by default
 
-`model.json` and `chunking.json` here are the identity of an artifact built with the
-Meivin Round 2 ONNX model's **int8 graph**, `seforim-embed-round2-int8.onnx`: what such an
-artifact declares, and what `build` must be handed to produce one. It is the graph an
-application ships and the one the library's vectors are built with: the production
-identity — see `../../README.md`.
+`model.json` and `chunking.json` here are the identity of a vector set built with the
+Meivin Round 2 ONNX model: what such a set declares, and what `build` must be handed to
+produce one. `model.json` declares the **family** — the weights' source and revision, the
+tokenizer, the width, the pooling, the token cap and the text recipe — and the two packages
+of it a query may be embedded with:
 
-The model's fp32 graph, which the int8 graph was quantized from, is the reference: a
-different model with its own identity, in
-[`../meivin-round2-onnx-fp32/`](../meivin-round2-onnx-fp32/README.md), and an artifact of
-its own. Vectors from one never go into an index of the other.
+| Package | Graph | Package checksum | Role |
+|---|---|---|---|
+| int8 | `seforim-embed-round2-int8.onnx` | `9e408407…d9d065` | **the application's default**: what it ships and embeds queries with |
+| fp32 | `seforim-embed-round2-fp32.onnx` | `4a4a2ae8…2ade46` | the graph int8 was quantized from: what the library's passages are embedded with, and a query package too |
+
+A set accepts a query from either package — `model.query_packages` is compared by
+membership, every other field exactly — so a set built from fp32 passages opens with the
+int8 graph an application ships, and with the fp32 graph where an application prefers it.
+Which package embedded the passages, and on what worker, is the set's provenance: recorded,
+never compared.
 
 ## Why int8
 
@@ -42,33 +48,40 @@ it between x86 and ARM belongs to the weak-PC measurement.
 | Vectors | 256 dimensions, unit-norm, from the graph's first output (`embedding`, `float32[1, 256]`) |
 | Inputs | `input_ids` and `attention_mask`, `int64[1, sequence_length]` — the batch is fixed at one |
 
-## The package
+## The packages
 
 An ONNX model is a package: the graph `model_path` names, `tokenizer.json` beside it,
-and any external-data file the graph's tensors name (this graph has none). The
-`model_checksum` is the `otzaria-onnx-package-v1` checksum of exactly these files:
+and any external-data file the graph's tensors name (neither graph has one). A package's
+checksum is the `otzaria-onnx-package-v1` checksum of exactly these files:
 
 ```text
 otzaria-onnx-package-v1
 seforim-embed-round2-int8.onnx	42489219	659226865abd3a1bc833565ae6b2e2f48abdd7136285824a12966d4d3294cbf8
 tokenizer.json	2191362	0664287976ecb078bdfd8f5e5515dc87d8cb7f985a79a481aa1cdf7a7321c0e9
 
-model_checksum = sha256(the text above) = 9e408407922b4aab26dd148cbe4b9a0e573c65591cfc799ba28e991d77d9d065
+checksum = sha256(the text above) = 9e408407922b4aab26dd148cbe4b9a0e573c65591cfc799ba28e991d77d9d065
 ```
 
-Either implementation recomputes it from the files, and both must agree:
+```text
+otzaria-onnx-package-v1
+seforim-embed-round2-fp32.onnx	168177986	1fc2aa8f9e1a85a38c8667b4901205d2cc1f17d1e2e5acc8c676514b2d687948
+tokenizer.json	2191362	0664287976ecb078bdfd8f5e5515dc87d8cb7f985a79a481aa1cdf7a7321c0e9
+
+checksum = sha256(the text above) = 4a4a2ae88a86f15ffe6069bfcefc3abd13c207cec5d7aaef52c0c59d752ade46
+```
+
+Either implementation recomputes them from the files, and both must agree:
 
 ```sh
 python3 tools/onnx_package_checksum.py /path/to/seforim-embed-round2-int8.onnx
 cargo run -- model-checksum --model-file /path/to/seforim-embed-round2-int8.onnx
 ```
 
-The rest of the model repository is not part of the package, because none of it reaches a
+The rest of the model repository is not part of a package, because none of it reaches a
 vector: `README.md`, `LICENSE.md`, the author's `manifest.json`, `.gitattributes`, the
-export script — and `seforim-embed-round2-fp32.onnx`, which is a different model, with its
-own identity beside this one. The two graphs can share a directory: the package is the
-graph `model_path` names, and neither graph's checksum sees the other. Neither is the ONNX
-Runtime library part of it, which is found separately (the path the application passes,
+export script. The two graphs can share a directory: a package is the graph `model_path`
+names, and neither graph's checksum sees the other. Neither is the ONNX Runtime library
+part of one, which is found separately (the path the application passes,
 `OTZARIA_ONNX_RUNTIME`, or the platform's file name beside the graph) and is code, not
 model data.
 
@@ -76,15 +89,19 @@ model data.
 
 | Field | Value | Why |
 |---|---|---|
-| `model_checksum` | `9e408407…d9d065` | the package checksum above |
-| `model_quantization` | `int8` | the dynamically quantized graph; a declaration — the checksum is what tells the graphs apart |
-| `embedding_backend` | `onnxruntime-sentence-v1` | ONNX Runtime, `tokenizer.json` → `input_ids` + `attention_mask`, the first output as the sentence vector |
-| `embedding_dim` | `256` | the graph's output width |
+| `family_id` | `ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6…` | the source repository and the revision both graphs were exported at |
+| `tokenizer_checksum` | `0664287976…7321c0e9` | the SHA-256 of the `tokenizer.json` both packages carry: it decides the token ids either graph sees |
+| `embedding_dim` | `256` | the graphs' output width |
 | `pooling` | `in-graph` | the graph pools and normalizes; nothing is pooled outside it. An `.onnx` model declaring anything else is refused |
 | `max_tokens` | `256` | the total sequence length, `[CLS]`, `[SEP]` and the role token included — the cap the model's own search encoder uses |
 | `embedding_text_version` | `2` | the role prefixes: `[PASSAGE] ` before every stored passage, `[QUERY] ` before every query. They are learned special tokens |
 | `normalization_version` | `1` | the text as the corpus supplies it |
 | `chunking_identity` | `2685558872390372738` | `ChunkerConfig::identity` of `chunking.json` here: `ChunkerConfig::default`'s chunking, with `embedding_text_version` 2 |
+| `query_packages` | int8 `9e408407…`, fp32 `4a4a2ae8…` | the packages above, int8 first because it is the default; a query from any of them lands in the space |
+
+The backend that runs a package (`onnxruntime-sentence-v1` here) is no longer identity: an
+installation's backend embeds its queries, and the worker that embedded the passages —
+ONNX Runtime on a CPU, or a GPU implementation certified against it — is provenance.
 
 ## Open questions
 

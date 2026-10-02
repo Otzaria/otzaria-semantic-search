@@ -1,16 +1,15 @@
 //! S4b's acceptance gate, from outside the crate.
 //!
-//! The stage's claim is one command: a corpus and a model in, a full semantic artifact
-//! out, verified against that same corpus. S4a proved a *packer* — it took finished floats
-//! and could only check that they lined up. What is asserted here is the step before that
-//! one, and the three things only a producer can be held to:
+//! The stage's claim is one command: a corpus and a model in, a base vector package out,
+//! which the application installs and opens. What is asserted here are the three things
+//! only a producer can be held to:
 //!
 //! 1. **The recipe is applied, not described.** Which lines get a vector is derived by
 //!    running the chunker over the corpus, and the chunker configuration is pinned to the
-//!    `chunking_identity` the artifact declares.
-//! 2. **The vectors come from the model the artifact names.** The build loads it and
+//!    `chunking_identity` the package declares.
+//! 2. **The vectors come from the model the package names.** The build loads it and
 //!    compares what the file reports against what was declared.
-//! 3. **What it writes is what the runtime opens** — through the importer and the official
+//! 3. **What it writes is what the runtime opens** — through the install and the official
 //!    read path, with no fixture assembled by hand anywhere in between.
 //!
 //! Everything but the first needs an embedding backend, because a build is inference. The
@@ -18,9 +17,10 @@
 //! model is opened, which is the difference between a build that fails in a second and one
 //! that fails after loading half a gigabyte of weights.
 
+use otzaria_semantic_search::distribution::corpus::CorpusIdentity;
 use otzaria_semantic_search::distribution::corpus::{CorpusLine, CorpusLineRecord};
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,7 +34,7 @@ const BERACHOT: &str = "otzaria/mishna/berachot.txt";
 ///
 /// Two of these are not ordinary lines. `ויהי אור` is under the recipe's
 /// `min_meaningful_chars`, so it is embedded together with its neighbours; `או` is under
-/// `min_embeddable_chars`, so it is not embedded at all — and an artifact that skips it is
+/// `min_embeddable_chars`, so it is not embedded at all — and a package that skips it is
 /// complete rather than short. A corpus of uniformly long lines would let a build that
 /// ignored the recipe entirely pass every assertion below.
 const LINES: [(u64, &str, &str, u64); 5] = [
@@ -91,9 +91,11 @@ impl Drop for TempDir {
 
 fn corpus_identity() -> CorpusIdentity {
     CorpusIdentity {
-        corpus_id: "9e".repeat(32),
-        library_version: "otzaria-library-2026-08".to_string(),
-        tantivy_schema_version: 3,
+        text: otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+            1,
+        ),
+        library_version: 30,
+        library_release_tag: "v30-20260930120000".to_string(),
         document_id_scheme_version: 1,
     }
 }
@@ -168,10 +170,12 @@ fn write_fixture(dir: &Path, model: &ModelIdentity, chunking: &ChunkerConfig) ->
 /// which only a real file can supply.
 fn model_identity(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
     ModelIdentity {
-        model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
-        model_checksum: checksum.to_string(),
-        model_quantization: "int8".to_string(),
-        embedding_backend: "mock-hash-v1".to_string(),
+        family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc6".to_string(),
+        tokenizer_checksum: "7".repeat(64),
+        query_packages: vec![ModelPackage {
+            checksum: checksum.to_string(),
+            quantization: "int8".to_string(),
+        }],
         embedding_dim: DIM,
         pooling: "in-graph".to_string(),
         max_tokens: 512,
@@ -185,7 +189,7 @@ fn cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_otzaria-semantic-search"))
 }
 
-/// `chunking_identity` is a hash of the whole configuration, so an artifact cannot be read
+/// `chunking_identity` is a hash of the whole configuration, so a package cannot be read
 /// back into a recipe — the build has to be handed one, and this is what establishes it was
 /// handed the right one.
 ///
@@ -207,7 +211,7 @@ fn a_recipe_that_is_not_the_one_the_model_declares_is_refused() {
     assert_ne!(applied.identity(), declared.identity());
     let fixture = write_fixture(dir.path(), &model, &applied);
 
-    let out = dir.path().join("artifact");
+    let out = dir.path().join("package");
     let built = cli()
         .args([
             "build",
@@ -255,7 +259,7 @@ fn a_build_without_an_inference_backend_refuses_rather_than_inventing_vectors() 
     let model_file = dir.path().join("model.onnx");
     std::fs::write(&model_file, b"not a model").unwrap();
 
-    let out = dir.path().join("artifact");
+    let out = dir.path().join("package");
     let built = cli()
         .args([
             "build",
@@ -277,7 +281,7 @@ fn a_build_without_an_inference_backend_refuses_rather_than_inventing_vectors() 
 
     assert!(
         !built.status.success(),
-        "a build with no backend must not produce an artifact"
+        "a build with no backend must not produce a package"
     );
     assert!(!out.exists(), "a refused build writes nothing");
 }
@@ -288,29 +292,49 @@ fn a_build_without_an_inference_backend_refuses_rather_than_inventing_vectors() 
 #[cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 mod with_a_backend {
     use super::*;
-    use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
-    use otzaria_semantic_search::distribution::package::ArtifactExpectation;
+    use otzaria_semantic_search::cancellation::CancellationToken;
+    use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
     use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
     use otzaria_semantic_search::semantic::model_package::validate_model;
     use otzaria_semantic_search::semantic::official_index::{
         LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
     };
+    use otzaria_semantic_search::semantic::segment_set::{
+        install_package, InstallExpectation, InstallSource,
+    };
+
+    /// [`model_identity`] for the stub package: its tokenizer is the stub's.
+    fn stub_identity(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
+        ModelIdentity {
+            tokenizer_checksum: mock::stub_tokenizer_checksum(),
+            ..model_identity(checksum, chunking)
+        }
+    }
 
     /// The lines the recipe embeds: everything in `LINES` but the one below
-    /// `min_embeddable_chars`.
+    /// `min_embeddable_chars`. Their texts are all different, so each is its own vector.
     const EMBEDDED: usize = 4;
 
-    /// Pull `Digest: <value>` out of what the CLI printed.
-    fn reported_digest(stdout: &str) -> String {
+    /// The value the CLI printed after `label`.
+    fn reported(stdout: &str, label: &str) -> String {
         stdout
             .lines()
-            .find_map(|line| line.strip_prefix("Digest:"))
-            .unwrap_or_else(|| panic!("the CLI reports a digest:\n{stdout}"))
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("the CLI reports {label:?}:\n{stdout}"))
             .trim()
             .to_string()
     }
 
-    /// A stub ONNX package and the checksum an artifact must declare for it.
+    /// The SHA-256 the CLI printed for the release manifest.
+    fn reported_manifest_sha256(stdout: &str) -> String {
+        let line = reported(stdout, "Manifest:");
+        line.rsplit_once("SHA-256 ")
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("a manifest digest in {line:?}"))
+            .to_string()
+    }
+
+    /// A stub ONNX package and the checksum an identity must declare for it.
     fn write_model_file(dir: &Path) -> (PathBuf, String) {
         let path = mock::write_stub_onnx_package(&dir.join("model"));
         let checksum = validate_model(&path).unwrap().checksum().to_string();
@@ -355,190 +379,119 @@ mod with_a_backend {
         String::from_utf8_lossy(&built.stdout).to_string()
     }
 
-    /// The stage's claim, through the binary: one command from a corpus and a model to a
-    /// verified artifact, and a second command that verifies it again from nothing but the
-    /// same three inputs.
+    /// The stage's claim, through the binary and then through the application's own path:
+    /// one command from a corpus and a model to a package, which installs against the
+    /// digest the build announced, opens, and answers each line's own text with that line.
+    ///
+    /// The query is the line's text, so a build that paired a vector with the wrong line
+    /// returns the wrong position here with a perfect score.
     #[test]
-    fn one_command_turns_a_corpus_and_a_model_into_a_verified_artifact() {
+    fn one_command_builds_a_package_the_application_installs_and_queries() {
         let dir = TempDir::new("gate");
         let chunking = ChunkerConfig::default();
         let (model_file, checksum) = write_model_file(dir.path());
-        let fixture = write_fixture(dir.path(), &model_identity(&checksum, &chunking), &chunking);
+        let model = stub_identity(&checksum, &chunking);
+        let fixture = write_fixture(dir.path(), &model, &chunking);
 
-        let out = dir.path().join("artifact");
+        let out = dir.path().join("package");
         let stdout = run_build(&fixture, &model_file, &out, "2026-08-08T00:00:00Z");
-
-        assert!(
-            stdout.contains(&format!("Vectors:         {EMBEDDED}")),
+        assert_eq!(
+            reported(&stdout, "Lines embedded:"),
+            EMBEDDED.to_string(),
             "one of the {} corpus lines is below min_embeddable_chars and must not have a \
              vector:\n{stdout}",
             LINES.len()
         );
+        assert_eq!(reported(&stdout, "Vectors:"), EMBEDDED.to_string());
 
-        // Verified again from the outside, with the recipe supplied rather than assumed —
-        // which is the only way "complete" is a checkable claim about a corpus whose lines
-        // are not all embedded.
-        let validated = cli()
-            .args([
-                "validate",
-                "--artifact",
-                out.to_str().unwrap(),
-                "--corpus-identity",
-                fixture.corpus_identity.to_str().unwrap(),
-                "--corpus-lines",
-                fixture.corpus_lines.to_str().unwrap(),
-                "--model",
-                fixture.model.to_str().unwrap(),
-                "--chunking",
-                fixture.chunking.to_str().unwrap(),
-            ])
-            .output()
-            .expect("the CLI binary runs");
-
-        assert!(
-            validated.status.success(),
-            "validation failed:\n{}",
-            String::from_utf8_lossy(&validated.stderr)
-        );
-        assert_eq!(
-            reported_digest(&String::from_utf8_lossy(&validated.stdout)),
-            reported_digest(&stdout),
-            "a validation that re-derives the identity must reach the same digest"
-        );
-
-        // And without the recipe the same artifact is *incomplete*, because the plain
-        // transcription reports every line it holds — including the one nothing embeds.
-        let unplanned = cli()
-            .args([
-                "validate",
-                "--artifact",
-                out.to_str().unwrap(),
-                "--corpus-identity",
-                fixture.corpus_identity.to_str().unwrap(),
-                "--corpus-lines",
-                fixture.corpus_lines.to_str().unwrap(),
-                "--model",
-                fixture.model.to_str().unwrap(),
-            ])
-            .output()
-            .expect("the CLI binary runs");
-
-        assert!(!unplanned.status.success());
-        let stderr = String::from_utf8_lossy(&unplanned.stderr);
-        assert!(
-            stderr.contains("no vector") && stderr.contains("4294967300"),
-            "the difference must be the line the recipe skips: {stderr}"
-        );
-    }
-
-    /// A published digest is a promise that the bytes are reproducible. Two builds of the
-    /// same corpus, by the same model, under the same recipe, have to agree on it — and on
-    /// every payload byte behind it — or announcing one means nothing.
-    #[test]
-    fn two_builds_of_one_corpus_produce_the_same_artifact() {
-        let dir = TempDir::new("reproducible");
-        let chunking = ChunkerConfig::default();
-        let (model_file, checksum) = write_model_file(dir.path());
-        let fixture = write_fixture(dir.path(), &model_identity(&checksum, &chunking), &chunking);
-
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        // Different timestamps on purpose: `created_at` is excluded from the digest, so a
-        // build that let it leak into the payload would fail here.
-        let one = run_build(&fixture, &model_file, &first, "2026-08-08T00:00:00Z");
-        let two = run_build(&fixture, &model_file, &second, "2027-01-01T12:34:56Z");
-
-        assert_eq!(reported_digest(&one), reported_digest(&two));
-        for payload in ["vectors.bin", "metadata.jsonl", "book_index.json"] {
-            assert_eq!(
-                std::fs::read(first.join(payload)).unwrap(),
-                std::fs::read(second.join(payload)).unwrap(),
-                "{payload} differs between two builds of the same corpus"
-            );
-        }
-    }
-
-    /// The other half of the stage: what a build writes is what the application opens.
-    ///
-    /// Built, installed through the importer, opened through the official read path, and
-    /// queried — and the query is the *line's own text*, so a build that paired a vector
-    /// with the wrong line returns the wrong id here with a perfect score.
-    #[test]
-    fn a_built_artifact_installs_opens_and_answers_a_query() {
-        let dir = TempDir::new("runtime");
-        let chunking = ChunkerConfig::default();
-        let (model_file, checksum) = write_model_file(dir.path());
-        let model = model_identity(&checksum, &chunking);
-        let fixture = write_fixture(dir.path(), &model, &chunking);
-
-        let source = dir.path().join("build-output");
-        let stdout = run_build(&fixture, &model_file, &source, "2026-08-08T00:00:00Z");
-        let digest = reported_digest(&stdout);
-
-        let local = LocalModel {
-            model_path: model_file.clone(),
-            model_id: model.model_id.clone(),
-            model_quantization: model.model_quantization.clone(),
-            embedding_dim: model.embedding_dim,
-            pooling: model.pooling.clone(),
-            max_tokens: model.max_tokens,
-            embedding_text_version: model.embedding_text_version,
-            normalization_version: model.normalization_version,
-            chunking_identity: model.chunking_identity,
-        };
         let identity = otzaria_semantic_search::semantic::versioning::IndexVersion {
-            corpus: corpus_identity(),
+            text: corpus_identity().text,
             model: model.clone(),
             store: otzaria_semantic_search::semantic::official_index::readable_store_identity(),
         };
-
-        let target = dir.path().join("semantic_index");
-        let installed = IndexImporter::new(ImportConfig {
-            source_path: source,
-            target_store_path: target.clone(),
-        })
-        .import(&ArtifactExpectation::with_published_digest(
-            identity.clone(),
-            digest.clone(),
-        ))
+        let vectors_dir = dir.path().join("vectors");
+        let manifest_json = std::fs::read_to_string(out.join("release.json")).unwrap();
+        let applied = install_package(
+            &vectors_dir,
+            &InstallSource {
+                segment: &out.join("segment.oxv"),
+                manifest_json: &manifest_json,
+            },
+            &InstallExpectation {
+                identity: identity.clone(),
+                published_manifest_sha256: Some(reported_manifest_sha256(&stdout)),
+            },
+            &CancellationToken::new(),
+        )
         .unwrap();
-        assert_eq!(installed.vectors_imported, EMBEDDED as u32);
+        assert_eq!(applied.slots_added, EMBEDDED as u64);
+        assert_eq!(applied.library_version, 30);
 
         let index = OfficialSemanticIndex::open(OfficialIndexConfig {
-            artifact_path: target,
-            corpus: corpus_identity(),
-            model: local,
+            vectors_dir,
+            text: corpus_identity().text,
+            model: LocalModel::of_family(model_file, &model, "int8"),
             deployment: EmbeddingDeployment::default(),
-            published_digest: Some(digest),
+            scan_threads: None,
         })
         .unwrap();
-
         assert_eq!(index.identity(), &identity);
-        assert_eq!(index.vector_count(), EMBEDDED as u32);
-        assert_eq!(index.book_keys(), [BERACHOT, GENESIS]);
+        assert_eq!(index.set_info().slots_live, EMBEDDED as u64);
+        assert_eq!(index.book_count(), 2);
 
         // The lines that stand alone are embedded as themselves, so querying one is asking
-        // the index for the exact vector it stored for it.
-        for (line_id, book, text, _) in LINES {
-            if text.chars().count() < ChunkerConfig::default().min_meaningful_chars {
-                continue;
-            }
-            let hit = &index.search(text, 1, None).unwrap()[0];
-            assert_eq!(hit.metadata.line_id, line_id);
-            assert_eq!(hit.metadata.source_book_key, book);
-            // Read out of the corpus at pack time, never supplied by whatever produced the
-            // vector — the build has no second description of a book to offer.
-            assert_eq!(hit.metadata.title, corpus_line(book, text, 1).title);
-            assert_eq!(hit.metadata.reference, corpus_line(book, text, 1).reference);
-            assert!((hit.similarity_score - 1.0).abs() < 1e-5);
+        // the index for the exact vector it stored for it — at the line's position in its
+        // book, which is all a segment records about where it came from.
+        let cancel = CancellationToken::new();
+        for (ordinal, (book, text)) in [(0, (GENESIS, LINES[0].2)), (1, (GENESIS, LINES[1].2))]
+            .into_iter()
+            .chain([(0, (BERACHOT, LINES[4].2))])
+        {
+            let hit = &index.search(text, 1, None, &cancel).unwrap()[0];
+            assert_eq!(hit.key, ChunkKey::of(text));
+            assert_eq!(hit.records.len(), 1);
+            assert_eq!(
+                (&*hit.records[0].book, hit.records[0].hint),
+                (book, ordinal)
+            );
+            assert!(hit.score > 0.99, "{}", hit.score);
         }
 
         // The skipped line has no vector, and therefore no way back into a result.
         assert!(index
-            .search("או", 5, None)
+            .search("או", 5, None, &cancel)
             .unwrap()
             .iter()
-            .all(|hit| hit.metadata.line_id != 4_294_967_300));
+            .flat_map(|hit| &hit.records)
+            .all(|record| (&*record.book, record.hint) != (GENESIS, 3)));
+    }
+
+    /// A published digest is a promise that the bytes are reproducible. Two builds of the
+    /// same corpus, by the same model, under the same recipe, have to agree on the segment
+    /// and on the package digest — or announcing one means nothing.
+    #[test]
+    fn two_builds_of_one_corpus_produce_the_same_package() {
+        let dir = TempDir::new("reproducible");
+        let chunking = ChunkerConfig::default();
+        let (model_file, checksum) = write_model_file(dir.path());
+        let fixture = write_fixture(dir.path(), &stub_identity(&checksum, &chunking), &chunking);
+
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        // Different timestamps on purpose: `created_at` is excluded from the package
+        // digest, so a build that let it leak into the segment would fail here.
+        let one = run_build(&fixture, &model_file, &first, "2026-08-08T00:00:00Z");
+        let two = run_build(&fixture, &model_file, &second, "2027-01-01T12:34:56Z");
+
+        assert_eq!(
+            reported(&one, "Package digest:"),
+            reported(&two, "Package digest:")
+        );
+        assert_eq!(
+            std::fs::read(first.join("segment.oxv")).unwrap(),
+            std::fs::read(second.join("segment.oxv")).unwrap(),
+            "the segment differs between two builds of the same corpus"
+        );
     }
 }
 
@@ -556,11 +509,20 @@ mod with_a_backend {
 #[cfg(all(feature = "onnx-backend", not(feature = "mock-embedding")))]
 #[test]
 #[ignore = "needs a Meivin graph and ONNX Runtime; set OTZARIA_TEST_ONNX_MODEL and OTZARIA_ONNX_RUNTIME"]
-fn the_real_model_builds_an_artifact_that_verifies() {
-    use otzaria_semantic_search::distribution::builder::{build, BuildRequest};
+fn the_real_model_builds_a_package_that_installs_and_answers() {
+    use otzaria_semantic_search::cancellation::CancellationToken;
+    use otzaria_semantic_search::distribution::builder::{
+        build, BuildRequest, RELEASE_MANIFEST_FILENAME, SEGMENT_FILENAME,
+    };
     use otzaria_semantic_search::distribution::corpus::JsonlCorpus;
-    use otzaria_semantic_search::distribution::packer::validate_artifact;
+    use otzaria_semantic_search::semantic::embedding::EmbeddingDeployment;
     use otzaria_semantic_search::semantic::model_package::validate_model;
+    use otzaria_semantic_search::semantic::official_index::{
+        LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
+    };
+    use otzaria_semantic_search::semantic::segment_set::{
+        install_package, InstallExpectation, InstallSource,
+    };
 
     let Ok(model_file) = std::env::var("OTZARIA_TEST_ONNX_MODEL") else {
         println!(
@@ -590,48 +552,78 @@ fn the_real_model_builds_an_artifact_that_verifies() {
     // The dimension, the pooling and the token cap are the model's, not this test's:
     // declaring anything else is exactly what the build is supposed to refuse, and
     // asserting that here would be asserting the check rather than the build.
+    let package = validate_model(&model_file).unwrap();
+    let tokenizer = package
+        .files()
+        .iter()
+        .find(|file| file.relpath == "tokenizer.json")
+        .unwrap()
+        .sha256
+        .clone();
     let model = ModelIdentity {
-        model_checksum: validate_model(&model_file).unwrap().checksum().to_string(),
-        // `OnnxBackend::ID`, spelled out: the module exists on desktop targets only.
-        embedding_backend: "onnxruntime-sentence-v1".to_string(),
+        tokenizer_checksum: tokenizer,
         embedding_dim: 256,
         max_tokens: 256,
         embedding_text_version: 2,
-        ..model_identity("unused", &chunking)
+        ..model_identity(package.checksum(), &chunking)
     };
     let fixture = write_fixture(dir.path(), &model, &chunking);
 
-    let out = dir.path().join("artifact");
+    let out = dir.path().join("package");
     let report = build(
         BuildRequest {
             output_path: out.clone(),
-            model_path: model_file,
+            model_path: model_file.clone(),
             model: model.clone(),
             chunking: chunking.clone(),
             created_at: "2026-08-09T00:00:00Z".to_string(),
-            collection_name: "chunks".to_string(),
             batch_size: 4,
+            codec: otzaria_semantic_search::semantic::oxv::codec::CodecSpec::default(),
             // Real inference: the gate this flag exists for must stay shut.
             allow_non_semantic_backend: false,
         },
         &JsonlCorpus::load(&fixture.corpus_identity, &fixture.corpus_lines).unwrap(),
     )
-    .expect("the real model builds an artifact");
+    .expect("the real model builds a package");
 
     assert_eq!(
-        report.vector_count, 4,
+        report.planned_lines, 4,
         "one line is below min_embeddable_chars"
     );
-    assert_eq!(report.identity.model.embedding_dim, 256);
+    assert_eq!(report.manifest.counts.slots, 4);
+    assert_eq!(report.manifest.identity.model.embedding_dim, 256);
 
-    // Verified independently, against the same corpus seen through the same recipe.
-    let corpus = JsonlCorpus::load(&fixture.corpus_identity, &fixture.corpus_lines).unwrap();
-    let planned = otzaria_semantic_search::distribution::builder::PlannedCorpus::new(
-        &corpus, &chunking, &model,
+    // Installed against the digest the build announced, and opened by the application's
+    // path with the same package for queries.
+    let vectors_dir = dir.path().join("vectors");
+    let manifest_json = std::fs::read_to_string(out.join(RELEASE_MANIFEST_FILENAME)).unwrap();
+    install_package(
+        &vectors_dir,
+        &InstallSource {
+            segment: &out.join(SEGMENT_FILENAME),
+            manifest_json: &manifest_json,
+        },
+        &InstallExpectation {
+            identity: report.manifest.identity.clone(),
+            published_manifest_sha256: Some(report.manifest_sha256.clone()),
+        },
+        &CancellationToken::new(),
     )
     .unwrap();
+    let index = OfficialSemanticIndex::open(OfficialIndexConfig {
+        vectors_dir,
+        text: corpus_identity().text,
+        model: LocalModel::of_family(model_file, &model, "int8"),
+        deployment: EmbeddingDeployment::default(),
+        scan_threads: None,
+    })
+    .unwrap();
+    let hits = index
+        .search(LINES[4].2, 10, None, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(hits.len(), 4, "every stored vector is a candidate");
     assert_eq!(
-        validate_artifact(&out, &model, &planned).unwrap().digest,
-        report.digest
+        &*hits[0].records[0].book, BERACHOT,
+        "a passage's own text, as a query, finds the passage"
     );
 }

@@ -14,11 +14,13 @@ use otzaria_semantic_search::distribution::importer::{
     previous_path, recover_interrupted_install, ImportConfig, IndexImporter,
 };
 use otzaria_semantic_search::distribution::package::{
-    ArtifactExpectation, IndexPackage, PackageManifest, PayloadDescriptor, VerificationDepth,
+    ArtifactExpectation, IndexPackage, PackageCounts, PackageDescription, PackageKind,
+    PackageManifest, PayloadDescriptor, VerificationDepth,
 };
 use otzaria_semantic_search::errors::ArtifactError;
 use otzaria_semantic_search::semantic::versioning::{
-    CorpusIdentity, IdentityField, IdentityGroup, IndexVersion, ModelIdentity, StoreIdentity,
+    EmbeddingWorker, IdentityField, IdentityGroup, IndexVersion, ModelIdentity, ModelPackage,
+    StoreIdentity, TextIdentity, VectorProvenance,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -67,17 +69,14 @@ fn expectation() -> ArtifactExpectation {
 /// decision, which is why they are data.
 fn identity() -> IndexVersion {
     IndexVersion {
-        corpus: CorpusIdentity {
-            corpus_id: "1f".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
-            document_id_scheme_version: 1,
-        },
+        text: TextIdentity::with_line_text_version(1),
         model: ModelIdentity {
-            model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
-            model_checksum: "ab".repeat(32),
-            model_quantization: "int8".to_string(),
-            embedding_backend: "onnxruntime-sentence-v1".to_string(),
+            family_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
+            tokenizer_checksum: "7".repeat(64),
+            query_packages: vec![ModelPackage {
+                checksum: "ab".repeat(32),
+                quantization: "int8".to_string(),
+            }],
             embedding_dim: 1024,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
@@ -102,9 +101,28 @@ fn build_artifact(root: &Path, identity: IndexVersion, payload: &[u8]) -> String
     let package = IndexPackage {
         manifest: PackageManifest::new(
             identity,
+            PackageDescription {
+                kind: PackageKind::Base,
+                from_library_version: 0,
+                to_library_version: 30,
+                library_release_tag: "v30-20260930120000".to_string(),
+                counts: PackageCounts {
+                    books: 12,
+                    slots: 340,
+                    ..PackageCounts::default()
+                },
+            },
+            VectorProvenance {
+                passage_package: ModelPackage {
+                    checksum: "ab".repeat(32),
+                    quantization: "int8".to_string(),
+                },
+                worker: EmbeddingWorker {
+                    backend: "onnxruntime-sentence-v1".to_string(),
+                    device: "cpu".to_string(),
+                },
+            },
             "2026-08-06T00:00:00Z".to_string(),
-            12,
-            340,
             payload.len() as u64,
         ),
         payloads: BTreeMap::from([(
@@ -138,7 +156,7 @@ fn a_matching_artifact_installs_and_verifies_again_from_the_installed_copy() {
     let opened = IndexPackage::verify_for_open(&target, &expectation()).unwrap();
     assert_eq!(opened.identity(), &identity());
     assert_eq!(opened.payload_names(), ["vectors.bin"]);
-    assert_eq!(opened.vector_count(), 340);
+    assert_eq!(opened.counts().slots, 340);
     assert_eq!(opened.depth(), VerificationDepth::MetadataAndPresence);
 
     // The deeper check is still available, and says so.
@@ -234,13 +252,13 @@ fn every_identity_group_can_refuse_an_artifact_and_says_which_field_disagreed() 
     let dir = TempDir::new("mismatch");
 
     let cases: Vec<Divergence> = vec![
-        // Same library, one book inserted: the ids in the vectors now name other lines.
-        (IdentityField::CorpusId, |identity| {
-            identity.corpus.corpus_id = "2e".repeat(32)
+        // Keyed against lines another recipe made: no key resolves.
+        (IdentityField::LineTextVersion, |identity| {
+            identity.text.line_text_version = 2
         }),
-        // Same model id, different weights behind it.
-        (IdentityField::ModelChecksum, |identity| {
-            identity.model.model_checksum = "cd".repeat(32)
+        // The same family, and a query package the installation does not have.
+        (IdentityField::QueryPackages, |identity| {
+            identity.model.query_packages[0].checksum = "cd".repeat(32)
         }),
         // A payload layout this build does not read.
         (IdentityField::StoreFormatVersion, |identity| {
@@ -279,7 +297,7 @@ fn every_identity_group_can_refuse_an_artifact_and_says_which_field_disagreed() 
     }
 
     for group in [
-        IdentityGroup::Corpus,
+        IdentityGroup::Text,
         IdentityGroup::Model,
         IdentityGroup::Store,
     ] {

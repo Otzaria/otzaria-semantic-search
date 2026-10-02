@@ -99,8 +99,8 @@ Tantivy הרשמי  ─┐
 
 | דרישה בחוזה | מצב בקוד היום | נסגר ב־ |
 |---|---|---|
-| backend read-only מתמיד | ✅ **קיים.** מסלול הריצה הוא [`OfficialSemanticIndex`](../src/semantic/official_index.rs) מעל `ReadOnlyZevcStore`: מתמיד, ומטיפוס שאין עליו insert/delete/clear. `SemanticEngine` נשאר צד ה־build ומחזיק את החוזה הכותב | S2a ✅ |
-| אחזור שעומד בתקציב זמן/RAM בקנה מידה | **פער.** כל ה־stores סורקים הכול, `O(N·D)`, והפתיחה טוענת כל וקטור ל־RAM ומגבבת כל רשומה; אין mmap ואין ANN, והסקייל לא נמדד. **החוזה אינו אוסר ANN ואינו מחייב אותו** — הוא מחייב לעמוד בתקציב, וההכרעה נעשית לפי מדידה | S2b |
+| backend read-only מתמיד | ✅ **קיים.** מסלול הריצה הוא [`OfficialSemanticIndex`](../src/semantic/official_index.rs) מעל סט וקטורים מותקן: segments ממופים שדבר במכשיר אינו כותב אליהם. `SemanticEngine` נשאר מסלול הפיתוח | S2a ✅ |
+| אחזור שעומד בתקציב זמן/RAM בקנה מידה | ✅ **נמדד.** סריקה מלאה מדויקת של int8 ממופה: 6.0M slots נפתחים ב־3.8 ms ונסרקים ב־69 ms בחוט אחד וב־17 ms בעשרה, בלי ANN ([`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §8). מה שעוד לא נמדד: recall על וקטורי הספרייה, ומחשב חלש | S2b ✅ |
 | זהות corpus/Tantivy מלאה | ✅ **קיים.** [`IndexVersion`](../src/semantic/versioning.rs) נושא `corpus_id`, גרסת ספרייה, `tantivy_schema_version` ו־`document_id_scheme_version`, וכל שדה נבדק ב־[`IndexPackage::verify_for_install`/`verify_for_open`](../src/distribution/package.rs), שגם מסלול הריצה קורא להם. חוזה השדות: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) | S3 ✅ |
 | זהות מודל בתוך החבילה | ✅ **קיים.** `model_checksum` (SHA-256 של קובץ המודל), `embedding_backend`, quantization, pooling, ממד ו־`max_tokens` הם חלק מזהות החבילה, וקובץ מודל אחר מאחורי אותו `model_id` נדחה בשם. ראו [`MODEL_DISTRIBUTION.md`](MODEL_DISTRIBUTION.md) §2.4 | S3 ✅ |
 | אכיפה במסלול שהמשתמש מפעיל | 🟡 **חצי נסגר.** יש מסלול ריצה שאוכף: `OfficialSemanticIndex::open` מקבל `VerifiedPackage` ולא נתיב, בודק את הספירות מול תוכן ה־payload, ודוחה כל פעולה בונה בשם. מה שנשאר: **אוצריא אינה מגיעה לשם** — אין חשיפה ב־FFI ואין קריאה מהאפליקציה | S5 |
@@ -132,7 +132,7 @@ Tantivy הרשמי  ─┐
 
 1. שהמשתמש מאנדקס את הספרייה, או שיהיה מסך התקדמות אינדוקס.
 2. שקיים overlay לספרי משתמש.
-3. ש־`ZevcStore` הוא ANN, HNSW או mmap — הוא סריקה מלאה מעל `HashMap`.
+3. שהסט הרשמי הוא ANN או HNSW — הוא ממופה ונסרק במלואו, בחשבון שלמים מדויק.
 4. שאוצריא כבר מפעילה UI סמנטי.
 5. „ענן” כתיאור של המסלול — המילה שמורה לשירות מרוחק, ואין כזה.
 6. שדרישה „נאכפת”, בהסתמך על קיומו של validator או על בדיקה שעוברת. שלושה דברים

@@ -109,11 +109,12 @@ Two things the diagram deliberately does not show:
 
 - **The official read path** ([`src/semantic/official_index.rs`](src/semantic/official_index.rs))
   — the diagram is the *builder* path, which chunks, embeds and writes. The
-  application's path holds no chunker and no manifest: it opens an installed artifact
-  through `ReadOnlyZevcStore` and searches it. That store is **not** an ANN index and
-  not the `zvec` library — opening reads every byte, verifies a checksum per record and
-  loads every vector into a `HashMap`, and the search scans all of them. Whether a full
-  scan and that open can meet the budget at library scale is S2b, and it is unmeasured.
+  application's path holds no chunker and no manifest: it opens an installed vector set —
+  int8 segments addressed by the text each vector was embedded from, mapped rather than
+  read — and scans every vector exactly, in integers, the same score on every CPU. A scan
+  returns keys and the books and lines they were built at; the host's `CandidateResolver`
+  ties them to its live lines. At 6.0M slots the set opens in 3.8 ms and a warm scan takes
+  69 ms on one thread, 17 ms on ten — no ANN ([`docs/ARTIFACT_CONTRACT.md`](docs/ARTIFACT_CONTRACT.md)).
 - **The FFI boundary** — this crate stays an `rlib`. The native library, the
   `flutter_rust_bridge` bindings and Tantivy hydration live in
   `otzaria_search_engine`, which depends on this crate. Nothing in Otzaria reaches the
@@ -141,14 +142,14 @@ otzaria-semantic-search/
 │   └── vector_search.rs                ➜ Vector-search latency benchmark (harness = false)
 ├── tests/
 │   ├── artifact_contract.rs            ➜ Artifact identity & install gate, through the public API
-│   ├── artifact_builder.rs             ➜ S4b's gate: build through the CLI, reproducible, and what it builds opens
-│   ├── artifact_packer.rs              ➜ S4a's gate: pack/validate through the CLI, and what it packs opens
-│   ├── official_runtime.rs             ➜ Install → open → query an artifact, through the public API
+│   ├── artifact_builder.rs             ➜ S4b's gate: build through the CLI, reproducible, and what it builds installs and answers
+│   ├── official_runtime.rs             ➜ Build → install → open → query a vector set through a resolver
+│   ├── vector_set_scale.rs             ➜ The set at library scale, measured (#[ignore])
 │   ├── hybrid_integration_test.rs      ➜ End-to-end integration test suite
 │   └── production_backend_gate.rs      ➜ Proves a default build refuses to embed
 └── src/
     ├── lib.rs                          ➜ Library root, module exports & product contract
-    ├── main.rs                         ➜ Development CLI (audit / smoke) + the build commands: pack / validate
+    ├── main.rs                         ➜ Development CLI (audit / smoke) + the build commands: build / plan / embed-shard / adopt-shard / warehouse-add / assemble / release-files
     ├── errors.rs                       ➜ Strongly-typed error hierarchy (thiserror)
     ├── cancellation.rs                 ➜ CancellationToken: abandoning a query nobody waits for
     ├── api/
@@ -162,9 +163,9 @@ otzaria-semantic-search/
     ├── distribution/
     │   ├── package.rs                  ➜ Index package manifest & SHA-256 payload checksums
     │   ├── importer.rs                 ➜ Staged install, with recovery from an interrupted swap
-    │   ├── builder.rs                  ➜ Corpus + model → the recipe applied, embedded, and packed
+    │   ├── builder.rs                  ➜ Corpus + model → a base segment, its package and release manifest
     │   ├── corpus.rs                   ➜ The port onto the lexical index, and a two-file transcription of one
-    │   └── packer.rs                   ➜ The build side: ready-made vectors → a verified artifact
+    │   └── shard.rs                    ➜ The same build cut in two: export a plan, embed shards, check them
     ├── hybrid/
     │   ├── mod.rs                      ➜ Hybrid search module declaration
     │   ├── coordinator.rs              ➜ Hybrid search coordinator & fallback logic
@@ -176,19 +177,22 @@ otzaria-semantic-search/
     │   └── cache.rs                    ➜ Generation-invalidated query result cache
     ├── semantic/
     │   ├── mod.rs                      ➜ Semantic subsystem module declaration
-    │   ├── chunker.rs                  ➜ Anchored semantic chunking & SHA256 ID generation
+    │   ├── chunk_key.rs                ➜ ChunkKey: SHA-256 of the embedded text, the address of a vector
+    │   ├── chunker.rs                  ➜ Anchored semantic chunking; embedded_text / chunk_keys over a window
     │   ├── embedding.rs                ➜ Configuration checks, batching & L2 normalization
     │   ├── embedding_cache.rs          ➜ LRU cache of recently embedded texts
     │   ├── backend.rs                  ➜ EmbeddingBackend contract & backend selection
     │   ├── model_package.rs            ➜ The ONNX package: what a model path names, its validation & checksum
     │   ├── onnx_backend.rs             ➜ Real ONNX Runtime inference (feature `onnx-backend`), the only backend
     │   ├── engine.rs                   ➜ SemanticEngine: the build-side orchestrator; its indexing API is a prototype scaffold
-    │   ├── official_index.rs           ➜ The application's read path over a verified artifact
+    │   ├── official_index.rs           ➜ The application's read path: an installed set and a model
+    │   ├── resolve.rs                  ➜ VectorHit, and the CandidateResolver port onto live lines
+    │   ├── oxv/                        ➜ The segment format, its codecs and the exact int8 scan
+    │   ├── segment_set/                ➜ The installed set: install, apply, compact, recover, GC, scrub
     │   ├── manifest.rs                 ➜ Atomic JSON manifest versioning & Tantivy diff tracker
-    │   ├── store.rs                    ➜ Pre-normalized vector database & BinaryHeap Top-K search
-    │   ├── store_backend.rs            ➜ Two contracts: the read side the runtime gets, the write side a builder gets
-    │   ├── zevc_store.rs               ➜ The payload format: a writable opener and a read-only one (full scan, not ANN)
-    │   ├── versioning.rs               ➜ Artifact identity (corpus/model/store) & typed rejection
+    │   ├── store.rs                    ➜ The development path's in-memory store & BinaryHeap Top-K search
+    │   ├── store_backend.rs            ➜ The development path's two contracts: search, and indexing's mutations
+    │   ├── versioning.rs               ➜ Identity (text / model family / store) & typed rejection
     │   └── types.rs                    ➜ Domain models & data transfer objects (DTOs)
     └── telemetry/
         └── mod.rs                      ➜ In-process search metrics aggregation (no network)
@@ -211,11 +215,14 @@ otzaria-semantic-search/
 | **Backend Contract** | [`src/semantic/backend.rs`](src/semantic/backend.rs) | `EmbeddingBackend`, `Pooling`, `select_backend` | `Send + Sync` trait every backend implements; backends return **raw** vectors |
 | **Model Package** | [`src/semantic/model_package.rs`](src/semantic/model_package.rs) | `validate_model`, `ensure_onnx_model_path`, `OnnxPackage` | What a model path names — an ONNX graph, or a refusal — and the package around it: the graph, `tokenizer.json` and any external data, each validated, and the one checksum that names them all |
 | **Real Inference** | [`src/semantic/onnx_backend.rs`](src/semantic/onnx_backend.rs) | `OnnxBackend`, `OnnxBackendConfig` | ONNX Runtime inference behind `--features onnx-backend`, the only backend: the package's own `tokenizer.json`, one text per run, pooling in the graph; ONNX Runtime is a shared library loaded at run time, never linked |
-| **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **Volatile**, and what the builder path opens by default |
-| **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorSearchBackend`, `VectorStoreBackend` | Split in two on purpose: the runtime is handed the read side and so has no `insert` to call; the write side is what a builder gets |
-| **Payload Format** | [`src/semantic/zevc_store.rs`](src/semantic/zevc_store.rs) | `ZevcStore`, `ReadOnlyZevcStore` | Checksummed disk snapshots, opened writable by a builder and read-only by the runtime. A checksum **per record** is what catches a same-length edit. **Full scan, not ANN, not `zvec`** |
-| **Official Read Path** | [`src/semantic/official_index.rs`](src/semantic/official_index.rs) | `OfficialSemanticIndex`, `LocalModel` | Opens a `VerifiedPackage` — never a path — checks the manifest's counts against the payload's content, and refuses every build-side operation by name |
-| **Artifact Identity** | [`src/semantic/versioning.rs`](src/semantic/versioning.rs) | `IndexVersion`, `IdentityField`, `verify_matches` | Corpus, Tantivy schema, id scheme, model file, backend and store format an artifact declares. Every field compared, all mismatches named |
+| **Vector Store** | [`src/semantic/store.rs`](src/semantic/store.rs) | `VectorStore`, `VectorStoreConfig`, `StoredVectorRecord` | Pre-normalized L2 dot-product search with bounded `BinaryHeap` Top-K. **Volatile**: the development path's store |
+| **Store Contract** | [`src/semantic/store_backend.rs`](src/semantic/store_backend.rs) | `VectorSearchBackend`, `VectorStoreBackend` | The development path's store, split in two on purpose: a search is handed the read side and so has no `insert` to call |
+| **Chunk Keys** | [`src/semantic/chunk_key.rs`](src/semantic/chunk_key.rs) | `ChunkKey`, `KEY_VERSION`, `LineRef` | A vector's address: the first 16 bytes of the SHA-256 of the text it was embedded from. `column_value` is what the host's index stores per line |
+| **Segment Format** | [`src/semantic/oxv/`](src/semantic/oxv/mod.rs) | `SegmentBuilder`, `Segment`, `Codec`, `scan_segments` | `.oxv` segments: int8 vectors with a scale each (`i8-sym-vec`, the default; `i8-sym-dim` and `f32` too), keys and hints per slot, records apart from vectors; a streaming writer, a mapped reader checked by CRC, and an exact integer scan — scalar, AVX2 and NEON, bit-identical |
+| **Vector Sets** | [`src/semantic/segment_set/`](src/semantic/segment_set/mod.rs) | `SegmentSet`, `install_package`, `compact`, `scrub`, `ReleaseManifest` | The installed set: a base and deltas as generations behind `CURRENT`/`PREVIOUS`, every crash point recoverable, compaction, garbage collection that waits for Windows to unmap |
+| **Resolver Port** | [`src/semantic/resolve.rs`](src/semantic/resolve.rs) | `VectorHit`, `CandidateResolver`, `ResolvedLine`, `NoResolver` | What a scan returns — a key and where it was built — and the host's port that ties it to the lines its live index holds now |
+| **Official Read Path** | [`src/semantic/official_index.rs`](src/semantic/official_index.rs) | `OfficialSemanticIndex`, `OfficialIndexConfig`, `LocalModel` | Recovers, opens the set, loads the model, holds the set's identity to the installation's; returns hits, reloads a new generation in place, and refuses every build-side operation by name |
+| **Identity** | [`src/semantic/versioning.rs`](src/semantic/versioning.rs) | `IndexVersion`, `IdentityField`, `VectorProvenance` | The line recipe and key version, the model family with the query packages it accepts, and the store format. Every field compared — the packages by membership — all mismatches named; provenance recorded, never compared |
 | **Index Manifest** | [`src/semantic/manifest.rs`](src/semantic/manifest.rs) | `SemanticManifest`, `BookManifestEntry`, `validate` | Atomic JSON tracking (`.tmp` write + rename) & Tantivy incremental diffing |
 | **Semantic Engine** | [`src/semantic/engine.rs`](src/semantic/engine.rs) | `SemanticEngine`, `SemanticConfig` | Chunking, embedding and storage in one engine — a **prototype scaffold**: the library's vectors are built on the build machine only (`build`, `embed-shard`), and the application opens a prebuilt artifact read-only through `OfficialSemanticIndex`, embedding nothing but the query |
 | **Embedding Cache** | [`src/semantic/embedding_cache.rs`](src/semantic/embedding_cache.rs) | `EmbeddingCache` | LRU cache over recently embedded query texts |
@@ -227,14 +234,14 @@ otzaria-semantic-search/
 | **Telemetry** | [`src/telemetry/mod.rs`](src/telemetry/mod.rs) | `TelemetryCollector`, `SearchTelemetry` | In-process counters only — nothing is transmitted anywhere |
 | **Index Package** | [`src/distribution/package.rs`](src/distribution/package.rs) | `IndexPackage`, `ArtifactExpectation`, `VerifiedPackage`, `VerificationDepth` | Metadata plus a SHA-256 per payload, and the artifact digest that a published value can be compared against. `verify_for_install` hashes everything; `verify_for_open` does not, and the token records which ran |
 | **Package Install** | [`src/distribution/importer.rs`](src/distribution/importer.rs) | `IndexImporter`, `recover_interrupted_install` | Verify the source, copy to staging, verify the copy, swap. The swap is two renames with a window in between, so the intermediate names are deterministic and recovery is a documented step |
-| **Corpus Port** | [`src/distribution/corpus.rs`](src/distribution/corpus.rs) | `CorpusIndex`, `CorpusBooks`, `CorpusLine`, `JsonlCorpus` | The lexical index a packer joins against, as a trait — Tantivy is not a dependency of this crate and must not be. The corpus supplies the identity, every stored field, **and the exact set of lines the declared recipe embeds**, so there is no second description of a book to drift from the first, no silently partial artifact, and no vector for a line that should never have been embedded. `CorpusBooks` adds the corpus's *shape* — which lines share a book, and in what order — because a recipe reads a line together with its neighbours; it answers nothing about a line's contents, so the two halves cannot describe a book differently |
-| **Artifact Packer** | [`src/distribution/packer.rs`](src/distribution/packer.rs) | `pack`, `validate_artifact`, `VectorInput` | Ready-made vectors in, a verified artifact out. An input is a `line_id`, a vector and two digests: of the corpus line, which is checked and catches a vector file shifted by one row, and of the text that was actually embedded, which becomes the record's `chunk_hash` |
-| **Artifact Builder** | [`src/distribution/builder.rs`](src/distribution/builder.rs) | `build`, `BuildPlan`, `PlannedCorpus`, `BuildRequest` | A corpus and a model in, a verified artifact out. The vector, the digest of the text it was built from and the model identity come out of one pass over one model, which is the provenance the packer alone cannot establish. The set of lines to embed is derived from the recipe **before** any inference, and the recipe is pinned to the `chunking_identity` the artifact declares |
+| **Corpus Port** | [`src/distribution/corpus.rs`](src/distribution/corpus.rs) | `CorpusIndex`, `CorpusBooks`, `CorpusLine`, `JsonlCorpus` | The lexical index a build reads, as a trait — Tantivy is not a dependency of this crate and must not be. The corpus supplies the identity, every stored field, **and the exact set of lines the declared recipe embeds**, so there is no second description of a book to drift from the first, no silently partial artifact, and no vector for a line that should never have been embedded. `CorpusBooks` adds the corpus's *shape* — which lines share a book, and in what order — because a recipe reads a line together with its neighbours; it answers nothing about a line's contents, so the two halves cannot describe a book differently |
+| **Artifact Builder** | [`src/distribution/builder.rs`](src/distribution/builder.rs) | `build`, `BuildPlan`, `BuildRequest`, `BuildReport` | A corpus and a model in, a base package out: `segment.oxv`, its metadata-v3 package and `release.json`. The vector, the key of the text it was built from and the model identity come out of one pass over one model; the set of lines to embed is derived from the recipe **before** any inference, and the recipe is pinned to the declared `chunking_identity` |
+| **Sharded Build** | [`src/distribution/shard.rs`](src/distribution/shard.rs) | `export_plan`, `embed_shard`, `verify_shards`, `read_vector_inputs` | The same work cut in two: the recipe applied where the corpus is, the inference where the model is, every shard checked against the plan before a byte is read |
 | **Benchmark Harness** | [`src/benchmark/mod.rs`](src/benchmark/mod.rs) | `measure`, `aggregate`, `QuerySet` | Timing and percentile helpers. A measurement tool, **not** a relevance dataset |
 | **Integration Test** | [`tests/hybrid_integration_test.rs`](tests/hybrid_integration_test.rs) | feature-gated integration tests | End-to-end public-API suite using the explicit mock backend |
-| **Official Runtime Test** | [`tests/official_runtime.rs`](tests/official_runtime.rs) | feature-gated integration tests | Builds an artifact the way the packer does, installs it, opens it, and asserts a query returns the `line_id` it was built from — plus that every build-side call is refused and the artifact is never written to |
-| **Builder Test** | [`tests/artifact_builder.rs`](tests/artifact_builder.rs) | integration tests, most feature-gated | S4b end to end through the binary: a corpus and a model in, an artifact out that re-validates to the same digest, two builds producing byte-identical payloads, and the line the recipe skips absent from both the artifact and every result. A mismatched recipe is refused in a default build, before a model is opened — as is a build with no inference backend compiled in |
-| **Packer Test** | [`tests/artifact_packer.rs`](tests/artifact_packer.rs) | integration tests, one feature-gated | S4a end to end through the binary a pipeline runs: pack, re-validate, two independent packs producing byte-identical payloads, and misaligned or partial input refused. Then what the packer wrote is installed, opened and queried — with no fixture assembled by hand in between. (The "extra vector" half of coverage needs a corpus that can tell "exists" from "is embedded" apart, which the JSONL transcription cannot, so it is exercised in the packer's own tests.) |
+| **Official Runtime Test** | [`tests/official_runtime.rs`](tests/official_runtime.rs) | feature-gated integration tests | Builds a package, installs it, opens it, and queries it through the coordinator with a resolver standing in for the live index: the ids are the resolver's, two books sharing an id stay apart, a line whose text changed is not shown, the cache follows the resolver's generation and a reload, and every build-side call is refused with nothing written |
+| **Builder Test** | [`tests/artifact_builder.rs`](tests/artifact_builder.rs) | integration tests, most feature-gated | S4b end to end through the binary: a corpus and a model in, a package out that installs against the digest the build printed and finds each line by its own text; two builds produce the same segment, and the line the recipe skips is absent from every result. A mismatched recipe is refused in a default build, before a model is opened — as is a build with no inference backend compiled in |
+| **Scale Test** | [`tests/vector_set_scale.rs`](tests/vector_set_scale.rs) | `#[ignore]`d measurement | A synthetic set with the v30 library's shape at N records: write, install, open, scan, a delta and compaction, timed |
 | **CI Workflow** | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | `check-and-test` | Multi-platform GitHub Actions CI workflow (Linux, Windows, macOS) |
 
 ---
@@ -242,8 +249,9 @@ otzaria-semantic-search/
 ## 🚀 Roadmap & Implementation Status
 
 The stages below are the plan of record from
-[שלבי ויעדי התקדמות.md](שלבי%20ויעדי%20התקדמות.md). S4a is the packer in this repo and
-S4b is the builder above it; what remains of S4b, and S5–S8, land in
+[שלבי ויעדי התקדמות.md](שלבי%20ויעדי%20התקדמות.md). S4b is the builder in this repo, and
+store v2 — content-addressed int8 segments, installed sets, hits and a resolver — is the
+store under all of it; the resolver over a live index, and S5–S8, land in
 `otzaria_search_engine` and `otzaria`.
 
 ```text
@@ -260,9 +268,9 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
 │ [✔] S0  Product contract alignment (this section, and the docs around it)        │
 │ [ ] S1  Representation quality & dimension/precision decision                    │
 │ [✔] S2a Read-only runtime path: the artifact's reader, read/write store split    │
-│ [ ] S2b Scale: cold-open, latency, RSS and disk at 1M/6M — then the ANN decision │
+│ [✔] S2b Scale: 6.0M slots open in 3.8 ms, scan in 17–69 ms — no ANN             │
 │ [✔] S3  Artifact contract: identity, two depths, recoverable install, reader     │
-│ [✔] S4a Packer: ready-made vectors + a corpus join → a verified artifact         │
+│ [✔] S4a Packer (since replaced by store v2's segments, built by key)             │
 │ [~] S4b Builder: corpus + model → embeddings → artifact. Live Tantivy remains    │
 │ [ ] S5  Repin, open/install API, explicit statuses, FFI (otzaria_search_engine)  │
 │ [ ] S6  Artifact & model management in the app (otzaria)                         │
@@ -277,16 +285,15 @@ S4b is the builder above it; what remains of S4b, and S5–S8, land in
    - Measure `line` versus `title + reference + line` versus neighbour context on a labelled rabbinic query set.
    - Choose 1024/512/256/128 dimensions and f32/f16/int8 on measured Recall@K, MRR and nDCG — the size arithmetic (~23.1 GiB at f32/1024 for 6.1M lines) is why this matters.
    - Freeze `embedding_text_version`, dimension, precision, `max_tokens`, pooling and normalization into the index identity.
-2. **Scale measurement (S2b)** — the read-only path exists; what it costs is unknown:
-   - Run `ZevcStore` as a correctness baseline at 1M and 6M records, and measure cold-open, p50/p95/p99, peak RSS and disk. Opening currently reads every byte, verifies a checksum per record and holds every vector in RAM.
-   - Move to a real on-disk ANN only if the measurement says a full scan cannot meet the budget — not because "ANN" sounds faster. `VectorSearchBackend` is the seam either answer slots into.
+2. **Scale measurement (S2b)** — answered: at 6.4M records (6.0M slots) a set opens in
+   3.8 ms and an exact int8 scan takes 69 ms on one thread and 17 ms on ten, so there is no
+   ANN. Still to measure: recall against exact f32 on the library's own vectors, and a weak
+   laptop.
 3. **Official artifact contract (S3) and its reader (S2a)** — identity, two verification
    depths, the published-digest anchor, a recoverable install, and a runtime path that
    opens the verified token landed; see
    [docs/ARTIFACT_CONTRACT.md](docs/ARTIFACT_CONTRACT.md). What is left:
-   - Publish the artifact digest (and sign it): the check exists, and `pack` now prints the value, but nobody publishes it (S6).
-   - Decide whether the distributed artifact is a single archive rather than a directory. The packer writes a directory, so this is entirely a distribution decision (S6).
-   - Measure open and install against a budget on a representative artifact (S2b/S8).
+   - Publish the release manifest's digest (and sign it): the check exists, and `build` prints the value, but nobody publishes it yet.
 4. **A `CorpusIndex` over a live Tantivy index (S4b, in `otzaria_search_engine`)** — the
    [builder](src/distribution/builder.rs) now produces the vectors itself, from a corpus
    and a model, so what is left of S4b is the one thing Tantivy owns:

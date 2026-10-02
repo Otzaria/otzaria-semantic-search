@@ -74,6 +74,15 @@ pub enum SemanticSearchError {
         requirement: &'static str,
     },
 
+    /// The application's resolver could not tie the vectors a scan returned to live lines
+    /// — its index could not be read, say. The semantic side of that one search fails, and
+    /// the search degrades to its lexical results as it does for any other semantic failure.
+    ///
+    /// Distinct from a hit that resolves nowhere, which is not an error: a vector whose
+    /// text no live line holds any more is skipped, and counted.
+    #[error("The semantic results could not be resolved to live lines: {reason}")]
+    Resolution { reason: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -90,6 +99,17 @@ impl From<VectorStoreError> for SemanticSearchError {
         match error {
             VectorStoreError::Cancelled => Self::Cancelled,
             other => Self::VectorStore(other),
+        }
+    }
+}
+
+/// A cancelled resolution is a cancelled search, as a cancelled scan is; any other failure
+/// of the index is [`SemanticSearchError::Resolution`].
+impl From<crate::semantic::resolve::ResolveError> for SemanticSearchError {
+    fn from(error: crate::semantic::resolve::ResolveError) -> Self {
+        match error {
+            crate::semantic::resolve::ResolveError::Cancelled => Self::Cancelled,
+            crate::semantic::resolve::ResolveError::Index { reason } => Self::Resolution { reason },
         }
     }
 }
@@ -327,7 +347,7 @@ pub enum ArtifactError {
         declared: u32,
     },
 
-    /// The artifact describes a different corpus, model or store format than this
+    /// The artifact describes a different line recipe, model or store format than this
     /// installation. Lists every disagreement, not the first.
     #[error(
         "Artifact does not match this installation: {}",
@@ -384,6 +404,27 @@ pub enum ArtifactError {
     #[error("Invalid install target: {reason}")]
     InvalidInstallTarget { reason: String },
 
+    /// A delta that is not the next step for the vector set it was offered to.
+    ///
+    /// `field` names what disagreed: `delta.from_library_version` for a delta that starts
+    /// past the set's library version, or overlaps it — a gap, which applying would paper
+    /// over with vectors the set never had — and `delta.codec_params` for one quantized in
+    /// another codec epoch, whose bytes mean something else. A delta the set has already
+    /// absorbed is not this error; it is reported as already applied.
+    #[error("The delta does not apply to this vector set: {field} — {reason}")]
+    DeltaDoesNotApply { field: &'static str, reason: String },
+
+    /// The device lacks the free space an install or a compaction needs.
+    ///
+    /// `available` is what the filesystem reported, or — where it could not be asked — what
+    /// the operation managed to write before the device filled up. Nothing was installed or
+    /// replaced, and the partial output was removed.
+    #[error(
+        "Not enough free space: the operation needs {needed} byte(s) and {available} are \
+         available"
+    )]
+    InsufficientSpace { needed: u64, available: u64 },
+
     /// A crash interrupted an install and the leftovers could not be resolved.
     ///
     /// Distinct from [`Self::Io`] because the caller's next step is different: the
@@ -417,58 +458,42 @@ pub enum PackError {
     #[error("The corpus could not be read: {reason}")]
     Corpus { reason: String },
 
-    /// The output path is not somewhere a whole artifact can be written: it is not a
+    /// The output path is not somewhere a whole package can be written: it is not a
     /// directory, or it is one that already holds files.
     ///
-    /// A non-empty directory is refused rather than merged into: the payload writer would
-    /// otherwise *load* an artifact already sitting there and append to it, and the result
-    /// would carry vectors this run never saw and never joined to the corpus.
-    #[error("Cannot pack into {path}: {reason}")]
+    /// A non-empty directory is refused rather than merged into: what is already there is
+    /// evidence of an earlier build, and a package written over it would describe files
+    /// this run never wrote.
+    #[error("Cannot build into {path}: {reason}")]
     UnusableOutput { path: String, reason: String },
 
     #[error("The vector input is malformed: {reason}")]
     MalformedInput { reason: String },
 
-    /// One input vector is not the width the model identity declares. The uniform
-    /// dimension the artifact promises is checked per vector, not sampled.
-    #[error(
-        "The vector for line {line_id} holds {found} value(s), and the model declares {expected}"
-    )]
-    VectorDimensionMismatch {
-        line_id: u64,
-        expected: u32,
-        found: usize,
-    },
-
-    /// A vector no search could ever return — a non-finite component, an overflowing
-    /// norm, or no direction at all. Refused at pack time because the alternative is a
-    /// record that exists, counts, and is unreachable.
-    #[error("The vector for line {line_id} cannot be searched: {reason}")]
-    UnusableVector { line_id: u64, reason: String },
-
-    /// Two vectors claim the same line. One of them would silently replace the other in
-    /// the payload, and the artifact would ship with a count nobody can explain.
+    /// Two books, or two entries of one book, claim the same line: built, it would be
+    /// recorded twice, at two positions.
     #[error("line_id {line_id} appears more than once in the input")]
     DuplicateLineId { line_id: u64 },
 
-    #[error("line_id {line_id} has a vector but no document in the corpus")]
+    /// A book lists a line the corpus holds no document for.
+    #[error("line_id {line_id} is listed under a book and the corpus holds no such line")]
     LineNotInCorpus { line_id: u64 },
 
-    /// The vectors and the corpus do not describe the same set of lines.
+    /// The vectors and the plan do not describe the same set of lines.
     ///
     /// Checked in **both** directions, because they are different faults and neither is
     /// visible any other way:
     ///
     /// * *missing* — lines the recipe embeds that got no vector. A library missing most of
-    ///   itself still produces an artifact whose counts, checksums and identity all agree,
-    ///   so one good vector out of six million would otherwise pack successfully.
+    ///   itself still produces a package whose counts, checksums and identity all agree,
+    ///   so one good vector out of six million would otherwise build successfully.
     /// * *unexpected* — vectors for lines the recipe does **not** embed. Distinct from
     ///   [`Self::LineNotInCorpus`], which is a line the corpus has never heard of: this one
     ///   exists and is answerable, it simply should not have been embedded. A line too
-    ///   short to carry meaning acquiring a vector means the artifact was built by a recipe
+    ///   short to carry meaning acquiring a vector means the package was built by a recipe
     ///   other than the one it declares.
     #[error(
-        "The artifact covers {covered} line(s) and the corpus expects {expected}: \
+        "The vectors cover {covered} line(s) and the plan expects {expected}: \
          {missing} have no vector{}, and {unexpected} vector(s) name a line the recipe \
          does not embed{}",
         describe_first(*first_missing),
@@ -485,60 +510,8 @@ pub enum PackError {
         first_unexpected: Option<u64>,
     },
 
-    /// The vector was produced from text this corpus does not hold for that line.
-    ///
-    /// This is the check that catches the failure the whole join exists for: a vector
-    /// file and an id list that drifted apart by one, or were sorted differently. Nothing
-    /// about the vectors themselves would ever reveal it.
-    #[error(
-        "The vector for line {line_id} was built from text the corpus does not hold for \
-         it: it declares {declared}, and the corpus line hashes to {actual}"
-    )]
-    LineTextMismatch {
-        line_id: u64,
-        declared: String,
-        actual: String,
-    },
-
-    /// A record inside a written artifact disagrees with the corpus it claims to
-    /// describe. This is what "the builder must not restate Tantivy's metadata" is
-    /// enforced by.
-    #[error(
-        "The artifact's record for line {line_id} declares {field}={artifact:?}, and the \
-         corpus says {corpus:?}"
-    )]
-    RecordDisagreesWithCorpus {
-        line_id: u64,
-        field: &'static str,
-        artifact: String,
-        corpus: String,
-    },
-
-    /// Vectors were accepted and did not reach the payload — a `semantic_id` collision
-    /// is the way this happens. Counted rather than assumed, because the payload writer
-    /// replaces on collision instead of failing.
-    #[error("{accepted} vector(s) were accepted and the payload holds {stored}")]
-    VectorCountChanged { accepted: u32, stored: u32 },
-
     #[error("There is nothing to pack: the input holds no vectors")]
     NoVectors,
-
-    /// The ledger being reused from describes a different vector space.
-    ///
-    /// A digest names a vector only within one model, one backend, one pooling and one
-    /// recipe. Two artifacts can agree that a line's embedding text hashes to the same
-    /// value and still hold vectors that cannot be compared to each other — so reuse is
-    /// refused unless every field of the identity matches, including the ones that look
-    /// cosmetic.
-    #[error(
-        "The ledger was built under {field}={ledger:?} and this build uses {build:?}: its \
-         vectors describe a different space and cannot be reused"
-    )]
-    LedgerDisagreesWithBuild {
-        field: &'static str,
-        ledger: String,
-        build: String,
-    },
 
     /// A plan record's text is not the text its digest names.
     ///
@@ -549,11 +522,12 @@ pub enum PackError {
     /// passage the library does not contain while carrying a `chunk_hash` that says
     /// otherwise.
     #[error(
-        "The plan's text for line {line_id} hashes to {actual}, and the plan declares \
+        "The plan's text for record {record} hashes to {actual}, and the plan declares \
          {declared}: what reached this worker is not what was exported"
     )]
     PlanTextChanged {
-        line_id: u64,
+        /// The record's position in the plan.
+        record: u64,
         declared: String,
         actual: String,
     },

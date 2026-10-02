@@ -9,6 +9,13 @@
 > נמדדו על מודל ה־GGUF ונשמרים כרשומה. מודל ה־ONNX, Meivin Round 2, הוא 256 ממדים — כ־6 GB
 > ב־f32 לכל הספרייה — וזמני ה־inference שלו על M4 ב־`ONNX_BACKEND.md` §7. הארכיטקטורה —
 > ledger לפי digest של טקסט ה־embedding, וה־shards — אינה תלויה במודל.
+>
+> **אחרי store v2:** הארטיפקט של גרסה 1 והפקודות `pack`, `validate`, `plan-split`,
+> `assemble` ו־`ledger` הוסרו. וקטורים ממוענים עכשיו לפי הטקסט שהוטמע (`ChunkKey`),
+> ושחרור הוא segment של base או של delta לצד manifest
+> ([`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md)); צינור הבנייה לפי מפתחות — plan,
+> warehouse ו־`assemble` — הוא S7. מה שכתוב כאן על ה־ledger, על `pack` ועל `metadata.jsonl`
+> נשמר כרשומה.
 
 ## 1. המספרים
 

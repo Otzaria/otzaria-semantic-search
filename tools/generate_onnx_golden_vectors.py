@@ -9,8 +9,8 @@ to, reached through their Python bindings instead of through this crate. What th
 has to reproduce is therefore the model's own wiring, not a second copy of ours.
 
 Each graph has its own golden file (GRAPHS below): the int8 graph, which is the default
-identity (config/models/meivin-round2-onnx/), into tests/data/onnx_golden_vectors_int8.json,
-and the fp32 graph it was quantized from (config/models/meivin-round2-onnx-fp32/) into
+package (config/models/meivin-round2-onnx/), into tests/data/onnx_golden_vectors_int8.json,
+and the fp32 graph it was quantized from (the same family's other package) into
 tests/data/onnx_golden_vectors.json. They are different models -- their vectors agree at
 cosine 0.999, not 1 -- so neither file may describe the other's graph.
 

@@ -125,10 +125,12 @@ impl OtzariaHybridEngine {
             ranking: request.ranking,
         };
 
+        // The facade serves a self-built index, which resolves its own hits.
         self.coordinator.search_cancellable(
             &request.query,
             request.lexical_candidates,
             &params,
+            &crate::semantic::resolve::NoResolver,
             cancel,
         )
     }

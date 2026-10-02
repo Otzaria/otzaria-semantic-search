@@ -1,30 +1,29 @@
-//! S4b in this crate: a corpus and a model in, a verified artifact out.
+//! S4b in this crate: a corpus and a model in, a base vector package out.
 //!
-//! [`packer`](crate::distribution::packer) takes finished floats and can only check that
-//! they line up with the corpus. This module produces them — it opens the model, applies
-//! the recipe to the corpus, embeds the text it derived, and hands the results to the same
-//! packer. Everything the packer already enforces still runs; what changes is who the
-//! producer is.
+//! The development one-shot of a build. It opens the model, applies the recipe to the
+//! corpus, embeds every distinct text the recipe derives, and writes what an installation
+//! takes: a base [segment](crate::semantic::oxv) holding every (book, key) pair of the
+//! corpus, the metadata-v3 package around it, and the release manifest that describes both
+//! (see [`install_package`](crate::semantic::segment_set::install_package)). The library is
+//! built on machines that never see the corpus (see [`shard`](super::shard)); this is the
+//! same recipe, the same model checks and the same segment, in one process and in memory.
 //!
 //! # What that closes
 //!
-//! S4a's two digests are an alignment check and nothing more: a producer that hashed the
-//! corpus at pack time rather than at embedding time satisfies both, and no tool receiving
-//! finished vectors can tell. Here the vector, `embedding_text_sha256` and the model
-//! identity come out of one pass over one model:
+//! A tool handed finished floats can only check that they line up with the corpus. Here
+//! the vector, its key and the model identity come out of one pass over one model:
 //!
-//! * the text that is hashed is the same `String` that is handed to the backend, in the
-//!   same expression — there is no path by which one can describe the other;
-//! * `model_checksum`, `embedding_backend`, `embedding_dim`, `pooling` and the effective
-//!   `max_tokens` are **reported by the loaded runtime** and compared against what the
-//!   artifact declares, so the declaration is a checked claim rather than a copied string.
+//! * the text that is hashed into the key is the same `String` that is handed to the
+//!   backend — there is no path by which one can describe the other;
+//! * `tokenizer_checksum`, `embedding_dim`, `pooling`, the effective `max_tokens` and the
+//!   package checksum are **reported by the loaded runtime** and compared against what the
+//!   identity declares, so the declaration is a checked claim rather than a copied string.
 //!
 //! "Reported by the runtime" rather than "read from the file", because they are not all the
-//! same kind of fact: the checksum is of the bytes on disk; the width and the token cap are
-//! what the weights actually carry; the backend id is which implementation was selected;
-//! and pooling is what that implementation performs. All five are settled by the thing that
-//! is about to produce the vectors, which is what makes comparing them worth anything —
-//! but only the first three are properties of the file.
+//! same kind of fact: the checksums are of the bytes on disk; the width and the token cap
+//! are what the weights actually carry; and pooling is what the selected implementation
+//! performs. All of them are settled by the thing that is about to produce the vectors,
+//! which is what makes comparing them worth anything.
 //!
 //! The three **recipe versions** — `chunking_version`, `embedding_text_version` and
 //! `normalization_version` — are not properties of a model at all. They are versions of
@@ -34,9 +33,10 @@
 //! the **text**; L2 normalization of the finished vector is an unconditional invariant of
 //! cosine and is deliberately not versioned. See [`recipe`](crate::semantic::recipe).
 //!
-//! What is left declared and unverifiable: `model_id` and `model_quantization`. Nothing in
-//! an ONNX package states either in a form anything here could check, and inventing a
-//! check that reads them from the same place that wrote them would prove nothing.
+//! What is left declared and unverifiable: `family_id` and each package's quantization.
+//! Nothing in an ONNX package states either in a form anything here could check, and
+//! inventing a check that reads them from the same place that wrote them would prove
+//! nothing.
 //!
 //! **One window stays open, and is not closed here.** The checksum is computed, and then
 //! the backend opens the same path again; a model file swapped between those two reads
@@ -47,72 +47,103 @@
 //! # The plan comes before the inference
 //!
 //! [`BuildPlan`] is the set of lines the recipe embeds, derived from the corpus and the
-//! chunker configuration **before a single vector exists**. It is then what
-//! [`PlannedCorpus`] answers `expected_line_ids` with, so the packer's coverage check
-//! compares what was produced against what was intended.
+//! chunker configuration **before a single vector exists**. The embedding pass derives the
+//! same set again, line by line, and a build whose two passes disagree is refused as
+//! [`PackError::CoverageMismatch`]: the corpus changed underneath it.
 //!
-//! Deriving that set from the vectors instead would make the check confirm itself: a batch
-//! that died halfway, or a book the corpus stopped answering for, would disappear from both
-//! sides at once and the artifact would be certified complete for the subset that happened
-//! to survive.
+//! Deriving that set from the vectors instead would make the check confirm itself: a book
+//! the corpus stopped answering for would disappear from both sides at once and the
+//! package would be certified complete for the part that happened to survive.
 //!
 //! # The recipe cannot be guessed, so it is supplied and pinned
 //!
-//! `chunking_identity` in an artifact is a one-way hash of a whole [`ChunkerConfig`]. A
-//! build is therefore handed the configuration itself, and [`BuildPlan::compute`] refuses
-//! one whose identity is not the value the artifact will declare. Without that, the model
-//! identity would be a label on a recipe nobody applied.
+//! `chunking_identity` is a one-way hash of a whole [`ChunkerConfig`]. A build is
+//! therefore handed the configuration itself, and [`BuildPlan::compute`] refuses one whose
+//! identity is not the value the package will declare. Without that, the model identity
+//! would be a label on a recipe nobody applied.
 //!
 //! # What it costs
 //!
 //! Each line is chunked twice — once to plan, once to embed — and read from the corpus
-//! twice with it. Holding every embedded text between the two passes would cost more than
-//! recomputing it, and the second read is not waste: it is what proves the corpus still
-//! says what the plan assumed. The packer then reads each line a third time to join the
-//! finished vector back. All three are build-machine costs, and none is on a device.
+//! twice with it; the second read is what proves the corpus still says what the plan
+//! assumed. Every distinct vector is held as floats until the codec is calibrated on all
+//! of them, which is what makes this a development path: the library's build streams.
 
-use crate::distribution::corpus::{CorpusBooks, CorpusIndex, CorpusLine};
-use crate::distribution::packer::{
-    compose_identity, ensure_output_is_free, pack, PackReport, PackRequest, VectorInput,
-};
+use crate::distribution::corpus::{CorpusBooks, CorpusLine};
+use crate::distribution::package::{IndexPackage, PackageKind};
 use crate::errors::PackError;
 use crate::semantic::backend::Pooling;
+use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::official_index::readable_store_identity;
+use crate::semantic::oxv::codec::CodecSpec;
+use crate::semantic::oxv::reader::Segment;
+use crate::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
 use crate::semantic::recipe::EmbeddingRecipe;
+use crate::semantic::segment_set::ReleaseManifest;
 use crate::semantic::types::{BookForIndexing, BookLine, SemanticChunk};
-use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use crate::semantic::versioning::{
+    EmbeddingWorker, IndexVersion, ModelIdentity, StoreIdentity, VectorProvenance,
+};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// The segment's name in a built package — the one payload of the package a release
+/// manifest describes.
+pub const SEGMENT_FILENAME: &str = "segment.oxv";
+
+/// The release manifest a build writes beside its package: with the segment, what an
+/// installation is handed.
+pub const RELEASE_MANIFEST_FILENAME: &str = "release.json";
 
 /// What to build, beyond the corpus.
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
-    /// Directory the artifact is written into. Must not exist, or be an empty directory.
+    /// Directory the package is written into. Must not exist, or be an empty directory.
     pub output_path: PathBuf,
-    /// The ONNX graph the vectors are produced with, its package beside it. The package
-    /// checksum has to be the one `model.model_checksum` declares.
+    /// The ONNX graph the vectors are produced with, its package beside it. Its checksum
+    /// has to be one of `model.query_packages`.
     pub model_path: PathBuf,
-    /// What the artifact will declare about how its vectors were made. The half a model
-    /// file can answer for is checked against it; see the module documentation for the
-    /// half that cannot be.
+    /// The model family the package declares. The half a model file can answer for is
+    /// checked against it; see the module documentation for the half that cannot be.
     pub model: ModelIdentity,
     /// The recipe itself. `model.chunking_identity` is its hash, and a disagreement is
     /// [`PackError::RecipeMismatch`].
     pub chunking: ChunkerConfig,
     pub created_at: String,
-    pub collection_name: String,
-    /// Texts per inference call. Also the granularity at which vectors reach the packer,
-    /// so it bounds what a build holds beyond the payload itself.
+    /// Texts per inference call.
     pub batch_size: usize,
+    /// The codec the segment is written in: `i8-sym-vec` unless a test or a study asks
+    /// otherwise. It is the store identity's `vector_precision`, and the application reads
+    /// the default only.
+    pub codec: CodecSpec,
     /// Permit a backend whose vectors carry no meaning.
     ///
     /// `false` in anything that ships. The deterministic stand-in produces vectors that
-    /// are structurally perfect and semantically empty, and an artifact built from them
+    /// are structurally perfect and semantically empty, and a package built from them
     /// passes every check in this crate — so the refusal has to be here, where the backend
     /// is still identifiable, rather than downstream where it is not.
     pub allow_non_semantic_backend: bool,
+}
+
+/// What a build wrote.
+#[derive(Debug, Clone)]
+pub struct BuildReport {
+    pub output_path: PathBuf,
+    /// As written to [`RELEASE_MANIFEST_FILENAME`]: the identity, the counts, the segment's
+    /// digest and the package digest.
+    pub manifest: ReleaseManifest,
+    /// SHA-256 of the release manifest's bytes: the value a publisher announces outside it,
+    /// and an installation expects as
+    /// [`published_manifest_sha256`](crate::semantic::segment_set::InstallExpectation).
+    pub manifest_sha256: String,
+    /// Lines the recipe embeds.
+    pub planned_lines: usize,
+    /// Components the codec clipped.
+    pub clipped_components: u64,
 }
 
 /// The lines a recipe embeds, decided before anything is embedded.
@@ -124,7 +155,6 @@ pub struct BuildRequest {
 /// comparison says so.
 #[derive(Debug, Clone)]
 pub struct BuildPlan {
-    chunking_identity: u64,
     line_ids: BTreeSet<u64>,
 }
 
@@ -142,16 +172,16 @@ impl BuildPlan {
         chunking: &ChunkerConfig,
         model: &ModelIdentity,
     ) -> Result<Self, PackError> {
-        let chunking_identity = ensure_recipe_matches(chunking, model)?;
+        ensure_recipe_matches(chunking, model)?;
         let chunker = Chunker::new(chunking.clone())?;
         let mut line_ids = BTreeSet::new();
         let mut books = 0usize;
         for book_key in corpus.book_keys()? {
             books += 1;
             for chunk in chunks_for_book(corpus, &chunker, &book_key)? {
-                // Two books claiming one line, or one book listing it twice. The packer
-                // would reject it later as a duplicate; saying so here names the recipe's
-                // input instead of the vector stream, which is where the fault is.
+                // Two books claiming one line, or one book listing it twice. Built, it
+                // would be recorded twice, under two positions; refusing here names the
+                // corpus, which is where the fault is.
                 if !line_ids.insert(chunk.line_id) {
                     return Err(PackError::DuplicateLineId {
                         line_id: chunk.line_id,
@@ -163,10 +193,7 @@ impl BuildPlan {
         if line_ids.is_empty() {
             return Err(PackError::NothingToEmbed { books });
         }
-        Ok(Self {
-            chunking_identity,
-            line_ids,
-        })
+        Ok(Self { line_ids })
     }
 
     /// How many lines will be embedded. Reported before the model is asked for anything,
@@ -183,72 +210,6 @@ impl BuildPlan {
     /// The planned ids, in ascending order.
     pub fn line_ids(&self) -> &BTreeSet<u64> {
         &self.line_ids
-    }
-}
-
-/// A corpus seen through the recipe that will be applied to it.
-///
-/// The only thing it changes is the answer to [`CorpusIndex::expected_line_ids`]: the
-/// underlying corpus reports which lines it *holds*, and this reports which lines the
-/// recipe *embeds*. Those are different questions, and only the second one is coverage —
-/// a line too short to carry meaning exists perfectly well and must not get a vector.
-///
-/// It is also what lets a corpus with no opinion on the recipe — the JSONL transcription,
-/// which records a recipe that was already applied — be packed against one anyway. Wrap it,
-/// and the expected set is derived rather than assumed.
-pub struct PlannedCorpus<'a> {
-    corpus: &'a dyn CorpusBooks,
-    plan: BuildPlan,
-}
-
-impl<'a> PlannedCorpus<'a> {
-    pub fn new(
-        corpus: &'a dyn CorpusBooks,
-        chunking: &ChunkerConfig,
-        model: &ModelIdentity,
-    ) -> Result<Self, PackError> {
-        let plan = BuildPlan::compute(corpus, chunking, model)?;
-        Ok(Self { corpus, plan })
-    }
-
-    pub fn plan(&self) -> &BuildPlan {
-        &self.plan
-    }
-}
-
-impl CorpusIndex for PlannedCorpus<'_> {
-    fn identity(&self) -> Result<CorpusIdentity, PackError> {
-        self.corpus.identity()
-    }
-
-    /// The plan's ids — but only for the recipe the plan was computed for.
-    ///
-    /// The model reaches this method a second time, from inside the packer, and it need not
-    /// be the one the plan was built with: a caller can wrap a corpus once and pack twice.
-    /// Answering anyway would be certifying coverage for a recipe that was never applied,
-    /// which is exactly what the parameter exists to prevent.
-    fn expected_line_ids(&self, model: &ModelIdentity) -> Result<BTreeSet<u64>, PackError> {
-        if model.chunking_identity != self.plan.chunking_identity {
-            return Err(PackError::RecipeMismatch {
-                declared: model.chunking_identity,
-                actual: self.plan.chunking_identity,
-            });
-        }
-        Ok(self.plan.line_ids.clone())
-    }
-
-    fn line(&self, line_id: u64) -> Result<Option<CorpusLine>, PackError> {
-        self.corpus.line(line_id)
-    }
-}
-
-impl CorpusBooks for PlannedCorpus<'_> {
-    fn book_keys(&self) -> Result<Vec<String>, PackError> {
-        self.corpus.book_keys()
-    }
-
-    fn book_line_ids(&self, book_key: &str) -> Result<Vec<u64>, PackError> {
-        self.corpus.book_line_ids(book_key)
     }
 }
 
@@ -271,15 +232,16 @@ pub(crate) fn ensure_recipe_matches(
     Ok(actual)
 }
 
-/// Build an official artifact from a corpus and a model.
+/// Build a base vector package from a corpus and a model.
 ///
 /// The order is cost, not taste — each step is the cheapest way to fail that is still
 /// available:
 ///
 /// 1. Refuse an output path that already holds something. Nothing else is worth doing if
 ///    the result cannot be written.
-/// 2. Refuse an identity with a field left unfilled — one read of the corpus identity, and
-///    it is fatal at the end of a build just as surely as at the start.
+/// 2. Refuse an identity with a field left unfilled, or a release tag a segment cannot
+///    carry — one read of the corpus identity, and fatal at the end of a build just as
+///    surely as at the start.
 /// 3. Refuse a recipe that is not the declared one: five integers hashed, no model and no
 ///    corpus.
 /// 4. Load the model, and hold the declared identity to what the file reports — before six
@@ -287,54 +249,137 @@ pub(crate) fn ensure_recipe_matches(
 /// 5. Refuse a backend whose vectors are not semantic, unless the caller has said otherwise
 ///    in as many words.
 /// 6. Plan: apply the recipe to the whole corpus.
-/// 7. Embed, book by book, and hand the results to [`pack`], which performs every check S4a
-///    performs — including comparing the ids produced against the plan.
+/// 7. Embed, book by book in byte order of their names, every text whose key has no slot
+///    yet; a key's first appearance takes the next slot, a later one in another book is an
+///    extra record of it, and the plan is derived again and compared.
+/// 8. Calibrate the codec on those vectors; write the segment, the package around it —
+///    which hashes the segment again before describing it — and the release manifest.
 ///
-/// Steps 1–6 write nothing. Step 7 writes nothing until the payload commits, so any
-/// rejection up to that point leaves the output directory empty and the run can simply be
-/// repeated.
-pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<PackReport, PackError> {
+/// Steps 1–7 write nothing, so any rejection up to there leaves the output directory empty
+/// and the run can simply be repeated. The release manifest is written last, under a
+/// temporary name renamed into place: a directory without one holds nothing an
+/// installation takes, and the next attempt refuses it rather than writing over it.
+pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildReport, PackError> {
     ensure_output_is_free(&request.output_path)?;
-    compose_identity(corpus, &request.model)?;
+    let corpus_identity = corpus.identity()?;
+    let identity = IndexVersion {
+        text: corpus_identity.text.clone(),
+        model: request.model.clone(),
+        // The layout this build reads, in the codec asked for.
+        store: StoreIdentity {
+            vector_precision: request.codec.name().to_string(),
+            ..readable_store_identity()
+        },
+    };
+    identity.validate_complete()?;
+    crate::distribution::package::validate_release_tag(&corpus_identity.library_release_tag)?;
     // Every version the build is about to act under, settled before anything is opened:
     // the chunker will resolve them again from the same configuration, and the text
-    // normalization is applied there, where the digest of the embedded string is computed.
+    // normalization is applied there, where the key of the embedded string is computed.
     EmbeddingRecipe::resolve(&request.chunking, &request.model)?;
     ensure_recipe_matches(&request.chunking, &request.model)?;
-    let runtime = load_model(&request)?;
+    let (runtime, provenance) = load_model(&request)?;
 
-    let planned = PlannedCorpus::new(corpus, &request.chunking, &request.model)?;
+    let plan = BuildPlan::compute(corpus, &request.chunking, &request.model)?;
     log::info!(
         "The recipe embeds {} line(s) of {}",
-        planned.plan().len(),
+        plan.len(),
         request.output_path.display()
     );
+    let assembled = embed_corpus(corpus, &runtime, &request, &plan)?;
 
-    let inputs = PlannedEmbeddings::new(&planned, &runtime, &request.chunking, request.batch_size)?;
+    let dim = request.model.embedding_dim as usize;
+    let vectors: Vec<&[f32]> = assembled.vectors.chunks_exact(dim).collect();
+    let codec = request
+        .codec
+        .build(dim, &vectors)
+        .map_err(|reason| PackError::MalformedInput {
+            reason: format!("the codec cannot be built: {reason}"),
+        })?;
 
-    pack(
-        PackRequest {
-            output_path: request.output_path,
-            model: request.model,
-            created_at: request.created_at,
-            collection_name: request.collection_name,
+    let root = &request.output_path;
+    std::fs::create_dir_all(root).map_err(io_error(format!("creating {}", root.display())))?;
+    let mut segment = SegmentBuilder::new(
+        SegmentSpec {
+            kind: PackageKind::Base,
+            identity_digest: identity.identity_digest(),
+            from_library_version: 0,
+            to_library_version: corpus_identity.library_version,
+            library_release_tag: corpus_identity.library_release_tag.clone(),
         },
-        inputs,
-        &planned,
-    )
+        codec,
+    );
+    for book in &assembled.books {
+        segment
+            .add_book(&book.name, &book.primary, &book.extras, &[])
+            .map_err(io_error(format!("assembling book {:?}", book.name)))?;
+    }
+    let codec_params_sha256 = segment.codec().params_sha256();
+    let segment_path = root.join(SEGMENT_FILENAME);
+    let written = (|| {
+        let mut sink = segment.write(&segment_path)?;
+        for vector in &vectors {
+            sink.push_f32(vector)?;
+        }
+        sink.finish()
+    })()
+    .map_err(io_error(format!("writing {}", segment_path.display())))?;
+
+    let manifest = ReleaseManifest::for_segment(
+        &written,
+        &identity,
+        codec_params_sha256,
+        provenance,
+        request.created_at.clone(),
+    );
+    IndexPackage::write(root, &manifest.package())?;
+    // What the package's own check cannot see: the tables inside the segment.
+    Segment::open(&segment_path)?;
+
+    let json = manifest.to_json();
+    let manifest_path = root.join(RELEASE_MANIFEST_FILENAME);
+    let partial = root.join(format!("{RELEASE_MANIFEST_FILENAME}.partial"));
+    (|| {
+        // Flushed through the handle that wrote it: Windows refuses to flush a handle
+        // opened only for reading.
+        let mut file = std::fs::File::create(&partial)?;
+        io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&partial, &manifest_path)?;
+        crate::distribution::package::sync_dir(root)
+    })()
+    .map_err(io_error(format!("writing {}", manifest_path.display())))?;
+
+    log::info!(
+        "Built {}: {} vector(s) and {} further record(s) across {} book(s), {} bytes",
+        root.display(),
+        written.counts.slots,
+        written.counts.extras,
+        written.counts.books,
+        written.size
+    );
+    Ok(BuildReport {
+        output_path: request.output_path,
+        manifest_sha256: format!("{:x}", Sha256::digest(json.as_bytes())),
+        manifest,
+        planned_lines: plan.len(),
+        clipped_components: written.clipped_components,
+    })
 }
 
-/// Open the model and prove it is the one the artifact will name.
+/// Open the model and prove it is a package of the family the artifact will name.
 ///
 /// The runtime refuses a width or a pooling that disagrees with the loaded backend before
-/// this returns, so two of the five comparisons below can only fail through it. They are
-/// listed anyway: this table is the statement of what the loaded runtime can be held to,
-/// and leaving a field out of it because something else happens to cover it today is how
-/// such a check quietly stops covering it.
+/// this returns, so two of the comparisons below can only fail through it. They are listed
+/// anyway: this table is the statement of what the loaded runtime can be held to, and
+/// leaving a field out of it because something else happens to cover it today is how such
+/// a check quietly stops covering it.
 ///
-/// Not all five are facts about the *file* — see the module header. The checksum is; the
-/// backend id is which implementation was selected for it.
-fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
+/// The package itself has to be one of the family's: its checksum among
+/// `query_packages`, which is also where the precision it is recorded under comes from.
+/// What it is, and the backend that ran it, become the artifact's provenance.
+fn load_model(request: &BuildRequest) -> Result<(EmbeddingRuntime, VectorProvenance), PackError> {
     let declared = &request.model;
     let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
         model_path: request.model_path.clone(),
@@ -347,14 +392,9 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
 
     for (field, declared, loaded) in [
         (
-            "model_checksum",
-            declared.model_checksum.clone(),
-            runtime.model_checksum().unwrap_or_default().to_string(),
-        ),
-        (
-            "embedding_backend",
-            declared.embedding_backend.clone(),
-            runtime.backend_id().unwrap_or_default().to_string(),
+            "tokenizer_checksum",
+            declared.tokenizer_checksum.clone(),
+            runtime.tokenizer_checksum().unwrap_or_default().to_string(),
         ),
         (
             "embedding_dim",
@@ -384,13 +424,37 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
         }
     }
 
+    let checksum = runtime.model_checksum().unwrap_or_default();
+    let package = declared
+        .query_packages
+        .iter()
+        .find(|package| package.checksum == checksum)
+        .ok_or_else(|| PackError::ModelDisagreesWithFile {
+            field: "query_packages",
+            declared: declared
+                .query_packages
+                .iter()
+                .map(|package| format!("{} {}", package.quantization, package.checksum))
+                .collect::<Vec<_>>()
+                .join(", "),
+            loaded: checksum.to_string(),
+        })?
+        .clone();
+
     if !runtime.backend_is_semantic() && !request.allow_non_semantic_backend {
         return Err(PackError::NonSemanticBackend {
             backend: runtime.backend_id().unwrap_or("none").to_string(),
         });
     }
 
-    Ok(runtime)
+    let provenance = VectorProvenance {
+        passage_package: package,
+        worker: EmbeddingWorker {
+            backend: runtime.backend_id().unwrap_or("none").to_string(),
+            device: "cpu".to_string(),
+        },
+    };
+    Ok((runtime, provenance))
 }
 
 /// The recipe applied to one book: the corpus's lines in corpus order, chunked.
@@ -399,20 +463,27 @@ fn load_model(request: &BuildRequest) -> Result<EmbeddingRuntime, PackError> {
 /// recipe has exactly one implementation, and a build applies *that* one rather than a
 /// second reading of it.
 ///
-/// The book-level metadata below reaches nothing that is stored: a chunk's title, facets
-/// and content hash are discarded here, and the packer reads every stored field from
-/// [`CorpusIndex::line`] instead. What the chunker actually consumes is each line's text,
-/// its `section_id` and its position in the list.
+/// The book-level metadata below reaches nothing that is stored: a segment stores a book's
+/// name, and each line's key and position. What the chunker actually consumes is each
+/// line's text, its `section_id` and its position in the list.
 pub(crate) fn chunks_for_book(
     corpus: &dyn CorpusBooks,
     chunker: &Chunker,
     book_key: &str,
 ) -> Result<Vec<SemanticChunk>, PackError> {
+    Ok(chunk_book_lines(corpus, chunker, book_key)?.1)
+}
+
+/// [`chunks_for_book`], with the book's line ids in the order they were read.
+pub(crate) fn chunk_book_lines(
+    corpus: &dyn CorpusBooks,
+    chunker: &Chunker,
+    book_key: &str,
+) -> Result<(Vec<u64>, Vec<SemanticChunk>), PackError> {
     let line_ids = corpus.book_line_ids(book_key)?;
     let mut lines = Vec::with_capacity(line_ids.len());
     /// The book-level fields, taken from whichever line comes first. None of them reaches
-    /// the artifact, so a book whose lines disagreed about its title would still be
-    /// described by [`CorpusIndex::line`] alone when the packer builds the records.
+    /// the segment, so a book whose lines disagreed about its title builds all the same.
     struct BookFields {
         title: String,
         content_hash: u64,
@@ -421,7 +492,7 @@ pub(crate) fn chunks_for_book(
     }
     let mut book_fields: Option<BookFields> = None;
 
-    for line_id in line_ids {
+    for &line_id in &line_ids {
         let line = corpus
             .line(line_id)?
             .ok_or(PackError::LineNotInCorpus { line_id })?;
@@ -476,7 +547,7 @@ pub(crate) fn chunks_for_book(
         });
     };
 
-    Ok(chunker.chunk_book(&BookForIndexing {
+    let chunks = chunker.chunk_book(&BookForIndexing {
         source_book_key: book_key.to_string(),
         title: book.title,
         content_fingerprint: book.content_hash,
@@ -484,151 +555,192 @@ pub(crate) fn chunks_for_book(
         topics: String::new(),
         extra_facets: book.facets,
         lines,
-    }))
+    });
+    Ok((line_ids, chunks))
 }
 
-/// The corpus, chunked and embedded, one batch at a time.
-///
-/// An iterator rather than a `Vec` because the packer consumes one at a time, so a build
-/// never holds a second complete copy of the payload the writer is accumulating.
-///
-/// What it does hold, stated rather than implied: **one book's chunks and one batch of
-/// vectors.** A book is chunked whole because neighbour context needs the lines around a
-/// line, so `pending` is as large as the longest book in the corpus — that is the number to
-/// measure, not the batch size. Both are inside the same S2b measurement as the payload
-/// writer, and neither is on a device.
-///
-/// The first error ends the stream. Continuing after one would mean the packer sees a
-/// truncated set and reports a coverage mismatch — a second, louder symptom of a fault
-/// already named precisely.
-struct PlannedEmbeddings<'a> {
-    corpus: &'a dyn CorpusBooks,
-    runtime: &'a EmbeddingRuntime,
-    chunker: Chunker,
-    batch_size: usize,
-    books: std::vec::IntoIter<String>,
-    /// Chunks of the book being worked through, still to embed.
-    pending: std::vec::IntoIter<SemanticChunk>,
-    /// Embedded and ready to hand over.
-    ready: std::vec::IntoIter<VectorInput>,
-    failed: bool,
+/// One book's records, as a segment stores them.
+struct AssembledBook {
+    name: String,
+    /// `(key, hint)` of each record whose key got its slot in this book, in hint order.
+    primary: Vec<(ChunkKey, u32)>,
+    /// `(hint, slot)` of each record whose key already had a slot.
+    extras: Vec<(u32, u32)>,
 }
 
-impl<'a> PlannedEmbeddings<'a> {
-    fn new(
-        corpus: &'a dyn CorpusBooks,
-        runtime: &'a EmbeddingRuntime,
-        chunking: &ChunkerConfig,
-        batch_size: usize,
-    ) -> Result<Self, PackError> {
-        Ok(Self {
-            corpus,
-            runtime,
-            chunker: Chunker::new(chunking.clone())?,
-            // A batch of zero would embed nothing forever.
-            batch_size: batch_size.max(1),
-            books: corpus.book_keys()?.into_iter(),
-            pending: Vec::new().into_iter(),
-            ready: Vec::new().into_iter(),
-            failed: false,
-        })
+/// Every book's records, and every distinct vector in slot order.
+struct Assembled {
+    books: Vec<AssembledBook>,
+    /// `slots × embedding_dim` floats.
+    vectors: Vec<f32>,
+}
+
+/// Apply the recipe to every book and embed what it derives, assigning slots the way a
+/// segment stores them: books in byte order of their names, each book's lines in order, and
+/// a key takes the next slot the first time it appears. A later appearance in another book
+/// is an extra record of that slot; a later appearance in the same book is not recorded at
+/// all, because a record is a book and a key, and its hint is the first line that has it.
+///
+/// A line's hint is its position in the book as [`CorpusBooks::book_line_ids`] lists it —
+/// the line's ordinal, in the application's terms.
+///
+/// What it holds: one book's chunks, and every distinct vector so far.
+fn embed_corpus(
+    corpus: &dyn CorpusBooks,
+    runtime: &EmbeddingRuntime,
+    request: &BuildRequest,
+    plan: &BuildPlan,
+) -> Result<Assembled, PackError> {
+    let chunker = Chunker::new(request.chunking.clone())?;
+    // A batch of zero would embed nothing forever.
+    let batch_size = request.batch_size.max(1);
+    let dim = request.model.embedding_dim as usize;
+
+    let mut book_keys = corpus.book_keys()?;
+    book_keys.sort_unstable();
+    if let Some(pair) = book_keys.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(PackError::Corpus {
+            reason: format!("book {:?} is listed twice", pair[0]),
+        });
     }
 
-    /// Fill [`Self::ready`] from the next batch that has one, or report the corpus is
-    /// exhausted.
-    fn refill(&mut self) -> Result<bool, PackError> {
-        loop {
-            let batch: Vec<SemanticChunk> = self.pending.by_ref().take(self.batch_size).collect();
-            if !batch.is_empty() {
-                self.ready = self.embed(batch)?.into_iter();
-                return Ok(true);
-            }
-            let Some(book_key) = self.books.next() else {
-                return Ok(false);
-            };
-            self.pending = chunks_for_book(self.corpus, &self.chunker, &book_key)?.into_iter();
-        }
-    }
-
-    /// Embed one batch, and pair each vector with the digests of the two texts it came
-    /// from.
-    ///
-    /// `embedding_text` is hashed and handed to the backend in the same breath, which is
-    /// what makes the recorded `chunk_hash` describe the text that was actually embedded
-    /// rather than a text that was merely available. `anchor_text` is the corpus line
-    /// verbatim, so its digest is what the packer will compare against a fresh read of the
-    /// corpus.
-    fn embed(&self, batch: Vec<SemanticChunk>) -> Result<Vec<VectorInput>, PackError> {
-        let texts: Vec<&str> = batch
-            .iter()
-            .map(|chunk| chunk.embedding_text.as_str())
-            .collect();
-        let vectors = self.runtime.embed_batch(&texts)?;
-
-        // The runtime already refuses a short batch from a backend; this is the same
-        // invariant one layer up, where `zip` would silently drop the tail instead.
-        if vectors.len() != batch.len() {
-            return Err(PackError::MalformedInput {
+    let mut slots: HashMap<ChunkKey, u32> = HashMap::new();
+    let mut vectors = Vec::new();
+    let mut books = Vec::with_capacity(book_keys.len());
+    let mut chunked = BTreeSet::new();
+    for name in book_keys {
+        let (line_ids, chunks) = chunk_book_lines(corpus, &chunker, &name)?;
+        if line_ids.len() > crate::semantic::oxv::format::HINT_MASK as usize {
+            return Err(PackError::Corpus {
                 reason: format!(
-                    "{} vector(s) came back for {} text(s)",
-                    vectors.len(),
-                    batch.len()
+                    "book {name:?} holds {} lines, more than a hint can name",
+                    line_ids.len()
                 ),
             });
         }
+        let ordinals: HashMap<u64, u32> = line_ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, line_id)| (*line_id, ordinal as u32))
+            .collect();
 
-        Ok(batch
-            .into_iter()
-            .zip(vectors)
-            .map(|(chunk, vector)| VectorInput {
-                line_id: chunk.line_id,
-                source_line_sha256: sha256_hex(chunk.anchor_text.as_bytes()),
-                embedding_text_sha256: sha256_hex(chunk.embedding_text.as_bytes()),
-                vector,
-            })
-            .collect())
-    }
-}
-
-impl Iterator for PlannedEmbeddings<'_> {
-    type Item = Result<VectorInput, PackError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.failed {
-                return None;
+        let mut book = AssembledBook {
+            name,
+            primary: Vec::new(),
+            extras: Vec::new(),
+        };
+        let mut recorded = HashSet::new();
+        let mut texts = Vec::new();
+        for chunk in chunks {
+            chunked.insert(chunk.line_id);
+            let hint = ordinals[&chunk.line_id];
+            // The string the backend is handed below, and nothing derived from it.
+            let key = ChunkKey::of(&chunk.embedding_text);
+            if !recorded.insert(key) {
+                continue;
             }
-            if let Some(input) = self.ready.next() {
-                return Some(Ok(input));
-            }
-            match self.refill() {
-                Ok(true) => continue,
-                Ok(false) => return None,
-                Err(error) => {
-                    self.failed = true;
-                    return Some(Err(error));
+            match slots.get(&key) {
+                Some(&slot) => book.extras.push((hint, slot)),
+                None => {
+                    slots.insert(key, slots.len() as u32);
+                    book.primary.push((key, hint));
+                    texts.push(chunk.embedding_text);
                 }
             }
         }
+
+        for batch in texts.chunks(batch_size) {
+            let batch: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let embedded = runtime.embed_batch(&batch)?;
+            // The runtime already refuses a short batch from a backend; this is the same
+            // invariant one layer up, where the slots would silently shift instead.
+            if embedded.len() != batch.len() || embedded.iter().any(|v| v.len() != dim) {
+                return Err(PackError::MalformedInput {
+                    reason: format!(
+                        "{} vector(s) came back for {} text(s) of book {:?}, and each must \
+                         be {dim} wide",
+                        embedded.len(),
+                        batch.len(),
+                        book.name
+                    ),
+                });
+            }
+            for vector in embedded {
+                vectors.extend_from_slice(&vector);
+            }
+        }
+        books.push(book);
     }
+
+    if chunked != *plan.line_ids() {
+        let missing: Vec<u64> = plan.line_ids().difference(&chunked).copied().collect();
+        let unexpected: Vec<u64> = chunked.difference(plan.line_ids()).copied().collect();
+        return Err(PackError::CoverageMismatch {
+            expected: plan.len(),
+            covered: chunked.len(),
+            missing: missing.len(),
+            unexpected: unexpected.len(),
+            first_missing: missing.first().copied(),
+            first_unexpected: unexpected.first().copied(),
+        });
+    }
+    Ok(Assembled { books, vectors })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+/// Refuse an output path that is not an empty place to write a whole package.
+pub(crate) fn ensure_output_is_free(path: &Path) -> Result<(), PackError> {
+    let unusable = |reason: String| PackError::UnusableOutput {
+        path: path.display().to_string(),
+        reason,
+    };
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(PackError::Io {
+                context: format!("inspecting {}", path.display()),
+                source,
+            })
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(unusable("it exists and is not a directory".to_string()));
+    }
+
+    let entries = std::fs::read_dir(path)
+        .map_err(|source| PackError::Io {
+            context: format!("listing {}", path.display()),
+            source,
+        })?
+        .count();
+    if entries > 0 {
+        return Err(unusable(format!(
+            "it already holds {entries} entr{}, and a build writes a whole package",
+            if entries == 1 { "y" } else { "ies" }
+        )));
+    }
+    Ok(())
+}
+
+fn io_error(context: String) -> impl FnOnce(io::Error) -> PackError {
+    move |source| PackError::Io { context, source }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::corpus::{CorpusLineRecord, JsonlCorpus};
-    use crate::distribution::package::{ArtifactExpectation, IndexPackage};
+    use crate::cancellation::CancellationToken;
+    use crate::distribution::corpus::{CorpusIdentity, CorpusIndex, CorpusLineRecord, JsonlCorpus};
     use crate::semantic::chunker::compute_chunk_hash;
     use crate::semantic::embedding::mock;
     use crate::semantic::model_package::validate_model;
-    use crate::semantic::versioning::IndexVersion;
-    use crate::semantic::zevc_store::ReadOnlyZevcStore;
-    use std::collections::HashMap;
-    use std::path::Path;
+    use crate::semantic::oxv::scan::ScanRequest;
+    use crate::semantic::segment_set::{
+        install_package, InstallExpectation, InstallSource, SegmentSet,
+    };
+    use crate::semantic::versioning::ModelPackage;
+    use std::collections::BTreeMap;
 
     const DIM: u32 = 64;
     const GENESIS: &str = "otzaria/tanach/genesis.txt";
@@ -671,9 +783,9 @@ mod tests {
 
     fn corpus_identity() -> CorpusIdentity {
         CorpusIdentity {
-            corpus_id: "5c".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
+            text: crate::semantic::versioning::TextIdentity::with_line_text_version(1),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         }
     }
@@ -739,10 +851,12 @@ mod tests {
 
     fn model_for(checksum: &str, chunking: &ChunkerConfig) -> ModelIdentity {
         ModelIdentity {
-            model_id: "otzaria-embedding-v1".to_string(),
-            model_checksum: checksum.to_string(),
-            model_quantization: "int8".to_string(),
-            embedding_backend: "mock-hash-v1".to_string(),
+            family_id: "otzaria-embedding-v1".to_string(),
+            tokenizer_checksum: crate::semantic::embedding::mock::stub_tokenizer_checksum(),
+            query_packages: vec![ModelPackage {
+                checksum: checksum.to_string(),
+                quantization: "int8".to_string(),
+            }],
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
@@ -773,32 +887,31 @@ mod tests {
             model,
             chunking,
             created_at: "2026-08-08T00:00:00Z".to_string(),
-            collection_name: "chunks".to_string(),
             batch_size: 2,
+            codec: CodecSpec::default(),
             allow_non_semantic_backend: true,
         }
     }
 
-    /// Every stored record of an artifact, keyed by `line_id`.
-    fn stored_records(
-        path: &Path,
-        model: &ModelIdentity,
-    ) -> HashMap<u64, crate::semantic::types::VectorMetadata> {
-        let identity = IndexVersion {
-            corpus: corpus_identity(),
-            model: model.clone(),
-            store: crate::semantic::official_index::readable_store_identity(),
-        };
-        let verified = IndexPackage::verify_for_install(
-            path,
-            &ArtifactExpectation::without_published_digest(identity),
-        )
-        .unwrap();
-        let store = ReadOnlyZevcStore::open(&verified).unwrap();
-        store
-            .stored_metadata()
-            .map(|record| (record.line_id, record.clone()))
-            .collect()
+    /// Every record of a built segment: `(book, hint)` to the key's hex and whether the
+    /// record holds the key's slot.
+    fn stored_records(report: &BuildReport) -> BTreeMap<(String, u32), (String, bool)> {
+        let segment = Segment::open(&report.output_path.join(SEGMENT_FILENAME)).unwrap();
+        let mut records = BTreeMap::new();
+        for book in segment.books() {
+            for slot in book.slots.clone() {
+                let entry = (segment.key(slot).to_hex(), true);
+                records.insert((book.name.to_string(), segment.hint(slot)), entry);
+            }
+            for extra in book.extras.clone() {
+                let (slot, hint) = segment.extra(extra);
+                records.insert(
+                    (book.name.to_string(), hint),
+                    (segment.key(slot).to_hex(), false),
+                );
+            }
+        }
+        records
     }
 
     /// The recipe decides what gets a vector, and it is not "every line the corpus holds".
@@ -845,35 +958,6 @@ mod tests {
             }
             other => panic!("a recipe that is not the declared one must be refused, got {other:?}"),
         }
-    }
-
-    /// A wrapped corpus is not a corpus that answers for any recipe. The packer asks it a
-    /// second time, with whatever model the caller passed there, and answering that with a
-    /// set derived from a different one would certify coverage nobody built.
-    #[test]
-    fn a_planned_corpus_answers_only_for_the_recipe_it_planned() {
-        let dir = TempDir::new("planned_model");
-        let corpus = standard_corpus(&dir);
-        let chunking = ChunkerConfig::default();
-        let model = model_for(&"ab".repeat(32), &chunking);
-        let planned = PlannedCorpus::new(&corpus, &chunking, &model).unwrap();
-
-        assert_eq!(planned.expected_line_ids(&model).unwrap().len(), 3);
-        assert_eq!(planned.identity().unwrap(), corpus_identity());
-        assert_eq!(
-            planned.line(4_294_967_297).unwrap().unwrap().text,
-            LONG,
-            "the wrapper changes the expected set and nothing else"
-        );
-
-        let other = ModelIdentity {
-            chunking_identity: model.chunking_identity ^ 1,
-            ..model.clone()
-        };
-        assert!(matches!(
-            planned.expected_line_ids(&other),
-            Err(PackError::RecipeMismatch { .. })
-        ));
     }
 
     /// An empty plan would produce an artifact that verifies and holds nothing. Refused
@@ -968,8 +1052,8 @@ mod tests {
         ));
     }
 
-    /// Two books claiming one line. The packer would refuse the duplicate vector later;
-    /// refusing here names the corpus, which is where the fault actually is.
+    /// Two books claiming one line. Built, the line would be recorded in both; refusing
+    /// here names the corpus, which is where the fault actually is.
     #[test]
     fn two_books_claiming_one_line_are_refused() {
         struct Shared(JsonlCorpus);
@@ -1032,20 +1116,23 @@ mod tests {
             &corpus,
         )
         .unwrap();
-        assert_eq!(report.vector_count, 3);
+        assert_eq!(report.manifest.counts.slots, 3);
 
         for (field, wrong) in [
             (
-                "model_checksum",
+                "query_packages",
                 ModelIdentity {
-                    model_checksum: "cd".repeat(32),
+                    query_packages: vec![ModelPackage {
+                        checksum: "cd".repeat(32),
+                        quantization: "int8".to_string(),
+                    }],
                     ..truthful.clone()
                 },
             ),
             (
-                "embedding_backend",
+                "tokenizer_checksum",
                 ModelIdentity {
-                    embedding_backend: "onnxruntime-sentence-v1".to_string(),
+                    tokenizer_checksum: "cd".repeat(32),
                     ..truthful.clone()
                 },
             ),
@@ -1081,7 +1168,7 @@ mod tests {
         let mut incomplete = build_request(
             &dir,
             ModelIdentity {
-                model_id: String::new(),
+                family_id: String::new(),
                 ..truthful.clone()
             },
             chunking.clone(),
@@ -1280,27 +1367,27 @@ mod tests {
         }
     }
 
-    /// The record's `chunk_hash` describes the text the model was actually given — which
-    /// for a short line is the line *plus its neighbours*, and for a long one is the line
-    /// itself. Deriving it from the corpus line would have made every borrowed chunk record
-    /// a digest of a text nothing was built from.
+    /// A record's key describes the text the model was actually given — which for a short
+    /// line is the line *plus its neighbours*, and for a long one is the line itself.
+    /// Deriving it from the corpus line would have keyed every borrowed chunk by a text
+    /// nothing was built from.
     #[test]
-    fn a_chunk_hash_describes_the_text_the_model_was_given() {
+    fn a_key_describes_the_text_the_model_was_given() {
         let dir = TempDir::new("chunk_hash");
         let corpus = standard_corpus(&dir);
         let chunking = ChunkerConfig::default();
         let (_, checksum) = write_model(&dir);
         let model = model_for(&checksum, &chunking);
 
-        let report = build(build_request(&dir, model.clone(), chunking), &corpus).unwrap();
-        let records = stored_records(&report.artifact_path, &model);
+        let report = build(build_request(&dir, model, chunking), &corpus).unwrap();
+        let records = stored_records(&report);
 
         assert_eq!(
-            records[&4_294_967_297].chunk_hash,
+            records[&(GENESIS.to_string(), 0)].0,
             compute_chunk_hash(LONG),
             "a line that stands alone is embedded as itself"
         );
-        let borrowed = &records[&4_294_967_298].chunk_hash;
+        let borrowed = &records[&(GENESIS.to_string(), 1)].0;
         assert_ne!(
             *borrowed,
             compute_chunk_hash(BORROWS),
@@ -1311,48 +1398,165 @@ mod tests {
             compute_chunk_hash(&format!("{LONG} {BORROWS} {SKIPPED}")),
             "and the context is its section's neighbours, in order"
         );
+        assert!(
+            !records.contains_key(&(GENESIS.to_string(), 2)),
+            "the line the recipe skips has no record"
+        );
+    }
+
+    /// A text is embedded once, wherever it occurs: its first book in byte order holds the
+    /// slot, a later book an extra record of it, and a second line of the same book with
+    /// the same text no record at all — a record is a book and a key.
+    #[test]
+    fn a_shared_text_is_embedded_once_and_recorded_once_per_book() {
+        let dir = TempDir::new("shared_text");
+        let corpus = write_corpus(
+            &dir,
+            &[
+                (4_294_967_297, GENESIS, LONG, 1),
+                (4_294_967_298, GENESIS, LONG_TWO, 2),
+                (4_294_967_299, GENESIS, LONG, 3),
+                (8_589_934_593, BERACHOT, LONG, 1),
+            ],
+        );
+        let chunking = ChunkerConfig::default();
+        let (_, checksum) = write_model(&dir);
+        let model = model_for(&checksum, &chunking);
+
+        let report = build(build_request(&dir, model, chunking), &corpus).unwrap();
+        let counts = report.manifest.counts;
+        assert_eq!((counts.books, counts.slots, counts.extras), (2, 2, 1));
+        assert_eq!(report.planned_lines, 4);
+
+        let records = stored_records(&report);
+        let long = compute_chunk_hash(LONG);
+        assert_eq!(
+            records.into_iter().collect::<Vec<_>>(),
+            vec![
+                ((BERACHOT.to_string(), 0), (long.clone(), true)),
+                ((GENESIS.to_string(), 0), (long, false)),
+                (
+                    (GENESIS.to_string(), 1),
+                    (compute_chunk_hash(LONG_TWO), true)
+                ),
+            ],
+            "berachot sorts first and takes the slot; genesis records it once, at its first line"
+        );
     }
 
     /// The stage's own claim, end to end and without a hand-built fixture anywhere: a
-    /// corpus and a model in, an artifact out that verifies against the same corpus.
+    /// corpus and a model in, a package out that installs, opens and finds what it holds.
     #[test]
-    fn a_built_artifact_verifies_against_the_corpus_it_was_built_from() {
+    fn a_built_package_installs_and_answers_with_its_own_vectors() {
         let dir = TempDir::new("end_to_end");
+        let corpus = standard_corpus(&dir);
+        let chunking = ChunkerConfig::default();
+        let (model_path, checksum) = write_model(&dir);
+        let model = model_for(&checksum, &chunking);
+
+        let report = build(build_request(&dir, model.clone(), chunking), &corpus).unwrap();
+        let counts = report.manifest.counts;
+        assert_eq!((counts.books, counts.slots, counts.extras), (2, 3, 0));
+        assert_eq!(report.manifest.to_library_version, 30);
+        assert_eq!(report.clipped_components, 0, "i8-sym-vec clips nothing");
+        assert_eq!(
+            report.manifest.provenance.passage_package.checksum, checksum,
+            "the package that embedded the passages is on record"
+        );
+
+        // The package around the segment is the one the manifest names.
+        let package = IndexPackage::read(&report.output_path).unwrap();
+        package.verify_integrity(&report.output_path).unwrap();
+        assert_eq!(package.digest(), report.manifest.package_digest);
+
+        // Installed, against the digest published for it.
+        let json =
+            std::fs::read_to_string(report.output_path.join(RELEASE_MANIFEST_FILENAME)).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(json.as_bytes())),
+            report.manifest_sha256
+        );
+        let vectors = dir.path().join("vectors");
+        let applied = install_package(
+            &vectors,
+            &InstallSource {
+                segment: &report.output_path.join(SEGMENT_FILENAME),
+                manifest_json: &json,
+            },
+            &InstallExpectation {
+                identity: report.manifest.identity.clone(),
+                published_manifest_sha256: Some(report.manifest_sha256.clone()),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(applied.slots_added, 3);
+
+        // Each stored text, embedded again as a query would be, finds its own record first.
+        let set = SegmentSet::open(&vectors).unwrap();
+        let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
+            model_path,
+            embedding_dim: DIM,
+            max_tokens: 512,
+            batch_size: 1,
+            pooling: Pooling::InGraph,
+        });
+        runtime.load().unwrap();
+        for (book, hint, text) in [(GENESIS, 0, LONG), (BERACHOT, 0, LONG_TWO)] {
+            let hits = set
+                .scan(
+                    &runtime.embed_one(text).unwrap(),
+                    &ScanRequest {
+                        top_k: 3,
+                        books: None,
+                        threads: 1,
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 3);
+            assert_eq!(hits[0].key, ChunkKey::of(text));
+            assert_eq!(
+                (&*hits[0].records[0].book, hits[0].records[0].hint),
+                (book, hint)
+            );
+            assert!(hits[0].score > 0.99, "{}", hits[0].score);
+        }
+
+        // A second build into a used directory is refused rather than writing over it.
+        let again = build(
+            build_request(&dir, model, ChunkerConfig::default()),
+            &corpus,
+        );
+        assert!(
+            matches!(again, Err(PackError::UnusableOutput { .. })),
+            "{again:?}"
+        );
+    }
+
+    /// Two builds of one corpus are the same bytes: the slot order, the calibration and the
+    /// rounding are all deterministic.
+    #[test]
+    fn two_builds_of_one_corpus_write_the_same_segment() {
+        let dir = TempDir::new("deterministic");
         let corpus = standard_corpus(&dir);
         let chunking = ChunkerConfig::default();
         let (_, checksum) = write_model(&dir);
         let model = model_for(&checksum, &chunking);
 
-        let report = build(
+        let first = build(
             build_request(&dir, model.clone(), chunking.clone()),
             &corpus,
         )
         .unwrap();
-        assert_eq!(report.vector_count, 3);
-        assert_eq!(report.book_count, 2);
-
-        // Independently, through the packer's own entry point and the same wrapper the
-        // build used: the artifact covers the lines the recipe embeds, and no others.
-        let planned = PlannedCorpus::new(&corpus, &chunking, &model).unwrap();
-        let revalidated =
-            crate::distribution::packer::validate_artifact(&report.artifact_path, &model, &planned)
-                .unwrap();
-        assert_eq!(revalidated.digest, report.digest);
-
-        // Against the unwrapped transcription it is *incomplete*, because that corpus
-        // reports every line it holds — including the one the recipe skips.
-        match crate::distribution::packer::validate_artifact(&report.artifact_path, &model, &corpus)
-        {
-            Err(PackError::CoverageMismatch {
-                missing,
-                unexpected,
-                first_missing,
-                ..
-            }) => {
-                assert_eq!((missing, unexpected), (1, 0));
-                assert_eq!(first_missing, Some(4_294_967_299));
-            }
-            other => panic!("the skipped line must show up as missing, got {other:?}"),
-        }
+        let mut request = build_request(&dir, model, chunking);
+        request.output_path = dir.path().join("again");
+        let second = build(request, &corpus).unwrap();
+        assert_eq!(first.manifest.segment, second.manifest.segment);
+        assert_eq!(
+            first.manifest.package_digest,
+            second.manifest.package_digest
+        );
+        assert_eq!(first.manifest_sha256, second.manifest_sha256);
     }
 }

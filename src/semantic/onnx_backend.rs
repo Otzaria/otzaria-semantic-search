@@ -778,6 +778,13 @@ impl X86Features {
     }
 }
 
+/// The int8 kernels ONNX Runtime gives this CPU, and whether the backend sets
+/// `session.x64quantprecision` for them — what a worker records about its device, so a
+/// shard says which products its int8 vectors came from (the x86 gate; see `X86Int8`).
+pub fn cpu_int8_kernels() -> String {
+    x86_int8().to_string()
+}
+
 /// This process's [`X86Int8`], decided once and kept, so that every session of every
 /// backend in the process is built alike.
 fn x86_int8() -> X86Int8 {
