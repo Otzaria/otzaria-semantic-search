@@ -522,11 +522,12 @@ pub enum PackError {
     /// passage the library does not contain while carrying a `chunk_hash` that says
     /// otherwise.
     #[error(
-        "The plan's text for line {line_id} hashes to {actual}, and the plan declares \
+        "The plan's text for record {record} hashes to {actual}, and the plan declares \
          {declared}: what reached this worker is not what was exported"
     )]
     PlanTextChanged {
-        line_id: u64,
+        /// The record's position in the plan.
+        record: u64,
         declared: String,
         actual: String,
     },

@@ -43,6 +43,8 @@ Commands:
   search <query> [options]            Execute a search query against the engine.
   index-text <key> <title> <text>     Index a plain-text book into the database.
   build [options]                     Embed a corpus and write a base vector package.
+  plan [options]                      Apply the recipe to a corpus and write a vector
+                                      build's plan, split against the release before.
   export-plan [options]               Apply the recipe and write the work out, for a
                                       machine that will embed it elsewhere.
   embed-shard [options]               Embed one window of an exported plan.
@@ -76,6 +78,18 @@ Options for 'build':
   --allow-non-semantic       Write a package from a backend whose vectors mean nothing.
                              For tests only: such a package passes every check here and
                              answers nonsense.
+
+Options for 'plan':
+  --corpus-identity <path>   As for 'build'
+  --corpus-lines <path>      As for 'build'
+  --model <path>             The family the vectors are for (JSON ModelIdentity)
+  --chunking <path>          The recipe to apply
+  --passage-quantization <q> Which of the family's packages embeds the passages
+                             (default: fp32)
+  --previous-ledger <dir>    The ledger of the release before; omit for a first base
+  --out <dir>                Receives records.bin, books.json, embed.jsonl,
+                             embed-manifest.json, tombstones.bin and plan-manifest.json
+  --created-at <timestamp>   Manifest timestamp (default: now, UTC)
 
 Options for 'export-plan':
   --corpus-identity <path>   As for 'build'
@@ -312,6 +326,7 @@ fn main() {
             }
         }
         "build" => run_build(&args),
+        "plan" => run_plan(&args),
         "export-plan" => run_export_plan(&args),
         "embed-shard" => run_embed_shard(&args),
         "model-checksum" => run_model_checksum(&args),
@@ -424,6 +439,57 @@ fn read_chunking(path: &str) -> ChunkerConfig {
         .unwrap_or_else(|error| exit_with(&format!("Could not read {path}"), error));
     serde_json::from_str(&json)
         .unwrap_or_else(|error| exit_with(&format!("{path} is not a chunker configuration"), error))
+}
+
+/// Write a vector build's plan from a corpus transcription.
+fn run_plan(args: &[String]) {
+    use otzaria_semantic_search::distribution::ledger::Ledger;
+    use otzaria_semantic_search::distribution::plan::{plan_from_corpus, PlanRequest};
+
+    let model = read_model(&require_arg(args, "--model"));
+    let quantization = parse_arg(args, "--passage-quantization").unwrap_or_else(|| "fp32".into());
+    let passage_package = model
+        .query_packages
+        .iter()
+        .find(|package| package.quantization == quantization)
+        .cloned()
+        .unwrap_or_else(|| {
+            exit_with(
+                "The family has no such package",
+                format!("no {quantization} package among its query packages"),
+            )
+        });
+    let previous = parse_arg(args, "--previous-ledger").map(|dir| {
+        Ledger::open(Path::new(&dir), None)
+            .unwrap_or_else(|error| exit_with("Could not open the previous ledger", error))
+    });
+    let corpus = load_corpus(args);
+    let manifest = plan_from_corpus(
+        &corpus,
+        PlanRequest {
+            out_dir: PathBuf::from(require_arg(args, "--out")),
+            model,
+            chunking: read_chunking(&require_arg(args, "--chunking")),
+            passage_package,
+            previous: previous.as_ref(),
+            warehouse: None,
+            created_at: parse_arg(args, "--created-at")
+                .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
+        },
+    )
+    .unwrap_or_else(|error| exit_with("Planning failed", error));
+
+    let counts = manifest.counts;
+    println!("\n=== Planned v{} ===", manifest.library_version);
+    println!("Records:         {}", counts.records);
+    println!("Books:           {}", counts.books);
+    println!("Distinct keys:   {}", counts.unique);
+    println!("Reused:          {}", counts.reused);
+    println!("To ship:         {}", counts.to_ship);
+    println!("To embed:        {}", counts.to_embed);
+    println!("Revived:         {}", counts.revived);
+    println!("Tombstones:      {}", counts.tombstones);
+    println!("Foreign pairs:   {}", counts.foreign_pairs);
 }
 
 /// Apply the recipe on the machine that holds the corpus, and write the work out.

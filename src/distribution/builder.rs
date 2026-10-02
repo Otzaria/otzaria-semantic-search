@@ -469,7 +469,7 @@ pub(crate) fn chunks_for_book(
 }
 
 /// [`chunks_for_book`], with the book's line ids in the order they were read.
-fn chunk_book_lines(
+pub(crate) fn chunk_book_lines(
     corpus: &dyn CorpusBooks,
     chunker: &Chunker,
     book_key: &str,

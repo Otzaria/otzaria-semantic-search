@@ -21,6 +21,14 @@
 //! work in two, for a library embedded on machines that never see the corpus.
 pub mod builder;
 pub mod corpus;
+pub(crate) mod files;
 pub mod importer;
+pub mod ledger;
 pub mod package;
+pub mod plan;
 pub mod shard;
+
+#[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
+pub(crate) mod testing;

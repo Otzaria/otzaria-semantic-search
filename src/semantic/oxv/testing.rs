@@ -29,6 +29,10 @@ impl TempDir {
     pub(crate) fn join(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 impl Drop for TempDir {

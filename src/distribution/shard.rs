@@ -424,7 +424,7 @@ fn verify_text(chunk: &PlannedChunk) -> Result<(), PackError> {
     let actual = sha256_hex(chunk.embedding_text.as_bytes());
     if actual != chunk.embedding_text_sha256 {
         return Err(PackError::PlanTextChanged {
-            line_id: chunk.line_id,
+            record: chunk.line_id,
             declared: chunk.embedding_text_sha256.clone(),
             actual,
         });
@@ -1298,7 +1298,9 @@ mod tests {
             &mut records,
         );
         match outcome {
-            Err(PackError::PlanTextChanged { line_id, .. }) => {
+            Err(PackError::PlanTextChanged {
+                record: line_id, ..
+            }) => {
                 assert_eq!(line_id, 4_294_967_297);
             }
             Ok(_) => panic!("text that is not what its digest names must not be embedded"),
