@@ -197,7 +197,8 @@ otzaria-semantic-search/
   - `search_cancellable(query, lexical, params, resolver, cancel)` — מחזיר `Cancelled` מכל
     מצב, ולעולם אינו מתדרדר ל-BM25: לתוצאות הלקסיקליות אין מי שממתין. `search()` הוא אותה
     קריאה עם `NoResolver` וטוקן שאיש אינו מבטל. בצד `Official`: `admissible_books` →
-    סריקה בספרים האלה → checkpoint → `resolve` → `SemanticCandidate` שכל id, סעיף,
+    תחת מסנן, `unreached` → סריקה בספרים האלה, ולצדה הווקטורים ש-`unreached` נקב בהם
+    (`search_hits_with`) → checkpoint → `resolve` → `SemanticCandidate` שכל id, סעיף,
     `line_hash` ו-facet בו של האינדקס החי. resolver שנכשל הוא כשל סמנטי ככל כשל: החיפוש
     נשאר עם התוצאות הלקסיקליות ו-`fallback_reason`.
   - מפתח מטמון השאילתות כולל את `resolver.generation()` ואת הדור של הסט, כי לחיפוש
@@ -440,11 +441,14 @@ otzaria-semantic-search/
     ה-scalar.
   - `scan` — `scan_segments`: כל slot חי מדורג, על כמה חוטים, תחת מסנן ספרים, `k`
     הטובים נשמרים בסדר מלא; כפילות מפתח נספרת פעם אחת. `default_scan_threads` — חצי
-    מהליבות, עד שמונה.
+    מהליבות, עד שמונה. `scan_with` — אותה סריקה, ולצדה slots שהמארח נוקב בהם
+    (`SlotRef`): כל אחד שחי ומחזיק את המפתח שלו מנוקד כמו בסריקה, ו-`k` הטובים מבין אלה
+    שהסריקה לא החזירה ממוזגים בסדר שלה — לצד הפגיעות שלה, אף פעם לא במקומן.
 
 * [`src/semantic/segment_set/`](../src/semantic/segment_set/mod.rs) — **הסט על המכשיר.**
   - `SegmentSet::open` — שחזור כשה-lock פנוי, ואז הדור ש-`CURRENT` מונה, או `PREVIOUS`;
-    `scan`, `info`, `generation`, `identity`.
+    `scan`, `scan_with`, `info`, `generation`, `identity`; `segments()` לקריאה בלבד,
+    ו-`is_live(seg, slot)` — האם slot חי בדור הזה.
   - `install_package` — segment ו-manifest של שחרור, לפי §5.3 של החוזה: אימות, staging,
     העברה, delta שנפתר במעבר אחד על המפתחות הישנים, דור חדש, החלפת מצביעים, אשפה.
     `ApplyReport` מדווח, ו-`already_applied` הוא delta שהסט כבר בלע.
@@ -455,9 +459,13 @@ otzaria-semantic-search/
     קטנות במקום תלות.
 
 * [`src/semantic/resolve.rs`](../src/semantic/resolve.rs) — **הפורט אל השורות החיות.**
-  - `VectorHit` (ציון, מפתח, רשומות, segment ו-slot), `RecordRef` (ספר ו-hint) ו-`BookSet`.
+  - `VectorHit` (ציון, מפתח, רשומות, segment ו-slot), `RecordRef` (ספר ו-hint), `BookSet`
+    ו-`SlotRef` (segment, slot ומפתח — וקטור של דור אחד של הסט).
   - `CandidateResolver` — מה שהמארח מממש מעל האינדקס שפתח: `generation`,
-    `admissible_books(filters)` ו-`resolve(hits, filters, cancel)` → `ResolvedLine`.
+    `admissible_books(filters)` ו-`resolve(hits, filters, cancel)` → `ResolvedLine`;
+    ו-`unreached(filters, set_generation, cancel)` — הווקטורים שסריקת הספרים המותרים אינה
+    מגיעה אליהם אף שהשורות החיות שלהם מחזיקות את הטקסט (טקסט שעבר לספר מותר מאז שהסט
+    נבנה). ברירת המחדל: אין.
     `NoResolver` — חיפוש בלי אינדקס חי מאחוריו; סט רשמי דרכו אינו תורם דבר, ואומר למה.
   - `LiveKeySource` — מה שדחיסה שואלת: איזה מפתח מחזיקה כל שורה חיה של ספר.
   - `ResolveError` — `Cancelled`, או `Index { reason }`.
@@ -550,6 +558,7 @@ otzaria-semantic-search/
     מהמשפחה המוצהרת (`LocalModel::of_family`) עם החבילה שנטענה, ו-**store** ממה ש-build
     הזה יודע לקרוא (`readable_store_identity()`: `otzaria-oxv`, 2, `i8-sym-vec`).
   - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
+    `search_hits_with(vector, …, also, …)` — ולצדם הווקטורים של `also` (`scan_with`);
     `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
     `book_count`.
   - `status` מדווח `vectors_persisted = true` ו-`needs_full_reindex = None`, ולא כטענה

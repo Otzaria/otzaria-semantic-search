@@ -39,10 +39,10 @@ use otzaria_semantic_search::semantic::official_index::{
     LocalModel, OfficialIndexConfig, OfficialSemanticIndex, ReloadOutcome,
 };
 use otzaria_semantic_search::semantic::resolve::{
-    BookSet, CandidateResolver, ResolveError, ResolvedLine, VectorHit,
+    BookSet, CandidateResolver, ResolveError, ResolvedLine, SlotRef, VectorHit,
 };
 use otzaria_semantic_search::semantic::segment_set::{
-    install_package, InstallExpectation, InstallSource,
+    install_package, InstallExpectation, InstallSource, SegmentSet,
 };
 use otzaria_semantic_search::semantic::types::{
     ContentFingerprint, LexicalCandidate, SearchFilters, SearchMode,
@@ -470,6 +470,147 @@ fn a_query_over_an_installed_set_returns_the_live_line_it_resolves_to() {
         .results
         .iter()
         .all(|item| item.file_path == BERACHOT));
+}
+
+/// The application's index after a text moved: genesis's last line is in berachot now, a
+/// line the set records nowhere in berachot. Under a filter that admits berachot alone, the
+/// scan of berachot's vectors never reaches that text's vector, so this resolver names it
+/// as unreached, and resolves it to the line in berachot that holds it now.
+struct MovedIntoBerachot {
+    index: FakeResolver,
+    moved: SlotRef,
+    /// The set generation each `unreached` was asked for.
+    asked: Mutex<Vec<u64>>,
+}
+
+/// The id the moved line has in berachot.
+const MOVED_LINE: u64 = 8_589_934_594;
+
+impl CandidateResolver for MovedIntoBerachot {
+    fn generation(&self) -> u64 {
+        self.index.generation()
+    }
+
+    fn admissible_books(
+        &self,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Option<BookSet>, ResolveError> {
+        self.index.admissible_books(filters)
+    }
+
+    fn resolve(
+        &self,
+        hits: &[VectorHit],
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResolvedLine>, ResolveError> {
+        let mut lines = self.index.resolve(hits, filters, cancel)?;
+        let admitted = filters
+            .and_then(SearchFilters::compile)
+            .is_none_or(|compiled| compiled.matches_book(BERACHOT, &facets_of(BERACHOT), false));
+        for (index, hit) in hits.iter().enumerate() {
+            if hit.key == self.moved.key && admitted {
+                lines.push(ResolvedLine {
+                    hit: index as u32,
+                    line_id: MOVED_LINE,
+                    file_path: BERACHOT.to_string(),
+                    section_id: 1,
+                    line_hash: MOVED_LINE ^ 0xABCD,
+                    segment: 1,
+                    is_pdf: false,
+                    facets: facets_of(BERACHOT).into(),
+                    title: title_of(BERACHOT),
+                    reference: String::new(),
+                });
+            }
+        }
+        Ok(lines)
+    }
+
+    fn unreached(
+        &self,
+        _filters: Option<&SearchFilters>,
+        set_generation: u64,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<SlotRef>, ResolveError> {
+        self.asked.lock().unwrap().push(set_generation);
+        Ok(vec![self.moved])
+    }
+}
+
+/// A filtered search weighs the vectors the resolver names as unreached, at the scores an
+/// unfiltered search gives them, beside the admitted books' own hits, which stay as they
+/// were; a resolver that names none — the default — searches as before. Only a filtered
+/// search asks.
+#[test]
+fn a_filtered_search_weighs_the_vectors_its_resolver_names_as_unreached() {
+    let dir = TempDir::new("unreached");
+    let (model_path, vectors) = install(&dir);
+    let (_, _, moved_text) = LINES[2];
+    let (own_line, _, _) = LINES[3];
+    let set = SegmentSet::open(&vectors).unwrap();
+    let segment = &set.segments()[0];
+    let moved = (0..segment.slot_count())
+        .map(|slot| SlotRef {
+            seg: 0,
+            slot,
+            key: segment.key(slot),
+        })
+        .find(|slot| slot.key == ChunkKey::of(moved_text))
+        .expect("the set holds genesis's last line");
+    let generation = set.generation();
+    drop(set);
+
+    let filtered = HybridSearchParams {
+        force_mode: Some(SearchMode::SemanticOnly),
+        filters: Some(SearchFilters {
+            facets: Some(vec!["/משנה".to_string()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    // Each its own coordinator, so that none answers from another's query cache.
+    let search = |resolver: &dyn CandidateResolver, params: &HybridSearchParams| {
+        HybridCoordinator::with_official_index(open_official(&vectors, &model_path))
+            .search_cancellable(moved_text, vec![], params, resolver, &cancel)
+            .unwrap()
+    };
+    let scores = |result: &otzaria_semantic_search::semantic::types::HybridSearchResult| {
+        result
+            .results
+            .iter()
+            .map(|item| ((item.id, item.file_path.clone()), item.semantic_score))
+            .collect::<HashMap<_, _>>()
+    };
+
+    let before = search(&FakeResolver::of_the_corpus(), &filtered);
+    assert!(before.results.iter().all(|item| item.id != MOVED_LINE));
+    let resolver = MovedIntoBerachot {
+        index: FakeResolver::of_the_corpus(),
+        moved,
+        asked: Mutex::new(Vec::new()),
+    };
+    let after = search(&resolver, &filtered);
+    assert_eq!(*resolver.asked.lock().unwrap(), [generation]);
+    let (before, after) = (scores(&before), scores(&after));
+    let own = (own_line, BERACHOT.to_string());
+    assert_eq!(
+        after[&own], before[&own],
+        "the admitted book's own hit stays"
+    );
+    let unfiltered = scores(&search(&resolver, &mode(SearchMode::SemanticOnly)));
+    assert_eq!(
+        *resolver.asked.lock().unwrap(),
+        [generation],
+        "an unfiltered search reaches every vector, and asks nothing"
+    );
+    let moved_line = (MOVED_LINE, BERACHOT.to_string());
+    assert!(after[&moved_line].is_some());
+    assert_eq!(
+        after[&moved_line], unfiltered[&moved_line],
+        "the moved text at the score a full scan gives its vector"
+    );
 }
 
 /// The ids a result carries are the live index's. A commit that renumbered a book — or

@@ -164,6 +164,10 @@ impl SemanticSide {
     /// set holds keys and the records where they were built, so its hits go through the
     /// host's `resolver`, and every candidate carries the live line's id, section, line
     /// hash and facets — never the vectors'.
+    ///
+    /// Under a filter the scan reads the books the resolver admits, and weighs besides the
+    /// vectors it names as [unreached](CandidateResolver::unreached): those of texts that
+    /// moved into an admitted book, at their own scores, beside the scan's hits.
     fn candidates(
         &self,
         query_vector: &[f32],
@@ -180,8 +184,13 @@ impl SemanticSide {
             Self::Official(index) => index,
         };
         let books = resolver.admissible_books(filters)?;
+        let unreached = match &books {
+            Some(_) => resolver.unreached(filters, index.generation(), cancel)?,
+            None => Vec::new(),
+        };
         let scan_started = std::time::Instant::now();
-        let hits = index.search_hits(query_vector, top_k, books.as_ref(), cancel)?;
+        let hits =
+            index.search_hits_with(query_vector, top_k, books.as_ref(), &unreached, cancel)?;
         telemetry.scan_ms = Some(scan_started.elapsed().as_millis() as u64);
         telemetry.semantic_hits = hits.len().min(u32::MAX as usize) as u32;
         cancel.checkpoint()?;

@@ -32,7 +32,7 @@ use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, Embedding
 use crate::semantic::oxv::format::SEGMENT_FORMAT_VERSION;
 use crate::semantic::oxv::scan::{default_scan_threads, ScanRequest};
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
-use crate::semantic::resolve::{BookSet, VectorHit};
+use crate::semantic::resolve::{BookSet, SlotRef, VectorHit};
 use crate::semantic::segment_set::{self, SegmentSet, SetInfo, STORE_BACKEND_ID};
 use crate::semantic::types::SemanticStatus;
 use crate::semantic::versioning::{
@@ -282,13 +282,28 @@ impl OfficialSemanticIndex {
         books: Option<&BookSet>,
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, SemanticSearchError> {
-        Ok(self.set.scan(
+        self.search_hits_with(query_vector, top_k, books, &[], cancel)
+    }
+
+    /// [`Self::search_hits`], weighing the vectors of `also` besides the ones `books`
+    /// reaches: see [`SegmentSet::scan_with`]. Slots of this index's
+    /// [generation](Self::generation).
+    pub fn search_hits_with(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        books: Option<&BookSet>,
+        also: &[SlotRef],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, SemanticSearchError> {
+        Ok(self.set.scan_with(
             query_vector,
             &ScanRequest {
                 top_k,
                 books,
                 threads: self.scan_threads,
             },
+            also,
             cancel,
         )?)
     }
