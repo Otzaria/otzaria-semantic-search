@@ -520,6 +520,225 @@ fn a_delta_that_ships_no_vector_installs() {
     }
 }
 
+/// `books` books of `lines` consecutive texts from text 0, then `more`.
+fn library(books: usize, lines: usize, more: &[(&str, &[usize])]) -> Vec<(String, Vec<usize>)> {
+    (0..books)
+        .map(|book| {
+            (
+                format!("otzaria/{book:02}.txt"),
+                (book * lines..(book + 1) * lines).collect(),
+            )
+        })
+        .chain(
+            more.iter()
+                .map(|(book, texts)| (book.to_string(), texts.to_vec())),
+        )
+        .collect()
+}
+
+fn borrowed(library: &[(String, Vec<usize>)]) -> Vec<(&str, &[usize])> {
+    library
+        .iter()
+        .map(|(book, texts)| (book.as_str(), texts.as_slice()))
+        .collect()
+}
+
+fn g5_of(report: &GateReport) -> &Gate {
+    report.gates.iter().find(|gate| gate.gate == "G5").unwrap()
+}
+
+/// A delta of deletions and/or reuse passes every gate, G5 as not applicable; a delta with
+/// a new vector and the base are measured as before.
+#[test]
+fn a_delta_that_ships_no_vector_passes_the_gates() {
+    // The base is large enough for G7 to pass a small delta.
+    let c: &[usize] = &[600, 601, 602, 603];
+    let d: &[usize] = &[5, 305];
+    let v1 = library(2, 300, &[(C, c)]);
+    let deletions = library(2, 300, &[]);
+    let reuse = library(2, 300, &[(C, c), (D, d)]);
+    let both = library(2, 300, &[(D, d)]);
+    let new = library(2, 300, &[(D, &[5, 305, 700])]);
+    let dim = EpochChoice::New(CodecSpec::I8SymDim { clip_q: 1.0 });
+    for (name, epoch) in [("vec", NEW), ("dim", dim)] {
+        let machine = Machine::new(&format!("no_vector_gates_{name}"));
+        let p1 = machine.plan("p1", 1, &borrowed(&v1), None);
+        let base = machine.assemble(&p1, PackageKind::Base, None, epoch, "base1");
+        let ledger1 = Ledger::open(&base.out_dir, Some(1)).unwrap();
+
+        let report = machine.verify(&p1, "base1", None);
+        assert!(report.passed(), "{name} base: {:?}", report.gates);
+        assert!(
+            report
+                .gates
+                .iter()
+                .all(|gate| gate.status == GateStatus::Passed),
+            "{name} base: {:?}",
+            report.gates
+        );
+        let g5 = g5_of(&report);
+        assert!(
+            g5.detail
+                .starts_with("604 slot(s) encode their vectors; on 604 sampled, cosine mean 0.99"),
+            "{name} base: {}",
+            g5.detail
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        for gate in json["gates"].as_array().unwrap() {
+            let mut fields: Vec<&str> = gate
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort_unstable();
+            assert_eq!(
+                fields,
+                ["detail", "gate", "passed", "status"],
+                "{name} base"
+            );
+            assert_eq!(
+                (&gate["passed"], &gate["status"]),
+                (&true.into(), &"passed".into())
+            );
+        }
+
+        for (what, next, slots, tombstones, foreign) in [
+            ("deletions", &deletions, 0, 4, 0),
+            ("reuse", &reuse, 0, 0, 2),
+            ("deletions and reuse", &both, 0, 4, 2),
+            ("a new text", &new, 1, 4, 2),
+        ] {
+            let out = format!("delta-{}", what.replace(' ', "-"));
+            let p2 = machine.plan(&format!("p2-{out}"), 2, &borrowed(next), Some(&ledger1));
+            assert_eq!(p2.manifest.counts.to_embed, slots, "{name} {what}");
+            let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger1), NEW, &out);
+            let counts = delta.manifest.counts;
+            assert_eq!(
+                (counts.slots, counts.tombstones, counts.foreign),
+                (slots, tombstones, foreign),
+                "{name} {what}"
+            );
+            let report = machine.verify(&p2, &out, Some(&ledger1));
+            assert_eq!(report.gates.len(), 6);
+            for gate in &report.gates {
+                assert!(
+                    gate.passed,
+                    "{name} {what}: {} failed: {}",
+                    gate.gate, gate.detail
+                );
+            }
+            assert!(report.passed(), "{name} {what}");
+            let g5 = g5_of(&report);
+            if slots == 0 {
+                assert_eq!(g5.status, GateStatus::NotApplicable, "{name} {what}");
+                assert_eq!(
+                    g5.detail,
+                    format!(
+                        "not applicable: the delta ships no vector, only {tombstones} \
+                         tombstone(s) and {foreign} foreign record(s), so there is no new \
+                         vector to compare with its original"
+                    ),
+                    "{name} {what}"
+                );
+                let json = serde_json::to_value(g5).unwrap();
+                assert_eq!(
+                    (&json["passed"], &json["status"]),
+                    (&true.into(), &"notApplicable".into())
+                );
+                for gate in report.gates.iter().filter(|gate| gate.gate != "G5") {
+                    assert_eq!(gate.status, GateStatus::Passed, "{name} {what}");
+                }
+                if name == "dim" {
+                    let g1 = &report.gates[0];
+                    assert!(
+                        g1.detail
+                            .ends_with("no component to clip: the segment ships no vector"),
+                        "{}",
+                        g1.detail
+                    );
+                }
+            } else {
+                assert_eq!(g5.status, GateStatus::Passed, "{name} {what}");
+                assert!(
+                    g5.detail.starts_with(
+                        "1 slot(s) encode their vectors; on 1 sampled, cosine mean 0.99"
+                    ),
+                    "{name} {what}: {}",
+                    g5.detail
+                );
+            }
+        }
+    }
+}
+
+/// Nothing to measure where something should be fails, with no number made up.
+#[test]
+fn a_gate_with_nothing_to_measure_fails_unless_it_does_not_apply() {
+    let machine = Machine::new("nothing_to_measure");
+    let p1 = machine.plan("p1", 1, &v1(), None);
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base1");
+    let ledger1 = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    let p2 = machine.plan("p2", 2, &v2(), Some(&ledger1));
+    machine.assemble(&p2, PackageKind::Delta, Some(&ledger1), NEW, "delta2");
+
+    // A warehouse without the delta's two new vectors: no cosine is sampled.
+    let empty = machine.dir.join("empty-warehouse");
+    Warehouse::create(
+        &empty,
+        WarehouseIdentity::of(&machine.model, &machine.package),
+    )
+    .unwrap();
+    let report = verify_release(&VerifyRequest {
+        release_dir: &machine.dir.join("delta2"),
+        plan: &p2,
+        warehouse: &Warehouse::open(&empty).unwrap(),
+        previous: Some(&ledger1),
+        scratch_dir: machine.dir.join("delta2-empty"),
+        samples: G5_SAMPLES,
+    })
+    .unwrap();
+    let g5 = g5_of(&report);
+    assert_eq!((g5.passed, g5.status), (false, GateStatus::Failed));
+    assert_eq!(
+        g5.detail,
+        "2 slot(s) have no vector in the warehouse; no vector of the 2 slot(s) was sampled: \
+         the cosines could not be measured"
+    );
+    assert!(!report.passed());
+
+    let zero = machine.dir.join("zero-base");
+    std::fs::create_dir(&zero).unwrap();
+    for name in ["ledger-v1.keys", "pairs-v1.bin"] {
+        std::fs::copy(base.out_dir.join(name), zero.join(name)).unwrap();
+    }
+    let manifest = base.out_dir.join("ledger-v1.manifest.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+    json["base"]["size"] = 0.into();
+    std::fs::write(
+        zero.join("ledger-v1.manifest.json"),
+        serde_json::to_vec(&json).unwrap(),
+    )
+    .unwrap();
+    let zero = Ledger::open(&zero, Some(1)).unwrap();
+    assert_eq!(zero.manifest.base.size, 0);
+    let report = machine.verify(&p2, "delta2", Some(&zero));
+    let (g7, g10) = (&report.gates[2], &report.gates[5]);
+    assert_eq!((g7.gate, g7.status), ("G7", GateStatus::Failed));
+    assert_eq!(
+        g7.detail,
+        "the ledger records the v1 base as 0 bytes: the delta's size could not be checked \
+         against it"
+    );
+    assert_eq!((g10.gate, g10.status), ("G10", GateStatus::Passed));
+    assert_eq!(
+        g10.detail,
+        "the ledger records a base of 0 bytes: growth unknown"
+    );
+    assert!(!report.passed());
+}
+
 /// `i8-sym-dim` is calibrated on the slots' vectors exactly as the in-memory calibration
 /// takes it, and G1 holds its clip rate to 1e-4.
 #[test]

@@ -55,8 +55,20 @@ pub const G10_MAX_GROWTH: f64 = 1.3;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Gate {
     pub gate: &'static str,
+    /// False only when `status` is `Failed`.
     pub passed: bool,
+    pub status: GateStatus,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GateStatus {
+    Passed,
+    /// Also a gate that could not check what it should have.
+    Failed,
+    /// Nothing to check, as `detail` says; not a failure.
+    NotApplicable,
 }
 
 /// Every gate [`verify_release`] checks, in order.
@@ -96,7 +108,7 @@ pub fn verify_release(request: &VerifyRequest<'_>) -> Result<GateReport, PackErr
     let content = content_pass(&segment, request.warehouse, request.samples);
     let gates = vec![
         g1(&manifest, &segment, &content),
-        g5(&content),
+        g5(&content, manifest.kind),
         g7(&manifest, request.previous),
         g8(request, &manifest)?,
         g9(dir, &manifest),
@@ -112,6 +124,8 @@ pub fn verify_release(request: &VerifyRequest<'_>) -> Result<GateReport, PackErr
 /// encoding, the clipped components, and the cosines of the sample.
 struct Content {
     slots: u64,
+    tombstones: u64,
+    foreign: u64,
     without_vector: u64,
     mismatched: u64,
     bad_scales: u64,
@@ -126,8 +140,11 @@ fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Con
     let step = (slots as usize).div_ceil(samples.max(1)).max(1);
     let (mut original, mut decoded) = (vec![0f32; dim], vec![0f32; dim]);
     let mut encoded = vec![0u8; codec.bytes_per_vector()];
+    let counts = segment.counts();
     let mut content = Content {
         slots: u64::from(slots),
+        tombstones: counts.tombstones,
+        foreign: counts.foreign,
         without_vector: 0,
         mismatched: 0,
         bad_scales: 0,
@@ -177,6 +194,20 @@ fn gate(gate: &'static str, passed: bool, detail: String) -> Gate {
     Gate {
         gate,
         passed,
+        status: if passed {
+            GateStatus::Passed
+        } else {
+            GateStatus::Failed
+        },
+        detail,
+    }
+}
+
+fn not_applicable(gate: &'static str, detail: String) -> Gate {
+    Gate {
+        gate,
+        passed: true,
+        status: GateStatus::NotApplicable,
         detail,
     }
 }
@@ -209,16 +240,18 @@ fn g1(manifest: &ReleaseManifest, segment: &Segment, content: &Content) -> Gate 
         faults.push(format!("{bad} scale(s) are not finite and positive"));
     }
     let components = content.slots * codec.dim() as u64;
-    let clip_rate = content.clipped as f64 / components.max(1) as f64;
-    let clip = if codec.clip_q().is_some() {
+    let clip = if codec.clip_q().is_none() {
+        "no clipping in this codec".to_string()
+    } else if components == 0 {
+        "no component to clip: the segment ships no vector".to_string()
+    } else {
+        let clip_rate = content.clipped as f64 / components as f64;
         if clip_rate > G1_MAX_CLIP_RATE {
             faults.push(format!(
                 "{clip_rate:.2e} of the components are clipped, more than {G1_MAX_CLIP_RATE:e}"
             ));
         }
         format!("clip rate {clip_rate:.2e}")
-    } else {
-        "no clipping in this codec".to_string()
     };
     gate(
         "G1",
@@ -233,15 +266,28 @@ fn g1(manifest: &ReleaseManifest, segment: &Segment, content: &Content) -> Gate 
 
 /// G5: every slot holds its key's warehouse vector, encoded; on the sample, the decoded
 /// vectors' cosine with their originals has a mean of at least [`G5_MIN_MEAN_COSINE`] and
-/// a 0.1st percentile of at least [`G5_MIN_P001_COSINE`].
-fn g5(content: &Content) -> Gate {
+/// a 0.1st percentile of at least [`G5_MIN_P001_COSINE`]. Not applicable to a delta with no
+/// slot; any other empty or non-finite sample fails.
+fn g5(content: &Content, kind: PackageKind) -> Gate {
+    if content.slots == 0 {
+        return match kind {
+            PackageKind::Delta => not_applicable(
+                "G5",
+                format!(
+                    "not applicable: the delta ships no vector, only {} tombstone(s) and {} \
+                     foreign record(s), so there is no new vector to compare with its original",
+                    content.tombstones, content.foreign
+                ),
+            ),
+            _ => gate(
+                "G5",
+                false,
+                format!("the {kind} ships no vector: its fidelity could not be checked"),
+            ),
+        };
+    }
     let mut cosines = content.cosines.clone();
     cosines.sort_by(f64::total_cmp);
-    let mean = cosines.iter().sum::<f64>() / cosines.len().max(1) as f64;
-    let p001 = cosines
-        .get(((cosines.len().max(1) - 1) as f64 * 0.001) as usize)
-        .copied()
-        .unwrap_or(0.0);
     let mut faults = Vec::new();
     if content.without_vector > 0 {
         faults.push(format!(
@@ -255,26 +301,43 @@ fn g5(content: &Content) -> Gate {
             content.mismatched
         ));
     }
-    if mean < G5_MIN_MEAN_COSINE || p001 < G5_MIN_P001_COSINE {
+    let non_finite = cosines.iter().filter(|cosine| !cosine.is_finite()).count();
+    let measured = if cosines.is_empty() {
         faults.push(format!(
-            "cosine mean {mean:.6} and p0.1 {p001:.6}, under {G5_MIN_MEAN_COSINE} and \
-             {G5_MIN_P001_COSINE}"
+            "no vector of the {} slot(s) was sampled: the cosines could not be measured",
+            content.slots
         ));
-    }
-    gate(
-        "G5",
-        faults.is_empty(),
-        if faults.is_empty() {
+        None
+    } else if non_finite > 0 {
+        faults.push(format!(
+            "{non_finite} of {} sampled cosine(s) are not finite",
+            cosines.len()
+        ));
+        None
+    } else {
+        let mean = cosines.iter().sum::<f64>() / cosines.len() as f64;
+        let p001 = cosines[((cosines.len() - 1) as f64 * 0.001) as usize];
+        if !(mean >= G5_MIN_MEAN_COSINE && p001 >= G5_MIN_P001_COSINE) {
+            faults.push(format!(
+                "cosine mean {mean:.6} and p0.1 {p001:.6}, under {G5_MIN_MEAN_COSINE} and \
+                 {G5_MIN_P001_COSINE}"
+            ));
+        }
+        Some((mean, p001))
+    };
+    match measured {
+        Some((mean, p001)) if faults.is_empty() => gate(
+            "G5",
+            true,
             format!(
                 "{} slot(s) encode their vectors; on {} sampled, cosine mean {mean:.6}, \
                  p0.1 {p001:.6}",
                 content.slots,
                 cosines.len()
-            )
-        } else {
-            faults.join("; ")
-        },
-    )
+            ),
+        ),
+        _ => gate("G5", false, faults.join("; ")),
+    }
 }
 
 /// G7: a base is at most [`G7_MAX_BASE_BYTES`]; a delta at most [`G7_MAX_DELTA_RATIO`] of
@@ -283,9 +346,18 @@ fn g7(manifest: &ReleaseManifest, previous: Option<&Ledger>) -> Gate {
     let size = manifest.segment.size;
     match manifest.kind {
         PackageKind::Delta => match previous {
+            Some(ledger) if ledger.manifest.base.size == 0 => gate(
+                "G7",
+                false,
+                format!(
+                    "the ledger records the v{} base as 0 bytes: the delta's size could not be \
+                     checked against it",
+                    ledger.manifest.base.library_version
+                ),
+            ),
             Some(ledger) => {
                 let base = ledger.manifest.base.size;
-                let ratio = size as f64 / base.max(1) as f64;
+                let ratio = size as f64 / base as f64;
                 gate(
                     "G7",
                     ratio <= G7_MAX_DELTA_RATIO,
@@ -421,10 +493,13 @@ fn g9(dir: &Path, manifest: &ReleaseManifest) -> Gate {
 /// as a multiple of the base — past [`G10_MAX_GROWTH`] the next release should be a base.
 fn g10(manifest: &ReleaseManifest, previous: Option<&Ledger>) -> Gate {
     let detail = match (manifest.kind, previous) {
+        (PackageKind::Delta, Some(ledger)) if ledger.manifest.base.size == 0 => {
+            "the ledger records a base of 0 bytes: growth unknown".to_string()
+        }
         (PackageKind::Delta, Some(ledger)) => {
             let base = ledger.manifest.base.size;
             let chain = base + ledger.manifest.deltas_since_base + manifest.segment.size;
-            let growth = chain as f64 / base.max(1) as f64;
+            let growth = chain as f64 / base as f64;
             format!(
                 "base and deltas are {chain} bytes, {growth:.3} × the base{}",
                 if growth <= G10_MAX_GROWTH {
@@ -517,6 +592,7 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    /// True for a plan with no record.
     pub fn complete(&self) -> bool {
         self.records == self.reachable
     }
@@ -661,11 +737,114 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     lanes.iter().sum::<f32>() + a_rest.iter().zip(b_rest).map(|(x, y)| x * y).sum::<f32>()
 }
 
-/// recall@k: the share of `exact`'s keys that `found` has too.
+/// recall@k: the share of `exact`'s keys that `found` has too; 1.0 when `exact` is empty.
 pub fn recall(found: &[ChunkKey], exact: &[ChunkKey]) -> f64 {
     if exact.is_empty() {
         return 1.0;
     }
     let found: std::collections::HashSet<&ChunkKey> = found.iter().collect();
     exact.iter().filter(|key| found.contains(key)).count() as f64 / exact.len() as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content(slots: u64, cosines: Vec<f64>) -> Content {
+        Content {
+            slots,
+            tombstones: 3,
+            foreign: 1,
+            without_vector: 0,
+            mismatched: 0,
+            bad_scales: 0,
+            clipped: 0,
+            cosines,
+        }
+    }
+
+    /// Only a delta with no slot passes without a cosine; no mean is made up.
+    #[test]
+    fn g5_measures_what_there_is_and_fails_what_it_cannot() {
+        let gate = g5(&content(0, Vec::new()), PackageKind::Delta);
+        assert_eq!(
+            (gate.passed, gate.status),
+            (true, GateStatus::NotApplicable)
+        );
+        assert_eq!(
+            gate.detail,
+            "not applicable: the delta ships no vector, only 3 tombstone(s) and 1 foreign \
+             record(s), so there is no new vector to compare with its original"
+        );
+
+        for kind in [PackageKind::Base, PackageKind::Compacted] {
+            let gate = g5(&content(0, Vec::new()), kind);
+            assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+            assert_eq!(
+                gate.detail,
+                format!("the {kind} ships no vector: its fidelity could not be checked")
+            );
+        }
+
+        for kind in [PackageKind::Base, PackageKind::Delta] {
+            let gate = g5(&content(3, Vec::new()), kind);
+            assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+            assert_eq!(
+                gate.detail,
+                "no vector of the 3 slot(s) was sampled: the cosines could not be measured"
+            );
+        }
+
+        // A NaN mean is under no floor: it used to pass.
+        for odd in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let gate = g5(&content(3, vec![1.0, odd, 1.0]), PackageKind::Base);
+            assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+            assert_eq!(gate.detail, "1 of 3 sampled cosine(s) are not finite");
+        }
+
+        let gate = g5(&content(2, vec![1.0, 1.0]), PackageKind::Delta);
+        assert_eq!((gate.passed, gate.status), (true, GateStatus::Passed));
+        assert_eq!(
+            gate.detail,
+            "2 slot(s) encode their vectors; on 2 sampled, cosine mean 1.000000, p0.1 1.000000"
+        );
+        let gate = g5(&content(2, vec![1.0, 0.9]), PackageKind::Base);
+        assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+        assert_eq!(
+            gate.detail,
+            "cosine mean 0.950000 and p0.1 0.900000, under 0.9995 and 0.998"
+        );
+        let missing = Content {
+            without_vector: 1,
+            ..content(2, vec![1.0])
+        };
+        let gate = g5(&missing, PackageKind::Delta);
+        assert_eq!(
+            (gate.passed, gate.detail.as_str()),
+            (false, "1 slot(s) have no vector in the warehouse")
+        );
+    }
+
+    #[test]
+    fn a_gate_that_does_not_apply_is_no_failure() {
+        let report = GateReport {
+            segment_id: String::new(),
+            gates: vec![
+                gate("G1", true, String::new()),
+                not_applicable("G5", String::new()),
+            ],
+        };
+        assert!(report.passed());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["gates"][0]["status"], "passed");
+        assert_eq!(json["gates"][1]["status"], "notApplicable");
+        assert_eq!(json["gates"][1]["passed"], true);
+        let failed = gate("G7", false, String::new());
+        assert_eq!(failed.status, GateStatus::Failed);
+        assert!(!GateReport {
+            gates: vec![failed],
+            ..report
+        }
+        .passed());
+    }
 }

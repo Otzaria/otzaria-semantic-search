@@ -153,41 +153,57 @@ fn gates(release: &str) -> Vec<(String, bool)> {
         .collect()
 }
 
-#[test]
-fn a_base_and_a_delta_round_trip_through_the_cli() {
-    let work = Work::new("vector-build-cli");
-    let chunking = work.path("chunking.json");
-    std::fs::write(
-        &chunking,
-        serde_json::to_vec(&ChunkerConfig::default()).unwrap(),
-    )
-    .unwrap();
-    let model = work.path("model.json");
-    let identity = ModelIdentity {
-        family_id: "otzaria-cli-family".to_string(),
-        tokenizer_checksum: "b".repeat(64),
-        embedding_dim: DIM as u32,
-        pooling: "in-graph".to_string(),
-        max_tokens: 512,
-        embedding_text_version: 1,
-        normalization_version: 1,
-        chunking_identity: ChunkerConfig::default().identity(),
-        query_packages: vec![
-            ModelPackage {
-                checksum: "a".repeat(64),
-                quantization: "int8".to_string(),
-            },
-            ModelPackage {
-                checksum: "c".repeat(64),
-                quantization: "fp32".to_string(),
-            },
-        ],
-    };
-    std::fs::write(&model, serde_json::to_vec(&identity).unwrap()).unwrap();
-    let warehouse = work.path("warehouse");
+struct Build {
+    work: Work,
+    model: String,
+    chunking: String,
+    warehouse: String,
+}
 
-    let step = |version: u32, books: &[(&str, &[usize])], previous: Option<&str>| -> String {
-        let (corpus_identity, corpus_lines) = corpus(&work, version, books);
+impl Build {
+    fn new(name: &str) -> Self {
+        let work = Work::new(name);
+        let chunking = work.path("chunking.json");
+        std::fs::write(
+            &chunking,
+            serde_json::to_vec(&ChunkerConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let model = work.path("model.json");
+        let identity = ModelIdentity {
+            family_id: "otzaria-cli-family".to_string(),
+            tokenizer_checksum: "b".repeat(64),
+            embedding_dim: DIM as u32,
+            pooling: "in-graph".to_string(),
+            max_tokens: 512,
+            embedding_text_version: 1,
+            normalization_version: 1,
+            chunking_identity: ChunkerConfig::default().identity(),
+            query_packages: vec![
+                ModelPackage {
+                    checksum: "a".repeat(64),
+                    quantization: "int8".to_string(),
+                },
+                ModelPackage {
+                    checksum: "c".repeat(64),
+                    quantization: "fp32".to_string(),
+                },
+            ],
+        };
+        std::fs::write(&model, serde_json::to_vec(&identity).unwrap()).unwrap();
+        let warehouse = work.path("warehouse");
+        Self {
+            work,
+            model,
+            chunking,
+            warehouse,
+        }
+    }
+
+    /// Plan `version`, then embed and add to the warehouse whatever the plan lists.
+    fn step(&self, version: u32, books: &[(&str, &[usize])], previous: Option<&str>) -> String {
+        let work = &self.work;
+        let (corpus_identity, corpus_lines) = corpus(work, version, books);
         let plan = work.path(&format!("plan-v{version}"));
         let mut args: Vec<&str> = vec![
             "plan",
@@ -196,9 +212,9 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
             "--corpus-lines",
             &corpus_lines,
             "--model",
-            &model,
+            &self.model,
             "--chunking",
-            &chunking,
+            &self.chunking,
             "--out",
             &plan,
             "--created-at",
@@ -209,10 +225,17 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
                 "--previous-ledger",
                 previous,
                 "--warehouse",
-                warehouse.as_str(),
+                self.warehouse.as_str(),
             ]);
         }
         ok(&args);
+        if std::fs::metadata(Path::new(&plan).join("embed.jsonl"))
+            .unwrap()
+            .len()
+            == 0
+        {
+            return plan;
+        }
         let shard = work.0.join(format!("shard-v{version}"));
         let plan_sha256 = worker_output(&plan, &shard);
         let shard = shard.to_string_lossy().to_string();
@@ -221,7 +244,7 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
             "--dir",
             &shard,
             "--model",
-            &model,
+            &self.model,
             "--plan-sha256",
             &plan_sha256,
             "--worker-name",
@@ -238,10 +261,10 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
         ok(&[
             "warehouse-add",
             "--warehouse",
-            &warehouse,
+            &self.warehouse,
             "--create",
             "--model",
-            &model,
+            &self.model,
             "--plan",
             &plan,
             "--shards",
@@ -249,7 +272,14 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
             "--allow-non-semantic",
         ]);
         plan
-    };
+    }
+}
+
+#[test]
+fn a_base_and_a_delta_round_trip_through_the_cli() {
+    let build = Build::new("vector-build-cli");
+    let (work, warehouse) = (&build.work, &build.warehouse);
+    let step = |version, books: &[(&str, &[usize])], previous| build.step(version, books, previous);
 
     let plan1 = step(
         1,
@@ -264,7 +294,7 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
         "--plan",
         &plan1,
         "--warehouse",
-        &warehouse,
+        warehouse,
         "--out",
         &base,
         "--created-at",
@@ -282,7 +312,7 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
         "--plan",
         &plan1,
         "--warehouse",
-        &warehouse,
+        warehouse,
         "--out",
         &base,
     ]);
@@ -300,7 +330,7 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
         "--plan",
         &plan2,
         "--warehouse",
-        &warehouse,
+        warehouse,
         "--previous",
         &base,
         "--out",
@@ -348,9 +378,120 @@ fn a_base_and_a_delta_round_trip_through_the_cli() {
         "--plan",
         &plan2,
         "--warehouse",
-        &warehouse,
+        warehouse,
         "--out",
         &work.path("refused"),
     ]);
     assert_eq!(code, 1);
+}
+
+/// A delta of deletions and reuse verifies with exit 0, G5 `notApplicable`.
+#[test]
+fn a_delta_that_ships_no_vector_verifies_through_the_cli() {
+    let build = Build::new("vector-build-cli-no-vector");
+    let (work, warehouse) = (&build.work, build.warehouse.as_str());
+    let a: Vec<usize> = (0..300).collect();
+    let b: Vec<usize> = (300..600).collect();
+    let (c, d): (&[usize], &[usize]) = (&[600, 601, 602, 603], &[5, 305]);
+    let plan1 = build.step(
+        1,
+        &[
+            ("otzaria/a.txt", &a),
+            ("otzaria/b.txt", &b),
+            ("otzaria/c.txt", c),
+        ],
+        None,
+    );
+    let base = work.path("base-v1");
+    ok(&[
+        "assemble",
+        "--kind",
+        "base",
+        "--plan",
+        &plan1,
+        "--warehouse",
+        warehouse,
+        "--out",
+        &base,
+        "--created-at",
+        AT,
+        "--verify",
+    ]);
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&base).join("gates.json")).unwrap(),
+    )
+    .unwrap();
+    for gate in report["gates"].as_array().unwrap() {
+        let mut fields: Vec<&str> = gate
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["detail", "gate", "passed", "status"], "{gate}");
+        assert_eq!(gate["passed"], true, "{gate}");
+        assert_eq!(gate["status"], "passed", "{gate}");
+    }
+
+    let plan2 = build.step(
+        2,
+        &[
+            ("otzaria/a.txt", &a),
+            ("otzaria/b.txt", &b),
+            ("otzaria/d.txt", d),
+        ],
+        Some(&base),
+    );
+    let delta = work.path("delta-v2");
+    let (code, text) = run(&[
+        "assemble",
+        "--kind",
+        "delta",
+        "--plan",
+        &plan2,
+        "--warehouse",
+        warehouse,
+        "--previous",
+        &base,
+        "--out",
+        &delta,
+        "--created-at",
+        AT,
+        "--verify",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("0 slot(s), 0 extra(s), 2 foreign, 4 tombstone(s)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("G5   n/a   not applicable: the delta ships no vector"),
+        "{text}"
+    );
+    assert_eq!(
+        gates(&delta),
+        ["G1", "G5", "G7", "G8", "G9", "G10"].map(|gate| (gate.to_string(), true))
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&delta).join("gates.json")).unwrap(),
+    )
+    .unwrap();
+    let statuses: Vec<&str> = report["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gate| gate["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            "passed",
+            "notApplicable",
+            "passed",
+            "passed",
+            "passed",
+            "passed"
+        ]
+    );
 }
