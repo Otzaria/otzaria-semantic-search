@@ -2020,6 +2020,111 @@ fn garbage_waits_while_current_is_missing() {
     assert!(!dir.join(files::generation_dir(2)).exists());
 }
 
+/// `release` left in `incoming/` as `name`, as a host's download is.
+fn downloaded(dir: &Path, release: &(PathBuf, String), name: &str) -> (PathBuf, String) {
+    std::fs::create_dir_all(incoming_dir(dir)).unwrap();
+    let download = incoming_dir(dir).join(name);
+    std::fs::copy(&release.0, &download).unwrap();
+    (download, release.1.clone())
+}
+
+/// A download the host left in `incoming/` read-only installs. The set flushes it where it
+/// lies before it takes it: on Unix a read-only handle flushes a file; Windows flushes only
+/// through a handle that writes, so there a read-only download is copied instead, and left
+/// where it was.
+#[test]
+fn a_read_only_download_in_incoming_installs() {
+    let work = TempDir::new("set_read_only_download");
+    let dir = work.join("vectors");
+    let (download, json) = downloaded(&dir, &release(&work, &v29(), None), "download.oxv");
+    let mut permissions = std::fs::metadata(&download).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&download, permissions).unwrap();
+
+    let report = install(&dir, &(download.clone(), json))
+        .unwrap_or_else(|error| panic!("a read-only download must install: {error}"));
+    assert_eq!(report.generation, 1);
+    assert_eq!(SegmentSet::open(&dir).unwrap().info().slots_live, 7);
+    assert_eq!(
+        download.exists(),
+        cfg!(windows),
+        "taken, unless it had to be copied"
+    );
+    #[cfg(windows)]
+    {
+        // So that the test's directory can be removed.
+        let mut permissions = std::fs::metadata(&download).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&download, permissions).unwrap();
+    }
+}
+
+/// A download in `incoming/` is the host's until it is installed: an install that does not
+/// happen — refused, cancelled, a segment that does not verify, a failure after the segment
+/// was placed — leaves it where it was, byte for byte, for the host to retry or remove.
+#[test]
+fn a_download_that_does_not_install_stays_in_incoming() {
+    let work = TempDir::new("set_download_kept");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let still_there = |download: &Path, bytes: &[u8], what: &str| {
+        assert_eq!(
+            std::fs::read(download).ok().as_deref(),
+            Some(bytes),
+            "{what}: the download is lost"
+        );
+    };
+
+    // Refused: the installed version, published again.
+    let (download, json) = downloaded(&dir, &republished(&work, &v29(), None), "again.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+    assert!(matches!(
+        install(&dir, &(download.clone(), json)),
+        Err(SemanticSearchError::Artifact(
+            ArtifactError::SegmentIdTaken { .. }
+        ))
+    ));
+    still_there(&download, &bytes, "refused");
+
+    // Cancelled.
+    let (download, json) = downloaded(&dir, &release(&work, &v30(), Some(&v29())), "delta.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let cancelled = install_package(
+        &dir,
+        &InstallSource {
+            segment: &download,
+            manifest_json: &json,
+        },
+        &expectation(),
+        &cancel,
+    );
+    assert!(matches!(cancelled, Err(SemanticSearchError::Cancelled)));
+    still_there(&download, &bytes, "cancelled");
+
+    // A segment that is not the manifest's.
+    let mut damaged = bytes.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    std::fs::write(&download, &damaged).unwrap();
+    assert!(install(&dir, &(download.clone(), json.clone())).is_err());
+    still_there(&download, &damaged, "damaged");
+    std::fs::remove_file(&download).unwrap();
+
+    // Placed, and then the generation cannot be published: CURRENT is a directory with a
+    // file in it, which no pointer can be written over.
+    let current = dir.join(CURRENT);
+    std::fs::remove_file(&current).unwrap();
+    std::fs::create_dir(&current).unwrap();
+    std::fs::write(current.join("left here"), b"by someone").unwrap();
+    let (download, json) = downloaded(&dir, &release(&work, &v31(), None), "v31.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+    assert!(install(&dir, &(download.clone(), json)).is_err());
+    still_there(&download, &bytes, "failed after it was placed");
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
