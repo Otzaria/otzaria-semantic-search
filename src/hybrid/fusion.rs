@@ -19,16 +19,34 @@ use crate::semantic::types::{FusedCandidate, ResultSource};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-/// The order of fused results, best first: the score, then the line id, then the book — two
-/// books can hold lines with the same id, and a line is one per book and id — so the order is
-/// total. Fusion, grouping and the groups themselves all sort by it, so a page is the same on
-/// every call and pagination neither repeats nor skips a result; `HashMap` iteration order,
-/// which every fusion and grouping starts from, differs from one call to the next.
+/// The order of fused results, best first: the score; then the semantic path's own order
+/// ([`FusedCandidate::semantic_position`]), a line only the lexical path found after every
+/// line it placed; then the line id, then the book — two books can hold lines with the same
+/// id, and a line is one per book and id — so the order is total. Fusion, grouping and the
+/// groups themselves all sort by it, so a page is the same on every call and pagination
+/// neither repeats nor skips a result; `HashMap` iteration order, which every fusion and
+/// grouping starts from, differs from one call to the next.
+///
+/// The semantic order comes before the id because every line one vector resolved to has
+/// the same score: the resolver placed them — a line of each book first, then the repeats
+/// within a book — and the id would put one book's repeats, numbered in a row, ahead of
+/// every other book's copy of the text.
 pub(crate) fn best_first(a: &FusedCandidate, b: &FusedCandidate) -> Ordering {
     b.fused_score
         .total_cmp(&a.fused_score)
+        .then_with(|| semantic_order(a.semantic_position, b.semantic_position))
         .then_with(|| a.line_id.cmp(&b.line_id))
         .then_with(|| a.file_path.cmp(&b.file_path))
+}
+
+/// The semantic path's order, a line it did not place after every line it did.
+fn semantic_order(a: Option<u32>, b: Option<u32>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -391,5 +409,139 @@ mod tests {
 
         let scores3 = vec![1.0];
         assert_eq!(compute_confidence(&scores3), None);
+    }
+
+    /// A fused candidate with what [`best_first`] reads, and nothing else.
+    fn ranked(score: f32, position: Option<u32>, line_id: u64, book: &str) -> FusedCandidate {
+        FusedCandidate {
+            title: String::new(),
+            reference: String::new(),
+            text: String::new(),
+            line_id,
+            section_id: 0,
+            line_hash: 0,
+            segment: 0,
+            is_pdf: false,
+            file_path: book.to_string(),
+            needs_hydration: position.is_some(),
+            source: if position.is_some() {
+                ResultSource::Semantic
+            } else {
+                ResultSource::Lexical
+            },
+            raw_bm25_score: None,
+            normalized_bm25: None,
+            raw_semantic_score: None,
+            normalized_semantic: None,
+            fused_score: score,
+            semantic_position: position,
+            lexical_weight: 0.5,
+            semantic_weight: 0.5,
+        }
+    }
+
+    /// What `best_first` orders by, a score by its bits.
+    fn keys(candidate: &FusedCandidate) -> (u32, Option<u32>, u64, String) {
+        (
+            candidate.fused_score.to_bits(),
+            candidate.semantic_position,
+            candidate.line_id,
+            candidate.file_path.clone(),
+        )
+    }
+
+    /// Lines with the same score fall in the semantic path's order — a line it did not place
+    /// after every one it did — and only then by id and book; the score comes first.
+    #[test]
+    fn equal_scores_fall_in_the_semantic_order_before_the_id() {
+        let mut lines = [
+            ranked(0.5, None, 1, "a.txt"),
+            ranked(0.5, Some(3), 2, "a.txt"),
+            ranked(0.5, Some(0), 90, "c.txt"),
+            ranked(0.9, None, 50, "z.txt"),
+            ranked(0.5, Some(1), 3, "a.txt"),
+            ranked(0.5, None, 1, "b.txt"),
+        ];
+        lines.sort_by(best_first);
+        let order: Vec<(u64, &str)> = lines
+            .iter()
+            .map(|line| (line.line_id, line.file_path.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (50, "z.txt"),
+                (90, "c.txt"),
+                (3, "a.txt"),
+                (2, "a.txt"),
+                (1, "a.txt"),
+                (1, "b.txt")
+            ]
+        );
+    }
+
+    /// `best_first` is a total order: antisymmetric, transitive, and two candidates compare
+    /// equal only when every key it reads is equal — so two lines, one per book and id, never
+    /// do, whatever their scores (NaN and both zeros included) and wherever the semantic path
+    /// put them. A sort therefore gives one order whatever order the lines came in, which is
+    /// what makes a page the same on every call.
+    #[test]
+    fn best_first_is_a_total_order() {
+        let mut lines = Vec::new();
+        for score in [0.5, f32::NAN, 0.0, -0.0, 1.0, f32::NEG_INFINITY] {
+            for position in [None, Some(0), Some(1), Some(u32::MAX)] {
+                for line_id in [1, 2] {
+                    for book in ["a.txt", "b.txt"] {
+                        lines.push(ranked(score, position, line_id, book));
+                    }
+                }
+            }
+        }
+        for a in &lines {
+            for b in &lines {
+                let ab = best_first(a, b);
+                assert_eq!(
+                    ab,
+                    best_first(b, a).reverse(),
+                    "{:?} {:?}",
+                    keys(a),
+                    keys(b)
+                );
+                assert_eq!(ab == Ordering::Equal, keys(a) == keys(b));
+                for c in &lines {
+                    if ab.is_le() && best_first(b, c).is_le() {
+                        assert!(
+                            best_first(a, c).is_le(),
+                            "{:?} {:?} {:?}",
+                            keys(a),
+                            keys(b),
+                            keys(c)
+                        );
+                    }
+                }
+            }
+        }
+
+        let sorted = |mut lines: Vec<FusedCandidate>| {
+            lines.sort_by(best_first);
+            lines.iter().map(keys).collect::<Vec<_>>()
+        };
+        let once = sorted(lines.clone());
+        let mut shuffled = lines.clone();
+        // Fisher–Yates on a fixed linear congruential sequence: arbitrary, and repeatable.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in (1..shuffled.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            shuffled.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        for input in [lines.iter().rev().cloned().collect(), shuffled, {
+            let mut rotated = lines.clone();
+            rotated.rotate_left(37);
+            rotated
+        }] {
+            assert_eq!(sorted(input), once);
+        }
     }
 }

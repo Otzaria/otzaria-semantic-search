@@ -205,6 +205,12 @@ otzaria-semantic-search/
     `SemanticOnly` אין קלט לקסיקלי שישתנה עם commit לאינדקס.
   - המיזוג הוא על `(file_path, line_id)` ולא על ה-id לבדו: אינדקס שעודכן ספר אחר ספר
     יכול לתת לשני ספרים אותו טווח ids.
+  - סדר התוצאות שוות הציון (`best_first` ב-`fusion.rs`): אחרי הציון — הסדר של המסלול
+    הסמנטי (`FusedCandidate::semantic_position`: מקום השורה ברשימה ש-`candidates_of`
+    החזיר — סדר הסריקה, ובתוך hit אחד הסדר שה-resolver נתן; `None` לשורה שרק BM25 מצא,
+    אחרי כולן), ורק אחריו ה-id והספר. כל השורות ש-hit אחד נקשר אליהן מקבלות אותו ציון,
+    וה-id הציב את החזרות של ספר אחד — ids רצופים — לפני העותק שבכל ספר אחר, עד שמילאו עמוד
+    שלם. הסדר נשאר טוטאלי, ולכן העמוד זהה בכל קריאה.
   - `reload_semantic_vectors()` — פותח את הדור ש-`CURRENT` מונה, עם אותו מודל, ומנקה את
     מטמון השאילתות; `vector_set_info()` מדווח על הסט.
   - חלון המועמדים הסמנטיים חסום ב-`MAX_SEMANTIC_CANDIDATES` (מדווח ב-log כשנחתך).
@@ -221,6 +227,8 @@ otzaria-semantic-search/
   - `normalize_semantic_scores()` — נורמליזציה ליניארית $(x + 1) / 2$ לציוני Cosine $[-1,1] \to [0,1]$.
   - `fuse_weighted()` — מיזוג ממושקל לפי אלפא: $\alpha \cdot BM25 + (1-\alpha) \cdot Semantic$.
   - `fuse_rrf()` — מיזוג בשיטת Reciprocal Rank Fusion ($1 / (k + rank)$).
+  - `best_first()` — הסדר הכולל של תוצאות ממוזגות: ציון, הסדר הסמנטי, id, ספר. ה-fusion,
+    ה-grouping והקבוצות עצמן ממוינים לפיו.
 
 * [`src/hybrid/ranking.rs`](../src/hybrid/ranking.rs)
   - `analyze_query()` — מזהה מאפייני שאילתא (ביטוי במרכאות, שאילתא קצרה, מילות קונספט, מספרים).
@@ -229,7 +237,8 @@ otzaria-semantic-search/
   - `BonusConfig` — הגדרת בונוסים וקנסות (בונוס התאמה מדויקת, קנס כפילויות וכו').
 
 * [`src/hybrid/grouping.rs`](../src/hybrid/grouping.rs)
-  - `group_by_section()` — מקבץ תוצאות לפי `section_id` וקובץ. הנציג בעל הציון הגבוה ביותר נבחר כ-Representative.
+  - `group_by_section()` — מקבץ תוצאות לפי `section_id` וקובץ. הנציג בעל הציון הגבוה ביותר נבחר כ-Representative
+    (בשוויון — זה שהמסלול הסמנטי הציב ראשון, לפי `best_first`).
   - `group_by_identical_text()` — מקבץ תוצאות בעלות `line_hash` זהה (מניעת כפילויות של נוסחים זהים).
   - `group_results()` — Dispatcher לפי `GroupingMode`.
 
@@ -585,7 +594,8 @@ otzaria-semantic-search/
   - **ברירות המחדל עדיין לא נמדדו.** הכיול צריך את סט הרלוונטיות המתויג של S1 (שאילתות
     עבריות מכל סוג, עם השורות הרלוונטיות לכל אחת), מדד על העמוד (nDCG@10 או recall), וריצות
     שמשנות משפחת פרמטרים אחת בכל פעם. עד אז ברירות המחדל הן הדירוג שהיה תמיד — ובדיקה
-    ב-coordinator משווה אותו ביט-לביט מול עותק קפוא של ה-fusion כפי שהיה.
+    ב-coordinator משווה אותו ביט-לביט מול עותק קפוא של ה-fusion כפי שהיה. שינוי מכוון אחד
+    נכנס לשניהם יחד: בשוויון ציון, הסדר הסמנטי לפני ה-id; כל ציון כפי שהיה.
   - `FusionStrategy` — `Weighted` / `RRF { k }` / `Adaptive`.
 
 * [`src/config/feature_flags.rs`](../src/config/feature_flags.rs)

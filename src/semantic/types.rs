@@ -494,6 +494,17 @@ pub struct FusedCandidate {
     pub raw_semantic_score: Option<f32>,
     pub normalized_semantic: Option<f32>,
     pub fused_score: f32,
+    /// The line's place among the semantic candidates fusion was handed — the scan's order,
+    /// best hit first, and within one hit the order the resolver gave its lines — or `None`
+    /// for a line only the lexical path found.
+    ///
+    /// What orders results after the score. Every line one vector resolved to scores
+    /// alike, so this decides how they are shown: as the resolver placed them — a line of
+    /// each book before a second line of any, when it returns them so — and not by id,
+    /// which put one book's repeats of a text, their ids in a row, ahead of every other
+    /// book's copy, and could fill a page with them.
+    #[serde(default)]
+    pub semantic_position: Option<u32>,
     pub lexical_weight: f32,
     pub semantic_weight: f32,
 }
