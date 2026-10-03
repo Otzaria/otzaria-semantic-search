@@ -51,7 +51,13 @@ impl Library {
 
 /// The vector a key embeds as: the same in every segment, as content addressing promises.
 fn vector_of(key: u64) -> Vec<f32> {
-    Random(key.wrapping_mul(0x9E37_79B9) ^ 0xABCD).unit(DIM)
+    vector_in(key, 0)
+}
+
+/// The vector a key embeds as under `embedding`: 0 is [`vector_of`]'s; another stands for a
+/// worker or a passage package that embeds the same texts a little differently.
+fn vector_in(key: u64, embedding: u64) -> Vec<f32> {
+    Random(key.wrapping_mul(0x9E37_79B9) ^ 0xABCD ^ embedding.wrapping_mul(0x5851_F42D)).unit(DIM)
 }
 
 fn codec() -> Codec {
@@ -80,7 +86,11 @@ fn expectation() -> InstallExpectation {
 /// records in hint order, a key's first appearance a slot and every later one an extra.
 /// `shipped` decides which keys this segment ships; `foreign` which records it carries for
 /// keys an older segment ships.
-fn books_for(records: &BTreeMap<(String, u64), u32>, shipped: &BTreeSet<u64>) -> Vec<TestBook> {
+fn books_for(
+    records: &BTreeMap<(String, u64), u32>,
+    shipped: &BTreeSet<u64>,
+    embedding: u64,
+) -> Vec<TestBook> {
     let mut by_book: BTreeMap<&str, Vec<(u32, u64)>> = BTreeMap::new();
     for ((book, key), hint) in records {
         by_book.entry(book).or_default().push((*hint, *key));
@@ -97,7 +107,8 @@ fn books_for(records: &BTreeMap<(String, u64), u32>, shipped: &BTreeSet<u64>) ->
                     None => {
                         let slot = slot_of.len() as u32;
                         slot_of.insert(key, slot);
-                        book.primary.push((self::key(key), hint, vector_of(key)));
+                        book.primary
+                            .push((self::key(key), hint, vector_in(key, embedding)));
                     }
                 }
             } else {
@@ -111,12 +122,24 @@ fn books_for(records: &BTreeMap<(String, u64), u32>, shipped: &BTreeSet<u64>) ->
 
 /// Write a release of `library` — a base, or a delta from `previous` — and its manifest.
 fn release(dir: &TempDir, library: &Library, previous: Option<&Library>) -> (PathBuf, String) {
+    release_embedded(dir, library, previous, 0)
+}
+
+/// [`release`], its vectors embedded under `embedding` ([`vector_in`]): another embedding of
+/// the same release is the same keys in the same slots — the same segment id — and other
+/// bytes, as a version published again would be.
+fn release_embedded(
+    dir: &TempDir,
+    library: &Library,
+    previous: Option<&Library>,
+    embedding: u64,
+) -> (PathBuf, String) {
     let pairs = library.pairs();
     let (kind, from, books, tombstones) = match previous {
         None => (
             PackageKind::Base,
             0,
-            books_for(&pairs, &library.keys()),
+            books_for(&pairs, &library.keys(), embedding),
             Vec::new(),
         ),
         Some(previous) => {
@@ -138,14 +161,20 @@ fn release(dir: &TempDir, library: &Library, previous: Option<&Library>) -> (Pat
             (
                 PackageKind::Delta,
                 previous.version,
-                books_for(&records, &new_keys),
+                books_for(&records, &new_keys, embedding),
                 gone,
             )
         }
     };
     let mut spec = spec(kind, from, library.version);
     spec.identity_digest = identity().identity_digest();
-    let path = dir.join(&format!("{kind}-{}.oxv", library.version));
+    let path = match embedding {
+        0 => dir.join(&format!("{kind}-{}.oxv", library.version)),
+        _ => dir.join(&format!(
+            "{kind}-{}-embedding-{embedding}.oxv",
+            library.version
+        )),
+    };
     let _ = std::fs::remove_file(&path);
     let written = write_segment(&path, spec, codec(), &books, &tombstones);
     let manifest = ReleaseManifest::for_segment(
@@ -1506,8 +1535,9 @@ fn a_condemned_generation_falls_back_alike_for_open_info_and_scrub() {
 
 /// A scrub that read a damaged file while an install replaced it would leave a verdict on
 /// bytes the file no longer holds; it withdraws it, so the install's bytes are never
-/// condemned. One on the bytes the file holds stands, and so does a marker that names no
-/// bytes — as every marker before verdicts did.
+/// condemned. One on the bytes the file holds stands — damaged bytes, which no generation
+/// names — and so does a marker that names no bytes, as every marker before verdicts did. One
+/// on exactly the bytes the generation names condemns nothing: those are the bytes it serves.
 #[test]
 fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
     let work = TempDir::new("set_verdict_race");
@@ -1515,16 +1545,22 @@ fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
     let base = release(&work, &v29(), None);
     install(&dir, &base).unwrap();
     let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let file = dir.join(format!("segments/{id}.oxv"));
     let marker = dir.join(format!("segments/{id}.corrupt"));
 
     assert!(!files::condemn(&dir, &id, &"0".repeat(64), "a block failed").unwrap());
     assert!(!marker.exists());
     SegmentSet::open(&dir).unwrap();
 
-    let held = files::sha256_hex(&std::fs::read(dir.join(format!("segments/{id}.oxv"))).unwrap());
-    assert!(files::condemn(&dir, &id, &held, "a block failed").unwrap());
+    let sound = std::fs::read(&file).unwrap();
+    let damaged = damage_last_byte(&file);
+    assert!(files::condemn(&dir, &id, &files::sha256_hex(&damaged), "a block failed").unwrap());
     assert!(is_corrupt(SegmentSet::open(&dir)));
     assert!(is_corrupt(info(&dir)));
+
+    std::fs::write(&file, &sound).unwrap();
+    assert!(files::condemn(&dir, &id, &files::sha256_hex(&sound), "a block failed").unwrap());
+    SegmentSet::open(&dir).unwrap();
 
     std::fs::write(&marker, b"a block failed").unwrap();
     assert!(is_corrupt(SegmentSet::open(&dir)));
@@ -1601,49 +1637,160 @@ fn two_compactions_that_differ_are_two_segments_and_previous_keeps_its_own() {
     );
 }
 
-/// A release under an installed segment's id with other bytes — what an id that does not
-/// name its content allows — is refused, and the installed file and every generation that
-/// names it are left as they were. The bytes a generation names are never rewritten.
+/// The release `library` is, published again: embedded anew, so the same keys in the same
+/// slots — the same segment id — and other bytes.
+fn republished(dir: &TempDir, library: &Library, previous: Option<&Library>) -> (PathBuf, String) {
+    release_embedded(dir, library, previous, 1)
+}
+
+fn manifest_of(release: &(PathBuf, String)) -> ReleaseManifest {
+    serde_json::from_str(&release.1).unwrap()
+}
+
+/// A version that is installed, published again — embedded anew, or its hints anchored
+/// anew — is the installed segment's id with other bytes. While a generation that opens
+/// stands on the installed bytes it is refused as what it is, `SegmentIdTaken`, naming both,
+/// and nothing changes. Once no generation that opens names them — two other bases later,
+/// `PREVIOUS` included — it installs.
 #[test]
-fn a_release_under_an_installed_segments_id_with_other_bytes_is_refused() {
-    let work = TempDir::new("set_impostor");
+fn a_republished_version_is_refused_while_its_installed_bytes_are_served() {
+    let work = TempDir::new("set_republished");
     let dir = work.join("vectors");
     install(&dir, &release(&work, &v29(), None)).unwrap();
-    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
-    let installed = dir.join(format!("segments/{id}.oxv"));
-    let held = std::fs::read(&installed).unwrap();
-    let answers = everything(&SegmentSet::open(&dir).unwrap(), 10);
+    let installed = info(&dir).unwrap().unwrap().segments[0].clone();
+    let file = dir.join(format!("segments/{}.oxv", installed.id));
+    let answers = everything(&SegmentSet::open(&dir).unwrap(), 13);
+    let again = republished(&work, &v29(), None);
+    let offered = manifest_of(&again);
+    assert_eq!(offered.segment_id, installed.id, "one release, so one id");
+    assert_ne!(offered.segment.sha256, installed.sha256);
 
-    // v29 with one record moved, its header and its manifest made to claim that id.
-    let mut moved = v29();
-    let lines = moved.books.get_mut("id:3").unwrap();
-    lines.remove(&1);
-    lines.insert(4, 7);
-    let (path, json) = release(&work, &moved, None);
-    let mut bytes = std::fs::read(&path).unwrap();
-    let mut header = crate::semantic::oxv::format::Header::decode(&bytes).unwrap();
-    header.segment_id = (0..16)
-        .map(|at| u8::from_str_radix(&id[at * 2..at * 2 + 2], 16).unwrap())
-        .collect::<Vec<u8>>()
-        .try_into()
-        .unwrap();
-    bytes[..4096].copy_from_slice(&header.encode());
-    std::fs::write(&path, &bytes).unwrap();
-    let mut manifest: ReleaseManifest = serde_json::from_str(&json).unwrap();
-    manifest.segment_id = id.clone();
-    manifest.segment.sha256 = files::sha256_hex(&bytes);
-    manifest.package_digest = manifest.package().digest();
-
-    match install(&dir, &(path, manifest.to_json())) {
-        Err(SemanticSearchError::Artifact(ArtifactError::ManifestDisagreesWithPayload {
-            reason,
-        })) => assert!(reason.contains(&id), "{reason}"),
-        other => panic!("a release under another segment's id must be refused, got {other:?}"),
-    }
-    assert_eq!(std::fs::read(&installed).unwrap(), held);
+    let refused = |result: Result<ApplyReport, SemanticSearchError>| match result {
+        Err(SemanticSearchError::Artifact(ArtifactError::SegmentIdTaken {
+            id,
+            installed_sha256,
+            offered_sha256,
+        })) => assert_eq!(
+            (id, installed_sha256, offered_sha256),
+            (
+                installed.id.clone(),
+                installed.sha256.clone(),
+                offered.segment.sha256.clone()
+            )
+        ),
+        other => panic!("a version published again must be refused as one, got {other:?}"),
+    };
+    refused(install(&dir, &again));
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        installed.sha256
+    );
     let set = SegmentSet::open(&dir).unwrap();
     assert_eq!(set.generation(), 1);
-    assert_eq!(everything(&set, 10), answers);
+    assert_eq!(everything(&set, 13), answers);
+    drop(set);
+
+    // Another base: v29 is PREVIOUS's, which opens, so still refused.
+    let mut v40 = v30();
+    v40.version = 40;
+    install(&dir, &release(&work, &v40, None)).unwrap();
+    refused(install(&dir, &again));
+    // One more, and nothing that opens names v29's bytes.
+    let mut v41 = v40.clone();
+    v41.version = 41;
+    install(&dir, &release(&work, &v41, None)).unwrap();
+    assert_eq!(install(&dir, &again).unwrap().library_version, 29);
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        offered.segment.sha256
+    );
+}
+
+/// The review's scenario: a base damaged under a delta — scrubbed, so both generations are
+/// condemned, or not yet, so both open on damaged bytes — and its version published again.
+/// No generation that opens stands on the bytes the file holds, so the release installs as a
+/// repair and the set opens on it. The generations that name the old bytes stay shut: those
+/// bytes are gone, and they never open on the new ones.
+#[test]
+fn a_damaged_base_is_repaired_by_its_version_published_again() {
+    for scrubbed in [true, false] {
+        let work = TempDir::new("set_republished_repair");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+        let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+        let file = dir.join(format!("segments/{id}.oxv"));
+        damage_last_byte(&file);
+        if scrubbed {
+            assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+            assert!(is_corrupt(SegmentSet::open(&dir)));
+        }
+
+        let again = republished(&work, &v29(), None);
+        let report = install(&dir, &again).unwrap_or_else(|error| {
+            panic!("scrubbed {scrubbed}: the repair must install: {error}")
+        });
+        assert_eq!((report.generation, report.library_version), (3, 29));
+        assert_eq!(
+            files::sha256_hex(&std::fs::read(&file).unwrap()),
+            manifest_of(&again).segment.sha256
+        );
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(set.generation(), 3, "scrubbed {scrubbed}");
+        assert!(!set.info().recovered_from_previous);
+        drop(set);
+        assert_eq!(info(&dir).unwrap().unwrap().generation, 3);
+        assert_eq!(
+            scrub(&dir, &CancellationToken::new()).unwrap().generation,
+            3
+        );
+
+        // PREVIOUS names the base's old bytes: it does not open on the new ones.
+        assert_eq!(previous_generation(&dir), 2, "scrubbed {scrubbed}");
+        break_current(&dir, Broken::Garbage);
+        assert!(is_corrupt(SegmentSet::open(&dir)), "scrubbed {scrubbed}");
+        assert!(is_corrupt(info(&dir)), "scrubbed {scrubbed}");
+    }
+}
+
+/// A delta published again, offered to a set on a fallback: `CURRENT` names the generation
+/// with the delta, which does not open, and `PREVIOUS` the base's, which does. Nothing that
+/// opens stands on the delta's installed bytes, so the release applies to the generation
+/// that opens, as any delta from its version would.
+#[test]
+fn a_republished_delta_applies_to_a_fallback() {
+    let work = TempDir::new("set_republished_delta");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let delta = info(&dir).unwrap().unwrap().segments[1].clone();
+    let del = std::fs::read_dir(dir.join(files::generation_dir(2)))
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".del"))
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&del).unwrap();
+    bytes[20] ^= 1;
+    std::fs::write(&del, bytes).unwrap();
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+
+    let again = republished(&work, &v30(), Some(&v29()));
+    assert_eq!(manifest_of(&again).segment_id, delta.id);
+    let report = install(&dir, &again).unwrap();
+    assert_eq!((report.generation, report.library_version), (3, 30));
+    assert_eq!(previous_generation(&dir), 1);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (3, 30));
+    assert_eq!(
+        set.info().segments[1].sha256,
+        manifest_of(&again).segment.sha256
+    );
+    drop(set);
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(dir.join(format!("segments/{}.oxv", delta.id))).unwrap()),
+        manifest_of(&again).segment.sha256
+    );
 }
 
 /// Compacting a set that is one compacted segment already writes that segment again: the

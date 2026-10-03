@@ -22,9 +22,9 @@
 use super::files::{
     encode_links, generation_dir, generation_path, hash_file, io_error, is_segment_id,
     next_generation, place_segment, read_pointer, segment_file, sha256_hex, sync_file,
-    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument,
-    SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE,
-    SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
+    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Placed, Pointer,
+    SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR,
+    SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -311,6 +311,11 @@ pub fn install_package(
             return Ok(report);
         }
     }
+    // A base takes nothing from the set but the pointer it was built on, and lets go of its
+    // mappings now: the file it may replace could be one of them, and Windows replaces no
+    // file that is mapped.
+    let base = current.as_ref().map(|set| set.pointer().clone());
+    let current = current.filter(|_| manifest.kind == PackageKind::Delta);
 
     // 3. Stage and verify.
     let staging = dir.join(STAGING_DIR);
@@ -378,14 +383,25 @@ pub fn install_package(
     // generation names.
     let file = segment_file(&manifest.segment_id);
     let target = dir.join(&file);
-    place_segment(
+    let placed = place_segment(
         dir,
         &manifest.segment_id,
         &staged,
         &manifest.segment.sha256,
         cancel,
-        |reason| ArtifactError::ManifestDisagreesWithPayload { reason }.into(),
+        |installed| {
+            ArtifactError::SegmentIdTaken {
+                id: manifest.segment_id.clone(),
+                installed_sha256: installed,
+                offered_sha256: manifest.segment.sha256.clone(),
+            }
+            .into()
+        },
     )?;
+    if placed == Placed::Kept {
+        // The same segment, installed before and still on disk — mapped, perhaps.
+        fs::remove_file(&staged).map_err(io_error(format!("removing {}", staged.display())))?;
+    }
     let segments_dir = dir.join(SEGMENTS_DIR);
     let provenance_path = segments_dir.join(format!("{}.package.json", manifest.segment_id));
     write_atomically(&provenance_path, source.manifest_json.as_bytes())
@@ -418,7 +434,6 @@ pub fn install_package(
     };
     let resolution = generation.push(entry, &segment, older, cancel)?;
     generation.library_release_tag = manifest.library_release_tag.clone();
-    let base = current.as_ref().map(|set| set.pointer().clone());
     let document = generation.commit(dir, base.as_ref())?;
 
     let bytes_on_disk = document.stats.bytes;

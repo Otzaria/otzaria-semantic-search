@@ -403,14 +403,18 @@ pub fn compact(
     let id = hex(&written.segment_id);
     let file = files::segment_file(&id);
     let target = dir.join(&file);
-    files::place_segment(
-        dir,
-        &id,
-        &partial,
-        &hex(&written.sha256),
-        cancel,
-        |reason| VectorStoreError::Corrupted { reason }.into(),
-    )?;
+    let placed = files::place_segment(dir, &id, &partial, &hex(&written.sha256), cancel, |held| {
+        VectorStoreError::Corrupted {
+            reason: format!(
+                "segment {id} is served with SHA-256 {held}, and a compaction wrote other bytes \
+                 under its name"
+            ),
+        }
+        .into()
+    })?;
+    if placed == files::Placed::Kept {
+        fs::remove_file(&partial).map_err(io_error(format!("removing {}", partial.display())))?;
+    }
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);
     generation.library_release_tag = document.library_release_tag.clone();

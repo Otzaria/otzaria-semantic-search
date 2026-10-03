@@ -394,9 +394,10 @@ impl SegmentSet {
 /// alike.
 fn condemnation(dir: &Path, document: &SetDocument) -> Option<String> {
     document.segments.iter().find_map(|entry| {
-        files::read_verdict(dir, &entry.id).map(|verdict| {
+        files::verdict_against(dir, &entry.id, &entry.sha256).map(|verdict| {
             format!(
-                "segment {} failed a scrub ({}); the set has to be installed again",
+                "segment {} does not hold the bytes this generation names, as a scrub or an \
+                 install found ({}); the set has to be installed again",
                 entry.id, verdict.reason
             )
         })

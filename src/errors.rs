@@ -414,6 +414,22 @@ pub enum ArtifactError {
     #[error("The delta does not apply to this vector set: {field} — {reason}")]
     DeltaDoesNotApply { field: &'static str, reason: String },
 
+    /// A release under the id of a segment the set holds with other bytes, which a generation
+    /// that opens still stands on: a version that is installed — the same identity, kind,
+    /// library versions and keys — published again, embedded or anchored anew. A sound
+    /// release, and a sound set: the set keeps the bytes it serves, and the release does not
+    /// replace them (`docs/ARTIFACT_CONTRACT.md` §2.4 says what a host can do).
+    #[error(
+        "The release's segment {id} is a version this set has installed, published again with \
+         other bytes: it holds SHA-256 {installed_sha256} and serves it, and this release is \
+         {offered_sha256}"
+    )]
+    SegmentIdTaken {
+        id: String,
+        installed_sha256: String,
+        offered_sha256: String,
+    },
+
     /// The device lacks the free space an install or a compaction needs.
     ///
     /// `available` is what the filesystem reported, or — where it could not be asked — what
