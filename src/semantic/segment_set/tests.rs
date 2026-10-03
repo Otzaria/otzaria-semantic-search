@@ -1344,52 +1344,67 @@ fn journal_of(work: impl FnOnce()) -> Vec<files::Durable> {
     files::JOURNAL.with(|journal| journal.borrow_mut().drain(..).collect())
 }
 
-/// The order one publish into `dir` must show: the segment's bytes flushed in `staging/`,
-/// the segment renamed into `segments/` and that directory flushed; the new generation's
-/// `set.json` renamed in, and the set's directory flushed after it — the generation's own
-/// entry; all of it before `CURRENT` is renamed, and the set's directory flushed after.
+/// The order one publish into `dir` must show: the segment's bytes flushed where they are,
+/// then renamed into `segments/`; the new generation's `set.json` renamed in; `CURRENT`
+/// renamed last. And on Unix, where a directory can be flushed, `segments/` flushed after the
+/// segment lands, the set's directory — the generation's own entry — after the generation is
+/// written, and again after the flip, all before what follows; on Windows, which flushes no
+/// directory and keeps a rename's order itself, no directory flush is claimed at all.
 fn assert_published_in_order(steps: &[files::Durable], dir: &Path, what: &str) {
     use files::Durable;
-    let flip = steps
-        .iter()
-        .position(|step| *step == Durable::Renamed(dir.join(CURRENT)))
-        .unwrap_or_else(|| panic!("{what}: no flip in {steps:#?}"));
-    let (staging, segments) = (dir.join(STAGING_DIR), dir.join(SEGMENTS_DIR));
+    let renamed_to = |to: &Path| {
+        steps
+            .iter()
+            .position(|step| matches!(step, Durable::Renamed(_, path) if path == to))
+    };
+    let flip =
+        renamed_to(&dir.join(CURRENT)).unwrap_or_else(|| panic!("{what}: no flip in {steps:#?}"));
+    let segments = dir.join(SEGMENTS_DIR);
     let placed = steps
         .iter()
         .position(|step| {
-            matches!(step, Durable::Renamed(path)
+            matches!(step, Durable::Renamed(_, path)
                 if path.parent() == Some(segments.as_path())
                     && path.extension().is_some_and(|extension| extension == "oxv"))
         })
         .unwrap_or_else(|| panic!("{what}: no segment placed in {steps:#?}"));
+    let Durable::Renamed(source, _) = &steps[placed] else {
+        unreachable!("a placement is a rename")
+    };
     assert!(
-        steps[..placed].iter().any(
-            |step| matches!(step, Durable::File(path) if path.parent() == Some(staging.as_path()))
-        ),
-        "{what}: the segment's bytes are flushed before it is renamed into place: {steps:#?}"
-    );
-    assert!(
-        steps[placed..flip].contains(&Durable::Dir(segments.clone())),
-        "{what}: segments/ is flushed after the segment lands and before the flip: {steps:#?}"
+        steps[..placed].contains(&Durable::File(source.clone())),
+        "{what}: the segment's bytes are flushed where they are before they are renamed into \
+         place: {steps:#?}"
     );
     let generation = steps[..flip]
         .iter()
         .rposition(|step| {
-            matches!(step, Durable::Renamed(path)
+            matches!(step, Durable::Renamed(_, path)
                 if path.file_name().is_some_and(|name| name == files::SET_FILE))
         })
         .unwrap_or_else(|| panic!("{what}: no generation written in {steps:#?}"));
-    assert!(
-        steps[generation..flip].contains(&Durable::Dir(dir.to_path_buf())),
-        "{what}: the set's directory — the new generation's entry — is flushed before the \
-         flip: {steps:#?}"
-    );
-    assert_eq!(
-        steps.get(flip + 1),
-        Some(&Durable::Dir(dir.to_path_buf())),
-        "{what}: and so is the flip"
-    );
+    assert!(placed < generation, "{what}: {steps:#?}");
+    if cfg!(unix) {
+        assert!(
+            steps[placed..flip].contains(&Durable::Dir(segments.clone())),
+            "{what}: segments/ is flushed after the segment lands and before the flip: {steps:#?}"
+        );
+        assert!(
+            steps[generation..flip].contains(&Durable::Dir(dir.to_path_buf())),
+            "{what}: the set's directory — the new generation's entry — is flushed before the \
+             flip: {steps:#?}"
+        );
+        assert_eq!(
+            steps.get(flip + 1),
+            Some(&Durable::Dir(dir.to_path_buf())),
+            "{what}: and so is the flip"
+        );
+    } else {
+        assert!(
+            !steps.iter().any(|step| matches!(step, Durable::Dir(_))),
+            "{what}: no directory flush is claimed where none happens: {steps:#?}"
+        );
+    }
 }
 
 /// Every publish writes, flushes the file, renames it into place and flushes the directory,
@@ -1403,6 +1418,11 @@ fn every_publish_is_flushed_before_the_flip_that_names_it() {
         install(&dir, &release(&work, &v29(), None)).unwrap();
     });
     assert_published_in_order(&steps, &dir, "a base, copied");
+    let flushed = journal_of(|| files::sync_set_dir(&dir).unwrap());
+    match cfg!(unix) {
+        true => assert_eq!(flushed, [files::Durable::Dir(dir.clone())]),
+        false => assert_eq!(flushed, []),
+    }
 
     let (path, json) = release(&work, &v30(), Some(&v29()));
     std::fs::create_dir_all(incoming_dir(&dir)).unwrap();

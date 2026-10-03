@@ -415,9 +415,10 @@ fn trailer<'a>(bytes: &'a [u8], magic: &[u8; 8], expected_crc: u32) -> Result<&'
 pub(crate) enum Durable {
     /// A file's bytes, flushed.
     File(PathBuf),
-    /// A file renamed into place at this path.
-    Renamed(PathBuf),
-    /// A directory's entries, flushed.
+    /// A file renamed into place: from, to.
+    Renamed(PathBuf, PathBuf),
+    /// A directory's entries, flushed. Only where that happens — Unix: Windows cannot flush a
+    /// directory, and keeps a rename's order itself.
     Dir(PathBuf),
 }
 
@@ -447,6 +448,8 @@ pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
 /// loss before anything names it.
 pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
     sync_dir(path)?;
+    // `sync_dir` flushes on Unix and does nothing elsewhere; only a flush is noted.
+    #[cfg(unix)]
     note(|| Durable::Dir(path.to_path_buf()));
     Ok(())
 }
@@ -454,7 +457,7 @@ pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
 /// Rename a flushed file into place.
 pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)?;
-    note(|| Durable::Renamed(to.to_path_buf()));
+    note(|| Durable::Renamed(from.to_path_buf(), to.to_path_buf()));
     Ok(())
 }
 
