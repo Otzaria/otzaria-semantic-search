@@ -629,6 +629,114 @@ fn an_install_never_waits_behind_another_and_a_reader_never_waits_at_all() {
     install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
 }
 
+/// A reader beside an open session opens the set without its lock and cleans nothing: not
+/// under another holder's lock, and not with the lock free, where [`SegmentSet::open`]
+/// would remove a crashed install's `staging/` and a garbage generation.
+#[test]
+fn a_set_opens_without_recovery_under_another_holders_lock_and_cleans_nothing() {
+    let work = TempDir::new("set_without_recovery");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let debris = |dir: &Path| {
+        std::fs::create_dir_all(dir.join(STAGING_DIR)).unwrap();
+        std::fs::write(dir.join(STAGING_DIR).join("left.oxv"), b"half").unwrap();
+        std::fs::create_dir_all(dir.join(generation_dir(999))).unwrap();
+    };
+    let left = |dir: &Path| {
+        dir.join(STAGING_DIR).join("left.oxv").exists() && dir.join(generation_dir(999)).exists()
+    };
+    debris(&dir);
+
+    let held = files::SetLock::take(&dir).unwrap();
+    let opened = SegmentSet::open_without_recovery(&dir).unwrap();
+    assert_eq!(opened.generation(), 2);
+    assert!(left(&dir), "nothing is cleaned under another holder's lock");
+    assert!(
+        files::SetLock::try_take(&dir).unwrap().is_none(),
+        "the lock stays the holder's"
+    );
+    drop(held);
+
+    // With the lock free, still nothing: it never takes the lock, and never recovers.
+    let opened = SegmentSet::open_without_recovery(&dir).unwrap();
+    assert_eq!(opened.generation(), 2);
+    assert!(left(&dir));
+    // What open does with the lock free, for contrast.
+    SegmentSet::open(&dir).unwrap();
+    assert!(!left(&dir));
+}
+
+/// Installs beside a reader that opens the set over and over without recovery are never
+/// refused: it takes no lock for them to meet. Each of its opens is a generation an install
+/// flipped to, or — when two flips during one open collected the generation it read — an
+/// error that opening again resolves.
+#[test]
+fn an_install_beside_a_reader_without_recovery_is_never_refused() {
+    let work = TempDir::new("set_reader_beside_installs");
+    let dir = work.join("vectors");
+    let bases: Vec<(PathBuf, String)> = [29u32, 30, 31, 32]
+        .into_iter()
+        .map(|version| {
+            let mut library = v30();
+            library.version = version;
+            library
+                .books
+                .get_mut("id:3")
+                .unwrap()
+                .insert(9, 100 + u64::from(version));
+            release(&work, &library, None)
+        })
+        .collect();
+    install(&dir, &bases[0]).unwrap();
+    let installing = std::sync::atomic::AtomicBool::new(true);
+    let (installed, opened) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut opened: Vec<Result<u64, String>> = Vec::new();
+            while installing.load(std::sync::atomic::Ordering::Acquire) {
+                opened.push(
+                    SegmentSet::open_without_recovery(&dir)
+                        .map(|set| set.generation())
+                        .map_err(|error| error.to_string()),
+                );
+            }
+            opened
+        });
+        // Collected, not unwrapped: a refused install must not leave the reader spinning.
+        let outcomes: Vec<Result<u64, String>> = (0..12)
+            .map(|round| {
+                install(&dir, &bases[1 + round % 3])
+                    .map(|report| report.generation)
+                    .map_err(|error| error.to_string())
+            })
+            .collect();
+        installing.store(false, std::sync::atomic::Ordering::Release);
+        (outcomes, reader.join().unwrap())
+    });
+    let refused: Vec<&String> = installed
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "every install went through: {refused:?}"
+    );
+    let installed: Vec<u64> = std::iter::once(1)
+        .chain(installed.into_iter().flatten())
+        .collect();
+    assert!(!opened.is_empty());
+    // Each open is a generation an install made; one that failed — two flips collected the
+    // generation it read — is resolved by opening again, below.
+    for generation in opened.iter().flatten() {
+        assert!(
+            installed.contains(generation),
+            "generation {generation} is none an install made: {installed:?}"
+        );
+    }
+    let last = SegmentSet::open_without_recovery(&dir).unwrap();
+    assert_eq!(last.generation(), *installed.last().unwrap());
+}
+
 #[test]
 fn a_cancelled_install_leaves_the_set_as_it_was() {
     let work = TempDir::new("set_cancel");
