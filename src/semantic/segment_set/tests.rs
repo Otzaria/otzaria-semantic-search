@@ -2125,6 +2125,50 @@ fn a_download_that_does_not_install_stays_in_incoming() {
     still_there(&download, &bytes, "failed after it was placed");
 }
 
+/// A pointer that reads and names the last generation number, which no install writes and no
+/// directory holds, blocked every install with "no generation number is left" — and, copied
+/// into `PREVIOUS`, every collection after. A number only a pointer names, whose generation
+/// does not read, is passed over when nothing is left past it, and the next install heals the
+/// set: with a fallback to build on, and without one.
+#[test]
+fn a_pointer_naming_the_last_generation_number_blocks_no_install() {
+    let last = files::Pointer {
+        generation: u64::MAX,
+        set: format!("{}/{}", files::generation_dir(u64::MAX), files::SET_FILE),
+        set_sha256: "0".repeat(64),
+    };
+    let point_current_at_the_last =
+        |dir: &Path| std::fs::write(dir.join(CURRENT), serde_json::to_vec(&last).unwrap()).unwrap();
+
+    let work = TempDir::new("set_last_number");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    point_current_at_the_last(&dir);
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+    let report = install(&dir, &release(&work, &v31(), None))
+        .unwrap_or_else(|error| panic!("with a fallback: {error}"));
+    assert_eq!(report.generation, 3);
+    assert_eq!(previous_generation(&dir), 1);
+    assert!(
+        !dir.join(files::generation_dir(2)).exists(),
+        "both pointers read again, and garbage is collected"
+    );
+
+    let alone = work.join("alone");
+    install(&alone, &release(&work, &v29(), None)).unwrap();
+    point_current_at_the_last(&alone);
+    assert!(is_corrupt(SegmentSet::open(&alone)));
+    let report = install(&alone, &release(&work, &v31(), None))
+        .unwrap_or_else(|error| panic!("without a fallback: {error}"));
+    assert_eq!(report.generation, 2);
+    assert!(
+        !alone.join(PREVIOUS).exists(),
+        "a pointer whose generation does not read is no fallback"
+    );
+    assert_eq!(SegmentSet::open(&alone).unwrap().generation(), 2);
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);

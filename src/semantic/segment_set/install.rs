@@ -23,10 +23,10 @@
 
 use super::files::{
     encode_links, generation_dir, generation_path, hash_file, io_error, is_segment_id,
-    next_generation, place_segment, read_pointer, segment_file, sha256_hex, sync_file,
-    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Placed, Pointer,
-    SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR,
-    SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
+    next_generation, place_segment, read_generation, read_pointer, segment_file, sha256_hex,
+    sync_file, sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Placed,
+    Pointer, SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS,
+    SEGMENTS_DIR, SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -924,12 +924,16 @@ impl NewGeneration {
             set_sha256: sha256_hex(&bytes),
         };
         // PREVIOUS: the generation this one was built on, or — when none opened — what
-        // CURRENT names, if it reads. Never CURRENT's bytes as they are: an unreadable
-        // CURRENT would overwrite the one pointer that still opens, and on a fallback
-        // CURRENT names the generation that did not.
+        // CURRENT names, if it and its generation read. Never CURRENT's bytes as they are: an
+        // unreadable CURRENT would overwrite the one pointer that still opens, and on a
+        // fallback CURRENT names the generation that did not. A pointer whose generation does
+        // not read is no fallback, and in PREVIOUS it would stop every collection.
         let previous = match base {
             Some(base) => Some(base.clone()),
-            None => read_pointer(dir, CURRENT).ok().flatten(),
+            None => read_pointer(dir, CURRENT)
+                .ok()
+                .flatten()
+                .filter(|pointer| read_generation(dir, pointer).is_ok()),
         };
         if let Some(previous) = previous {
             if read_pointer(dir, PREVIOUS).ok().flatten().as_ref() != Some(&previous) {

@@ -65,24 +65,45 @@ pub(crate) fn generation_of(name: &str) -> Option<u64> {
 /// `gen-` entry in the directory. A new generation never lands on one that exists — a
 /// pointer's, one that only an unreadable pointer could name, or one a crash left — so
 /// writing it removes and overwrites nothing.
+///
+/// A pointer naming the last number, `u64::MAX`, which no install writes, is passed over
+/// unless a directory holds that generation; and should one, the next generation takes the
+/// lowest number nothing on disk holds and no pointer names. Either way a pointer that reads
+/// cannot stop every install for good.
 pub(crate) fn next_generation(dir: &Path) -> Result<u64, ArtifactError> {
-    let mut highest = 0u64;
-    for name in [CURRENT, PREVIOUS] {
-        if let Ok(Some(pointer)) = read_pointer(dir, name) {
-            highest = highest.max(pointer.generation);
-        }
-    }
+    let mut on_disk = std::collections::BTreeSet::new();
     let listing = io_error(format!("listing {}", dir.display()));
     for entry in fs::read_dir(dir).map_err(listing)? {
         let entry = entry.map_err(io_error(format!("listing {}", dir.display())))?;
         if let Some(generation) = generation_of(&entry.file_name().to_string_lossy()) {
-            highest = highest.max(generation);
+            on_disk.insert(generation);
         }
     }
-    highest.checked_add(1).ok_or_else(|| ArtifactError::Io {
-        context: format!("{}: no generation number is left", dir.display()),
-        source: io::Error::from(io::ErrorKind::InvalidData),
-    })
+    let named: Vec<u64> = [CURRENT, PREVIOUS]
+        .into_iter()
+        .filter_map(|name| read_pointer(dir, name).ok().flatten())
+        .map(|pointer| pointer.generation)
+        .collect();
+    let highest = on_disk
+        .iter()
+        .copied()
+        .chain(
+            named
+                .iter()
+                .copied()
+                .filter(|generation| *generation < u64::MAX),
+        )
+        .max()
+        .unwrap_or(0);
+    if let Some(next) = highest.checked_add(1) {
+        return Ok(next);
+    }
+    (1..u64::MAX)
+        .find(|generation| !on_disk.contains(generation) && !named.contains(generation))
+        .ok_or_else(|| ArtifactError::Io {
+            context: format!("{}: no generation number is left", dir.display()),
+            source: io::Error::from(io::ErrorKind::InvalidData),
+        })
 }
 
 /// Point `name` — `CURRENT` or `PREVIOUS` — at a generation, `bytes` being the serialized
