@@ -167,6 +167,11 @@ pub trait CandidateResolver: Send + Sync {
     /// The live lines that hold each hit's key, in books `filters` admits — at most a few
     /// per hit, the best-placed first. A line two hits resolve to is returned once, for the
     /// better-scored hit; a hit that resolves nowhere contributes nothing.
+    ///
+    /// A hit's lines all score alike, so the order they are returned in is the order a
+    /// result list shows them: a resolver that wants a line of each book before a second
+    /// line of any returns them so. The same index and hits must give the same order, or a
+    /// page of them differs from one call to the next.
     fn resolve(
         &self,
         hits: &[VectorHit],
