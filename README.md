@@ -587,6 +587,10 @@ See the [LICENSE](LICENSE) file for complete details.
 
 > **Note:** This license applies strictly to original project code. Third-party libraries, embedding models, and Otzaria texts remain under their respective original licenses.
 
+> **Model files:** The embedding model files in this repository's releases are licensed under
+> [MODEL_LICENSE](MODEL_LICENSE): personal use only; any public use, even free, requires prior
+> written permission from the Otzaria Project (otzaria.1@gmail.com).
+
 ---
 
 ## ✉️ Contact & Support
