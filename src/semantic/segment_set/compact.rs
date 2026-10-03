@@ -176,8 +176,9 @@ pub fn compact(
     for (segment, entry) in set.segments().iter().zip(&set.document().segments) {
         if let Err(error) = segment.verify_blocks(cancel, |_| {}) {
             if let VectorStoreError::Corrupted { reason } = &error {
-                let failed = files::sha256_hex(segment.file_bytes());
-                files::condemn(dir, &entry.id, &failed, reason)?;
+                files::damage_found();
+                let failed = files::sha256_cancellable(segment.file_bytes(), cancel)?;
+                files::condemn(dir, &entry.id, &failed, reason, cancel)?;
                 log::error!("Compaction of {}: {reason}", dir.display());
             }
             return Err(error.into());

@@ -549,9 +549,11 @@ pub fn scrub(dir: &Path, cancel: &CancellationToken) -> Result<ScrubReport, Sema
     for (segment, entry) in set.segments.iter().zip(&set.document.segments) {
         if let Err(error) = segment.verify_blocks(cancel, |block| bytes += block) {
             if let VectorStoreError::Corrupted { reason } = &error {
-                // The bytes that failed are the ones mapped, whatever the path holds now.
-                let failed = files::sha256_hex(segment.file_bytes());
-                if files::condemn(dir, &entry.id, &failed, reason)? {
+                files::damage_found();
+                // The bytes that failed are the ones mapped, whatever the path holds now. A
+                // cancel before they are named records nothing.
+                let failed = files::sha256_cancellable(segment.file_bytes(), cancel)?;
+                if files::condemn(dir, &entry.id, &failed, reason, cancel)? {
                     log::error!("Scrub of {}: {reason}", dir.display());
                 } else {
                     log::warn!(

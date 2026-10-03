@@ -458,6 +458,25 @@ pub(crate) fn note(step: impl FnOnce() -> Durable) {
     let _ = step;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What a test runs the moment a scrub or a compaction finds a block that fails, before
+    /// anything is recorded: cancelling its token, or replacing the file under it.
+    pub(crate) static ON_DAMAGE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the test's [`ON_DAMAGE`] hook, if one is set; nothing outside a test build.
+#[inline]
+pub(crate) fn damage_found() {
+    #[cfg(test)]
+    ON_DAMAGE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
 /// Flush a file the set is about to publish.
 pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
     file.sync_all()?;
@@ -503,6 +522,20 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// SHA-256 of `bytes` — a mapped segment, perhaps — 1 MiB at a time, looking at `cancel`
+/// before each.
+pub(crate) fn sha256_cancellable(
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> Result<String, SemanticSearchError> {
+    let mut hasher = Sha256::new();
+    for chunk in bytes.chunks(1 << 20) {
+        cancel.checkpoint()?;
+        hasher.update(chunk);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// SHA-256 of a file, read in blocks, cancellably.
@@ -577,12 +610,14 @@ pub(crate) fn verdict_against(dir: &Path, id: &str, sha256: &str) -> Option<Verd
 /// damaged — and `reason`. The file is then hashed again, and a verdict on bytes it no longer
 /// holds is withdrawn at once — an install replaced the file while the scrub read the old one,
 /// and its bytes were never judged — leaving what [`settle_verdict`] leaves for the bytes it
-/// holds. Whether the verdict stands.
+/// holds. Whether the verdict stands: it does when `cancel` stops that second look, since it
+/// names exactly the bytes that failed.
 pub(crate) fn condemn(
     dir: &Path,
     id: &str,
     sha256: &str,
     reason: &str,
+    cancel: &CancellationToken,
 ) -> Result<bool, SemanticSearchError> {
     let path = verdict_path(dir, id);
     let verdict = Verdict {
@@ -592,7 +627,7 @@ pub(crate) fn condemn(
     let bytes = serde_json::to_vec_pretty(&verdict).expect("a verdict serializes");
     write_atomically(&path, &bytes).map_err(io_error(format!("marking {}", path.display())))?;
     // A file that cannot be hashed keeps the verdict: it condemns, which is the safe side.
-    match hash_file(&dir.join(segment_file(id)), &CancellationToken::new()) {
+    match hash_file(&dir.join(segment_file(id)), cancel) {
         Ok(held) if held != sha256 => {
             settle_verdict(dir, id, &held)?;
             Ok(false)

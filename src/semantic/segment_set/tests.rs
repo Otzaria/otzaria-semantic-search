@@ -1568,18 +1568,39 @@ fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
     let file = dir.join(format!("segments/{id}.oxv"));
     let marker = dir.join(format!("segments/{id}.corrupt"));
 
-    assert!(!files::condemn(&dir, &id, &"0".repeat(64), "a block failed").unwrap());
+    assert!(!files::condemn(
+        &dir,
+        &id,
+        &"0".repeat(64),
+        "a block failed",
+        &CancellationToken::new()
+    )
+    .unwrap());
     assert!(!marker.exists());
     SegmentSet::open(&dir).unwrap();
 
     let sound = std::fs::read(&file).unwrap();
     let damaged = damage_last_byte(&file);
-    assert!(files::condemn(&dir, &id, &files::sha256_hex(&damaged), "a block failed").unwrap());
+    assert!(files::condemn(
+        &dir,
+        &id,
+        &files::sha256_hex(&damaged),
+        "a block failed",
+        &CancellationToken::new()
+    )
+    .unwrap());
     assert!(is_corrupt(SegmentSet::open(&dir)));
     assert!(is_corrupt(info(&dir)));
 
     std::fs::write(&file, &sound).unwrap();
-    assert!(files::condemn(&dir, &id, &files::sha256_hex(&sound), "a block failed").unwrap());
+    assert!(files::condemn(
+        &dir,
+        &id,
+        &files::sha256_hex(&sound),
+        "a block failed",
+        &CancellationToken::new()
+    )
+    .unwrap());
     SegmentSet::open(&dir).unwrap();
 
     std::fs::write(&marker, b"a block failed").unwrap();
@@ -2167,6 +2188,58 @@ fn a_pointer_naming_the_last_generation_number_blocks_no_install() {
         "a pointer whose generation does not read is no fallback"
     );
     assert_eq!(SegmentSet::open(&alone).unwrap().generation(), 2);
+}
+
+/// Run `work` with `hook` as what happens the moment a block is found to fail.
+fn on_damage<T>(hook: impl FnMut() + 'static, work: impl FnOnce() -> T) -> T {
+    files::ON_DAMAGE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let result = work();
+    files::ON_DAMAGE.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+/// A scrub or a compaction cancelled as it finds a block that fails returns at once and
+/// records nothing. Naming the bytes that failed reads the whole segment, twice, and the
+/// cancel stops it there — before a verdict exists, so nothing changes, as a cancel promises;
+/// the next scrub finds the damage again.
+#[test]
+fn a_scrub_or_a_compaction_cancelled_on_damage_records_nothing() {
+    for compaction in [false, true] {
+        let work = TempDir::new("set_cancel_on_damage");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+        let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+        damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+
+        let cancel = CancellationToken::new();
+        let cancelling = cancel.clone();
+        let result = on_damage(
+            move || cancelling.cancel(),
+            || match compaction {
+                true => compact(
+                    &dir,
+                    &CompactionPolicy {
+                        force: true,
+                        ..CompactionPolicy::default()
+                    },
+                    None,
+                    &cancel,
+                )
+                .map(|_| ()),
+                false => scrub(&dir, &cancel).map(|_| ()),
+            },
+        );
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "compaction {compaction}: {result:?}"
+        );
+        assert!(
+            !dir.join(format!("segments/{id}.corrupt")).exists(),
+            "compaction {compaction}"
+        );
+        assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+    }
 }
 
 #[test]
