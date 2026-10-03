@@ -325,6 +325,11 @@ Runtime. המימוש הוא [`model_package`](../src/semantic/model_package.rs)
 תעודת parity מול ORT מפיק את אותם וקטורים כמו ORT על CPU, ותעודת ה־parity שייכת
 ל־manifest של הבנייה, לא לזהות.
 
+`worker` הוא מי שהטמיע את הווקטורים שה־segment נושא, ולכן segment שאינו נושא אף וקטור —
+delta של tombstones ושל רשומות foreign בלבד, מהדורה שרק מחקה טקסטים או העתיקה טקסטים שכבר
+היו בה — לא הוטמע בידי שום worker, ו־`worker` שלו ריק (`backend` ו־`device` ריקים).
+segment שנושא וקטורים חייב לנקוב ב־worker.
+
 ### 4.5 `identity_digest`
 
 SHA-256 מעל `"otzaria-vector-identity-v1\n"` ושורת `path=value\n` לכל שדה בסדר

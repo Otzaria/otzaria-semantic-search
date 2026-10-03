@@ -157,6 +157,14 @@ impl VectorProvenance {
     /// Refuse a record that says nothing, or that could not be written into a
     /// line-oriented digest.
     pub fn validate(&self) -> Result<(), ArtifactError> {
+        self.validate_for(1)
+    }
+
+    /// [`Self::validate`], for a segment that ships `slots` vectors. One that ships none — a
+    /// delta of tombstones and foreign records alone, a version that only dropped texts or
+    /// copied texts it held — was embedded by no worker, and may say so with a blank
+    /// `worker`; one that ships any names the worker, as every release did.
+    pub fn validate_for(&self, slots: u64) -> Result<(), ArtifactError> {
         let refuse = |what: &str, reason: &str| {
             Err(ArtifactError::ManifestDisagreesWithPayload {
                 reason: format!("provenance: {what} {reason}"),
@@ -168,15 +176,16 @@ impl VectorProvenance {
                 "is not a SHA-256 of 64 lowercase hex digits",
             );
         }
-        for (what, value) in [
+        for (what, value, may_be_blank) in [
             (
                 "passage_package.quantization",
                 &self.passage_package.quantization,
+                false,
             ),
-            ("worker.backend", &self.worker.backend),
-            ("worker.device", &self.worker.device),
+            ("worker.backend", &self.worker.backend, slots == 0),
+            ("worker.device", &self.worker.device, slots == 0),
         ] {
-            if value.trim().is_empty() {
+            if value.trim().is_empty() && !may_be_blank {
                 return refuse(what, "is blank");
             }
             if value.chars().any(char::is_control) {
@@ -930,6 +939,24 @@ mod tests {
         let mut bad = test_provenance();
         bad.passage_package.checksum = "F".repeat(64);
         assert!(bad.validate().is_err());
+
+        // A segment that ships no vector names no worker; one that ships any must.
+        let mut no_worker = test_provenance();
+        no_worker.worker = EmbeddingWorker {
+            backend: String::new(),
+            device: String::new(),
+        };
+        no_worker.validate_for(0).unwrap();
+        assert!(no_worker.validate_for(1).is_err());
+        assert!(no_worker.validate().is_err());
+        bad.worker = no_worker.worker.clone();
+        assert!(
+            bad.validate_for(0).is_err(),
+            "the passage package is still checked"
+        );
+        let mut control = no_worker;
+        control.worker.device = "cpu\n".to_string();
+        assert!(control.validate_for(0).is_err());
     }
 
     #[test]

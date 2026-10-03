@@ -249,7 +249,8 @@ assembly. The plan must have been split against that ledger.
   order, a key's first record its slot, a later one in another book an extra.
 * **A delta** ships the keys the previous ledger lacks as slots, their later records as
   extras, new (book, key) pairs of keys it holds as foreign records, and the ledger keys
-  the plan no longer has as tombstones.
+  the plan no longer has as tombstones. A delta with no new key ships no vector, and its
+  provenance names no worker: none embedded anything.
 * **Vectors** come from the warehouse by the full SHA-256 of their text, read 4096 at a
   time in warehouse order. A key the warehouse lacks fails the assembly, with the count
   and the first missing digest.
