@@ -447,8 +447,9 @@ otzaria-semantic-search/
 
 * [`src/semantic/segment_set/`](../src/semantic/segment_set/mod.rs) — **הסט על המכשיר.**
   - `SegmentSet::open` — שחזור כשה-lock פנוי, ואז הדור ש-`CURRENT` מונה, או `PREVIOUS`;
-    `scan`, `scan_with`, `info`, `generation`, `identity`; `segments()` לקריאה בלבד,
-    ו-`is_live(seg, slot)` — האם slot חי בדור הזה.
+    `open_without_recovery` — אותה פתיחה בלי ה-lock ובלי שחזור ואיסוף אשפה, לקורא לצד
+    session פתוח (§5.5 של החוזה); `scan`, `scan_with`, `info`, `generation`, `identity`;
+    `segments()` לקריאה בלבד, ו-`is_live(seg, slot)` — האם slot חי בדור הזה.
   - `install_package` — segment ו-manifest של שחרור, לפי §5.3 של החוזה: אימות, staging,
     העברה, delta שנפתר במעבר אחד על המפתחות הישנים, דור חדש, החלפת מצביעים, אשפה.
     `ApplyReport` מדווח, ו-`already_applied` הוא delta שהסט כבר בלע.

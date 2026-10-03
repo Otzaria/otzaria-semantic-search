@@ -164,6 +164,30 @@ impl SegmentSet {
         Self::open_unlocked(dir)
     }
 
+    /// The live generation of the set at `dir`, opened as [`Self::open`] opens it, but
+    /// without taking the set's lock and without recovery or garbage collection: for a
+    /// reader beside a session that already opened the set, which must never make an
+    /// install or a compaction wait, nor clean up on the thread that reads.
+    ///
+    /// The reader's contract:
+    /// - It reads `CURRENT` — or `PREVIOUS`, when `CURRENT`'s generation does not open — as
+    ///   one consistent snapshot: a pointer is flipped by an atomic rename, so it names a
+    ///   whole generation, never part of one.
+    /// - It never writes, recovers or collects anything: not `staging/`, not a half-written
+    ///   pointer, not garbage, and not the lock file.
+    /// - A generation an install's garbage collection removes while it is being opened —
+    ///   which takes two flips during one open — fails the open, and the caller may simply
+    ///   open again.
+    /// - On Unix a segment already mapped stays readable after it is unlinked, so a set
+    ///   opened this way keeps answering from its generation whatever is collected after.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`]'s.
+    pub fn open_without_recovery(dir: &Path) -> Result<Self, SemanticSearchError> {
+        Self::open_unlocked(dir)
+    }
+
     /// [`Self::open`] without recovery, for a caller already holding the lock.
     pub(crate) fn open_unlocked(dir: &Path) -> Result<Self, SemanticSearchError> {
         let current = read_pointer(dir, CURRENT);
