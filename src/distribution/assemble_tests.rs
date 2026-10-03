@@ -420,6 +420,106 @@ fn a_release_is_assembled_into_the_bytes_bc4c854_assembled() {
     assert!(coverage(&set, &p2).complete());
 }
 
+/// A delta that ships no vector — a version that only dropped texts, or only copied texts it
+/// held into another book — names no worker, since none embedded anything, and installs like
+/// any delta: the set opens on it at its version, it reaches every record of the version, and
+/// a dropped text is gone. A segment that ships vectors and names no worker is still
+/// refused.
+#[test]
+fn a_delta_that_ships_no_vector_installs() {
+    use crate::semantic::oxv::scan::ScanRequest;
+    use crate::semantic::segment_set::{install_package, InstallExpectation, InstallSource};
+    use crate::semantic::versioning::EmbeddingWorker;
+    use std::collections::BTreeSet;
+
+    // Book C dropped, so texts 8 and 11 leave the library; or texts 5 and 3 copied into D.
+    let dropped: Vec<(&str, &[usize])> = vec![(A, &[1, 2, 3, 2, 4]), (B, &[5, 1, 6, 7])];
+    let copied: Vec<(&str, &[usize])> = vec![
+        (A, &[1, 2, 3, 2, 4]),
+        (B, &[5, 1, 6, 7]),
+        (C, &[8, 11]),
+        (D, &[5, 3]),
+    ];
+    for (what, next, tombstones, foreign) in [("dropped", dropped, 2, 0), ("copied", copied, 0, 2)]
+    {
+        let machine = Machine::new(&format!("no_vector_{what}"));
+        let p1 = machine.plan("p1", 1, &v1(), None);
+        let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base1");
+        let ledger1 = Ledger::open(&base.out_dir, Some(1)).unwrap();
+        let p2 = machine.plan("p2", 2, &next, Some(&ledger1));
+        assert_eq!(p2.manifest.counts.to_embed, 0, "{what}");
+        let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger1), NEW, "delta2");
+        let counts = delta.manifest.counts;
+        assert_eq!(
+            (counts.slots, counts.tombstones, counts.foreign),
+            (0, tombstones, foreign),
+            "{what}"
+        );
+        let no_worker = EmbeddingWorker {
+            backend: String::new(),
+            device: String::new(),
+        };
+        assert_eq!(delta.manifest.provenance.worker, no_worker, "{what}");
+
+        let device = machine.dir.join("device");
+        let set = simulate_device(&device, &[&base.out_dir, &delta.out_dir])
+            .unwrap_or_else(|error| panic!("{what}: a delta with no vector must install: {error}"));
+        assert_eq!(
+            (set.generation(), set.info().library_version),
+            (2, 2),
+            "{what}"
+        );
+        assert!(coverage(&set, &p2).complete(), "{what}");
+        let mut query = vec![0f32; set.codec().dim()];
+        query[0] = 1.0;
+        let reached: BTreeSet<ChunkKey> = set
+            .scan(
+                &query,
+                &ScanRequest {
+                    top_k: 1000,
+                    books: None,
+                    threads: 1,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.key)
+            .collect();
+        let held: BTreeSet<ChunkKey> = p2.records.iter().map(|record| record.key()).collect();
+        assert_eq!(
+            reached, held,
+            "{what}: the version's texts, and no dropped one"
+        );
+        drop(set);
+
+        // The base ships vectors: without a worker, it is refused.
+        let json = std::fs::read_to_string(base.out_dir.join(RELEASE_FILE)).unwrap();
+        let mut manifest: crate::semantic::segment_set::ReleaseManifest =
+            serde_json::from_str(&json).unwrap();
+        manifest.provenance.worker = no_worker.clone();
+        manifest.package_digest = manifest.package().digest();
+        let refused = install_package(
+            &machine.dir.join("refused"),
+            &InstallSource {
+                segment: &base.out_dir.join(SEGMENT_FILE),
+                manifest_json: &manifest.to_json(),
+            },
+            &InstallExpectation {
+                identity: manifest.identity.clone(),
+                published_manifest_sha256: None,
+            },
+            &CancellationToken::new(),
+        );
+        match refused {
+            Err(crate::errors::SemanticSearchError::Artifact(
+                crate::errors::ArtifactError::ManifestDisagreesWithPayload { reason },
+            )) => assert!(reason.contains("worker"), "{what}: {reason}"),
+            other => panic!("{what}: a segment with vectors and no worker, got {other:?}"),
+        }
+    }
+}
+
 /// `i8-sym-dim` is calibrated on the slots' vectors exactly as the in-memory calibration
 /// takes it, and G1 holds its clip rate to 1e-4.
 #[test]

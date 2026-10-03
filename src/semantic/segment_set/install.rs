@@ -7,12 +7,14 @@
 //! 2. **check that the release applies**: its manifest is the published one, its identity
 //!    is this installation's, its package digest is its own, and a delta starts where the
 //!    set stands and shares its codec epoch;
-//! 3. **stage and verify** the segment: its SHA-256 and size, its structure, its header
-//!    against the manifest, every block CRC;
-//! 4. **move** it into `segments/`;
-//! 5. **resolve keys**, for a delta: one sequential pass over the older segments' keys marks
+//! 3. **verify** the segment: its SHA-256 and size, its structure, its header against the
+//!    manifest, every block CRC — a download the host left in `incoming/` flushed and read
+//!    where it lies, any other segment copied to `staging/` first;
+//! 4. **resolve keys**, for a delta: one sequential pass over the older segments' keys marks
 //!    the slots its tombstones and its own slots supersede, and finds where its foreign
 //!    records resolve;
+//! 5. **place** it in `segments/` — a download is taken only now, and given back should
+//!    anything after it fail;
 //! 6. **write a new generation**, numbered past every one on disk — its `.del` and `.links`
 //!    files and `set.json`;
 //! 7. **flip** — `PREVIOUS` ← the generation the install was built on, the one the set
@@ -21,10 +23,10 @@
 
 use super::files::{
     encode_links, generation_dir, generation_path, hash_file, io_error, is_segment_id,
-    next_generation, place_segment, read_pointer, segment_file, sha256_hex, sync_file,
-    sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Pointer, SetDocument,
-    SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, SET_FILE,
-    SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
+    next_generation, place_segment, read_generation, read_pointer, segment_file, sha256_hex,
+    sync_file, sync_set_dir, write_atomically, write_pointer, Deleted, DerivedFile, Placed,
+    Pointer, SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS,
+    SEGMENTS_DIR, SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
 use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
@@ -42,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -179,8 +181,10 @@ impl ReleaseManifest {
 /// it, as published — its bytes are what a published digest names.
 #[derive(Debug, Clone, Copy)]
 pub struct InstallSource<'a> {
-    /// Inside [`incoming_dir`](super::incoming_dir) it is moved into the set; anywhere else
-    /// it is copied and left where it is.
+    /// Inside [`incoming_dir`](super::incoming_dir) it is verified where it lies and moved
+    /// into the set once it installs — and left where it is when it does not. A read-only one
+    /// on Windows, which flushes a file only through a handle that writes, is copied instead,
+    /// as one anywhere else is, and left where it is.
     pub segment: &'a Path,
     pub manifest_json: &'a str,
 }
@@ -311,41 +315,52 @@ pub fn install_package(
             return Ok(report);
         }
     }
+    // A base takes nothing from the set but the pointer it was built on, and lets go of its
+    // mappings now: the file it may replace could be one of them, and Windows replaces no
+    // file that is mapped.
+    let base = current.as_ref().map(|set| set.pointer().clone());
+    let current = current.filter(|_| manifest.kind == PackageKind::Delta);
 
-    // 3. Stage and verify.
+    // 3. Verify the segment. A download the host left in `incoming/` is flushed and verified
+    // where it lies, and taken only when its segment is placed: an install that does not
+    // happen leaves it where it was. Windows flushes a file only through a handle that can
+    // write, so a download it cannot open so is copied, as a segment from anywhere is.
     let staging = dir.join(STAGING_DIR);
-    fs::create_dir_all(&staging).map_err(io_error(format!("creating {}", staging.display())))?;
-    let staged = staging.join(format!("{}.oxv", manifest.segment_id));
     let incoming = dir.join(INCOMING_DIR);
-    let moving = source
+    let in_incoming = source
         .segment
         .parent()
         .and_then(|parent| parent.canonicalize().ok())
         .zip(incoming.canonicalize().ok())
         .is_some_and(|(parent, incoming)| parent == incoming);
-    if !moving {
+    let taking = in_incoming
+        && match flush_in_place(source.segment) {
+            Ok(()) => true,
+            Err(error) => {
+                log::info!(
+                    "{} cannot be flushed where it lies ({error}); it is copied",
+                    source.segment.display()
+                );
+                false
+            }
+        };
+    let (staged, sha256) = if taking {
+        (
+            source.segment.to_path_buf(),
+            hash_file(source.segment, cancel)?,
+        )
+    } else {
         let needed = manifest.segment.size;
         if let Some(available) = space::available(dir) {
             if available < needed {
                 return Err(ArtifactError::InsufficientSpace { needed, available }.into());
             }
         }
-    }
-    let sha256 = if moving {
-        fs::rename(source.segment, &staged).map_err(io_error(format!(
-            "moving {} into the set",
-            source.segment.display()
-        )))?;
-        // Written by the caller, who need not have flushed it; it is, before anything names
-        // it. Opened for writing, which Windows needs to flush a file.
-        OpenOptions::new()
-            .write(true)
-            .open(&staged)
-            .and_then(|file| sync_file(&file, &staged))
-            .map_err(io_error(format!("flushing {}", staged.display())))?;
-        hash_file(&staged, cancel)?
-    } else {
-        copy_hashing(source.segment, &staged, manifest.segment.size, cancel)?
+        fs::create_dir_all(&staging)
+            .map_err(io_error(format!("creating {}", staging.display())))?;
+        let staged = staging.join(format!("{}.oxv", manifest.segment_id));
+        let sha256 = copy_hashing(source.segment, &staged, manifest.segment.size, cancel)?;
+        (staged, sha256)
     };
     let size = fs::metadata(&staged)
         .map_err(io_error(format!("inspecting {}", staged.display())))?
@@ -374,26 +389,9 @@ pub fn install_package(
     }
     reached(Step::Staged)?;
 
-    // 4. Move it into the set — beside every segment there is, and never over the bytes a
-    // generation names.
+    // 4. Resolve keys, for a delta, against the set it applies to — the segment read where it
+    // lies, before anything is moved.
     let file = segment_file(&manifest.segment_id);
-    let target = dir.join(&file);
-    place_segment(
-        dir,
-        &manifest.segment_id,
-        &staged,
-        &manifest.segment.sha256,
-        cancel,
-        |reason| ArtifactError::ManifestDisagreesWithPayload { reason }.into(),
-    )?;
-    let segments_dir = dir.join(SEGMENTS_DIR);
-    let provenance_path = segments_dir.join(format!("{}.package.json", manifest.segment_id));
-    write_atomically(&provenance_path, source.manifest_json.as_bytes())
-        .map_err(space_or_io(&provenance_path, 0))?;
-    reached(Step::Moved)?;
-
-    // 5. Resolve keys, and 6–8: the new generation, the flip, the garbage.
-    let segment = Segment::open(&target)?;
     let entry = SetSegment {
         id: manifest.segment_id.clone(),
         file,
@@ -412,14 +410,68 @@ pub fn install_package(
         (PackageKind::Delta, Some(set)) => NewGeneration::from_set(set),
         _ => NewGeneration::empty(&manifest.identity, &manifest.codec_params_sha256),
     };
-    let older: &[Segment] = match (manifest.kind, &current) {
-        (PackageKind::Delta, Some(set)) => set.segments(),
-        _ => &[],
+    let resolution = {
+        let older: &[Segment] = match (manifest.kind, &current) {
+            (PackageKind::Delta, Some(set)) => set.segments(),
+            _ => &[],
+        };
+        let segment = Segment::open(&staged)?;
+        generation.push(entry, &segment, older, cancel)?
     };
-    let resolution = generation.push(entry, &segment, older, cancel)?;
     generation.library_release_tag = manifest.library_release_tag.clone();
-    let base = current.as_ref().map(|set| set.pointer().clone());
-    let document = generation.commit(dir, base.as_ref())?;
+    // Every mapping goes before the segment is placed: Windows moves no file that is mapped.
+    drop(current);
+
+    // 5. Place it — beside every segment there is, and never over bytes a generation that
+    // opens serves. A download is the set's from here.
+    let placed = place_segment(
+        dir,
+        &manifest.segment_id,
+        &staged,
+        &manifest.segment.sha256,
+        cancel,
+        |installed| {
+            ArtifactError::SegmentIdTaken {
+                id: manifest.segment_id.clone(),
+                installed_sha256: installed,
+                offered_sha256: manifest.segment.sha256.clone(),
+            }
+            .into()
+        },
+    )?;
+
+    // 6–8: the new generation, the flip, the garbage. Should any of it fail, a download whose
+    // segment was placed goes back where the host left it.
+    let published = (|| {
+        let provenance_path = dir
+            .join(SEGMENTS_DIR)
+            .join(format!("{}.package.json", manifest.segment_id));
+        write_atomically(&provenance_path, source.manifest_json.as_bytes())
+            .map_err(space_or_io(&provenance_path, 0))?;
+        reached(Step::Moved)?;
+        generation.commit(dir, base.as_ref())
+    })();
+    let document = match published {
+        Ok(document) => document,
+        Err(error) => {
+            if taking && placed != Placed::Kept {
+                let placed_at = dir.join(segment_file(&manifest.segment_id));
+                if let Err(back) = fs::rename(&placed_at, source.segment) {
+                    log::warn!(
+                        "{} could not go back to {}: {back}",
+                        placed_at.display(),
+                        source.segment.display()
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+    if placed == Placed::Kept {
+        // The same segment, installed before and still on disk — mapped, perhaps: the staged
+        // copy, or the host's download, is not needed.
+        let _ = fs::remove_file(&staged);
+    }
 
     let bytes_on_disk = document.stats.bytes;
     let info = super::info_of(
@@ -872,12 +924,16 @@ impl NewGeneration {
             set_sha256: sha256_hex(&bytes),
         };
         // PREVIOUS: the generation this one was built on, or — when none opened — what
-        // CURRENT names, if it reads. Never CURRENT's bytes as they are: an unreadable
-        // CURRENT would overwrite the one pointer that still opens, and on a fallback
-        // CURRENT names the generation that did not.
+        // CURRENT names, if it and its generation read. Never CURRENT's bytes as they are: an
+        // unreadable CURRENT would overwrite the one pointer that still opens, and on a
+        // fallback CURRENT names the generation that did not. A pointer whose generation does
+        // not read is no fallback, and in PREVIOUS it would stop every collection.
         let previous = match base {
             Some(base) => Some(base.clone()),
-            None => read_pointer(dir, CURRENT).ok().flatten(),
+            None => read_pointer(dir, CURRENT)
+                .ok()
+                .flatten()
+                .filter(|pointer| read_generation(dir, pointer).is_ok()),
         };
         if let Some(previous) = previous {
             if read_pointer(dir, PREVIOUS).ok().flatten().as_ref() != Some(&previous) {
@@ -895,6 +951,16 @@ impl NewGeneration {
         collect_garbage(dir);
         Ok(document)
     }
+}
+
+/// Flush a file the host wrote, where it lies, before the set takes it. Unix flushes through
+/// any handle; Windows only through one that can write, which a read-only file refuses.
+fn flush_in_place(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    let file = File::open(path)?;
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    sync_file(&file, path)
 }
 
 /// Copy `from` to `to` in blocks, hashing as it goes; a full filesystem is

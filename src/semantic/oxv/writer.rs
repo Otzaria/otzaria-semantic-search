@@ -697,8 +697,9 @@ impl VectorSink {
 ///
 /// It is what every published release carries, and stays as it is. It does not cover the
 /// hints or the vectors: two releases of one identity, kind, versions and keys but other
-/// bytes share it, and an install never puts one over the other while a generation names
-/// it (`segment_set::files::place_segment`).
+/// bytes share it, so such a release is published once (`docs/ARTIFACT_CONTRACT.md` §2.4),
+/// and an install never puts one in place of the other while a generation that opens serves
+/// the installed bytes (`segment_set::files::place_segment`).
 pub fn segment_id(
     identity_digest: &[u8; 32],
     kind: PackageKind,

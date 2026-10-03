@@ -65,24 +65,45 @@ pub(crate) fn generation_of(name: &str) -> Option<u64> {
 /// `gen-` entry in the directory. A new generation never lands on one that exists — a
 /// pointer's, one that only an unreadable pointer could name, or one a crash left — so
 /// writing it removes and overwrites nothing.
+///
+/// A pointer naming the last number, `u64::MAX`, which no install writes, is passed over
+/// unless a directory holds that generation; and should one, the next generation takes the
+/// lowest number nothing on disk holds and no pointer names. Either way a pointer that reads
+/// cannot stop every install for good.
 pub(crate) fn next_generation(dir: &Path) -> Result<u64, ArtifactError> {
-    let mut highest = 0u64;
-    for name in [CURRENT, PREVIOUS] {
-        if let Ok(Some(pointer)) = read_pointer(dir, name) {
-            highest = highest.max(pointer.generation);
-        }
-    }
+    let mut on_disk = std::collections::BTreeSet::new();
     let listing = io_error(format!("listing {}", dir.display()));
     for entry in fs::read_dir(dir).map_err(listing)? {
         let entry = entry.map_err(io_error(format!("listing {}", dir.display())))?;
         if let Some(generation) = generation_of(&entry.file_name().to_string_lossy()) {
-            highest = highest.max(generation);
+            on_disk.insert(generation);
         }
     }
-    highest.checked_add(1).ok_or_else(|| ArtifactError::Io {
-        context: format!("{}: no generation number is left", dir.display()),
-        source: io::Error::from(io::ErrorKind::InvalidData),
-    })
+    let named: Vec<u64> = [CURRENT, PREVIOUS]
+        .into_iter()
+        .filter_map(|name| read_pointer(dir, name).ok().flatten())
+        .map(|pointer| pointer.generation)
+        .collect();
+    let highest = on_disk
+        .iter()
+        .copied()
+        .chain(
+            named
+                .iter()
+                .copied()
+                .filter(|generation| *generation < u64::MAX),
+        )
+        .max()
+        .unwrap_or(0);
+    if let Some(next) = highest.checked_add(1) {
+        return Ok(next);
+    }
+    (1..u64::MAX)
+        .find(|generation| !on_disk.contains(generation) && !named.contains(generation))
+        .ok_or_else(|| ArtifactError::Io {
+            context: format!("{}: no generation number is left", dir.display()),
+            source: io::Error::from(io::ErrorKind::InvalidData),
+        })
 }
 
 /// Point `name` — `CURRENT` or `PREVIOUS` — at a generation, `bytes` being the serialized
@@ -415,9 +436,10 @@ fn trailer<'a>(bytes: &'a [u8], magic: &[u8; 8], expected_crc: u32) -> Result<&'
 pub(crate) enum Durable {
     /// A file's bytes, flushed.
     File(PathBuf),
-    /// A file renamed into place at this path.
-    Renamed(PathBuf),
-    /// A directory's entries, flushed.
+    /// A file renamed into place: from, to.
+    Renamed(PathBuf, PathBuf),
+    /// A directory's entries, flushed. Only where that happens — Unix: Windows cannot flush a
+    /// directory, and keeps a rename's order itself.
     Dir(PathBuf),
 }
 
@@ -436,6 +458,25 @@ pub(crate) fn note(step: impl FnOnce() -> Durable) {
     let _ = step;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What a test runs the moment a scrub or a compaction finds a block that fails, before
+    /// anything is recorded: cancelling its token, or replacing the file under it.
+    pub(crate) static ON_DAMAGE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the test's [`ON_DAMAGE`] hook, if one is set; nothing outside a test build.
+#[inline]
+pub(crate) fn damage_found() {
+    #[cfg(test)]
+    ON_DAMAGE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
 /// Flush a file the set is about to publish.
 pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
     file.sync_all()?;
@@ -447,6 +488,8 @@ pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
 /// loss before anything names it.
 pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
     sync_dir(path)?;
+    // `sync_dir` flushes on Unix and does nothing elsewhere; only a flush is noted.
+    #[cfg(unix)]
     note(|| Durable::Dir(path.to_path_buf()));
     Ok(())
 }
@@ -454,7 +497,7 @@ pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
 /// Rename a flushed file into place.
 pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)?;
-    note(|| Durable::Renamed(to.to_path_buf()));
+    note(|| Durable::Renamed(from.to_path_buf(), to.to_path_buf()));
     Ok(())
 }
 
@@ -481,6 +524,20 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// SHA-256 of `bytes` — a mapped segment, perhaps — 1 MiB at a time, looking at `cancel`
+/// before each.
+pub(crate) fn sha256_cancellable(
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> Result<String, SemanticSearchError> {
+    let mut hasher = Sha256::new();
+    for chunk in bytes.chunks(1 << 20) {
+        cancel.checkpoint()?;
+        hasher.update(chunk);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// SHA-256 of a file, read in blocks, cancellably.
 pub(crate) fn hash_file(
     path: &Path,
@@ -504,15 +561,17 @@ pub(crate) fn hash_file(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// `segments/<id>.corrupt`: a scrub's verdict on the bytes a segment file held when it read
-/// them.
+/// `segments/<id>.corrupt`: what the segment's file holds, as the last to judge it found it —
+/// a scrub, bytes that failed their CRCs; an install, the bytes it put there in place of
+/// others a generation still names. A generation that names other bytes for the segment does
+/// not open: they are not there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Verdict {
-    /// SHA-256 of the file that failed: the bytes condemned, and no others. Empty for a
-    /// marker that names none — one written before verdicts did, or one that does not read
-    /// as a verdict — which condemns whatever the file holds.
+    /// SHA-256 of what the file holds. Empty for a marker that names nothing — one written
+    /// before verdicts named bytes, or one that does not read as a verdict — which condemns
+    /// whatever any generation names.
     pub sha256: String,
-    /// What failed.
+    /// Why.
     pub reason: String,
 }
 
@@ -521,7 +580,7 @@ pub(crate) fn verdict_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 /// The verdict on segment `id`, if there is one. Opening cannot hash a segment, so a verdict
-/// stands until what replaces or verifies the segment's bytes withdraws it: an install, or
+/// stands until what replaces or verifies the segment's bytes settles it: an install, or
 /// the scrub that wrote it ([`condemn`]).
 pub(crate) fn read_verdict(dir: &Path, id: &str) -> Option<Verdict> {
     let path = verdict_path(dir, id);
@@ -541,15 +600,24 @@ pub(crate) fn read_verdict(dir: &Path, id: &str) -> Option<Verdict> {
     }))
 }
 
+/// The verdict that keeps a generation naming `sha256` for segment `id` shut, if one does: a
+/// verdict on other bytes than those — or on none it names.
+pub(crate) fn verdict_against(dir: &Path, id: &str, sha256: &str) -> Option<Verdict> {
+    read_verdict(dir, id).filter(|verdict| verdict.sha256.is_empty() || verdict.sha256 != sha256)
+}
+
 /// Condemn segment `id`: a verdict naming `sha256` — the bytes a scrub read and found
 /// damaged — and `reason`. The file is then hashed again, and a verdict on bytes it no longer
-/// holds is withdrawn at once: an install replaced the file while the scrub read the old one,
-/// and its bytes were never judged. Whether the verdict stands.
+/// holds is withdrawn at once — an install replaced the file while the scrub read the old one,
+/// and its bytes were never judged — leaving what [`settle_verdict`] leaves for the bytes it
+/// holds. Whether the verdict stands: it does when `cancel` stops that second look, since it
+/// names exactly the bytes that failed.
 pub(crate) fn condemn(
     dir: &Path,
     id: &str,
     sha256: &str,
     reason: &str,
+    cancel: &CancellationToken,
 ) -> Result<bool, SemanticSearchError> {
     let path = verdict_path(dir, id);
     let verdict = Verdict {
@@ -559,59 +627,112 @@ pub(crate) fn condemn(
     let bytes = serde_json::to_vec_pretty(&verdict).expect("a verdict serializes");
     write_atomically(&path, &bytes).map_err(io_error(format!("marking {}", path.display())))?;
     // A file that cannot be hashed keeps the verdict: it condemns, which is the safe side.
-    let held = hash_file(&dir.join(segment_file(id)), &CancellationToken::new());
-    if held.is_ok_and(|held| held != sha256) {
-        clear_verdict(dir, id)?;
-        return Ok(false);
+    match hash_file(&dir.join(segment_file(id)), cancel) {
+        Ok(held) if held != sha256 => {
+            settle_verdict(dir, id, &held)?;
+            Ok(false)
+        }
+        _ => Ok(true),
     }
-    Ok(true)
 }
 
-/// The generations a set may still open: those the pointers name and that read — and, when a
-/// pointer does not read or names a generation that does not, every generation on disk that
-/// reads, since any of them may be the one it named.
-pub(crate) fn openable_generations(dir: &Path) -> Vec<SetDocument> {
-    let mut documents = Vec::new();
-    let mut unknown = false;
+/// The generations the set opens now: those `CURRENT` and `PREVIOUS` name that open — every
+/// segment where its generation says, as large, as many slots and of the kind it says, no
+/// verdict against the bytes it names, every derived file sound. Only these stand on a
+/// segment's bytes; opening maps the segments and reads none of their vectors, and every
+/// mapping is gone when this returns.
+fn live_generations(dir: &Path) -> Vec<SetDocument> {
+    let mut documents: Vec<SetDocument> = Vec::new();
     for name in [CURRENT, PREVIOUS] {
-        match read_pointer(dir, name) {
-            Ok(Some(pointer)) => match read_generation(dir, &pointer) {
-                Ok(document) => documents.push(document),
-                Err(_) => unknown = true,
-            },
-            Ok(None) => {}
-            Err(_) => unknown = true,
+        let Ok(Some(pointer)) = read_pointer(dir, name) else {
+            continue;
+        };
+        if documents
+            .iter()
+            .any(|document| document.generation == pointer.generation)
+        {
+            continue;
+        }
+        if let Ok(set) = super::SegmentSet::open_generation(dir, &pointer) {
+            documents.push(set.document().clone());
         }
     }
-    if unknown {
-        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(generation) = generation_of(&name) else {
-                continue;
-            };
-            let Ok(bytes) = fs::read(entry.path().join(SET_FILE)) else {
-                continue;
-            };
-            if let Ok(document) = serde_json::from_slice::<SetDocument>(&bytes) {
-                if document.check(generation).is_ok() {
-                    documents.push(document);
-                }
+    documents
+}
+
+/// Every generation on disk whose `set.json` reads, named by a pointer or not: what may name a
+/// segment's bytes, now or once a pointer is mended.
+fn generations_on_disk(dir: &Path) -> Vec<SetDocument> {
+    let mut documents = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(generation) = generation_of(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(entry.path().join(SET_FILE)) else {
+            continue;
+        };
+        if let Ok(document) = serde_json::from_slice::<SetDocument>(&bytes) {
+            if document.check(generation).is_ok() {
+                documents.push(document);
             }
         }
     }
     documents
 }
 
+/// Leave the verdict segment `id` needs once its file holds the bytes `sha256`, just put there
+/// or verified there: none, when no generation on disk names other bytes for it; otherwise a
+/// verdict naming `sha256`, so a generation that names bytes no longer there never opens on
+/// these.
+pub(crate) fn settle_verdict(dir: &Path, id: &str, sha256: &str) -> Result<(), ArtifactError> {
+    let other = generations_on_disk(dir).into_iter().find_map(|document| {
+        document
+            .segments
+            .into_iter()
+            .find(|entry| entry.id == id && entry.sha256 != sha256)
+            .map(|entry| (document.generation, entry.sha256))
+    });
+    let Some((generation, named)) = other else {
+        if clear_verdict(dir, id)? {
+            log::info!("The verdict on segment {id} is withdrawn: it holds verified bytes now");
+        }
+        return Ok(());
+    };
+    let path = verdict_path(dir, id);
+    let verdict = Verdict {
+        sha256: sha256.to_string(),
+        reason: format!(
+            "segment {id} holds {sha256} now, and generation {generation} names {named}, which \
+             is gone"
+        ),
+    };
+    let bytes = serde_json::to_vec_pretty(&verdict).expect("a verdict serializes");
+    write_atomically(&path, &bytes).map_err(io_error(format!("marking {}", path.display())))
+}
+
+/// What [`place_segment`] did with a verified segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placed {
+    /// A file of the same bytes was in place already, and stays; the staged file is left
+    /// where it was, for the caller to remove.
+    Kept,
+    /// The staged file is the segment's file now; there was none.
+    New,
+    /// The staged file replaced one of other bytes that no generation that opens stood on:
+    /// damaged bytes, or bytes only shut or unreadable generations named.
+    Replaced,
+}
+
 /// Put the verified segment at `staged`, whose SHA-256 is `sha256`, in place as
-/// `segments/<id>.oxv` — the one name its id gives it — flush the directory, and withdraw any
-/// verdict on the segment, which was on bytes other than these.
+/// `segments/<id>.oxv` — the one name its id gives it — flush the directory, and settle the
+/// segment's verdict for the bytes it holds ([`settle_verdict`]).
 ///
-/// A file of the same bytes already there is kept — mapped by a reader, perhaps — and
-/// `staged` removed. A file of other bytes is replaced only when no generation the set may
-/// still open names `id` with bytes other than `sha256`: then it is damage, or garbage, and
-/// the new bytes are what every generation naming `id` names. Otherwise nothing is changed,
-/// and `refuse` makes the error: a segment id names one content, and the bytes a generation
-/// names are never rewritten. Whether the file was written.
+/// A file of the same bytes already there is kept — mapped by a reader, perhaps. A file of
+/// other bytes is replaced unless a generation that opens names exactly the bytes it holds:
+/// those are served, and are never rewritten, so `refuse` makes the error from what the file
+/// holds, and nothing changes. A file whose bytes no generation that opens names is damage,
+/// or what only shut generations stand on, and replacing it is a repair. Anything that fails
+/// after the rename moves the file back to `staged`.
 pub(crate) fn place_segment(
     dir: &Path,
     id: &str,
@@ -619,36 +740,47 @@ pub(crate) fn place_segment(
     sha256: &str,
     cancel: &CancellationToken,
     refuse: impl FnOnce(String) -> SemanticSearchError,
-) -> Result<bool, SemanticSearchError> {
+) -> Result<Placed, SemanticSearchError> {
     let segments = dir.join(SEGMENTS_DIR);
     fs::create_dir_all(&segments).map_err(io_error(format!("creating {}", segments.display())))?;
     let target = dir.join(segment_file(id));
-    let written = if target.exists() && hash_file(&target, cancel)? == sha256 {
-        fs::remove_file(staged).map_err(io_error(format!("removing {}", staged.display())))?;
-        false
-    } else {
-        let named = openable_generations(dir).into_iter().find_map(|document| {
-            document
-                .segments
-                .iter()
-                .find(|entry| entry.id == id && entry.sha256 != sha256)
-                .map(|entry| (document.generation, entry.sha256.clone()))
-        });
-        if let Some((generation, named)) = named {
-            return Err(refuse(format!(
-                "segment {id} is in generation {generation} with SHA-256 {named}, and this one's \
-                 is {sha256}: a segment id names one content"
-            )));
-        }
-        rename_into_place(staged, &target)
-            .map_err(io_error(format!("moving {} into place", staged.display())))?;
-        true
+    let held = match target.exists() {
+        true => Some(hash_file(&target, cancel)?),
+        false => None,
     };
-    sync_set_dir(&segments).map_err(io_error(format!("flushing {}", segments.display())))?;
-    if clear_verdict(dir, id)? {
-        log::info!("The scrub verdict on segment {id} is withdrawn: it holds verified bytes now");
+    let placed = match held {
+        Some(held) if held == sha256 => Placed::Kept,
+        held => {
+            if let Some(held) = held.as_deref() {
+                let served = live_generations(dir).iter().any(|document| {
+                    document
+                        .segments
+                        .iter()
+                        .any(|entry| entry.id == id && entry.sha256 == held)
+                });
+                if served {
+                    return Err(refuse(held.to_string()));
+                }
+            }
+            rename_into_place(staged, &target)
+                .map_err(io_error(format!("moving {} into place", staged.display())))?;
+            if held.is_some() {
+                Placed::Replaced
+            } else {
+                Placed::New
+            }
+        }
+    };
+    let settled = sync_set_dir(&segments)
+        .map_err(io_error(format!("flushing {}", segments.display())))
+        .and_then(|()| settle_verdict(dir, id, sha256));
+    if let Err(error) = settled {
+        if placed != Placed::Kept {
+            let _ = fs::rename(&target, staged);
+        }
+        return Err(error.into());
     }
-    Ok(written)
+    Ok(placed)
 }
 
 /// Withdraw any verdict on segment `id`, once its file holds bytes that were just verified

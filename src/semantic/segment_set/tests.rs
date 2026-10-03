@@ -51,7 +51,13 @@ impl Library {
 
 /// The vector a key embeds as: the same in every segment, as content addressing promises.
 fn vector_of(key: u64) -> Vec<f32> {
-    Random(key.wrapping_mul(0x9E37_79B9) ^ 0xABCD).unit(DIM)
+    vector_in(key, 0)
+}
+
+/// The vector a key embeds as under `embedding`: 0 is [`vector_of`]'s; another stands for a
+/// worker or a passage package that embeds the same texts a little differently.
+fn vector_in(key: u64, embedding: u64) -> Vec<f32> {
+    Random(key.wrapping_mul(0x9E37_79B9) ^ 0xABCD ^ embedding.wrapping_mul(0x5851_F42D)).unit(DIM)
 }
 
 fn codec() -> Codec {
@@ -80,7 +86,11 @@ fn expectation() -> InstallExpectation {
 /// records in hint order, a key's first appearance a slot and every later one an extra.
 /// `shipped` decides which keys this segment ships; `foreign` which records it carries for
 /// keys an older segment ships.
-fn books_for(records: &BTreeMap<(String, u64), u32>, shipped: &BTreeSet<u64>) -> Vec<TestBook> {
+fn books_for(
+    records: &BTreeMap<(String, u64), u32>,
+    shipped: &BTreeSet<u64>,
+    embedding: u64,
+) -> Vec<TestBook> {
     let mut by_book: BTreeMap<&str, Vec<(u32, u64)>> = BTreeMap::new();
     for ((book, key), hint) in records {
         by_book.entry(book).or_default().push((*hint, *key));
@@ -97,7 +107,8 @@ fn books_for(records: &BTreeMap<(String, u64), u32>, shipped: &BTreeSet<u64>) ->
                     None => {
                         let slot = slot_of.len() as u32;
                         slot_of.insert(key, slot);
-                        book.primary.push((self::key(key), hint, vector_of(key)));
+                        book.primary
+                            .push((self::key(key), hint, vector_in(key, embedding)));
                     }
                 }
             } else {
@@ -111,12 +122,24 @@ fn books_for(records: &BTreeMap<(String, u64), u32>, shipped: &BTreeSet<u64>) ->
 
 /// Write a release of `library` — a base, or a delta from `previous` — and its manifest.
 fn release(dir: &TempDir, library: &Library, previous: Option<&Library>) -> (PathBuf, String) {
+    release_embedded(dir, library, previous, 0)
+}
+
+/// [`release`], its vectors embedded under `embedding` ([`vector_in`]): another embedding of
+/// the same release is the same keys in the same slots — the same segment id — and other
+/// bytes, as a version published again would be.
+fn release_embedded(
+    dir: &TempDir,
+    library: &Library,
+    previous: Option<&Library>,
+    embedding: u64,
+) -> (PathBuf, String) {
     let pairs = library.pairs();
     let (kind, from, books, tombstones) = match previous {
         None => (
             PackageKind::Base,
             0,
-            books_for(&pairs, &library.keys()),
+            books_for(&pairs, &library.keys(), embedding),
             Vec::new(),
         ),
         Some(previous) => {
@@ -138,14 +161,20 @@ fn release(dir: &TempDir, library: &Library, previous: Option<&Library>) -> (Pat
             (
                 PackageKind::Delta,
                 previous.version,
-                books_for(&records, &new_keys),
+                books_for(&records, &new_keys, embedding),
                 gone,
             )
         }
     };
     let mut spec = spec(kind, from, library.version);
     spec.identity_digest = identity().identity_digest();
-    let path = dir.join(&format!("{kind}-{}.oxv", library.version));
+    let path = match embedding {
+        0 => dir.join(&format!("{kind}-{}.oxv", library.version)),
+        _ => dir.join(&format!(
+            "{kind}-{}-embedding-{embedding}.oxv",
+            library.version
+        )),
+    };
     let _ = std::fs::remove_file(&path);
     let written = write_segment(&path, spec, codec(), &books, &tombstones);
     let manifest = ReleaseManifest::for_segment(
@@ -1315,52 +1344,67 @@ fn journal_of(work: impl FnOnce()) -> Vec<files::Durable> {
     files::JOURNAL.with(|journal| journal.borrow_mut().drain(..).collect())
 }
 
-/// The order one publish into `dir` must show: the segment's bytes flushed in `staging/`,
-/// the segment renamed into `segments/` and that directory flushed; the new generation's
-/// `set.json` renamed in, and the set's directory flushed after it — the generation's own
-/// entry; all of it before `CURRENT` is renamed, and the set's directory flushed after.
+/// The order one publish into `dir` must show: the segment's bytes flushed where they are,
+/// then renamed into `segments/`; the new generation's `set.json` renamed in; `CURRENT`
+/// renamed last. And on Unix, where a directory can be flushed, `segments/` flushed after the
+/// segment lands, the set's directory — the generation's own entry — after the generation is
+/// written, and again after the flip, all before what follows; on Windows, which flushes no
+/// directory and keeps a rename's order itself, no directory flush is claimed at all.
 fn assert_published_in_order(steps: &[files::Durable], dir: &Path, what: &str) {
     use files::Durable;
-    let flip = steps
-        .iter()
-        .position(|step| *step == Durable::Renamed(dir.join(CURRENT)))
-        .unwrap_or_else(|| panic!("{what}: no flip in {steps:#?}"));
-    let (staging, segments) = (dir.join(STAGING_DIR), dir.join(SEGMENTS_DIR));
+    let renamed_to = |to: &Path| {
+        steps
+            .iter()
+            .position(|step| matches!(step, Durable::Renamed(_, path) if path == to))
+    };
+    let flip =
+        renamed_to(&dir.join(CURRENT)).unwrap_or_else(|| panic!("{what}: no flip in {steps:#?}"));
+    let segments = dir.join(SEGMENTS_DIR);
     let placed = steps
         .iter()
         .position(|step| {
-            matches!(step, Durable::Renamed(path)
+            matches!(step, Durable::Renamed(_, path)
                 if path.parent() == Some(segments.as_path())
                     && path.extension().is_some_and(|extension| extension == "oxv"))
         })
         .unwrap_or_else(|| panic!("{what}: no segment placed in {steps:#?}"));
+    let Durable::Renamed(source, _) = &steps[placed] else {
+        unreachable!("a placement is a rename")
+    };
     assert!(
-        steps[..placed].iter().any(
-            |step| matches!(step, Durable::File(path) if path.parent() == Some(staging.as_path()))
-        ),
-        "{what}: the segment's bytes are flushed before it is renamed into place: {steps:#?}"
-    );
-    assert!(
-        steps[placed..flip].contains(&Durable::Dir(segments.clone())),
-        "{what}: segments/ is flushed after the segment lands and before the flip: {steps:#?}"
+        steps[..placed].contains(&Durable::File(source.clone())),
+        "{what}: the segment's bytes are flushed where they are before they are renamed into \
+         place: {steps:#?}"
     );
     let generation = steps[..flip]
         .iter()
         .rposition(|step| {
-            matches!(step, Durable::Renamed(path)
+            matches!(step, Durable::Renamed(_, path)
                 if path.file_name().is_some_and(|name| name == files::SET_FILE))
         })
         .unwrap_or_else(|| panic!("{what}: no generation written in {steps:#?}"));
-    assert!(
-        steps[generation..flip].contains(&Durable::Dir(dir.to_path_buf())),
-        "{what}: the set's directory — the new generation's entry — is flushed before the \
-         flip: {steps:#?}"
-    );
-    assert_eq!(
-        steps.get(flip + 1),
-        Some(&Durable::Dir(dir.to_path_buf())),
-        "{what}: and so is the flip"
-    );
+    assert!(placed < generation, "{what}: {steps:#?}");
+    if cfg!(unix) {
+        assert!(
+            steps[placed..flip].contains(&Durable::Dir(segments.clone())),
+            "{what}: segments/ is flushed after the segment lands and before the flip: {steps:#?}"
+        );
+        assert!(
+            steps[generation..flip].contains(&Durable::Dir(dir.to_path_buf())),
+            "{what}: the set's directory — the new generation's entry — is flushed before the \
+             flip: {steps:#?}"
+        );
+        assert_eq!(
+            steps.get(flip + 1),
+            Some(&Durable::Dir(dir.to_path_buf())),
+            "{what}: and so is the flip"
+        );
+    } else {
+        assert!(
+            !steps.iter().any(|step| matches!(step, Durable::Dir(_))),
+            "{what}: no directory flush is claimed where none happens: {steps:#?}"
+        );
+    }
 }
 
 /// Every publish writes, flushes the file, renames it into place and flushes the directory,
@@ -1374,6 +1418,11 @@ fn every_publish_is_flushed_before_the_flip_that_names_it() {
         install(&dir, &release(&work, &v29(), None)).unwrap();
     });
     assert_published_in_order(&steps, &dir, "a base, copied");
+    let flushed = journal_of(|| files::sync_set_dir(&dir).unwrap());
+    match cfg!(unix) {
+        true => assert_eq!(flushed, [files::Durable::Dir(dir.clone())]),
+        false => assert_eq!(flushed, []),
+    }
 
     let (path, json) = release(&work, &v30(), Some(&v29()));
     std::fs::create_dir_all(incoming_dir(&dir)).unwrap();
@@ -1506,8 +1555,9 @@ fn a_condemned_generation_falls_back_alike_for_open_info_and_scrub() {
 
 /// A scrub that read a damaged file while an install replaced it would leave a verdict on
 /// bytes the file no longer holds; it withdraws it, so the install's bytes are never
-/// condemned. One on the bytes the file holds stands, and so does a marker that names no
-/// bytes — as every marker before verdicts did.
+/// condemned. One on the bytes the file holds stands — damaged bytes, which no generation
+/// names — and so does a marker that names no bytes, as every marker before verdicts did. One
+/// on exactly the bytes the generation names condemns nothing: those are the bytes it serves.
 #[test]
 fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
     let work = TempDir::new("set_verdict_race");
@@ -1515,16 +1565,43 @@ fn a_verdict_stands_only_on_the_bytes_the_file_holds() {
     let base = release(&work, &v29(), None);
     install(&dir, &base).unwrap();
     let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let file = dir.join(format!("segments/{id}.oxv"));
     let marker = dir.join(format!("segments/{id}.corrupt"));
 
-    assert!(!files::condemn(&dir, &id, &"0".repeat(64), "a block failed").unwrap());
+    assert!(!files::condemn(
+        &dir,
+        &id,
+        &"0".repeat(64),
+        "a block failed",
+        &CancellationToken::new()
+    )
+    .unwrap());
     assert!(!marker.exists());
     SegmentSet::open(&dir).unwrap();
 
-    let held = files::sha256_hex(&std::fs::read(dir.join(format!("segments/{id}.oxv"))).unwrap());
-    assert!(files::condemn(&dir, &id, &held, "a block failed").unwrap());
+    let sound = std::fs::read(&file).unwrap();
+    let damaged = damage_last_byte(&file);
+    assert!(files::condemn(
+        &dir,
+        &id,
+        &files::sha256_hex(&damaged),
+        "a block failed",
+        &CancellationToken::new()
+    )
+    .unwrap());
     assert!(is_corrupt(SegmentSet::open(&dir)));
     assert!(is_corrupt(info(&dir)));
+
+    std::fs::write(&file, &sound).unwrap();
+    assert!(files::condemn(
+        &dir,
+        &id,
+        &files::sha256_hex(&sound),
+        "a block failed",
+        &CancellationToken::new()
+    )
+    .unwrap());
+    SegmentSet::open(&dir).unwrap();
 
     std::fs::write(&marker, b"a block failed").unwrap();
     assert!(is_corrupt(SegmentSet::open(&dir)));
@@ -1601,49 +1678,160 @@ fn two_compactions_that_differ_are_two_segments_and_previous_keeps_its_own() {
     );
 }
 
-/// A release under an installed segment's id with other bytes — what an id that does not
-/// name its content allows — is refused, and the installed file and every generation that
-/// names it are left as they were. The bytes a generation names are never rewritten.
+/// The release `library` is, published again: embedded anew, so the same keys in the same
+/// slots — the same segment id — and other bytes.
+fn republished(dir: &TempDir, library: &Library, previous: Option<&Library>) -> (PathBuf, String) {
+    release_embedded(dir, library, previous, 1)
+}
+
+fn manifest_of(release: &(PathBuf, String)) -> ReleaseManifest {
+    serde_json::from_str(&release.1).unwrap()
+}
+
+/// A version that is installed, published again — embedded anew, or its hints anchored
+/// anew — is the installed segment's id with other bytes. While a generation that opens
+/// stands on the installed bytes it is refused as what it is, `SegmentIdTaken`, naming both,
+/// and nothing changes. Once no generation that opens names them — two other bases later,
+/// `PREVIOUS` included — it installs.
 #[test]
-fn a_release_under_an_installed_segments_id_with_other_bytes_is_refused() {
-    let work = TempDir::new("set_impostor");
+fn a_republished_version_is_refused_while_its_installed_bytes_are_served() {
+    let work = TempDir::new("set_republished");
     let dir = work.join("vectors");
     install(&dir, &release(&work, &v29(), None)).unwrap();
-    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
-    let installed = dir.join(format!("segments/{id}.oxv"));
-    let held = std::fs::read(&installed).unwrap();
-    let answers = everything(&SegmentSet::open(&dir).unwrap(), 10);
+    let installed = info(&dir).unwrap().unwrap().segments[0].clone();
+    let file = dir.join(format!("segments/{}.oxv", installed.id));
+    let answers = everything(&SegmentSet::open(&dir).unwrap(), 13);
+    let again = republished(&work, &v29(), None);
+    let offered = manifest_of(&again);
+    assert_eq!(offered.segment_id, installed.id, "one release, so one id");
+    assert_ne!(offered.segment.sha256, installed.sha256);
 
-    // v29 with one record moved, its header and its manifest made to claim that id.
-    let mut moved = v29();
-    let lines = moved.books.get_mut("id:3").unwrap();
-    lines.remove(&1);
-    lines.insert(4, 7);
-    let (path, json) = release(&work, &moved, None);
-    let mut bytes = std::fs::read(&path).unwrap();
-    let mut header = crate::semantic::oxv::format::Header::decode(&bytes).unwrap();
-    header.segment_id = (0..16)
-        .map(|at| u8::from_str_radix(&id[at * 2..at * 2 + 2], 16).unwrap())
-        .collect::<Vec<u8>>()
-        .try_into()
-        .unwrap();
-    bytes[..4096].copy_from_slice(&header.encode());
-    std::fs::write(&path, &bytes).unwrap();
-    let mut manifest: ReleaseManifest = serde_json::from_str(&json).unwrap();
-    manifest.segment_id = id.clone();
-    manifest.segment.sha256 = files::sha256_hex(&bytes);
-    manifest.package_digest = manifest.package().digest();
-
-    match install(&dir, &(path, manifest.to_json())) {
-        Err(SemanticSearchError::Artifact(ArtifactError::ManifestDisagreesWithPayload {
-            reason,
-        })) => assert!(reason.contains(&id), "{reason}"),
-        other => panic!("a release under another segment's id must be refused, got {other:?}"),
-    }
-    assert_eq!(std::fs::read(&installed).unwrap(), held);
+    let refused = |result: Result<ApplyReport, SemanticSearchError>| match result {
+        Err(SemanticSearchError::Artifact(ArtifactError::SegmentIdTaken {
+            id,
+            installed_sha256,
+            offered_sha256,
+        })) => assert_eq!(
+            (id, installed_sha256, offered_sha256),
+            (
+                installed.id.clone(),
+                installed.sha256.clone(),
+                offered.segment.sha256.clone()
+            )
+        ),
+        other => panic!("a version published again must be refused as one, got {other:?}"),
+    };
+    refused(install(&dir, &again));
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        installed.sha256
+    );
     let set = SegmentSet::open(&dir).unwrap();
     assert_eq!(set.generation(), 1);
-    assert_eq!(everything(&set, 10), answers);
+    assert_eq!(everything(&set, 13), answers);
+    drop(set);
+
+    // Another base: v29 is PREVIOUS's, which opens, so still refused.
+    let mut v40 = v30();
+    v40.version = 40;
+    install(&dir, &release(&work, &v40, None)).unwrap();
+    refused(install(&dir, &again));
+    // One more, and nothing that opens names v29's bytes.
+    let mut v41 = v40.clone();
+    v41.version = 41;
+    install(&dir, &release(&work, &v41, None)).unwrap();
+    assert_eq!(install(&dir, &again).unwrap().library_version, 29);
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        offered.segment.sha256
+    );
+}
+
+/// The review's scenario: a base damaged under a delta — scrubbed, so both generations are
+/// condemned, or not yet, so both open on damaged bytes — and its version published again.
+/// No generation that opens stands on the bytes the file holds, so the release installs as a
+/// repair and the set opens on it. The generations that name the old bytes stay shut: those
+/// bytes are gone, and they never open on the new ones.
+#[test]
+fn a_damaged_base_is_repaired_by_its_version_published_again() {
+    for scrubbed in [true, false] {
+        let work = TempDir::new("set_republished_repair");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+        let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+        let file = dir.join(format!("segments/{id}.oxv"));
+        damage_last_byte(&file);
+        if scrubbed {
+            assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+            assert!(is_corrupt(SegmentSet::open(&dir)));
+        }
+
+        let again = republished(&work, &v29(), None);
+        let report = install(&dir, &again).unwrap_or_else(|error| {
+            panic!("scrubbed {scrubbed}: the repair must install: {error}")
+        });
+        assert_eq!((report.generation, report.library_version), (3, 29));
+        assert_eq!(
+            files::sha256_hex(&std::fs::read(&file).unwrap()),
+            manifest_of(&again).segment.sha256
+        );
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(set.generation(), 3, "scrubbed {scrubbed}");
+        assert!(!set.info().recovered_from_previous);
+        drop(set);
+        assert_eq!(info(&dir).unwrap().unwrap().generation, 3);
+        assert_eq!(
+            scrub(&dir, &CancellationToken::new()).unwrap().generation,
+            3
+        );
+
+        // PREVIOUS names the base's old bytes: it does not open on the new ones.
+        assert_eq!(previous_generation(&dir), 2, "scrubbed {scrubbed}");
+        break_current(&dir, Broken::Garbage);
+        assert!(is_corrupt(SegmentSet::open(&dir)), "scrubbed {scrubbed}");
+        assert!(is_corrupt(info(&dir)), "scrubbed {scrubbed}");
+    }
+}
+
+/// A delta published again, offered to a set on a fallback: `CURRENT` names the generation
+/// with the delta, which does not open, and `PREVIOUS` the base's, which does. Nothing that
+/// opens stands on the delta's installed bytes, so the release applies to the generation
+/// that opens, as any delta from its version would.
+#[test]
+fn a_republished_delta_applies_to_a_fallback() {
+    let work = TempDir::new("set_republished_delta");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let delta = info(&dir).unwrap().unwrap().segments[1].clone();
+    let del = std::fs::read_dir(dir.join(files::generation_dir(2)))
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".del"))
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&del).unwrap();
+    bytes[20] ^= 1;
+    std::fs::write(&del, bytes).unwrap();
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+
+    let again = republished(&work, &v30(), Some(&v29()));
+    assert_eq!(manifest_of(&again).segment_id, delta.id);
+    let report = install(&dir, &again).unwrap();
+    assert_eq!((report.generation, report.library_version), (3, 30));
+    assert_eq!(previous_generation(&dir), 1);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (3, 30));
+    assert_eq!(
+        set.info().segments[1].sha256,
+        manifest_of(&again).segment.sha256
+    );
+    drop(set);
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(dir.join(format!("segments/{}.oxv", delta.id))).unwrap()),
+        manifest_of(&again).segment.sha256
+    );
 }
 
 /// Compacting a set that is one compacted segment already writes that segment again: the
@@ -1851,6 +2039,238 @@ fn garbage_waits_while_current_is_missing() {
     install(&dir, &release(&work, &v31(), None)).unwrap();
     assert_eq!(previous_generation(&dir), 1);
     assert!(!dir.join(files::generation_dir(2)).exists());
+}
+
+/// `release` left in `incoming/` as `name`, as a host's download is.
+fn downloaded(dir: &Path, release: &(PathBuf, String), name: &str) -> (PathBuf, String) {
+    std::fs::create_dir_all(incoming_dir(dir)).unwrap();
+    let download = incoming_dir(dir).join(name);
+    std::fs::copy(&release.0, &download).unwrap();
+    (download, release.1.clone())
+}
+
+/// A download the host left in `incoming/` read-only installs. The set flushes it where it
+/// lies before it takes it: on Unix a read-only handle flushes a file; Windows flushes only
+/// through a handle that writes, so there a read-only download is copied instead, and left
+/// where it was.
+#[test]
+fn a_read_only_download_in_incoming_installs() {
+    let work = TempDir::new("set_read_only_download");
+    let dir = work.join("vectors");
+    let (download, json) = downloaded(&dir, &release(&work, &v29(), None), "download.oxv");
+    let mut permissions = std::fs::metadata(&download).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&download, permissions).unwrap();
+
+    let report = install(&dir, &(download.clone(), json))
+        .unwrap_or_else(|error| panic!("a read-only download must install: {error}"));
+    assert_eq!(report.generation, 1);
+    assert_eq!(SegmentSet::open(&dir).unwrap().info().slots_live, 7);
+    assert_eq!(
+        download.exists(),
+        cfg!(windows),
+        "taken, unless it had to be copied"
+    );
+    #[cfg(windows)]
+    {
+        // So that the test's directory can be removed.
+        let mut permissions = std::fs::metadata(&download).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&download, permissions).unwrap();
+    }
+}
+
+/// A download in `incoming/` is the host's until it is installed: an install that does not
+/// happen — refused, cancelled, a segment that does not verify, a failure after the segment
+/// was placed — leaves it where it was, byte for byte, for the host to retry or remove.
+#[test]
+fn a_download_that_does_not_install_stays_in_incoming() {
+    let work = TempDir::new("set_download_kept");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let still_there = |download: &Path, bytes: &[u8], what: &str| {
+        assert_eq!(
+            std::fs::read(download).ok().as_deref(),
+            Some(bytes),
+            "{what}: the download is lost"
+        );
+    };
+
+    // Refused: the installed version, published again.
+    let (download, json) = downloaded(&dir, &republished(&work, &v29(), None), "again.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+    assert!(matches!(
+        install(&dir, &(download.clone(), json)),
+        Err(SemanticSearchError::Artifact(
+            ArtifactError::SegmentIdTaken { .. }
+        ))
+    ));
+    still_there(&download, &bytes, "refused");
+
+    // Cancelled.
+    let (download, json) = downloaded(&dir, &release(&work, &v30(), Some(&v29())), "delta.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let cancelled = install_package(
+        &dir,
+        &InstallSource {
+            segment: &download,
+            manifest_json: &json,
+        },
+        &expectation(),
+        &cancel,
+    );
+    assert!(matches!(cancelled, Err(SemanticSearchError::Cancelled)));
+    still_there(&download, &bytes, "cancelled");
+
+    // A segment that is not the manifest's.
+    let mut damaged = bytes.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    std::fs::write(&download, &damaged).unwrap();
+    assert!(install(&dir, &(download.clone(), json.clone())).is_err());
+    still_there(&download, &damaged, "damaged");
+    std::fs::remove_file(&download).unwrap();
+
+    // Placed, and then the generation cannot be published: CURRENT is a directory with a
+    // file in it, which no pointer can be written over.
+    let current = dir.join(CURRENT);
+    std::fs::remove_file(&current).unwrap();
+    std::fs::create_dir(&current).unwrap();
+    std::fs::write(current.join("left here"), b"by someone").unwrap();
+    let (download, json) = downloaded(&dir, &release(&work, &v31(), None), "v31.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+    assert!(install(&dir, &(download.clone(), json)).is_err());
+    still_there(&download, &bytes, "failed after it was placed");
+}
+
+/// A pointer that reads and names the last generation number, which no install writes and no
+/// directory holds, blocked every install with "no generation number is left" — and, copied
+/// into `PREVIOUS`, every collection after. A number only a pointer names, whose generation
+/// does not read, is passed over when nothing is left past it, and the next install heals the
+/// set: with a fallback to build on, and without one.
+#[test]
+fn a_pointer_naming_the_last_generation_number_blocks_no_install() {
+    let last = files::Pointer {
+        generation: u64::MAX,
+        set: format!("{}/{}", files::generation_dir(u64::MAX), files::SET_FILE),
+        set_sha256: "0".repeat(64),
+    };
+    let point_current_at_the_last =
+        |dir: &Path| std::fs::write(dir.join(CURRENT), serde_json::to_vec(&last).unwrap()).unwrap();
+
+    let work = TempDir::new("set_last_number");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    point_current_at_the_last(&dir);
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+    let report = install(&dir, &release(&work, &v31(), None))
+        .unwrap_or_else(|error| panic!("with a fallback: {error}"));
+    assert_eq!(report.generation, 3);
+    assert_eq!(previous_generation(&dir), 1);
+    assert!(
+        !dir.join(files::generation_dir(2)).exists(),
+        "both pointers read again, and garbage is collected"
+    );
+
+    let alone = work.join("alone");
+    install(&alone, &release(&work, &v29(), None)).unwrap();
+    point_current_at_the_last(&alone);
+    assert!(is_corrupt(SegmentSet::open(&alone)));
+    let report = install(&alone, &release(&work, &v31(), None))
+        .unwrap_or_else(|error| panic!("without a fallback: {error}"));
+    assert_eq!(report.generation, 2);
+    assert!(
+        !alone.join(PREVIOUS).exists(),
+        "a pointer whose generation does not read is no fallback"
+    );
+    assert_eq!(SegmentSet::open(&alone).unwrap().generation(), 2);
+}
+
+/// Run `work` with `hook` as what happens the moment a block is found to fail.
+fn on_damage<T>(hook: impl FnMut() + 'static, work: impl FnOnce() -> T) -> T {
+    files::ON_DAMAGE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let result = work();
+    files::ON_DAMAGE.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+/// A scrub or a compaction cancelled as it finds a block that fails returns at once and
+/// records nothing. Naming the bytes that failed reads the whole segment, twice, and the
+/// cancel stops it there — before a verdict exists, so nothing changes, as a cancel promises;
+/// the next scrub finds the damage again.
+#[test]
+fn a_scrub_or_a_compaction_cancelled_on_damage_records_nothing() {
+    for compaction in [false, true] {
+        let work = TempDir::new("set_cancel_on_damage");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+        let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+        damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+
+        let cancel = CancellationToken::new();
+        let cancelling = cancel.clone();
+        let result = on_damage(
+            move || cancelling.cancel(),
+            || match compaction {
+                true => compact(
+                    &dir,
+                    &CompactionPolicy {
+                        force: true,
+                        ..CompactionPolicy::default()
+                    },
+                    None,
+                    &cancel,
+                )
+                .map(|_| ()),
+                false => scrub(&dir, &cancel).map(|_| ()),
+            },
+        );
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "compaction {compaction}: {result:?}"
+        );
+        assert!(
+            !dir.join(format!("segments/{id}.corrupt")).exists(),
+            "compaction {compaction}"
+        );
+        assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+    }
+}
+
+/// An install replaces a segment while a scrub reads it: the scrub finds a block that fails
+/// in bytes the file no longer holds. It condemns nothing, and says so — a report marked
+/// `superseded` rather than a `Corrupted` that would send a host downloading for nothing. On
+/// Unix alone: Windows replaces no file that is mapped, so there it cannot happen.
+#[cfg(unix)]
+#[test]
+fn a_scrub_of_bytes_an_install_replaced_reports_it_superseded() {
+    let work = TempDir::new("set_scrub_superseded");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let file = dir.join(format!("segments/{id}.oxv"));
+    let sound = std::fs::read(&file).unwrap();
+    damage_last_byte(&file);
+    // Sound bytes, put back as an install puts a segment: renamed over the file.
+    let fresh = work.join("fresh.oxv");
+    std::fs::write(&fresh, &sound).unwrap();
+    let replaced = file.clone();
+
+    let report = on_damage(
+        move || std::fs::rename(&fresh, &replaced).unwrap(),
+        || scrub(&dir, &CancellationToken::new()),
+    )
+    .unwrap_or_else(|error| panic!("the scrub read bytes no longer installed: {error}"));
+    assert!(report.superseded);
+    assert!(!dir.join(format!("segments/{id}.corrupt")).exists());
+    let again = scrub(&dir, &CancellationToken::new()).unwrap();
+    assert!(!again.superseded);
+    assert!(again.bytes_checked > 0);
 }
 
 #[test]

@@ -176,8 +176,9 @@ pub fn compact(
     for (segment, entry) in set.segments().iter().zip(&set.document().segments) {
         if let Err(error) = segment.verify_blocks(cancel, |_| {}) {
             if let VectorStoreError::Corrupted { reason } = &error {
-                let failed = files::sha256_hex(segment.file_bytes());
-                files::condemn(dir, &entry.id, &failed, reason)?;
+                files::damage_found();
+                let failed = files::sha256_cancellable(segment.file_bytes(), cancel)?;
+                files::condemn(dir, &entry.id, &failed, reason, cancel)?;
                 log::error!("Compaction of {}: {reason}", dir.display());
             }
             return Err(error.into());
@@ -403,14 +404,18 @@ pub fn compact(
     let id = hex(&written.segment_id);
     let file = files::segment_file(&id);
     let target = dir.join(&file);
-    files::place_segment(
-        dir,
-        &id,
-        &partial,
-        &hex(&written.sha256),
-        cancel,
-        |reason| VectorStoreError::Corrupted { reason }.into(),
-    )?;
+    let placed = files::place_segment(dir, &id, &partial, &hex(&written.sha256), cancel, |held| {
+        VectorStoreError::Corrupted {
+            reason: format!(
+                "segment {id} is served with SHA-256 {held}, and a compaction wrote other bytes \
+                 under its name"
+            ),
+        }
+        .into()
+    })?;
+    if placed == files::Placed::Kept {
+        fs::remove_file(&partial).map_err(io_error(format!("removing {}", partial.display())))?;
+    }
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);
     generation.library_release_tag = document.library_release_tag.clone();

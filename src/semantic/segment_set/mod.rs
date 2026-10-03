@@ -113,6 +113,10 @@ pub struct ScrubReport {
     pub segments: u32,
     pub bytes_checked: u64,
     pub elapsed_ms: u64,
+    /// The set changed while the scrub read it: a block failed in bytes that an install has
+    /// since replaced. Nothing was condemned, and what the set holds now was not checked —
+    /// scrub again. The scrub stops where it found it.
+    pub superseded: bool,
 }
 
 /// One generation of a set, open for scans: its segments mapped, their derived files in
@@ -394,9 +398,10 @@ impl SegmentSet {
 /// alike.
 fn condemnation(dir: &Path, document: &SetDocument) -> Option<String> {
     document.segments.iter().find_map(|entry| {
-        files::read_verdict(dir, &entry.id).map(|verdict| {
+        files::verdict_against(dir, &entry.id, &entry.sha256).map(|verdict| {
             format!(
-                "segment {} failed a scrub ({}); the set has to be installed again",
+                "segment {} does not hold the bytes this generation names, as a scrub or an \
+                 install found ({}); the set has to be installed again",
                 entry.id, verdict.reason
             )
         })
@@ -541,35 +546,43 @@ pub fn info(dir: &Path) -> Result<Option<SetInfo>, SemanticSearchError> {
 /// (`segments/<id>.corrupt`) naming the SHA-256 of the bytes that failed, so every later open
 /// and [`info()`] pass its generation over rather than serve it, until an install writes or
 /// verifies the segment again; and the scrub returns [`VectorStoreError::Corrupted`].
+///
+/// When the bytes that failed are no longer the file's — an install replaced it while the
+/// scrub read it — nothing is condemned, and the scrub returns a report marked
+/// [`ScrubReport::superseded`]: scrub again to check what the set holds now.
 pub fn scrub(dir: &Path, cancel: &CancellationToken) -> Result<ScrubReport, SemanticSearchError> {
     let started = std::time::Instant::now();
     let set = SegmentSet::open(dir)?;
     let mut bytes = 0u64;
-    for (segment, entry) in set.segments.iter().zip(&set.document.segments) {
-        if let Err(error) = segment.verify_blocks(cancel, |block| bytes += block) {
-            if let VectorStoreError::Corrupted { reason } = &error {
-                // The bytes that failed are the ones mapped, whatever the path holds now.
-                let failed = files::sha256_hex(segment.file_bytes());
-                if files::condemn(dir, &entry.id, &failed, reason)? {
-                    log::error!("Scrub of {}: {reason}", dir.display());
-                } else {
-                    log::warn!(
-                        "Scrub of {}: {reason} — in bytes segment {} no longer holds, so its \
-                         verdict is withdrawn",
-                        dir.display(),
-                        entry.id
-                    );
-                }
-            }
-            return Err(error.into());
-        }
-    }
-    Ok(ScrubReport {
+    let report = |bytes, superseded| ScrubReport {
         generation: set.generation(),
         segments: set.segments.len() as u32,
         bytes_checked: bytes,
         elapsed_ms: started.elapsed().as_millis() as u64,
-    })
+        superseded,
+    };
+    for (segment, entry) in set.segments.iter().zip(&set.document.segments) {
+        if let Err(error) = segment.verify_blocks(cancel, |block| bytes += block) {
+            if let VectorStoreError::Corrupted { reason } = &error {
+                files::damage_found();
+                // The bytes that failed are the ones mapped, whatever the path holds now. A
+                // cancel before they are named records nothing.
+                let failed = files::sha256_cancellable(segment.file_bytes(), cancel)?;
+                if !files::condemn(dir, &entry.id, &failed, reason, cancel)? {
+                    log::warn!(
+                        "Scrub of {}: {reason} — in bytes segment {} no longer holds, so \
+                         nothing is condemned",
+                        dir.display(),
+                        entry.id
+                    );
+                    return Ok(report(bytes, true));
+                }
+                log::error!("Scrub of {}: {reason}", dir.display());
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(report(bytes, false))
 }
 
 /// A directory holding a v1 artifact is a store this build does not read, and says so by

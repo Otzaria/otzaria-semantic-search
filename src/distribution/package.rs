@@ -282,7 +282,7 @@ impl PackageManifest {
             }
         }
         validate_release_tag(&self.library_release_tag)?;
-        self.provenance.validate()
+        self.provenance.validate_for(self.counts.slots)
     }
 }
 
