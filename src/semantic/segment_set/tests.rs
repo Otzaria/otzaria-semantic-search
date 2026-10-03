@@ -2242,6 +2242,37 @@ fn a_scrub_or_a_compaction_cancelled_on_damage_records_nothing() {
     }
 }
 
+/// An install replaces a segment while a scrub reads it: the scrub finds a block that fails
+/// in bytes the file no longer holds. It condemns nothing, and says so — a report marked
+/// `superseded` rather than a `Corrupted` that would send a host downloading for nothing. On
+/// Unix alone: Windows replaces no file that is mapped, so there it cannot happen.
+#[cfg(unix)]
+#[test]
+fn a_scrub_of_bytes_an_install_replaced_reports_it_superseded() {
+    let work = TempDir::new("set_scrub_superseded");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let file = dir.join(format!("segments/{id}.oxv"));
+    let sound = std::fs::read(&file).unwrap();
+    damage_last_byte(&file);
+    // Sound bytes, put back as an install puts a segment: renamed over the file.
+    let fresh = work.join("fresh.oxv");
+    std::fs::write(&fresh, &sound).unwrap();
+    let replaced = file.clone();
+
+    let report = on_damage(
+        move || std::fs::rename(&fresh, &replaced).unwrap(),
+        || scrub(&dir, &CancellationToken::new()),
+    )
+    .unwrap_or_else(|error| panic!("the scrub read bytes no longer installed: {error}"));
+    assert!(report.superseded);
+    assert!(!dir.join(format!("segments/{id}.corrupt")).exists());
+    let again = scrub(&dir, &CancellationToken::new()).unwrap();
+    assert!(!again.superseded);
+    assert!(again.bytes_checked > 0);
+}
+
 #[test]
 fn a_full_disk_is_insufficient_space() {
     let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
