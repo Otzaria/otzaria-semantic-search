@@ -880,15 +880,18 @@ impl HybridCoordinator {
                     raw_semantic_score: None,
                     normalized_semantic: None,
                     fused_score,
+                    semantic_position: None,
                     lexical_weight: alpha,
                     semantic_weight: 1.0 - alpha,
                 },
             );
         }
 
-        for (semantic_rank, ((_, candidate), &normalized)) in
+        for (semantic_rank, ((position, candidate), &normalized)) in
             semantic.into_iter().zip(norm_sem.iter()).enumerate()
         {
+            // Where the semantic path placed the line, the order ties fall in.
+            let position = u32::try_from(position).unwrap_or(u32::MAX);
             // RRF ignores score magnitudes, so a threshold only has meaning if
             // candidates below it are excluded. Weighted/adaptive fusion keeps
             // them at zero to preserve semantic-only paging and grouping.
@@ -918,6 +921,7 @@ impl HybridCoordinator {
                     existing.source = ResultSource::Both;
                     existing.raw_semantic_score = Some(candidate.similarity_score);
                     existing.normalized_semantic = Some(normalized);
+                    existing.semantic_position = Some(position);
                     existing.fused_score += contribution + metadata_bonus;
                     if mode == SearchMode::Hybrid && rrf_k.is_none() {
                         existing.fused_score += profile.agreement_bonus.max(0.0);
@@ -946,6 +950,7 @@ impl HybridCoordinator {
                             raw_semantic_score: Some(candidate.similarity_score),
                             normalized_semantic: Some(normalized),
                             fused_score: contribution + metadata_bonus,
+                            semantic_position: Some(position),
                             lexical_weight: alpha,
                             semantic_weight: 1.0 - alpha,
                         },
@@ -979,8 +984,8 @@ impl HybridCoordinator {
             }
         }
 
-        // Ties break on the line, then its book, so pagination is stable across calls;
-        // `HashMap` iteration order is not.
+        // Ties break on the semantic path's order, then the line, then its book, so pagination
+        // is stable across calls; `HashMap` iteration order is not.
         let sort_results = |results: &mut Vec<FusedCandidate>| results.sort_by(best_first);
         sort_results(&mut results);
 
@@ -2492,7 +2497,10 @@ mod tests {
     ///
     /// Frozen on purpose. It is what "the defaults reproduce the ranking" is measured against,
     /// so it must not follow the code it checks; a deliberate change to the default ranking —
-    /// calibrated numbers, say — replaces it in the same commit.
+    /// calibrated numbers, say — replaces it in the same commit. One has: ties fall in the
+    /// semantic path's order before the line id's, so every line one vector resolved to — all
+    /// scored alike — is shown as the resolver placed it. That order, and the position it
+    /// reads, are the only lines that differ from 1865ba0; every score is as it was.
     fn fuse_before_profile_parameters(
         metadata_ranker: &crate::hybrid::metadata_ranker::MetadataRanker,
         lexical: Vec<LexicalCandidate>,
@@ -2608,15 +2616,18 @@ mod tests {
                     raw_semantic_score: None,
                     normalized_semantic: None,
                     fused_score,
+                    semantic_position: None,
                     lexical_weight: alpha,
                     semantic_weight: 1.0 - alpha,
                 },
             );
         }
 
-        for (semantic_rank, ((_, candidate), &normalized)) in
+        for (semantic_rank, ((position, candidate), &normalized)) in
             semantic.into_iter().zip(norm_sem.iter()).enumerate()
         {
+            // Where the semantic path placed the line, the order ties fall in.
+            let position = u32::try_from(position).unwrap_or(u32::MAX);
             // RRF ignores score magnitudes, so a threshold only has meaning if
             // candidates below it are excluded. Weighted/adaptive fusion keeps
             // them at zero to preserve semantic-only paging and grouping.
@@ -2646,6 +2657,7 @@ mod tests {
                     existing.source = ResultSource::Both;
                     existing.raw_semantic_score = Some(candidate.similarity_score);
                     existing.normalized_semantic = Some(normalized);
+                    existing.semantic_position = Some(position);
                     existing.fused_score += contribution + metadata_bonus;
                     if mode == SearchMode::Hybrid && rrf_k.is_none() {
                         existing.fused_score += profile.agreement_bonus.max(0.0);
@@ -2674,6 +2686,7 @@ mod tests {
                             raw_semantic_score: Some(candidate.similarity_score),
                             normalized_semantic: Some(normalized),
                             fused_score: contribution + metadata_bonus,
+                            semantic_position: Some(position),
                             lexical_weight: alpha,
                             semantic_weight: 1.0 - alpha,
                         },
@@ -2707,12 +2720,19 @@ mod tests {
             }
         }
 
-        // Ties break on the line, then its book, so pagination is stable across calls;
-        // `HashMap` iteration order is not.
+        // Ties break on the semantic path's order — a line it did not place last — then the
+        // line, then its book, so pagination is stable across calls; `HashMap` iteration order
+        // is not.
         let sort_results = |results: &mut Vec<FusedCandidate>| {
             results.sort_by(|a, b| {
                 b.fused_score
                     .total_cmp(&a.fused_score)
+                    .then_with(|| match (a.semantic_position, b.semantic_position) {
+                        (Some(a), Some(b)) => a.cmp(&b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    })
                     .then_with(|| a.line_id.cmp(&b.line_id))
                     .then_with(|| a.file_path.cmp(&b.file_path))
             });
@@ -2757,10 +2777,11 @@ mod tests {
             .iter()
             .map(|c| {
                 format!(
-                    "{} {:?} f={} rb={} nb={} rs={} ns={} lw={} sw={} h={} | {:?} {:?} {:?} {} {} {} {} {:?}",
+                    "{} {:?} f={} p={:?} rb={} nb={} rs={} ns={} lw={} sw={} h={} | {:?} {:?} {:?} {} {} {} {} {:?}",
                     c.line_id,
                     c.source,
                     bits(Some(c.fused_score)),
+                    c.semantic_position,
                     bits(c.raw_bm25_score),
                     bits(c.normalized_bm25),
                     bits(c.raw_semantic_score),
@@ -2856,6 +2877,110 @@ mod tests {
             [("b.txt", 5), ("a.txt", 7), ("a.txt", 9), ("c.txt", 3)]
         );
         assert_eq!(unresolved, 1);
+    }
+
+    /// A text repeated in many places is one vector, and every line it resolves to scores
+    /// alike. They are shown as the resolver placed them — a line of each book, then one
+    /// book's repeats — in every preset and strategy, in both modes that consult the
+    /// semantic path; not by id, by which the repeats, numbered lowest, came first and filled
+    /// the page. And in the same order on every call, so a page of them neither repeats nor
+    /// skips a line.
+    #[test]
+    fn the_lines_one_vector_resolved_to_come_in_the_resolvers_order() {
+        let hit = |slot: u32, score: f32| VectorHit {
+            score,
+            key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {slot}")),
+            records: Vec::new(),
+            seg: 0,
+            slot,
+        };
+        let hits = [hit(0, 0.9), hit(1, 0.6)];
+        // Each line in a section of its own, with the same facets: every bonus alike.
+        let line = |hit: u32, book: &str, line_id: u64| ResolvedLine {
+            hit,
+            line_id,
+            file_path: book.to_string(),
+            section_id: line_id,
+            line_hash: if hit == 0 { 4242 } else { 77 },
+            segment: line_id,
+            is_pdf: false,
+            facets: vec!["/era/תנך".to_string()].into(),
+            title: String::new(),
+            reference: String::new(),
+        };
+        // The resolver's order: the line of the book that repeats the text 25 times, a line
+        // of each other book, then the repeats — whose ids are the lowest of all.
+        let mut resolved = vec![line(0, "otzaria/a.txt", 500)];
+        for (n, book) in [
+            "otzaria/b.txt",
+            "otzaria/c.txt",
+            "otzaria/d.txt",
+            "otzaria/e.txt",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            resolved.push(line(0, book, 900 + n as u64));
+        }
+        resolved.extend((1..=25).map(|line_id| line(0, "otzaria/a.txt", line_id)));
+        let placed: Vec<(String, u64)> = resolved
+            .iter()
+            .map(|line| (line.file_path.clone(), line.line_id))
+            .chain([("otzaria/f.txt".to_string(), 3)])
+            .collect();
+        // A worse hit's line, after them all.
+        resolved.insert(3, line(1, "otzaria/f.txt", 3));
+        let (candidates, unresolved) = candidates_of(&hits, resolved);
+        assert_eq!(unresolved, 0);
+
+        let coordinator = HybridCoordinator::new(None);
+        let features = analyze_query("שאילתה כלשהי");
+        let facets = ["/era/תנך".to_string()];
+        let mut checked = 0;
+        for preset in [
+            SearchProfile::Fast,
+            SearchProfile::Balanced,
+            SearchProfile::Best,
+        ] {
+            for strategy in [
+                None,
+                Some(FusionStrategy::Weighted),
+                Some(FusionStrategy::RRF { k: 60 }),
+                Some(FusionStrategy::Adaptive),
+            ] {
+                let mut profile = RankingProfile::from_profile(preset);
+                if let Some(strategy) = strategy {
+                    profile.fusion_strategy = strategy;
+                }
+                for (mode, alpha) in [(SearchMode::SemanticOnly, 0.0), (SearchMode::Hybrid, 0.3)] {
+                    let order = || {
+                        coordinator
+                            .fuse_candidates(
+                                Vec::new(),
+                                candidates.clone(),
+                                FusionContext {
+                                    alpha,
+                                    mode,
+                                    profile: &profile,
+                                    query_features: &features,
+                                    query_facets: &facets,
+                                },
+                            )
+                            .into_iter()
+                            .map(|candidate| (candidate.file_path, candidate.line_id))
+                            .collect::<Vec<_>>()
+                    };
+                    let first = order();
+                    assert_eq!(first, placed, "{preset} {strategy:?} {mode}");
+                    // Each fusion starts from maps whose order differs from call to call.
+                    for _ in 0..20 {
+                        assert_eq!(order(), first, "{preset} {strategy:?} {mode}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 4 * 2);
     }
 
     /// Two books whose lines share an id are two lines, in every mode that fuses. An index

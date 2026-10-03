@@ -23,6 +23,7 @@
 
 use otzaria_semantic_search::api::hybrid_search::OtzariaHybridEngine;
 use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::config::profiles::SearchProfile;
 use otzaria_semantic_search::distribution::builder::{
     build, BuildRequest, RELEASE_MANIFEST_FILENAME, SEGMENT_FILENAME,
 };
@@ -611,6 +612,148 @@ fn a_filtered_search_weighs_the_vectors_its_resolver_names_as_unreached() {
         after[&moved_line], unfiltered[&moved_line],
         "the moved text at the score a full scan gives its vector"
     );
+}
+
+/// The application's index where berachot's line is in many places: once in each of
+/// [`COPIES`], and [`REPEATS`] times more in berachot itself. Its hit resolves as the
+/// application's resolver orders a text's lines — the line the vector names first, a line of
+/// each other book, then the repeats within a book — and every other hit as the corpus's
+/// index would.
+struct RepeatedText {
+    index: FakeResolver,
+}
+
+/// The books besides berachot that hold its line, once each. Of the mishna as it is, so the
+/// metadata bonus — which favours a primary source by its path — is the same for all.
+const COPIES: [&str; 4] = [
+    "otzaria/mishna/peah.txt",
+    "otzaria/mishna/demai.txt",
+    "otzaria/mishna/kilayim.txt",
+    "otzaria/mishna/sheviit.txt",
+];
+/// How many times more berachot holds its own line.
+const REPEATS: u64 = 25;
+
+impl RepeatedText {
+    /// The lines the repeated text resolves to, `(book, id)`, in the resolver's order. The
+    /// repeats have the lowest ids of all.
+    fn placed() -> Vec<(String, u64)> {
+        let (own, book, _) = LINES[3];
+        std::iter::once((book.to_string(), own))
+            .chain(
+                COPIES
+                    .iter()
+                    .enumerate()
+                    .map(|(n, book)| (book.to_string(), 9_000_000_000 + n as u64)),
+            )
+            .chain((1..=REPEATS).map(|id| (BERACHOT.to_string(), id)))
+            .collect()
+    }
+}
+
+impl CandidateResolver for RepeatedText {
+    fn generation(&self) -> u64 {
+        self.index.generation()
+    }
+
+    fn admissible_books(
+        &self,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Option<BookSet>, ResolveError> {
+        self.index.admissible_books(filters)
+    }
+
+    fn resolve(
+        &self,
+        hits: &[VectorHit],
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResolvedLine>, ResolveError> {
+        let mut lines = self.index.resolve(hits, filters, cancel)?;
+        let (own, _, text) = LINES[3];
+        if let Some(hit) = hits.iter().position(|hit| hit.key == ChunkKey::of(text)) {
+            for (book, line_id) in Self::placed().into_iter().skip(1) {
+                lines.push(ResolvedLine {
+                    hit: hit as u32,
+                    line_id,
+                    // Each in a section of its own, so no bonus sets one above another.
+                    section_id: 1_000 + line_id,
+                    // The same text.
+                    line_hash: own ^ 0xABCD,
+                    segment: line_id,
+                    is_pdf: false,
+                    facets: facets_of(&book).into(),
+                    title: title_of(&book),
+                    reference: String::new(),
+                    file_path: book,
+                });
+            }
+        }
+        Ok(lines)
+    }
+}
+
+/// A text in many places is one vector, and every line it resolves to scores alike. A page
+/// shows them as the resolver placed them — a line of each book before any book's second —
+/// though the repeats have the lowest ids, which ordered them first and filled the page with
+/// one book. In every preset, in both modes that consult the semantic path; the same page on
+/// every call; and the pages of one search neither repeat nor skip a line.
+#[test]
+fn a_repeated_text_shows_a_line_of_each_book_first_on_every_page() {
+    let dir = TempDir::new("repeated");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = RepeatedText {
+        index: FakeResolver::of_the_corpus(),
+    };
+    let cancel = CancellationToken::new();
+    let (_, _, text) = LINES[3];
+    let placed = RepeatedText::placed();
+
+    for preset in [
+        SearchProfile::Fast,
+        SearchProfile::Balanced,
+        SearchProfile::Best,
+    ] {
+        for search_mode in [SearchMode::SemanticOnly, SearchMode::Hybrid] {
+            let page = |offset: usize, limit: usize| {
+                // Every call fuses anew.
+                coordinator.clear_query_cache();
+                coordinator
+                    .search_cancellable(
+                        text,
+                        vec![],
+                        &HybridSearchParams {
+                            limit,
+                            offset,
+                            force_mode: Some(search_mode),
+                            profile: Some(preset),
+                            ..Default::default()
+                        },
+                        &resolver,
+                        &cancel,
+                    )
+                    .unwrap()
+                    .results
+                    .into_iter()
+                    .map(|item| (item.file_path, item.id))
+                    .collect::<Vec<_>>()
+            };
+            let first = page(0, 20);
+            assert_eq!(first, placed[..20], "{preset} {search_mode}");
+            for _ in 0..5 {
+                assert_eq!(page(0, 20), first, "{preset} {search_mode}");
+            }
+
+            let whole = page(0, 100);
+            assert_eq!(whole[..placed.len()], placed[..], "{preset} {search_mode}");
+            let paged: Vec<(String, u64)> = (0..=whole.len())
+                .step_by(7)
+                .flat_map(|offset| page(offset, 7))
+                .collect();
+            assert_eq!(paged, whole, "{preset} {search_mode}");
+        }
+    }
 }
 
 /// The ids a result carries are the live index's. A commit that renumbered a book — or
