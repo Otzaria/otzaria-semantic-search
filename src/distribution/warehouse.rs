@@ -18,8 +18,10 @@
 //!
 //! **`warehouse.json` is the commit point.** A batch appends to both data files, writes a
 //! new index and renames it into place, and only then records the new count. Opening for an
-//! append truncates whatever a crash left past the count and rebuilds an index that is not
-//! the count's; opening to read ignores both.
+//! append truncates whatever a crash left past the count; opening to read ignores it.
+//!
+//! **Checked before reuse.** [`Warehouse::verify`] re-hashes the batches and checks the index;
+//! assembly, the gates and an append run it themselves, and every lookup confirms its key.
 
 use crate::distribution::files::{hex, io_error, malformed, partial_path, read_json, write_json};
 use crate::distribution::plan::HeldVectors;
@@ -32,9 +34,13 @@ use crate::semantic::versioning::{ModelIdentity, ModelPackage};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub const WAREHOUSE_FORMAT: &str = "otzaria-vector-warehouse";
 pub const WAREHOUSE_FORMAT_VERSION: u32 = 1;
@@ -116,12 +122,35 @@ pub struct AddReport {
     pub total: u64,
 }
 
+/// What [`Warehouse::verify`] checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    pub records: u64,
+    pub batches: usize,
+    /// Bytes re-hashed: both data files, up to the count.
+    pub bytes: u64,
+    /// Why an append rebuilt the index from the verified keys, if it did.
+    pub index_rebuilt: Option<String>,
+}
+
+/// What a check found wrong: data, which nothing here repairs, and the index, which the
+/// verified keys can rebuild.
+struct Faults {
+    data: Vec<String>,
+    /// Every data fault is a digest recorded for a batch of no records.
+    manifest_only: bool,
+    index: Option<String>,
+}
+
 /// A warehouse, open.
 pub struct Warehouse {
     dir: PathBuf,
     manifest: WarehouseManifest,
     vectors: Option<Mmap>,
+    keys: Option<Mmap>,
     index: Option<Mmap>,
+    /// Set once the mapped files have passed [`Warehouse::verify`].
+    verified: OnceLock<Verified>,
     _lock: Option<AppendLock>,
 }
 
@@ -184,33 +213,45 @@ impl Warehouse {
         Self::open(dir)
     }
 
-    /// Open to read: what `warehouse.json` counts, whatever a crash left past it.
+    /// Open to read: what `warehouse.json` counts, whatever a crash left past it. Checks
+    /// sizes and headers only; [`Self::verify`] checks the contents.
     pub fn open(dir: &Path) -> Result<Self, PackError> {
-        let manifest: WarehouseManifest = read_json(&dir.join(MANIFEST_FILE))?;
-        if manifest.format != WAREHOUSE_FORMAT || manifest.version != WAREHOUSE_FORMAT_VERSION {
-            return Err(malformed(format!(
-                "{} is {} version {}, and this build reads {WAREHOUSE_FORMAT} version \
-                 {WAREHOUSE_FORMAT_VERSION}",
-                dir.display(),
-                manifest.format,
-                manifest.version
-            )));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let manifest = read_manifest(dir)?;
+            let records = manifest.records;
+            // An add renames its index into place before it writes the count: wait up to 1 s
+            // for the count, holding no map.
+            let wait = || Instant::now() < deadline && index_ahead(dir, records);
+            if !wait() {
+                let mut warehouse = Self::unmapped(dir, manifest);
+                match warehouse.map() {
+                    Err(_) if wait() => {}
+                    result => return result.map(|()| warehouse),
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(left.min(Duration::from_millis(20)));
         }
-        let mut warehouse = Self {
+    }
+
+    fn unmapped(dir: &Path, manifest: WarehouseManifest) -> Self {
+        Self {
             dir: dir.to_path_buf(),
             manifest,
             vectors: None,
+            keys: None,
             index: None,
+            verified: OnceLock::new(),
             _lock: None,
-        };
-        warehouse.map()?;
-        Ok(warehouse)
+        }
     }
 
-    /// Open to add a batch: hold the lock, and repair what a crash left.
+    /// Open to add a batch: hold the lock, cut what a crash left past the count, verify the
+    /// data, and rebuild an index that is not the verified keys'.
     pub fn open_for_append(dir: &Path) -> Result<Self, PackError> {
         let lock = AppendLock::take(dir)?;
-        let manifest: WarehouseManifest = read_json(&dir.join(MANIFEST_FILE))?;
+        let manifest = read_manifest(dir)?;
         let width = manifest.identity.embedding_dim as u64 * 4;
         for (name, bytes) in [
             (VECTORS, manifest.records * width),
@@ -239,39 +280,213 @@ impl Warehouse {
                     .map_err(io_error(format!("flushing {}", path.display())))?;
             }
         }
-        if index_count(&dir.join(INDEX))? != Some(manifest.records) {
-            rebuild_index(dir, manifest.records)?;
-        }
-        let mut warehouse = Self::open(dir)?;
+        let mut warehouse = Self::unmapped(dir, manifest);
         warehouse._lock = Some(lock);
+        warehouse.map_data()?;
+        let index = map_file(&dir.join(INDEX));
+        let mut faults = warehouse.faults(index.as_deref().ok())?;
+        if let Err(error) = &index {
+            faults.index = Some(error.to_string());
+        }
+        // Unmapped before it is replaced: Windows refuses to rename over a mapped file.
+        drop(index);
+        if !faults.data.is_empty() {
+            return Err(warehouse.refusal(faults));
+        }
+        let records = warehouse.manifest.records as usize;
+        if faults.index.is_some() {
+            let keys = &warehouse.keys.as_deref().expect("mapped")[..records * 32];
+            rebuild_index(&dir.join(INDEX), keys)?;
+        }
+        warehouse.map_index()?;
+        if faults.index.is_some() {
+            let keys = warehouse.keys.as_deref().expect("mapped");
+            let index = warehouse.index.as_deref().expect("mapped");
+            if let Some(fault) = index_fault(index, keys, records as u64) {
+                return Err(malformed(format!(
+                    "{} was rebuilt and is still not the index of {KEYS}: {fault}",
+                    dir.join(INDEX).display()
+                )));
+            }
+        }
+        let verified = warehouse.report(faults.index);
+        let _ = warehouse.verified.set(verified);
         Ok(warehouse)
     }
 
     fn map(&mut self) -> Result<(), PackError> {
+        self.map_data()?;
+        self.map_index()
+    }
+
+    /// Map both data files, each at least the count's length.
+    fn map_data(&mut self) -> Result<(), PackError> {
         let records = self.manifest.records;
-        let width = self.width() as u64;
-        let vectors = map_file(&self.dir.join(VECTORS))?;
-        if (vectors.len() as u64) < records * width {
-            return Err(malformed(format!(
-                "{} is short of the {records} records the warehouse counts",
-                self.dir.join(VECTORS).display()
-            )));
-        }
-        let index = map_file(&self.dir.join(INDEX))?;
-        if index.len() < HEADER
-            || &index[..8] != INDEX_MAGIC
-            || u64::from_le_bytes(index[8..16].try_into().expect("8")) != records
-            || (index.len() - HEADER) as u64 != records * ENTRY as u64
-        {
-            return Err(malformed(format!(
-                "{} is not the index of the warehouse's {records} records; adding to the \
-                 warehouse rebuilds it",
-                self.dir.join(INDEX).display()
-            )));
-        }
+        let map = |name: &str, width: u64| -> Result<Mmap, PackError> {
+            let path = self.dir.join(name);
+            let map = map_file(&path)?;
+            if (map.len() as u64) < records * width {
+                return Err(malformed(format!(
+                    "{} is short of the {records} records the warehouse counts",
+                    path.display()
+                )));
+            }
+            Ok(map)
+        };
+        let vectors = map(VECTORS, self.width() as u64)?;
+        let keys = map(KEYS, 32)?;
         self.vectors = Some(vectors);
+        self.keys = Some(keys);
+        Ok(())
+    }
+
+    /// Map the index, refusing one whose header is not the count's.
+    fn map_index(&mut self) -> Result<(), PackError> {
+        let path = self.dir.join(INDEX);
+        let index = map_file(&path)?;
+        let records = self.manifest.records;
+        if let Some(fault) = header_fault(&index, records) {
+            let ahead = header_count(&index).is_some_and(|count| count > records);
+            let added_to = if ahead {
+                "the warehouse may be being added to; if not, "
+            } else {
+                ""
+            };
+            return Err(malformed(format!(
+                "{} is not the index of the warehouse's {records} records ({fault}): {added_to}\
+                 adding to the warehouse, or warehouse-verify --repair, rebuilds it",
+                path.display()
+            )));
+        }
         self.index = Some(index);
         Ok(())
+    }
+
+    /// Re-hash every batch against `warehouse.json` and check the index against `keys.bin`;
+    /// once per open, on up to 8 threads reading 1 MiB at a time.
+    pub fn verify(&self) -> Result<Verified, PackError> {
+        if let Some(verified) = self.verified.get() {
+            return Ok(verified.clone());
+        }
+        let (Some(_), Some(_), Some(index)) = (&self.vectors, &self.keys, &self.index) else {
+            return Err(malformed(format!(
+                "{} is not open: an add to it failed",
+                self.dir.display()
+            )));
+        };
+        let faults = self.faults(Some(index))?;
+        if !faults.data.is_empty() || faults.index.is_some() {
+            return Err(self.refusal(faults));
+        }
+        Ok(self.verified.get_or_init(|| self.report(None)).clone())
+    }
+
+    fn report(&self, index_rebuilt: Option<String>) -> Verified {
+        Verified {
+            records: self.manifest.records,
+            batches: self.manifest.batches.len(),
+            bytes: self.manifest.records * (self.width() as u64 + 32),
+            index_rebuilt,
+        }
+    }
+
+    /// Hash every batch, largest first, and check `index` if given, all in parallel.
+    fn faults(&self, index: Option<&[u8]>) -> Result<Faults, PackError> {
+        let keys = self.keys.as_deref().expect("mapped");
+        let width = self.width() as u64;
+        let mut jobs: Vec<(usize, &str, u64, u64, &str)> = Vec::new();
+        for (at, batch) in self.manifest.batches.iter().enumerate() {
+            let (first, records) = (batch.first, batch.records);
+            let vectors = &batch.vectors_sha256;
+            jobs.push((at, VECTORS, first * width, records * width, vectors));
+            jobs.push((at, KEYS, first * 32, records * 32, &batch.keys_sha256));
+        }
+        jobs.sort_by_key(|job| Reverse(job.3));
+        let next = AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)
+            .min(jobs.len())
+            .max(1);
+        let (data, index) = std::thread::scope(|scope| {
+            let index = scope
+                .spawn(|| index.and_then(|index| index_fault(index, keys, self.manifest.records)));
+            let hashers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| -> Result<Vec<_>, PackError> {
+                        let mut wrong = Vec::new();
+                        while let Some(&(at, name, offset, len, recorded)) =
+                            jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                        {
+                            let actual = hash_range(&self.dir.join(name), offset, len)?;
+                            if actual != recorded {
+                                wrong.push((at, name, actual, recorded));
+                            }
+                        }
+                        Ok(wrong)
+                    })
+                })
+                .collect();
+            let mut data = Vec::new();
+            for hasher in hashers {
+                data.push(hasher.join().expect("a hashing thread"));
+            }
+            (data, index.join().expect("the index check"))
+        });
+        let mut wrong = Vec::new();
+        for found in data {
+            wrong.extend(found?);
+        }
+        wrong.sort_unstable();
+        let manifest_only = wrong
+            .iter()
+            .all(|(at, ..)| self.manifest.batches[*at].records == 0);
+        let data = wrong
+            .into_iter()
+            .map(|(at, name, actual, recorded)| {
+                let batch = &self.manifest.batches[at];
+                let found = if batch.records == 0 {
+                    format!(
+                        "it added no bytes, so warehouse.json's {recorded} for {name} is corrupt"
+                    )
+                } else {
+                    format!("{name} hashes to {actual}, and warehouse.json records {recorded}")
+                };
+                format!(
+                    "batch {at} (records {}..{}, added {}): {found}",
+                    batch.first,
+                    batch.first + batch.records,
+                    batch.added_at
+                )
+            })
+            .collect();
+        Ok(Faults {
+            data,
+            manifest_only,
+            index,
+        })
+    }
+
+    fn refusal(&self, faults: Faults) -> PackError {
+        let mut found = faults.data.clone();
+        if let Some(index) = faults.index {
+            found.push(format!("{INDEX} is not the index of {KEYS}: {index}"));
+        }
+        let remedy = if faults.data.is_empty() {
+            "the keys are sound, so adding to the warehouse, or warehouse-verify --repair, \
+             rebuilds the index from them"
+        } else if faults.manifest_only {
+            "the data is sound: restore warehouse.json, or set that digest to SHA-256 of nothing, \
+             e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        } else {
+            "data that fails its digest is not repaired: restore the warehouse from a copy, or \
+             move it aside and the next build embeds every text again"
+        };
+        malformed(format!(
+            "warehouse {}: {}; {remedy}",
+            self.dir.display(),
+            found.join("; ")
+        ))
     }
 
     pub fn identity(&self) -> &WarehouseIdentity {
@@ -298,27 +513,43 @@ impl Warehouse {
         self.manifest.records == 0
     }
 
-    /// The record holding the vector of the text whose SHA-256 is `sha256`.
-    pub fn find(&self, sha256: &[u8; 32]) -> Option<u64> {
-        let index = self.index.as_ref()?;
-        let entries = index[HEADER..].as_chunks::<ENTRY>().0;
-        entries
-            .binary_search_by(|entry| entry[..32].cmp(sha256))
-            .ok()
-            .map(|at| u64::from_le_bytes(entries[at][32..].try_into().expect("8")))
+    fn entries(&self) -> Option<&[[u8; ENTRY]]> {
+        Some(self.index.as_ref()?[HEADER..].as_chunks::<ENTRY>().0)
     }
 
-    /// The record holding a vector of a text whose SHA-256 starts with `key` — a segment's
-    /// [`ChunkKey`](crate::semantic::chunk_key::ChunkKey): the index is in digest order,
-    /// so its prefixes are in order too.
+    /// The record holding the vector of the text whose SHA-256 is `sha256`. None as well
+    /// when `keys.bin` holds another key there: a corrupt index finds nothing.
+    pub fn find(&self, sha256: &[u8; 32]) -> Option<u64> {
+        self.confirmed(self.indexed(sha256)?)
+    }
+
+    /// The index's entry for `sha256`, unconfirmed: for an append, which maps no data file
+    /// and runs on an index it verified.
+    fn indexed(&self, sha256: &[u8; 32]) -> Option<&[u8; ENTRY]> {
+        let entries = self.entries()?;
+        let at = entries
+            .binary_search_by(|entry| entry[..32].cmp(sha256))
+            .ok()?;
+        Some(&entries[at])
+    }
+
+    /// The record of a text whose SHA-256 starts with `key`, a segment's `ChunkKey`
+    /// (prefixes of a digest-ordered index are in order too), confirmed as [`Self::find`] is.
     pub fn find_key(&self, key: &[u8; 16]) -> Option<u64> {
-        let index = self.index.as_ref()?;
-        let entries = index[HEADER..].as_chunks::<ENTRY>().0;
+        let entries = self.entries()?;
         let at = entries.partition_point(|entry| entry[..16] < key[..]);
         entries
             .get(at)
             .filter(|entry| entry[..16] == key[..])
-            .map(|entry| u64::from_le_bytes(entry[32..].try_into().expect("8")))
+            .and_then(|entry| self.confirmed(entry))
+    }
+
+    /// The entry's record, if it is counted and `keys.bin` holds the entry's key there.
+    fn confirmed(&self, entry: &[u8; ENTRY]) -> Option<u64> {
+        let record = u64::from_le_bytes(entry[32..].try_into().expect("8"));
+        let keys = self.keys.as_ref()?;
+        (record < self.manifest.records && keys[record as usize * 32..][..32] == entry[..32])
+            .then_some(record)
     }
 
     /// Record `record`'s vector, into `out`.
@@ -364,11 +595,14 @@ impl Warehouse {
         let width = self.width();
         // Nothing maps a file this appends to: Windows refuses to resize a mapped one.
         self.vectors = None;
+        self.keys = None;
+        self.verified = OnceLock::new();
         let result = self.append(&shards, width);
         let (entries, vectors_sha256, keys_sha256, records) = match result {
             Ok(appended) => appended,
             Err(error) => {
                 self.truncate(first)?;
+                self.map_data()?;
                 return Err(error);
             }
         };
@@ -451,7 +685,7 @@ impl Warehouse {
                     .and_then(|()| keys_in.read_exact(&mut key))
                     .map_err(io_error(format!("reading {}", shard.dir.display())))?;
                 records += 1;
-                if self.find(&key).is_some() {
+                if self.indexed(&key).is_some() {
                     continue;
                 }
                 let context = || format!("appending to {}", self.dir.display());
@@ -522,20 +756,123 @@ fn map_file(path: &Path) -> Result<Mmap, PackError> {
     unsafe { Mmap::map(&file) }.map_err(io_error(format!("mapping {}", path.display())))
 }
 
-fn index_count(path: &Path) -> Result<Option<u64>, PackError> {
-    let Ok(mut file) = File::open(path) else {
-        return Ok(None);
-    };
-    let mut header = [0u8; HEADER];
-    if file.read_exact(&mut header).is_err() || &header[..8] != INDEX_MAGIC {
-        return Ok(None);
+/// SHA-256 of `len` bytes of `path` from `offset`.
+fn hash_range(path: &Path, offset: u64, len: u64) -> Result<String, PackError> {
+    use std::io::{Seek, SeekFrom};
+    let context = || format!("reading {}", path.display());
+    let mut file = File::open(path).map_err(io_error(context()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(io_error(context()))?;
+    let mut reader = file.take(len);
+    let (mut buffer, mut hasher, mut read) = (vec![0u8; 1 << 20], Sha256::new(), 0u64);
+    loop {
+        let n = reader.read(&mut buffer).map_err(io_error(context()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        read += n as u64;
     }
-    let count = u64::from_le_bytes(header[8..].try_into().expect("8"));
-    let length = file
-        .metadata()
-        .map_err(io_error(format!("inspecting {}", path.display())))?
-        .len();
-    Ok((length == HEADER as u64 + count * ENTRY as u64).then_some(count))
+    if read != len {
+        return Err(malformed(format!(
+            "{} ends {} bytes short of the warehouse's count",
+            path.display(),
+            len - read
+        )));
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// `warehouse.json`, of this format, its batches tiling `0..records` in order.
+fn read_manifest(dir: &Path) -> Result<WarehouseManifest, PackError> {
+    let manifest: WarehouseManifest = read_json(&dir.join(MANIFEST_FILE))?;
+    if manifest.format != WAREHOUSE_FORMAT || manifest.version != WAREHOUSE_FORMAT_VERSION {
+        return Err(malformed(format!(
+            "{} is {} version {}, and this build reads {WAREHOUSE_FORMAT} version \
+             {WAREHOUSE_FORMAT_VERSION}",
+            dir.display(),
+            manifest.format,
+            manifest.version
+        )));
+    }
+    let mut end = 0u64;
+    for (at, batch) in manifest.batches.iter().enumerate() {
+        if batch.first != end {
+            return Err(malformed(format!(
+                "{}: batch {at} starts at record {}, and the batches before it end at {end}",
+                dir.join(MANIFEST_FILE).display(),
+                batch.first
+            )));
+        }
+        end = end.checked_add(batch.records).ok_or_else(|| {
+            malformed(format!(
+                "{}: batch {at} overflows",
+                dir.join(MANIFEST_FILE).display()
+            ))
+        })?;
+    }
+    if end != manifest.records {
+        return Err(malformed(format!(
+            "{}: the batches cover records 0..{end}, and it counts {}",
+            dir.join(MANIFEST_FILE).display(),
+            manifest.records
+        )));
+    }
+    Ok(manifest)
+}
+
+/// Whether `index.bin` counts more than `records`, as between an add's index and its count.
+fn index_ahead(dir: &Path, records: u64) -> bool {
+    let mut header = [0u8; HEADER];
+    File::open(dir.join(INDEX))
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header_count(&header).is_some_and(|count| count > records)
+}
+
+/// The count an index header holds, if `index` starts with one.
+fn header_count(index: &[u8]) -> Option<u64> {
+    (index.len() >= HEADER && index[..8] == INDEX_MAGIC[..])
+        .then(|| u64::from_le_bytes(index[8..HEADER].try_into().expect("8")))
+}
+
+/// Why `index`'s header is not that of `records` entries, if it is not.
+fn header_fault(index: &[u8], records: u64) -> Option<String> {
+    let Some(count) = header_count(index) else {
+        return Some("no index header".to_string());
+    };
+    let entries = (index.len() - HEADER) as u64;
+    (count != records || entries != records * ENTRY as u64)
+        .then(|| format!("it counts {count} entries in {} bytes", index.len()))
+}
+
+/// Why `index` is not exactly the index of `keys`' first `records` keys, if it is not.
+/// Ascending keys that each match their record point at distinct records: a bijection.
+fn index_fault(index: &[u8], keys: &[u8], records: u64) -> Option<String> {
+    if let Some(fault) = header_fault(index, records) {
+        return Some(fault);
+    }
+    let entries = index[HEADER..].as_chunks::<ENTRY>().0;
+    for (at, entry) in entries.iter().enumerate() {
+        if at > 0 && entries[at - 1][..32] >= entry[..32] {
+            return Some(format!("entry {at} is not above the entry before it"));
+        }
+        let record = u64::from_le_bytes(entry[32..].try_into().expect("8"));
+        if record >= records {
+            return Some(format!(
+                "entry {at} points at record {record}, past the count"
+            ));
+        }
+        let key = &keys[record as usize * 32..][..32];
+        if *key != entry[..32] {
+            return Some(format!(
+                "entry {at} is key {} at record {record}, which holds key {}",
+                hex(&entry[..32]),
+                hex(key)
+            ));
+        }
+    }
+    None
 }
 
 /// Two sorted runs of index entries, as one.
@@ -608,26 +945,31 @@ fn write_index_partial(
     Ok(partial)
 }
 
-/// Rebuild the index of the first `records` keys from `keys.bin`.
-fn rebuild_index(dir: &Path, records: u64) -> Result<(), PackError> {
-    let path = dir.join(KEYS);
-    let mut reader = BufReader::with_capacity(
-        4 << 20,
-        File::open(&path).map_err(io_error(format!("reading {}", path.display())))?,
-    );
-    let mut entries = Vec::with_capacity(records as usize);
-    let mut key = [0u8; 32];
-    for record in 0..records {
-        reader
-            .read_exact(&mut key)
-            .map_err(io_error(format!("reading {}", path.display())))?;
-        let mut entry = [0u8; ENTRY];
-        entry[..32].copy_from_slice(&key);
-        entry[32..].copy_from_slice(&record.to_le_bytes());
-        entries.push(entry);
-    }
+/// Write `path`, the index of `keys`: every record's key, a record each.
+fn rebuild_index(path: &Path, keys: &[u8]) -> Result<(), PackError> {
+    let mut entries: Vec<[u8; ENTRY]> = keys
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(record, key)| {
+            let mut entry = [0u8; ENTRY];
+            entry[..32].copy_from_slice(key);
+            entry[32..].copy_from_slice(&(record as u64).to_le_bytes());
+            entry
+        })
+        .collect();
     entries.sort_unstable_by(|a, b| a[..32].cmp(&b[..32]));
-    write_index(&dir.join(INDEX), entries.into_iter())
+    if let Some(pair) = entries
+        .windows(2)
+        .find(|pair| pair[0][..32] == pair[1][..32])
+    {
+        return Err(malformed(format!(
+            "{KEYS} holds key {} twice: no index can be built",
+            hex(&pair[0][..32])
+        )));
+    }
+    write_index(path, entries.into_iter())
 }
 
 #[cfg(test)]

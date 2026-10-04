@@ -117,9 +117,10 @@ pub struct VerifyRequest<'a> {
 }
 
 /// Check G1, G5, G7, G8 and G9, and report G10. An `Err` is a release that could not be checked at
-/// all; a gate that fails is in the report.
+/// all, as against a warehouse that fails [`Warehouse::verify`]; a gate that fails is in the report.
 pub fn verify_release(request: &VerifyRequest<'_>) -> Result<GateReport, PackError> {
     let dir = request.release_dir;
+    request.warehouse.verify()?;
     let manifest: ReleaseManifest = read_json(&dir.join(RELEASE_FILE))?;
     let segment = Segment::open(&dir.join(SEGMENT_FILE))?;
     let content = content_pass(&segment, request.warehouse, request.samples);
@@ -649,8 +650,10 @@ pub struct ExactReference<'a> {
 }
 
 impl<'a> ExactReference<'a> {
-    /// Every live key of `set`. Refused if the warehouse lacks one's vector.
+    /// Every live key of `set`. Refused if the warehouse fails [`Warehouse::verify`] or
+    /// lacks one's vector.
     pub fn new(set: &SegmentSet, warehouse: &'a Warehouse) -> Result<Self, PackError> {
+        warehouse.verify()?;
         let mut entries = Vec::new();
         for (seg, segment) in set.segments().iter().enumerate() {
             for slot in 0..segment.slot_count() {

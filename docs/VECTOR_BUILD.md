@@ -192,13 +192,22 @@ its text. It makes a codec change, a new base and a revived key free of GPU work
   parity certificate.
 - `warehouse.json` is the commit point. An add appends both data files, writes a new
   index under a temporary name, renames it, and only then records the new count; the next
-  add truncates whatever a crash left past the count and rebuilds an index that is not the
-  count's.
+  add truncates whatever a crash left past the count.
 - A key the warehouse holds is not added again.
+- **Verified before reuse.** `assemble`, `assemble --verify`, G6's `ExactReference` and
+  `warehouse-add` re-hash every batch and check that `index.bin` is exactly `keys.bin`'s.
+  Bad data is refused and never repaired; a bad index over sound keys is rebuilt by the
+  next add or by `warehouse-verify --repair`.
+- **Cost**, at 6.35M records: a check hashes 6.7 GB, about 12 s with sha2's portable code
+  (0.57 GB/s on an Apple M4). On x86-64 sha2 0.10.9 uses SHA-NI at run time, which Intel
+  client CPUs before Ice Lake lack (13–20 s there). The mapped index and keys hold about
+  460 MB of reclaimable page cache, and `--repair` allocates about 254 MB. A build checks
+  3 times (2 when nothing is embedded), 4 once the plugin pins this sidecar, through G6.
 
 ```sh
 otzaria-semantic-search warehouse-add --warehouse <dir> [--create --model <model.json>] \
     [--passage-quantization fp32] [--plan <plan dir>] --shards <dir> [--shards <dir> …]
+otzaria-semantic-search warehouse-verify --warehouse <dir> [--repair]
 ```
 
 With `--plan`, the shards are held to the plan (§3); without it — an import — to

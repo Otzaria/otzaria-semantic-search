@@ -49,6 +49,8 @@ Commands:
   adopt-shard [options]               Write the v2 manifest of an external worker's output,
                                       so a warehouse can import it.
   warehouse-add [options]             Check shards and add their vectors to a warehouse.
+  warehouse-verify [options]          Re-hash a warehouse against its digests and check its
+                                      index; with --repair, rebuild a bad index.
   assemble [options]                  Assemble a base or a delta from a plan and the
                                       warehouse; with --verify, check gates G1, G5, G7-G10.
   release-files [options]             List the files a release downloads as, in the shape
@@ -139,6 +141,15 @@ Options for 'warehouse-add':
                              everything but the plan's own keys is checked
   --shards <dir>             A shard, or a directory holding shards at any depth; repeat
   --allow-non-semantic       Accept the stand-in's vectors (tests only)
+
+  The warehouse is verified first, as 'warehouse-verify --repair' does, and nothing is
+  added to one that fails.
+
+Options for 'warehouse-verify':
+  --warehouse <dir>          The warehouse; assemble and warehouse-add verify it themselves
+  --repair                   Under the append lock, cut what a crash left past the count
+                             and rebuild an index that is not the verified keys'. Data
+                             that fails its digests is never repaired
 
 Options for 'assemble':
   --plan <dir>               The plan
@@ -378,6 +389,7 @@ fn main() {
         "embed-shard" => run_embed_shard(&args),
         "adopt-shard" => run_adopt_shard(&args),
         "warehouse-add" => run_warehouse_add(&args),
+        "warehouse-verify" => run_warehouse_verify(&args),
         "assemble" => run_assemble(&args),
         "release-files" => run_release_files(&args),
         "model-checksum" => run_model_checksum(&args),
@@ -822,6 +834,7 @@ fn run_warehouse_add(args: &[String]) {
     }
     let mut warehouse = Warehouse::open_for_append(&dir)
         .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    print_verified(&warehouse);
     let plan = parse_arg(args, "--plan").map(PathBuf::from);
     let report = warehouse
         .add_shards(
@@ -839,6 +852,36 @@ fn run_warehouse_add(args: &[String]) {
     println!("Added:           {}", report.added);
     println!("Held already:    {}", report.held);
     println!("Warehouse:       {} record(s)", report.total);
+}
+
+/// Verify a warehouse, or repair what `warehouse-add` would before adding.
+fn run_warehouse_verify(args: &[String]) {
+    use otzaria_semantic_search::distribution::warehouse::Warehouse;
+
+    let dir = PathBuf::from(require_arg(args, "--warehouse"));
+    let started = std::time::Instant::now();
+    let warehouse = if args.iter().any(|arg| arg == "--repair") {
+        Warehouse::open_for_append(&dir)
+    } else {
+        Warehouse::open(&dir)
+    }
+    .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    print_verified(&warehouse);
+    println!("Took:            {:.1} s", started.elapsed().as_secs_f64());
+}
+
+/// Verify `warehouse`, once per process, or exit naming what failed.
+fn print_verified(warehouse: &otzaria_semantic_search::distribution::warehouse::Warehouse) {
+    let verified = warehouse
+        .verify()
+        .unwrap_or_else(|error| exit_with("The warehouse failed its check", error));
+    println!(
+        "Verified:        {} record(s) in {} batch(es), {} bytes re-hashed",
+        verified.records, verified.batches, verified.bytes
+    );
+    if let Some(reason) = &verified.index_rebuilt {
+        println!("Index rebuilt:   {reason}");
+    }
 }
 
 fn run_assemble(args: &[String]) {
@@ -860,6 +903,7 @@ fn run_assemble(args: &[String]) {
         .unwrap_or_else(|error| exit_with("Could not open the plan", error));
     let warehouse = Warehouse::open(Path::new(&require_arg(args, "--warehouse")))
         .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    print_verified(&warehouse);
     let previous = parse_arg(args, "--previous").map(|dir| {
         let version = parse_arg(args, "--previous-version").map(|value| {
             value

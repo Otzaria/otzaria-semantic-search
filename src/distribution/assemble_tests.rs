@@ -897,6 +897,54 @@ fn the_exact_reference_finds_a_vector_itself() {
     assert_eq!(recall(&keys[..1], &keys), 1.0 / 3.0);
 }
 
+/// A vector bit flipped after a base was assembled: assembly, the gates and G6's exact
+/// reference refuse the warehouse, naming the batch.
+#[test]
+fn a_corrupt_warehouse_fails_assembly_the_gates_and_the_exact_reference() {
+    let machine = Machine::new("assemble_corrupt_warehouse");
+    let p1 = machine.plan("p1", 1, &v1(), None);
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base1");
+    let set = simulate_device(&machine.dir.join("device"), &[&base.out_dir]).unwrap();
+    let vectors = machine.warehouse.join("vectors.f32");
+    let mut bytes = std::fs::read(&vectors).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x40;
+    std::fs::write(&vectors, bytes).unwrap();
+
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    let assembled = assemble(&AssembleRequest {
+        plan: &p1,
+        warehouse: &warehouse,
+        kind: PackageKind::Base,
+        previous: None,
+        epoch: NEW,
+        out_dir: machine.dir.join("again"),
+        created_at: CREATED.to_string(),
+        built_by: None,
+    })
+    .err()
+    .unwrap();
+    let verified = verify_release(&VerifyRequest {
+        release_dir: &base.out_dir,
+        plan: &p1,
+        warehouse: &warehouse,
+        previous: None,
+        scratch_dir: machine.dir.join("base1-again"),
+        samples: G5_SAMPLES,
+    })
+    .err()
+    .unwrap();
+    let exact = ExactReference::new(&set, &warehouse).err().unwrap();
+    for error in [assembled, verified, exact] {
+        let error = error.to_string();
+        assert!(
+            error.contains("batch 0 (records 0..9") && error.contains("vectors.f32 hashes to"),
+            "{error}"
+        );
+    }
+    assert!(!machine.dir.join("again").exists());
+}
+
 /// Assembly's heap grows with the slots it ships, by much less than a vector each: the
 /// vectors stream from the mapped warehouse.
 #[test]
