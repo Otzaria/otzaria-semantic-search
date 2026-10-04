@@ -860,7 +860,15 @@ pub(crate) fn read_generation(dir: &Path, pointer: &Pointer) -> Result<SetDocume
 
 /// The set directory's lock, held for as long as the value lives.
 pub(crate) struct SetLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for SetLock {
+    /// Unlocked, not only closed: a process spawned meanwhile shares the descriptor until it
+    /// execs, and closing ours would leave the lock held by its copy.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl SetLock {
@@ -875,7 +883,7 @@ impl SetLock {
             .open(&path)
             .map_err(io_error(format!("opening {}", path.display())))?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => {
                 Err(io_error(format!("locking {}", path.display()))(error))
@@ -911,6 +919,18 @@ pub(crate) fn generation_path(dir: &Path, generation: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::oxv::testing::TempDir;
+
+    #[test]
+    fn a_dropped_lock_is_free_whoever_shares_its_descriptor() {
+        let work = TempDir::new("set_lock_shared");
+        let held = SetLock::take(work.path()).unwrap();
+        // What a process spawned while the lock is held keeps until it execs.
+        let inherited = held.file.try_clone().unwrap();
+        drop(held);
+        assert!(SetLock::try_take(work.path()).unwrap().is_some());
+        drop(inherited);
+    }
 
     #[test]
     fn every_write_has_a_temporary_name_of_its_own() {
