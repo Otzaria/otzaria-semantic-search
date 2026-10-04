@@ -406,7 +406,10 @@ fn a_flipped_vector_bit_is_refused_naming_its_batch() {
         !error.contains("batch 0") && !error.contains("keys.bin hashes"),
         "{error}"
     );
-    assert!(error.contains("not repaired"), "{error}");
+    assert!(
+        error.contains("not repaired") && error.contains("move it aside"),
+        "{error}"
+    );
     drop(warehouse);
 
     let error = Warehouse::open_for_append(&at).err().unwrap().to_string();
@@ -497,6 +500,34 @@ fn a_flipped_key_is_refused_and_no_index_is_rebuilt_from_it() {
     let error = Warehouse::open_for_append(&at).err().unwrap().to_string();
     assert!(error.contains("keys.bin hashes to"), "{error}");
     assert_eq!(files(&at), before);
+}
+
+/// A batch that added nothing has the digests of nothing: any other is warehouse.json's fault.
+#[test]
+fn an_empty_batch_with_another_digest_names_warehouse_json() {
+    let (_dir, at) = two_batches("warehouse_empty_batch");
+    let path = at.join("warehouse.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut empty = manifest["batches"][1].clone();
+    empty["first"] = 4.into();
+    empty["records"] = 0.into();
+    empty["vectors_sha256"] = "0".repeat(64).into();
+    empty["keys_sha256"] = super::files::hex(&sha256(b"")).into();
+    manifest["batches"].as_array_mut().unwrap().push(empty);
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let error = Warehouse::open(&at)
+        .unwrap()
+        .verify()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("batch 2 (records 4..4, added now): it added no bytes, so warehouse.json's")
+            && error.contains("for vectors.f32 is corrupt"),
+        "{error}"
+    );
+    assert!(!error.contains("keys.bin"), "{error}");
 }
 
 /// Between an add's index and its count, a reader is told the warehouse may be being added

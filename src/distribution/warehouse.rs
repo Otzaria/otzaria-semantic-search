@@ -431,9 +431,15 @@ impl Warehouse {
             .into_iter()
             .map(|(at, name, actual, recorded)| {
                 let batch = &self.manifest.batches[at];
+                let found = if batch.records == 0 {
+                    format!(
+                        "it added no bytes, so warehouse.json's {recorded} for {name} is corrupt"
+                    )
+                } else {
+                    format!("{name} hashes to {actual}, and warehouse.json records {recorded}")
+                };
                 format!(
-                    "batch {at} (records {}..{}, added {}): {name} hashes to {actual}, and \
-                     warehouse.json records {recorded}",
+                    "batch {at} (records {}..{}, added {}): {found}",
                     batch.first,
                     batch.first + batch.records,
                     batch.added_at
@@ -452,7 +458,8 @@ impl Warehouse {
             "the keys are sound, so adding to the warehouse, or warehouse-verify --repair, \
              rebuilds the index from them"
         } else {
-            "data that fails its digest is not repaired: restore the warehouse from a copy"
+            "data that fails its digest is not repaired: restore the warehouse from a copy, or \
+             move it aside and the next build embeds every text again"
         };
         malformed(format!(
             "warehouse {}: {}; {remedy}",
