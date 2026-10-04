@@ -42,8 +42,11 @@ pub struct SemanticManifest {
 
     // ── Model metadata ──
     pub embedding_model_id: String,
-    /// SHA-256 of the model file, once a model has been loaded. Guards what the model
-    /// id alone cannot: same id, different weights behind the same path.
+    /// The model's checksum, once a model has been loaded: the ONNX graph's package
+    /// checksum — see
+    /// [`EmbeddingRuntime::model_checksum`](crate::semantic::embedding::EmbeddingRuntime::model_checksum).
+    /// Guards what the model id alone cannot: same id, different weights behind the same
+    /// path.
     pub model_checksum: Option<String>,
     /// Backend that produced the vectors, once a model is loaded (`"mock-hash-v1"`).
     pub embedding_backend: Option<String>,
@@ -57,7 +60,7 @@ pub struct SemanticManifest {
     /// clamp it — which errs towards a needless re-index rather than leaving vectors
     /// from two different caps in one index.
     pub embedding_max_tokens: usize,
-    /// Model quantization level (e.g. "Q4").
+    /// Model quantization level (e.g. "int8").
     pub model_quantization: String,
     /// Vector storage precision in the store (e.g. "f32", "f16").
     pub vector_precision: String,
@@ -865,13 +868,13 @@ mod tests {
 
     fn test_config() -> ManifestConfig {
         ManifestConfig {
-            embedding_model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
+            embedding_model_id: "ArieLLL123/judaic-semantic-round2-onnx-zayit".to_string(),
             model_checksum: None,
             embedding_backend: None,
             embedding_dim: 1024,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             embedding_max_tokens: 512,
-            model_quantization: "Q4".to_string(),
+            model_quantization: "int8".to_string(),
             vector_precision: "f32".to_string(),
             vector_backend: "in-memory-v1".to_string(),
             chunking_identity: 1,
@@ -913,7 +916,7 @@ mod tests {
         assert_eq!(manifest.format_version, MANIFEST_FORMAT_VERSION);
         assert_eq!(manifest.embedding_model_id, config.embedding_model_id);
         assert_eq!(manifest.embedding_dim, 1024);
-        assert_eq!(manifest.pooling, "last-token");
+        assert_eq!(manifest.pooling, "in-graph");
         assert_eq!(manifest.embedding_max_tokens, 512);
         assert_eq!(manifest.chunking_identity, 1);
         assert_eq!(manifest.vector_backend, "in-memory-v1");
@@ -1029,7 +1032,7 @@ mod tests {
         ));
 
         let mut other_backend = config;
-        other_backend.embedding_backend = Some("gguf-candle-v1".to_string());
+        other_backend.embedding_backend = Some("some-other-backend-v1".to_string());
         let mismatches = manifest.validate(&other_backend);
         assert_eq!(mismatches.len(), 1);
         assert!(matches!(
@@ -1377,12 +1380,12 @@ mod tests {
 
         let previous = serde_json::json!({
             "format_version": MANIFEST_FORMAT_VERSION - 1,
-            "embedding_model_id": "EMD123/Otzaria-Embedding-V1-Flash-0.6B",
+            "embedding_model_id": "ArieLLL123/judaic-semantic-round2-onnx-zayit",
             "model_checksum": "deadbeef",
             "embedding_backend": "mock-hash-v1",
             "embedding_dim": 1024,
-            "pooling": "last-token",
-            "model_quantization": "Q4",
+            "pooling": "in-graph",
+            "model_quantization": "int8",
             "vector_precision": "f32",
             "vector_backend": "in-memory-v1",
             "chunking_version": 1,

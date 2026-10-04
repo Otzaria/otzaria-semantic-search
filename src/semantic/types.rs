@@ -460,10 +460,11 @@ impl fmt::Display for ResultSource {
 ///
 /// # Identity
 ///
-/// `line_id` is the global Tantivy document id of the line and is the key used
-/// to merge a lexical and a semantic candidate into one result. Callers must
-/// therefore pass ids from the same id space on both paths; a `line_id` that is
-/// only unique within a book would merge unrelated lines.
+/// `(file_path, line_id)` — the book and the Tantivy document id of the line — is the key
+/// used to merge a lexical and a semantic candidate into one result. Callers must pass ids
+/// from the same id space on both paths. The book is part of the key because an id alone
+/// is not unique on every index: one updated book by book can give two books the same id
+/// range, and merging on the id would fuse unrelated lines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusedCandidate {
     pub title: String,
@@ -493,6 +494,17 @@ pub struct FusedCandidate {
     pub raw_semantic_score: Option<f32>,
     pub normalized_semantic: Option<f32>,
     pub fused_score: f32,
+    /// The line's place among the semantic candidates fusion was handed — the scan's order,
+    /// best hit first, and within one hit the order the resolver gave its lines — or `None`
+    /// for a line only the lexical path found.
+    ///
+    /// What orders results after the score. Every line one vector resolved to scores
+    /// alike, so this decides how they are shown: as the resolver placed them — a line of
+    /// each book before a second line of any, when it returns them so — and not by id,
+    /// which put one book's repeats of a text, their ids in a row, ahead of every other
+    /// book's copy, and could fill a page with them.
+    #[serde(default)]
+    pub semantic_position: Option<u32>,
     pub lexical_weight: f32,
     pub semantic_weight: f32,
 }
@@ -695,13 +707,22 @@ pub struct CompiledFilters<'a> {
 impl CompiledFilters<'_> {
     /// Whether `meta` passes every active filter.
     pub fn matches(&self, meta: &VectorMetadata) -> bool {
+        self.matches_book(&meta.source_book_key, &meta.facets, meta.is_pdf)
+    }
+
+    /// Whether a book — its key, its facets, whether it is a PDF — passes every active
+    /// filter. Every filter here is a property of the book, so this is the whole of
+    /// [`Self::matches`], and what a host applies to its live books to decide which a
+    /// semantic search may return lines from: the same rule as the lexical path, by
+    /// construction.
+    pub fn matches_book(&self, book_key: &str, facets: &[String], is_pdf: bool) -> bool {
         if let Some(paths) = self.book_paths {
-            if !paths.iter().any(|path| path == &meta.source_book_key) {
+            if !paths.iter().any(|path| path == book_key) {
                 return false;
             }
         }
 
-        if self.excludes_pdf && meta.is_pdf {
+        if self.excludes_pdf && is_pdf {
             return false;
         }
 
@@ -711,8 +732,7 @@ impl CompiledFilters<'_> {
             if group.is_empty() {
                 continue;
             }
-            let satisfied = meta
-                .facets
+            let satisfied = facets
                 .iter()
                 .any(|value| group.iter().any(|filter| facet_matches(value, filter)));
             if !satisfied {

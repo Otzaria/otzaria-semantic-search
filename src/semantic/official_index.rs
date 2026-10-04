@@ -1,80 +1,57 @@
-//! The application's path: open an installed official artifact and query it, read-only.
+//! The application's path: open an installed vector set and query it, read-only.
 //!
-//! This is the consumer the artifact contract was written for. Everything in
-//! [`distribution`](crate::distribution) up to now produced a
-//! [`VerifiedPackage`] that nothing read; [`OfficialSemanticIndex`] is what reads it,
-//! which is what turns "verify before touching a vector" from a call order someone has to
-//! remember into a property of the types: the payload is opened from the token, and the
-//! store behind it is a [`VectorSearchBackend`] with no mutation on it at all.
+//! [`OfficialSemanticIndex`] is a [`SegmentSet`] and the model a query is embedded with,
+//! opened in the order that lets every refusal name what disagreed:
 //!
-//! # What the caller supplies, and why it is not this crate's constant
+//! 1. **recover** — what an interrupted install left in the set's directory is removed, and
+//!    a `CURRENT` that does not open falls back to `PREVIOUS` (see [`segment_set`]);
+//! 2. **the set** — every segment mapped and checked, every derived file read;
+//! 3. **the model** — loaded, so its package checksum and its tokenizer's are known;
+//! 4. **the identity** — the set's against this installation's: the line recipe of the
+//!    index the caller has open, the model family it runs with the package it loaded, and
+//!    the store this build reads.
 //!
-//! Opening needs the full [`IndexVersion`] the artifact must match, assembled from three
-//! sources that each know a different part of it:
-//!
-//! * **corpus** — from the Tantivy index that is actually open. It is the half no vector
-//!   can reveal: an artifact from another catalogue points confidently at the wrong
-//!   lines. The caller passes it; this crate never invents it.
-//! * **model** — from the model file that is actually loaded, plus the text recipe this
-//!   build implements. [`LocalModel`] declares the recipe; the file's SHA-256 and the
-//!   backend that will run it come from the loaded runtime, because they are facts about
-//!   this machine rather than claims anyone can make up.
-//! * **store** — from what this build can *read*: [`readable_store_identity`]. A payload
-//!   in another backend's format, or another version of this one, is then refused by the
-//!   ordinary identity comparison rather than by a special case buried in a reader.
-//!
-//! # Read-only, with one exception that is not a write to the artifact
-//!
-//! Opening runs [`recover_interrupted_install`] first. An install killed between its two
-//! renames leaves the device's only good copy parked beside the target, and a reader that
-//! looked only at the target would report no artifact at all. That resolution renames
-//! directories the installer left behind; it never writes into a payload, and when there
-//! is nothing to resolve it touches nothing. What was found is reported by
-//! [`OfficialSemanticIndex::recovery`].
+//! A search embeds the query, scans the set and returns [`VectorHit`]s — keys and the
+//! records where they were built, not lines. Turning them into live lines is the caller's
+//! [`CandidateResolver`](crate::semantic::resolve::CandidateResolver), which the
+//! [`HybridCoordinator`](crate::hybrid::coordinator::HybridCoordinator) asks.
 //!
 //! # Which failure is which
 //!
-//! The host has to tell a damaged artifact from a foreign one — one is fixed by fetching
-//! this artifact again, the other by fetching the right one — so the errors stay distinct:
-//!
 //! | Error | Means |
 //! |---|---|
-//! | [`ArtifactError::IdentityMismatch`] | wrong artifact: the field names what disagreed |
-//! | [`ArtifactError::ManifestDisagreesWithPayload`] | the artifact does not describe itself: a payload's size, or a count the payload does not hold |
-//! | [`ArtifactError::UnexpectedArtifactDigest`] | self-consistent, but not the artifact that was published |
-//! | [`VectorStoreError::Corrupted`](crate::errors::VectorStoreError::Corrupted) | the payload's own structure or per-record checksums are broken |
+//! | [`ArtifactError::MetadataUnusable`] | no set is installed |
+//! | [`ArtifactError::IdentityMismatch`] | the wrong set — the field names what disagreed; a v1 artifact names `store.backend_id` |
+//! | [`VectorStoreError::Corrupted`](crate::errors::VectorStoreError::Corrupted) | neither generation opens: a segment or a derived file is damaged |
 //! | [`EmbeddingError`](crate::errors::EmbeddingError) | the model is missing or does not fit this configuration |
-//!
-//! Mapping those onto user-facing states (`ready`, `corrupt`, `incompatible`,
-//! `model_missing`) is the host application's job — S5 and S6.
 
-use crate::distribution::importer::{recover_interrupted_install, InstallRecovery};
-use crate::distribution::package::{
-    ArtifactExpectation, IndexPackage, VerificationDepth, VerifiedPackage,
-};
+use crate::cancellation::CancellationToken;
 use crate::errors::{ArtifactError, SemanticSearchError};
 use crate::semantic::backend::Pooling;
-use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
+use crate::semantic::oxv::format::SEGMENT_FORMAT_VERSION;
+use crate::semantic::oxv::scan::{default_scan_threads, ScanRequest};
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
-use crate::semantic::store_backend::VectorSearchBackend;
-use crate::semantic::types::{SearchFilters, SemanticCandidate, SemanticStatus};
-use crate::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity, StoreIdentity};
-use crate::semantic::zevc_store::{self, ReadOnlyZevcStore, SNAPSHOT_FILENAMES};
+use crate::semantic::resolve::{BookSet, SlotRef, VectorHit};
+use crate::semantic::segment_set::{self, SegmentSet, SetInfo, STORE_BACKEND_ID};
+use crate::semantic::types::SemanticStatus;
+use crate::semantic::versioning::{
+    IndexVersion, ModelIdentity, ModelPackage, StoreIdentity, TextIdentity,
+};
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-/// The payload layout this build can read.
+/// The store this build reads: `otzaria-oxv` segments, format 2, in the `i8-sym-vec` codec.
 ///
-/// Deliberately a constant and not something read out of the artifact: it is what the
-/// installation *requires*. One reader exists today — the snapshot format in
-/// [`zevc_store`] — so an artifact written by any other backend, or by a future version
-/// of this one, is a rejection naming `store.backend_id` or
+/// What the installation *requires*, not something read out of the set: a set in another
+/// codec or format is a rejection naming `store.vector_precision` or
 /// `store.store_format_version`.
 pub fn readable_store_identity() -> StoreIdentity {
     StoreIdentity {
-        backend_id: zevc_store::BACKEND_ID.to_string(),
-        store_format_version: zevc_store::STORE_FORMAT_VERSION,
-        vector_precision: zevc_store::VECTOR_PRECISION.to_string(),
+        backend_id: STORE_BACKEND_ID.to_string(),
+        store_format_version: SEGMENT_FORMAT_VERSION,
+        vector_precision: "i8-sym-vec".to_string(),
     }
 }
 
@@ -87,14 +64,18 @@ pub fn readable_store_identity() -> StoreIdentity {
 /// `chunking_identity`). The read path derives none of the second group: a query is not
 /// chunked, so nothing here could infer them. They are compared anyway, because an
 /// artifact built from differently-chunked or differently-normalized text is a different
-/// artifact — the results would be plausible and subtly wrong, and the granularity a
-/// `line_id` refers to would no longer be the one the caller hydrates.
+/// artifact — the results would be plausible and subtly wrong.
+///
+/// The package's checksum and its tokenizer's are not declared at all: the loaded runtime
+/// computes both, and the package must be one the artifact accepts for queries.
 #[derive(Debug, Clone)]
 pub struct LocalModel {
     pub model_path: PathBuf,
-    pub model_id: String,
-    /// Quantization of the weights, e.g. `"Q4_K_M"`. Redundant against the checksum by
-    /// design: it is what makes a rejection readable.
+    /// The family the package at `model_path` belongs to — see
+    /// [`ModelIdentity::family_id`].
+    pub family_id: String,
+    /// Quantization of the package at `model_path`, e.g. `"int8"`. Redundant against its
+    /// checksum by design: it is what makes a rejection readable.
     pub model_quantization: String,
     pub embedding_dim: u32,
     pub pooling: String,
@@ -105,8 +86,24 @@ pub struct LocalModel {
 }
 
 impl LocalModel {
+    /// The package at `model_path`, of precision `quantization`, as a member of `family` —
+    /// the family a deployment declares (`config/models/meivin-round2-onnx/model.json`).
+    pub fn of_family(model_path: PathBuf, family: &ModelIdentity, quantization: &str) -> Self {
+        Self {
+            model_path,
+            family_id: family.family_id.clone(),
+            model_quantization: quantization.to_string(),
+            embedding_dim: family.embedding_dim,
+            pooling: family.pooling.clone(),
+            max_tokens: family.max_tokens,
+            embedding_text_version: family.embedding_text_version,
+            normalization_version: family.normalization_version,
+            chunking_identity: family.chunking_identity,
+        }
+    }
+
     /// Compose the model half of the identity from what was declared here and what the
-    /// loaded runtime knows.
+    /// loaded runtime knows: the one package it loaded, and that package's tokenizer.
     fn identity(&self, runtime: &EmbeddingRuntime) -> Result<ModelIdentity, SemanticSearchError> {
         let unknown = |what: &str| {
             SemanticSearchError::Config(format!(
@@ -117,15 +114,10 @@ impl LocalModel {
         };
 
         Ok(ModelIdentity {
-            model_id: self.model_id.clone(),
-            model_checksum: runtime
-                .model_checksum()
-                .ok_or_else(|| unknown("model checksum"))?
-                .to_string(),
-            model_quantization: self.model_quantization.clone(),
-            embedding_backend: runtime
-                .backend_id()
-                .ok_or_else(|| unknown("backend id"))?
+            family_id: self.family_id.clone(),
+            tokenizer_checksum: runtime
+                .tokenizer_checksum()
+                .ok_or_else(|| unknown("tokenizer checksum"))?
                 .to_string(),
             embedding_dim: self.embedding_dim,
             pooling: self.pooling.clone(),
@@ -133,11 +125,18 @@ impl LocalModel {
             embedding_text_version: self.embedding_text_version,
             normalization_version: self.normalization_version,
             chunking_identity: self.chunking_identity,
+            query_packages: vec![ModelPackage {
+                checksum: runtime
+                    .model_checksum()
+                    .ok_or_else(|| unknown("model checksum"))?
+                    .to_string(),
+                quantization: self.model_quantization.clone(),
+            }],
         })
     }
 
-    /// The typed pooling strategy, refusing both a spelling [`Pooling`] cannot parse and
-    /// one no backend implements — the caller's configuration error either way.
+    /// The typed pooling strategy, refusing a spelling [`Pooling`] cannot parse and one
+    /// no backend implements — the caller's configuration error either way.
     fn pooling_strategy(&self) -> Result<Pooling, SemanticSearchError> {
         let pooling = Pooling::parse(&self.pooling)
             .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
@@ -150,800 +149,727 @@ impl LocalModel {
 /// What to open, and what it has to agree with.
 #[derive(Debug, Clone)]
 pub struct OfficialIndexConfig {
-    /// Directory the artifact was installed into — the target
-    /// [`IndexImporter`](crate::distribution::importer::IndexImporter) swaps into place.
-    pub artifact_path: PathBuf,
-    /// Identity of the corpus this installation actually has open. Never this crate's
-    /// constant; see the module documentation.
-    pub corpus: CorpusIdentity,
+    /// The vector set's directory — `<root>/vectors`, where
+    /// [`install_package`](crate::semantic::segment_set::install_package) installs.
+    pub vectors_dir: PathBuf,
+    /// The line recipe of the index this installation actually has open, and the key
+    /// version it computes keys with. Never this crate's constant.
+    pub text: TextIdentity,
     pub model: LocalModel,
-    /// A digest that arrived from outside the artifact, when there is one. Without it,
-    /// opening detects damage and the wrong artifact but not a deliberately rebuilt one —
-    /// see [`ArtifactExpectation`].
-    pub published_digest: Option<String>,
+    /// Where this machine keeps what the model runs on: the ONNX Runtime library the
+    /// application ships. Not part of what the set has to agree with — see
+    /// [`EmbeddingDeployment`].
+    pub deployment: EmbeddingDeployment,
+    /// Threads a scan uses; [`default_scan_threads`] when `None`.
+    pub scan_threads: Option<NonZeroUsize>,
 }
 
-/// An installed artifact, verified and open for queries.
-///
-/// Holds no chunker, no manifest and no diff: nothing about this index is repairable on
-/// the device, so there is nothing to compare a library against and nothing to re-index.
-/// A mismatch means this is the wrong artifact, and the answer is to install the right
-/// one.
+/// What [`OfficialSemanticIndex::reload_vectors`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// `CURRENT` still names the generation that is open.
+    Unchanged { generation: u64 },
+    /// A newer generation was opened, with the same model.
+    Reloaded {
+        from_generation: u64,
+        to_generation: u64,
+    },
+}
+
+/// An installed vector set, verified and open for queries.
 pub struct OfficialSemanticIndex {
-    verified: VerifiedPackage,
-    store: Box<dyn VectorSearchBackend>,
+    set: SegmentSet,
     runtime: EmbeddingRuntime,
-    /// The text recipe the artifact's vectors were built under, applied to every query.
-    /// Both sides of a comparison have to go through the same one.
+    /// The text normalization the vectors were built under, applied to every query.
     normalization: TextNormalizationRecipe,
-    recovery: InstallRecovery,
-    /// Counted once, at open, because the payload cannot change under a read-only store —
-    /// and because counting means listing every book key, which is not something
-    /// [`Self::status`] should allocate on every call.
+    /// The text recipe likewise: under version 2 it marks every query as one, as the
+    /// stored passages were marked as passages.
+    text_recipe: EmbeddingTextRecipe,
+    /// What this installation is, which every generation it opens must accept.
+    expected: IndexVersion,
+    scan_threads: usize,
+    /// Distinct books the set holds records for, counted at open.
     book_count: u32,
 }
 
 impl OfficialSemanticIndex {
-    /// Resolve any interrupted install, load the model, verify the artifact against this
-    /// installation, and open its payload.
-    ///
-    /// The order is forced rather than chosen. The model is loaded before the artifact is
-    /// verified because two identity fields — the file's checksum and the backend that
-    /// will run it — are only knowable once it is; a mismatch therefore costs one model
-    /// load, and the alternative (comparing the cheap half of the identity first, from a
-    /// package nothing has verified yet) would put identity comparison in two places.
-    ///
-    /// The payload is opened only from the verified token, and then checked against the
-    /// counts the manifest declares — the one check the contract layer cannot make,
-    /// because counting vectors means reading the store's format.
+    /// Recover, open the set, load the model, and hold the set's identity to this
+    /// installation's — see the module documentation for why in that order.
     pub fn open(config: OfficialIndexConfig) -> Result<Self, SemanticSearchError> {
         let OfficialIndexConfig {
-            artifact_path,
-            corpus,
+            vectors_dir,
+            text,
             model,
-            published_digest,
+            deployment,
+            scan_threads,
         } = config;
 
-        let recovery = recover_interrupted_install(&artifact_path)?;
-        if recovery.recovered_anything() {
-            log::warn!(
-                "Resolved an interrupted install at {} before opening it: {recovery:?}",
-                artifact_path.display()
-            );
-        }
-
-        // Before the model is opened: the two recipe versions this installation declares
-        // are versions of code in this crate, so an unimplemented one is settled here
-        // rather than compared against another copy of the same number and agreed with.
-        // The artifact's own copy is refused by `validate_complete` during verification;
-        // this refuses the *installation's*, which is what stops a configuration and an
-        // artifact from agreeing on a recipe neither can run.
-        EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
-        // Held, not just checked: the query has to reach the model through the same text
-        // recipe the stored vectors were built under, or the two live in different places
-        // and nothing about either vector says so.
+        // Versions of this crate's code, settled before anything is opened: an
+        // installation declaring a recipe nothing implements is refused here rather than
+        // agreed with by a set that declares the same number.
+        let text_recipe = EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
         let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
 
-        let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: model.model_path.clone(),
-            embedding_dim: model.embedding_dim,
-            pooling: model.pooling_strategy()?,
-            max_tokens: model.max_tokens,
-            // One query at a time is all this path ever embeds; batching belongs to the
-            // builder, which has a library to get through.
-            batch_size: 1,
-        });
+        let set = SegmentSet::open(&vectors_dir)?;
+
+        let mut runtime = EmbeddingRuntime::with_deployment(
+            EmbeddingConfig {
+                model_path: model.model_path.clone(),
+                embedding_dim: model.embedding_dim,
+                pooling: model.pooling_strategy()?,
+                max_tokens: model.max_tokens,
+                // One query at a time is all this path ever embeds.
+                batch_size: 1,
+            },
+            deployment,
+        );
         runtime.load()?;
 
-        let identity = IndexVersion {
-            corpus,
+        let expected = IndexVersion {
+            text,
             model: model.identity(&runtime)?,
             store: readable_store_identity(),
         };
-        let expected = match published_digest {
-            Some(digest) => ArtifactExpectation::with_published_digest(identity, digest),
-            None => ArtifactExpectation::without_published_digest(identity),
-        };
-
-        let verified = IndexPackage::verify_for_open(&artifact_path, &expected)?;
-        // Everything the reader gets comes off the token: the payload set it is allowed to
-        // read, the hash each of those files must have, and the record width — which
-        // verification has just proved equal to the model's. Nothing here is a path or a
-        // number the caller could have supplied.
-        ensure_snapshot_layout(&verified)?;
-        let store = ReadOnlyZevcStore::open(&verified)?;
-        let book_count = verify_counts_against_payload(&verified, &store)?;
+        set.identity().verify_matches(&expected)?;
+        let book_count = count_books(&set);
         let index = Self {
-            verified,
-            store: Box::new(store),
+            set,
             runtime,
             normalization,
-            recovery,
+            text_recipe,
+            expected,
+            scan_threads: scan_threads.map_or_else(default_scan_threads, NonZeroUsize::get),
             book_count,
         };
-
         log::info!(
-            "Opened official semantic index at {}: {} vector(s) across {} book(s), \
-             backend '{}', digest {}",
-            index.root().display(),
-            index.vector_count(),
-            index.book_count(),
-            index.store.backend_id(),
-            index.artifact_digest()
+            "Opened the vector set at {}: generation {}, library version {}, {} live vector(s) \
+             across {} book(s) in {} segment(s){}",
+            vectors_dir.display(),
+            index.set.generation(),
+            index.set_info().library_version,
+            index.set_info().slots_live,
+            book_count,
+            index.set_info().segments.len(),
+            if index.set_info().recovered_from_previous {
+                ", recovered from PREVIOUS"
+            } else {
+                ""
+            }
         );
         Ok(index)
     }
 
-    /// Embed a query and return the closest stored vectors.
-    ///
-    /// A result carries the `line_id` the artifact was built with; resolving it to a
-    /// book, a reference and its text is the lexical index's job, in the caller.
+    /// Embed `query` and return the `top_k` closest stored vectors, in books `books`
+    /// admits when given.
     pub fn search(
         &self,
         query: &str,
         top_k: usize,
-        filters: Option<&SearchFilters>,
-    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        books: Option<&BookSet>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, SemanticSearchError> {
+        cancel.checkpoint()?;
         let query_vector = self.embed_query(query)?;
-        self.search_vector(&query_vector, top_k, filters)
+        cancel.checkpoint()?;
+        self.search_hits(&query_vector, top_k, books, cancel)
+    }
+
+    /// Scan with a vector this index's runtime already produced.
+    pub fn search_hits(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        books: Option<&BookSet>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, SemanticSearchError> {
+        self.search_hits_with(query_vector, top_k, books, &[], cancel)
+    }
+
+    /// [`Self::search_hits`], weighing the vectors of `also` besides the ones `books`
+    /// reaches: see [`SegmentSet::scan_with`]. Slots of this index's
+    /// [generation](Self::generation).
+    pub fn search_hits_with(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        books: Option<&BookSet>,
+        also: &[SlotRef],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, SemanticSearchError> {
+        Ok(self.set.scan_with(
+            query_vector,
+            &ScanRequest {
+                top_k,
+                books,
+                threads: self.scan_threads,
+            },
+            also,
+            cancel,
+        )?)
     }
 
     /// Embed a query separately, so the coordinator can cache the vector.
     pub(crate) fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
         // The same recipe the stored vectors were built under. A query embedded from raw
-        // text against vectors built from normalized text scores nonsense with full
-        // confidence, and no check downstream can see it.
-        Ok(self.runtime.embed_one(&self.normalization.apply(query))?)
+        // text against vectors built from normalized text — or without the role prefix
+        // its passages were built with — scores nonsense with full confidence.
+        let text =
+            crate::semantic::recipe::query_input(self.text_recipe, self.normalization, query)?;
+        Ok(self.runtime.embed_one(&text)?)
     }
 
-    /// Search with a vector this index's runtime already produced.
-    pub(crate) fn search_vector(
-        &self,
-        query_vector: &[f32],
-        top_k: usize,
-        filters: Option<&SearchFilters>,
-    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
-        Ok(self.store.search(query_vector, top_k, filters)?)
+    /// Open the generation `CURRENT` names now, if it is not the open one, keeping the
+    /// model. The new generation is held to the same identity; until it opens, the old
+    /// one stays in service.
+    pub fn reload_vectors(&mut self) -> Result<ReloadOutcome, SemanticSearchError> {
+        let from_generation = self.set.generation();
+        let dir = self.set.dir().to_path_buf();
+        let Some(info) = segment_set::info(&dir)? else {
+            return Err(ArtifactError::MetadataUnusable {
+                path: dir.display().to_string(),
+                reason: "the vector set is gone".to_string(),
+            }
+            .into());
+        };
+        if info.generation == from_generation && !info.recovered_from_previous {
+            return Ok(ReloadOutcome::Unchanged {
+                generation: from_generation,
+            });
+        }
+        let set = SegmentSet::open(&dir)?;
+        set.identity().verify_matches(&self.expected)?;
+        if set.generation() == from_generation {
+            return Ok(ReloadOutcome::Unchanged {
+                generation: from_generation,
+            });
+        }
+        self.book_count = count_books(&set);
+        self.set = set;
+        log::info!(
+            "Reloaded the vector set at {}: generation {from_generation} → {}",
+            dir.display(),
+            self.set.generation()
+        );
+        Ok(ReloadOutcome::Reloaded {
+            from_generation,
+            to_generation: self.set.generation(),
+        })
     }
 
     /// Operational status, in the same shape the self-built path reports.
-    ///
-    /// `needs_full_reindex` is always `None`, and not because nothing was checked: an
-    /// artifact is either the right one or refused at [`Self::open`]. There is no state
-    /// here that re-indexing on the device could repair.
     pub fn status(&self) -> SemanticStatus {
-        let vector_count = self.store.count();
+        let info = self.set.info();
+        let vector_count = info.slots_live.min(u64::from(u32::MAX)) as u32;
         SemanticStatus {
             available: vector_count > 0 && self.runtime.is_loaded(),
             model_loaded: self.runtime.is_loaded(),
-            indexed_book_count: self.book_count(),
+            indexed_book_count: self.book_count,
             vector_count,
-            model_id: self.identity().model.model_id.clone(),
-            embedding_dim: self.store.embedding_dim(),
+            model_id: self.expected.model.family_id.clone(),
+            embedding_dim: self.expected.model.embedding_dim,
             embedding_backend: self.runtime.backend_id().map(str::to_string),
-            vector_backend: self.store.backend_id().to_string(),
-            vectors_persisted: self.store.is_persistent(),
+            vector_backend: STORE_BACKEND_ID.to_string(),
+            vectors_persisted: true,
             needs_full_reindex: None,
             last_error: None,
         }
     }
 
-    /// The artifact directory this index reads.
-    pub fn root(&self) -> &Path {
-        self.verified.root()
+    /// The open generation: its identity, segments and counts.
+    pub fn set_info(&self) -> &SetInfo {
+        self.set.info()
     }
 
-    /// Identity the artifact declared and this installation agreed with.
+    /// The identity the set declares, which this installation accepted.
     pub fn identity(&self) -> &IndexVersion {
-        self.verified.identity()
+        self.set.identity()
     }
 
-    /// The artifact's own digest — equal to the published one when the configuration
-    /// carried it.
-    pub fn artifact_digest(&self) -> &str {
-        self.verified.artifact_digest()
+    pub fn vectors_dir(&self) -> &Path {
+        self.set.dir()
     }
 
-    /// How much the contract layer checked at open.
-    ///
-    /// Always [`VerificationDepth::MetadataAndPresence`]: re-hashing the payload at every
-    /// launch is not in the budget. It is not the whole story either — the store reader
-    /// verifies a checksum per record while it loads, which is what catches a same-length
-    /// edit. See [`zevc_store`].
-    pub fn verification_depth(&self) -> VerificationDepth {
-        self.verified.depth()
+    /// The open generation's number: what a query cache keys on.
+    pub fn generation(&self) -> u64 {
+        self.set.generation()
     }
 
-    /// What an interrupted install left behind, resolved before this index was opened.
-    pub fn recovery(&self) -> InstallRecovery {
-        self.recovery
-    }
-
-    /// Vectors the payload holds, which the manifest agreed with at open.
-    pub fn vector_count(&self) -> u32 {
-        self.store.count()
-    }
-
-    /// Books the payload's vectors belong to, as counted at open.
+    /// Books the set holds records for, as counted when the generation was opened.
     pub fn book_count(&self) -> u32 {
         self.book_count
     }
-
-    /// Book keys the artifact holds vectors for, in a deterministic order.
-    pub fn book_keys(&self) -> Vec<String> {
-        self.store.book_keys()
-    }
 }
 
-/// Refuse a package whose declared payloads are not exactly this backend's layout.
-///
-/// The reader refuses such a package too — a file the token does not cover has no declared
-/// hash to check against — but it would report it as a corrupt payload. This says the true
-/// thing instead: the artifact does not describe an artifact of this backend. Two faults are
-/// covered: names other than the snapshot's, with snapshot files shipped beside them, and a
-/// package that omits one of the three.
-///
-/// The names are compared as a set: [`SNAPSHOT_FILENAMES`] is in read order, and the token's
-/// table is sorted.
-///
-/// `pub(crate)` so the packer's own acceptance check
-/// ([`validate_artifact`](crate::distribution::packer::validate_artifact)) is this check
-/// and not a second implementation of it.
-pub(crate) fn ensure_snapshot_layout(verified: &VerifiedPackage) -> Result<(), ArtifactError> {
-    let declared: BTreeSet<&str> = verified.payload_names().into_iter().collect();
-    let required: BTreeSet<&str> = SNAPSHOT_FILENAMES.into_iter().collect();
-    if declared != required {
-        return Err(ArtifactError::ManifestDisagreesWithPayload {
-            reason: format!(
-                "an artifact of store backend '{}' must declare exactly {:?}, and this one \
-                 declares {:?}",
-                zevc_store::BACKEND_ID,
-                required,
-                declared
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Check the manifest's counts against what the payload actually holds, and return the
-/// book count so nothing has to list every key again.
-///
-/// [`PackageManifest`](crate::distribution::package::PackageManifest) can only refuse a
-/// count of zero on its own — deciding that a payload holds exactly `vector_count` vectors
-/// across `book_count` books needs a reader of the store format. The definition the packer
-/// has to match: `vector_count` is the number of records, and `book_count` is the number of
-/// **distinct `source_book_key`s** among them.
-///
-/// `pub(crate)` so the packer matches that definition by *calling* it — see
-/// [`validate_artifact`](crate::distribution::packer::validate_artifact). A count the
-/// build side computes one way and the runtime checks another way is a build that ships
-/// artifacts refusing to open.
-pub(crate) fn verify_counts_against_payload(
-    verified: &VerifiedPackage,
-    store: &dyn VectorSearchBackend,
-) -> Result<u32, ArtifactError> {
-    let disagrees = |reason: String| ArtifactError::ManifestDisagreesWithPayload { reason };
-
-    let vectors = store.count();
-    if vectors != verified.vector_count() {
-        return Err(disagrees(format!(
-            "the manifest declares {} vector(s) and the payload holds {vectors}",
-            verified.vector_count()
-        )));
-    }
-
-    let books = store.book_keys().len().min(u32::MAX as usize) as u32;
-    if books != verified.book_count() {
-        return Err(disagrees(format!(
-            "the manifest declares {} book(s) and the payload's vectors belong to {books}",
-            verified.book_count()
-        )));
-    }
-    Ok(books)
+fn count_books(set: &SegmentSet) -> u32 {
+    let books: BTreeSet<&str> = set
+        .segments()
+        .iter()
+        .flat_map(|segment| segment.books().iter().map(|book| &*book.name))
+        .collect();
+    books.len().min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::importer::{previous_path, ImportConfig, IndexImporter};
-    use crate::distribution::package::{IndexPackage, PackageManifest, PayloadDescriptor};
-    use crate::errors::{EmbeddingError, VectorStoreError};
-    use crate::semantic::embedding::{mock, validate_and_checksum_gguf};
-    use crate::semantic::store_backend::VectorStoreBackend;
-    use crate::semantic::types::VectorMetadata;
-    use crate::semantic::versioning::IdentityField;
-    use crate::semantic::zevc_store::{
-        ZevcStore, ZevcStoreConfig, METADATA_FILENAME, SNAPSHOT_FILENAMES, VECTORS_FILENAME,
+    use crate::distribution::builder::{
+        build, BuildRequest, RELEASE_MANIFEST_FILENAME, SEGMENT_FILENAME,
     };
-    use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
+    use crate::distribution::corpus::{CorpusIdentity, CorpusLine, CorpusLineRecord, JsonlCorpus};
+    use crate::errors::EmbeddingError;
+    use crate::semantic::chunk_key::ChunkKey;
+    use crate::semantic::chunker::ChunkerConfig;
+    use crate::semantic::embedding::mock;
+    use crate::semantic::model_package::validate_model;
+    use crate::semantic::oxv::testing::TempDir;
+    use crate::semantic::segment_set::{install_package, InstallExpectation, InstallSource};
+    use crate::semantic::versioning::IdentityField;
     use std::fs;
 
-    struct TempDir(PathBuf);
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            // The clock alone collided: macOS ticks coarser than a test takes to start.
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "otzaria_official_{name}_{}_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     const DIM: u32 = 64;
+    const GENESIS: &str = "otzaria/tanach/genesis.txt";
+    const BERACHOT: &str = "otzaria/mishna/berachot.txt";
 
-    /// `(line_id, book, text)`, with ids formed the way `document_id_scheme_version` 1
-    /// forms them: `((catalogue_order + 1) << 32) + (ordinal + 1)`.
-    const LINES: [(u64, &str, &str); 4] = [
+    /// `(book, text)`, every one long enough to be embedded as itself.
+    const LINES: [(&str, &str); 3] = [
+        (GENESIS, "בראשית ברא אלהים את השמים ואת הארץ"),
+        (GENESIS, "והארץ היתה תהו ובהו וחשך על פני תהום"),
         (
-            4_294_967_297,
-            "otzaria/tanach/genesis.txt",
-            "בראשית ברא אלהים את השמים ואת הארץ",
-        ),
-        (
-            4_294_967_298,
-            "otzaria/tanach/genesis.txt",
-            "והארץ היתה תהו ובהו וחשך על פני תהום",
-        ),
-        (
-            4_294_967_299,
-            "otzaria/tanach/genesis.txt",
-            "ויאמר אלהים יהי אור ויהי אור",
-        ),
-        (
-            8_589_934_593,
-            "otzaria/talmud/berachot.txt",
-            "מאימתי קורין את שמע בערבית",
+            BERACHOT,
+            "מאימתי קורין את שמע בערבית משעה שהכהנים נכנסין לאכול בתרומתן",
         ),
     ];
 
-    fn corpus() -> CorpusIdentity {
-        CorpusIdentity {
-            corpus_id: "1f".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
-            document_id_scheme_version: 1,
+    fn package(path: &Path, quantization: &str) -> ModelPackage {
+        ModelPackage {
+            checksum: validate_model(path).unwrap().checksum().to_string(),
+            quantization: quantization.to_string(),
         }
     }
 
-    /// What this installation implements — the values a host passes in.
-    fn local_model(model_path: &Path) -> LocalModel {
-        LocalModel {
-            model_path: model_path.to_path_buf(),
-            model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
-            model_quantization: "Q4_K_M".to_string(),
+    /// The family a test set is built for: the packages it accepts for queries, every other
+    /// field the stub's.
+    fn family(query_packages: Vec<ModelPackage>, embedding_text_version: u32) -> ModelIdentity {
+        let chunking = ChunkerConfig {
+            embedding_text_version,
+            ..ChunkerConfig::default()
+        };
+        ModelIdentity {
+            family_id: "otzaria-test-family".to_string(),
+            tokenizer_checksum: mock::stub_tokenizer_checksum(),
             embedding_dim: DIM,
-            pooling: "last-token".to_string(),
+            pooling: "in-graph".to_string(),
             max_tokens: 512,
-            embedding_text_version: 1,
+            embedding_text_version,
             normalization_version: 1,
-            chunking_identity: 0x0BAD_C0DE,
+            chunking_identity: chunking.identity(),
+            query_packages,
         }
     }
 
-    /// What a builder records: the same declarations, plus the two facts only the model
-    /// file and the loaded backend can supply.
-    fn built_identity(model_path: &Path) -> IndexVersion {
-        let model = local_model(model_path);
-        IndexVersion {
-            corpus: corpus(),
-            model: ModelIdentity {
-                model_id: model.model_id,
-                model_checksum: validate_and_checksum_gguf(model_path).unwrap(),
-                model_quantization: model.model_quantization,
-                embedding_backend: crate::semantic::backend::MockHashBackend::ID.to_string(),
-                embedding_dim: model.embedding_dim,
-                pooling: model.pooling,
-                max_tokens: model.max_tokens,
-                embedding_text_version: model.embedding_text_version,
-                normalization_version: model.normalization_version,
-                chunking_identity: model.chunking_identity,
-            },
-            store: readable_store_identity(),
-        }
-    }
-
-    fn metadata(line_id: u64, book: &str) -> VectorMetadata {
-        VectorMetadata {
-            semantic_id: format!("{book}#{line_id}"),
-            source_book_key: book.to_string(),
-            source_doc_key: format!("{book}#{line_id}"),
-            line_id,
-            section_id: line_id,
-            line_hash: line_id.wrapping_mul(31),
-            chunk_hash: format!("chunk-{line_id}"),
-            content_hash: 0,
-            reference: format!("הפניה {line_id}"),
-            segment: 0,
-            is_pdf: false,
-            title: "ספר בדיקה".to_string(),
-            facets: vec!["/מקרא/תורה".to_string()],
-        }
-    }
-
-    /// Build an artifact the way the packer will: write the payload with the backend that
-    /// owns the format, then the metadata describing it. `adjust` is where a test makes
-    /// the package disagree with this installation. Returns the digest a publisher would
-    /// announce.
-    fn build_artifact(
-        root: &Path,
+    /// Build a base of [`LINES`] for library `version` with the package at `model_path`,
+    /// and install it into `vectors`.
+    fn install(
+        dir: &TempDir,
+        name: &str,
+        vectors: &Path,
         model_path: &Path,
-        adjust: impl FnOnce(&mut PackageManifest),
-    ) -> String {
-        let store = ZevcStore::open_or_create(ZevcStoreConfig {
-            db_path: root.to_path_buf(),
-            embedding_dim: DIM,
-            collection_name: "chunks".to_string(),
-            auto_persist: false,
-        })
-        .unwrap();
-        store
-            .insert_batch(
-                LINES
-                    .iter()
-                    .map(|(line_id, book, text)| {
-                        (metadata(*line_id, book), mock::hash_embedding(text, DIM))
-                    })
-                    .collect(),
-            )
-            .unwrap();
-        store.commit().unwrap();
-
-        let payloads: BTreeMap<String, PayloadDescriptor> = SNAPSHOT_FILENAMES
+        model: &ModelIdentity,
+        version: u32,
+    ) {
+        let identity_path = dir.join(&format!("{name}-identity.json"));
+        let lines_path = dir.join(&format!("{name}-lines.jsonl"));
+        let corpus = CorpusIdentity {
+            text: TextIdentity::with_line_text_version(1),
+            library_version: version,
+            library_release_tag: format!("v{version}-20260930120000"),
+            document_id_scheme_version: 1,
+        };
+        fs::write(&identity_path, serde_json::to_vec(&corpus).unwrap()).unwrap();
+        let mut ordinals = std::collections::HashMap::new();
+        let body: String = LINES
             .iter()
-            .map(|name| {
-                (
-                    (*name).to_string(),
-                    PayloadDescriptor::of_file(&root.join(name)).unwrap(),
-                )
+            .map(|(book, text)| {
+                let ordinal: &mut u64 = ordinals.entry(*book).or_default();
+                *ordinal += 1;
+                let catalogue = if *book == BERACHOT { 2 } else { 1 };
+                serde_json::to_string(&CorpusLineRecord {
+                    line_id: (catalogue << 32) + *ordinal,
+                    line: CorpusLine {
+                        source_book_key: book.to_string(),
+                        title: String::new(),
+                        reference: String::new(),
+                        section_id: 1,
+                        segment: 0,
+                        is_pdf: false,
+                        line_hash: 0,
+                        content_hash: 1,
+                        facets: Vec::new(),
+                        text: text.to_string(),
+                    },
+                })
+                .unwrap()
+                    + "\n"
             })
             .collect();
-        let mut manifest = PackageManifest::new(
-            built_identity(model_path),
-            "2026-08-06T00:00:00Z".to_string(),
-            2,
-            LINES.len() as u32,
-            payloads.values().map(|payload| payload.size_bytes).sum(),
-        );
-        adjust(&mut manifest);
+        fs::write(&lines_path, body).unwrap();
 
-        let package = IndexPackage { manifest, payloads };
-        IndexPackage::write(root, &package).unwrap();
-        package.digest()
+        let out = dir.join(name);
+        let report = build(
+            BuildRequest {
+                output_path: out.clone(),
+                model_path: model_path.to_path_buf(),
+                model: model.clone(),
+                chunking: ChunkerConfig {
+                    embedding_text_version: model.embedding_text_version,
+                    ..ChunkerConfig::default()
+                },
+                created_at: "2026-10-01T00:00:00Z".to_string(),
+                batch_size: 2,
+                codec: crate::semantic::oxv::codec::CodecSpec::default(),
+                allow_non_semantic_backend: true,
+            },
+            &JsonlCorpus::load(&identity_path, &lines_path).unwrap(),
+        )
+        .unwrap();
+        install_package(
+            vectors,
+            &InstallSource {
+                segment: &out.join(SEGMENT_FILENAME),
+                manifest_json: &fs::read_to_string(out.join(RELEASE_MANIFEST_FILENAME)).unwrap(),
+            },
+            &InstallExpectation {
+                identity: report.manifest.identity.clone(),
+                published_manifest_sha256: Some(report.manifest_sha256),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
     }
 
-    fn config_for(artifact_path: &Path, model_path: &Path) -> OfficialIndexConfig {
+    fn config(
+        vectors: &Path,
+        model_path: &Path,
+        model: &ModelIdentity,
+        quantization: &str,
+    ) -> OfficialIndexConfig {
         OfficialIndexConfig {
-            artifact_path: artifact_path.to_path_buf(),
-            corpus: corpus(),
-            model: local_model(model_path),
-            published_digest: None,
+            vectors_dir: vectors.to_path_buf(),
+            text: TextIdentity::with_line_text_version(1),
+            model: LocalModel::of_family(model_path.to_path_buf(), model, quantization),
+            deployment: EmbeddingDeployment::default(),
+            scan_threads: NonZeroUsize::new(1),
         }
     }
 
-    /// A model, an artifact built for it, and that artifact installed into `target`.
-    fn installed(dir: &TempDir) -> (PathBuf, PathBuf, String) {
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-
-        let source = dir.path().join("build-output");
-        let target = dir.path().join("semantic_index");
-        let digest = build_artifact(&source, &model_path, |_| {});
-
-        IndexImporter::new(ImportConfig {
-            source_path: source,
-            target_store_path: target.clone(),
-        })
-        .import(&ArtifactExpectation::without_published_digest(
-            built_identity(&model_path),
-        ))
-        .unwrap();
-
-        (model_path, target, digest)
+    /// The stub package, and a set of [`LINES`] built with it and installed.
+    fn installed(dir: &TempDir) -> (PathBuf, PathBuf, ModelIdentity) {
+        let model_path = mock::write_stub_onnx_package(&dir.join("model"));
+        let model = family(vec![package(&model_path, "int8")], 1);
+        let vectors = dir.join("vectors");
+        install(dir, "v30", &vectors, &model_path, &model, 30);
+        (model_path, vectors, model)
     }
 
-    /// Name, length and SHA-256 of everything in `dir`, so "opening changed nothing" can
-    /// be asserted rather than assumed.
-    fn fingerprint(dir: &Path) -> Vec<(String, u64, String)> {
-        let mut entries: Vec<(String, u64, String)> = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                let bytes = fs::read(entry.path()).unwrap();
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    bytes.len() as u64,
-                    format!("{:x}", Sha256::digest(&bytes)),
-                )
-            })
-            .collect();
-        entries.sort();
-        entries
+    fn refused_field(
+        result: Result<OfficialSemanticIndex, SemanticSearchError>,
+    ) -> Vec<IdentityField> {
+        match result.map(|index| index.generation()) {
+            Err(SemanticSearchError::Artifact(ArtifactError::IdentityMismatch { mismatches })) => {
+                mismatches.iter().map(|mismatch| mismatch.field).collect()
+            }
+            other => panic!("expected an identity mismatch, got {other:?}"),
+        }
     }
 
+    /// The shortest complete path: an installed set opens, reports itself, and a query for
+    /// a line's own text finds the key of that text, at the line's position in its book.
     #[test]
-    fn an_installed_artifact_opens_and_a_query_returns_the_line_it_was_built_from() {
-        let dir = TempDir::new("open_and_query");
-        let (model_path, target, digest) = installed(&dir);
-
-        let before = fingerprint(&target);
-        let index = OfficialSemanticIndex::open(OfficialIndexConfig {
-            published_digest: Some(digest.clone()),
-            ..config_for(&target, &model_path)
-        })
-        .unwrap();
-
-        assert_eq!(index.identity(), &built_identity(&model_path));
-        assert_eq!(index.artifact_digest(), digest);
-        assert_eq!(
-            index.verification_depth(),
-            VerificationDepth::MetadataAndPresence
-        );
-        assert_eq!(index.vector_count(), LINES.len() as u32);
-        assert_eq!(index.book_count(), 2);
-        assert!(!index.recovery().recovered_anything());
+    fn an_installed_set_opens_and_a_query_finds_the_line_it_was_built_from() {
+        let dir = TempDir::new("official_open");
+        let (model_path, vectors, model) = installed(&dir);
+        let index =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
 
         let status = index.status();
-        assert!(status.available);
-        assert!(
-            status.vectors_persisted,
-            "an installed artifact is on disk; reporting otherwise would license a re-index"
-        );
+        assert!(status.available && status.model_loaded && status.vectors_persisted);
         assert_eq!(status.vector_count, LINES.len() as u32);
         assert_eq!(status.indexed_book_count, 2);
-        assert_eq!(
-            status.vector_backend,
-            crate::semantic::zevc_store::BACKEND_ID
-        );
-        assert!(status.needs_full_reindex.is_none());
-        assert!(status.last_error.is_none());
+        assert_eq!(status.vector_backend, STORE_BACKEND_ID);
+        assert_eq!(index.set_info().library_version, 30);
+        assert_eq!(index.identity().store, readable_store_identity());
 
-        let (line_id, book, text) = LINES[2];
-        let hits = index.search(text, 3, None).unwrap();
-        assert_eq!(hits[0].metadata.line_id, line_id);
-        assert_eq!(hits[0].metadata.source_book_key, book);
-        assert!((hits[0].similarity_score - 1.0).abs() < 1e-5);
-
-        // Opening and querying an artifact is a read: no manifest of its own, no
-        // re-embedding, not one byte rewritten.
-        assert_eq!(fingerprint(&target), before);
-
-        // And a restart opens the same artifact again, without building anything.
-        drop(index);
-        let reopened = OfficialSemanticIndex::open(config_for(&target, &model_path)).unwrap();
-        assert_eq!(reopened.vector_count(), LINES.len() as u32);
-        assert_eq!(
-            reopened.search(text, 1, None).unwrap()[0].metadata.line_id,
-            line_id
-        );
-        assert_eq!(fingerprint(&target), before);
-    }
-
-    /// The gap the contract layer cannot close on its own: a count is a claim about the
-    /// payload's *content*, and settling it means reading the store's format.
-    #[test]
-    fn counts_the_payload_does_not_hold_are_refused_at_open() {
-        let dir = TempDir::new("counts");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-
-        for (label, adjust) in [
-            (
-                "vector",
-                (|m: &mut PackageManifest| m.vector_count += 1) as fn(&mut PackageManifest),
-            ),
-            ("book", |m: &mut PackageManifest| m.book_count = 7),
-        ] {
-            let source = dir.path().join(format!("artifact-{label}"));
-            build_artifact(&source, &model_path, adjust);
-
-            match OfficialSemanticIndex::open(config_for(&source, &model_path))
-                .map(|index| index.vector_count())
-            {
-                Err(SemanticSearchError::Artifact(
-                    ArtifactError::ManifestDisagreesWithPayload { reason },
-                )) => assert!(reason.contains(label), "{reason}"),
-                other => panic!("a wrong {label} count must be refused, got {other:?}"),
-            }
-        }
-    }
-
-    /// The pairing that makes the two verification depths honest: the cheap one cannot see
-    /// this edit, and the reader can — so the claim "an artifact that is tampered with
-    /// stops opening" holds for the *runtime* path even though it does not hold for
-    /// `verify_for_open` alone.
-    ///
-    /// Both forms are exercised, because they are caught by different things. A raw edit is
-    /// caught by the record's own checksum. An edit that also repairs that checksum — the
-    /// one a payload's internal checks are structurally unable to see — is caught only
-    /// because the reader compares each file against the hash `payloads.json` declares, and
-    /// that declaration is what a published digest pins.
-    #[test]
-    fn a_same_length_payload_edit_passes_verification_and_is_caught_by_the_reader() {
-        for forge_the_checksum_too in [false, true] {
-            let dir = TempDir::new("tamper");
-            let (model_path, target, _) = installed(&dir);
-
-            let vectors_path = target.join(VECTORS_FILENAME);
-            let mut bytes = fs::read(&vectors_path).unwrap();
-            let before = bytes.len();
-            bytes[0] ^= 0xff;
-            fs::write(&vectors_path, &bytes).unwrap();
-            assert_eq!(fs::metadata(&vectors_path).unwrap().len() as usize, before);
-
-            if forge_the_checksum_too {
-                let metadata_path = target.join(METADATA_FILENAME);
-                let text = fs::read_to_string(&metadata_path).unwrap();
-                let before = text.len();
-                let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-                let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-                first["vector_sha256"] = serde_json::Value::String(format!(
-                    "{:x}",
-                    Sha256::digest(&bytes[..DIM as usize * 4])
-                ));
-                lines[0] = serde_json::to_string(&first).unwrap();
-                fs::write(&metadata_path, format!("{}\n", lines.join("\n"))).unwrap();
-                assert_eq!(
-                    fs::read_to_string(&metadata_path).unwrap().len(),
-                    before,
-                    "a forgery that changes a length would be caught by the cheap depth"
-                );
-            }
-
-            assert!(
-                IndexPackage::verify_for_open(
-                    &target,
-                    &ArtifactExpectation::without_published_digest(built_identity(&model_path))
-                )
-                .is_ok(),
-                "a same-length edit is invisible without hashing the payload"
+        let cancel = CancellationToken::new();
+        for (hint, (book, text)) in [(0, LINES[0]), (1, LINES[1]), (0, LINES[2])] {
+            let hits = index.search(text, 2, None, &cancel).unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0].key, ChunkKey::of(text));
+            assert_eq!(
+                (&*hits[0].records[0].book, hits[0].records[0].hint),
+                (book, hint)
             );
-
-            match OfficialSemanticIndex::open(config_for(&target, &model_path))
-                .map(|index| index.vector_count())
-            {
-                Err(SemanticSearchError::VectorStore(VectorStoreError::Corrupted { .. })) => {}
-                other => panic!(
-                    "the reader must refuse an edited payload \
-                     (checksum forged: {forge_the_checksum_too}), got {other:?}"
-                ),
-            }
+            assert!(hits[0].score > 0.99, "{}", hits[0].score);
         }
+
+        // A filter is books, and only books it admits are scanned.
+        let berachot: BookSet = [BERACHOT].into_iter().collect();
+        let hits = index
+            .search(LINES[0].1, 5, Some(&berachot), &cancel)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(&*hits[0].records[0].book, BERACHOT);
     }
 
-    /// An artifact of this backend is exactly three payload files. A package that declares
-    /// anything else — while shipping snapshot files beside them — would have the reader
-    /// loading bytes the token covers nothing about.
+    /// A set's passages come from one package of a family, and a query may come from any
+    /// package the set accepts. An installation running the int8 package and one running
+    /// the fp32 package both open a set built from fp32 that accepts the two; one running a
+    /// package outside the list, a package with another tokenizer, another family or
+    /// another recipe is refused, by the field that disagreed.
     #[test]
-    fn a_package_that_does_not_declare_this_backends_payloads_is_refused() {
-        let dir = TempDir::new("payload_set");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+    fn an_installation_opens_a_set_with_any_package_the_set_accepts() {
+        let dir = TempDir::new("official_packages");
+        let int8 = mock::write_stub_onnx_package(&dir.join("int8"));
+        let fp32 = mock::write_stub_onnx_package(&dir.join("fp32"));
+        fs::write(&fp32, mock::onnx::stub_graph_named("fp32 weights")).unwrap();
+        let model = family(vec![package(&int8, "int8"), package(&fp32, "fp32")], 1);
+        let vectors = dir.join("vectors");
+        // Built with fp32: the passages' package is on record, and compared by nothing.
+        install(&dir, "fp32-built", &vectors, &fp32, &model, 30);
 
-        let source = dir.path().join("build-output");
-        build_artifact(&source, &model_path, |_| {});
+        for (model_path, quantization) in [(&int8, "int8"), (&fp32, "fp32")] {
+            let index =
+                OfficialSemanticIndex::open(config(&vectors, model_path, &model, quantization))
+                    .unwrap_or_else(|error| panic!("{quantization} must open the set: {error}"));
+            assert_eq!(index.set_info().slots_live, LINES.len() as u64);
+            let provenance = &index.set_info().segments[0].provenance;
+            assert_eq!(provenance.passage_package, package(&fp32, "fp32"));
+        }
 
-        // Re-declare the package over a decoy payload, leaving the real snapshot in place.
-        let decoy = "decoy.bin";
-        fs::write(source.join(decoy), b"not a snapshot").unwrap();
-        let payloads = BTreeMap::from([(
-            decoy.to_string(),
-            PayloadDescriptor::of_file(&source.join(decoy)).unwrap(),
-        )]);
-        let manifest = PackageManifest::new(
-            built_identity(&model_path),
-            "2026-08-06T00:00:00Z".to_string(),
-            2,
-            LINES.len() as u32,
-            payloads[decoy].size_bytes,
-        );
-        IndexPackage::write(&source, &IndexPackage { manifest, payloads }).unwrap();
+        let int4 = mock::write_stub_onnx_package(&dir.join("int4"));
+        fs::write(&int4, mock::onnx::stub_graph_named("int4 weights")).unwrap();
+        let retokenized = mock::write_stub_onnx_package(&dir.join("retokenized"));
+        fs::write(
+            retokenized.with_file_name("tokenizer.json"),
+            mock::STUB_TOKENIZER_JSON.replace("[UNK]", "[unk]"),
+        )
+        .unwrap();
+        let mut another_family = config(&vectors, &int8, &model, "int8");
+        another_family.model.family_id.push_str("-round3");
+        let mut another_recipe = config(&vectors, &int8, &model, "int8");
+        another_recipe.model.chunking_identity += 1;
+        let mut another_line_recipe = config(&vectors, &int8, &model, "int8");
+        another_line_recipe.text.line_text_version = 2;
 
-        match OfficialSemanticIndex::open(config_for(&source, &model_path))
-            .map(|index| index.vector_count())
-        {
-            Err(SemanticSearchError::Artifact(ArtifactError::ManifestDisagreesWithPayload {
-                reason,
-            })) => assert!(
-                reason.contains(decoy) || reason.contains(VECTORS_FILENAME),
-                "{reason}"
+        for (config, field) in [
+            (
+                config(&vectors, &int4, &model, "int4"),
+                IdentityField::QueryPackages,
             ),
-            other => panic!("a foreign payload set must be refused, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_artifact_built_for_another_corpus_or_another_model_is_refused_by_field_name() {
-        let dir = TempDir::new("mismatch");
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
-
-        // Same library name, one book inserted in the middle: every `line_id` after it
-        // now names a different line, and nothing in the vectors says so.
-        let foreign_corpus = dir.path().join("foreign-corpus");
-        build_artifact(&foreign_corpus, &model_path, |manifest| {
-            manifest.identity.corpus.corpus_id = "2e".repeat(32)
-        });
-
-        // Same `model_id`, different weights behind it.
-        let other_model = dir.path().join("other-model.gguf");
-        mock::write_stub_gguf(&other_model, 2).unwrap();
-        let foreign_model = dir.path().join("foreign-model");
-        build_artifact(&foreign_model, &model_path, |manifest| {
-            manifest.identity.model.model_checksum =
-                validate_and_checksum_gguf(&other_model).unwrap()
-        });
-
-        for (source, field) in [
-            (foreign_corpus, IdentityField::CorpusId),
-            (foreign_model, IdentityField::ModelChecksum),
+            (
+                config(&vectors, &retokenized, &model, "int8"),
+                IdentityField::TokenizerChecksum,
+            ),
+            (another_family, IdentityField::FamilyId),
+            (another_recipe, IdentityField::ChunkingIdentity),
+            (another_line_recipe, IdentityField::LineTextVersion),
         ] {
-            match OfficialSemanticIndex::open(config_for(&source, &model_path))
-                .map(|index| index.vector_count())
-            {
-                Err(SemanticSearchError::Artifact(ArtifactError::IdentityMismatch {
-                    mismatches,
-                })) => {
-                    assert_eq!(mismatches.len(), 1, "{field}");
-                    assert_eq!(mismatches[0].field, field);
-                }
-                other => panic!("{field} must refuse the artifact, got {other:?}"),
-            }
+            let fields = refused_field(OfficialSemanticIndex::open(config));
+            assert!(fields.contains(&field), "{field} must be among {fields:?}");
         }
     }
 
-    /// The reason opening runs recovery at all: killed between the installer's two
-    /// renames, the target is gone and the device's only good copy is parked beside it.
+    /// No set, and a v1 artifact where a set should be, are two different refusals: one is
+    /// fixed by installing, the other is a store this build does not read.
     #[test]
-    fn opening_resolves_an_install_that_was_interrupted_between_the_two_renames() {
-        let dir = TempDir::new("interrupted");
-        let (model_path, target, _) = installed(&dir);
+    fn no_set_and_a_version_one_artifact_are_refused_by_name() {
+        let dir = TempDir::new("official_absent");
+        let model_path = mock::write_stub_onnx_package(&dir.join("model"));
+        let model = family(vec![package(&model_path, "int8")], 1);
+        let vectors = dir.join("vectors");
 
-        fs::rename(&target, previous_path(&target).unwrap()).unwrap();
-        assert!(!target.exists());
+        match OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8"))
+            .map(|i| i.generation())
+        {
+            Err(SemanticSearchError::Artifact(ArtifactError::MetadataUnusable { .. })) => {}
+            other => panic!("an empty directory holds no set, got {other:?}"),
+        }
 
-        let index = OfficialSemanticIndex::open(config_for(&target, &model_path)).unwrap();
-        assert!(index.recovery().restored_previous);
-        assert_eq!(index.vector_count(), LINES.len() as u32);
-        assert_eq!(
-            index.search(LINES[0].2, 1, None).unwrap()[0]
-                .metadata
-                .line_id,
-            LINES[0].0
-        );
+        fs::create_dir_all(&vectors).unwrap();
+        fs::write(
+            vectors.join(crate::distribution::package::MANIFEST_FILENAME),
+            r#"{"metadata_version":2,"identity":{"store":{"backend_id":"zevc-persistent-v1"}}}"#,
+        )
+        .unwrap();
+        let fields = refused_field(OfficialSemanticIndex::open(config(
+            &vectors,
+            &model_path,
+            &model,
+            "int8",
+        )));
+        assert_eq!(fields, [IdentityField::StoreBackendId]);
     }
 
-    /// A missing model is not a broken artifact, and the host has to be able to tell them
-    /// apart — one is fixed by fetching the model, the other by fetching the index.
+    /// A set built under text recipe 2 is queried the way its passages were built:
+    /// normalized, then marked as a query — once.
+    #[test]
+    fn a_version_two_set_embeds_every_query_with_its_role_prefix() {
+        let dir = TempDir::new("official_prefix");
+        let model_path = mock::write_stub_onnx_package(&dir.join("model"));
+        let model = family(vec![package(&model_path, "int8")], 2);
+        let vectors = dir.join("vectors");
+        install(&dir, "v2", &vectors, &model_path, &model, 30);
+        let index =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
+
+        let query = LINES[1].1;
+        let embedded = |text: &str| {
+            let mut vector = mock::hash_embedding(text, DIM);
+            crate::semantic::embedding::normalize_validated(&mut vector, DIM).unwrap();
+            vector
+        };
+        let produced = index.embed_query(query).unwrap();
+        assert_eq!(produced, embedded(&format!("[QUERY] {query}")));
+        assert_ne!(produced, embedded(query));
+        assert_ne!(produced, embedded(&format!("[QUERY] [QUERY] {query}")));
+        assert!(
+            index.embed_query("   ").is_err(),
+            "an empty query has nothing to embed"
+        );
+
+        // And the passages were stored as passages.
+        let stored = index
+            .search(query, 1, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(stored[0].key, ChunkKey::of(&format!("[PASSAGE] {query}")));
+    }
+
+    /// Where this machine keeps the runtime is no part of what a set must agree with: the
+    /// same set opens, under the same identity, whatever the deployment says.
+    #[test]
+    fn the_deployment_is_not_compared_with_the_set() {
+        let dir = TempDir::new("official_deployment");
+        let (model_path, vectors, model) = installed(&dir);
+        let plain =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
+        let index = OfficialSemanticIndex::open(OfficialIndexConfig {
+            deployment: EmbeddingDeployment {
+                onnx_runtime: Some(dir.join("bundled").join("onnxruntime.dll")),
+            },
+            ..config(&vectors, &model_path, &model, "int8")
+        })
+        .unwrap();
+        assert_eq!(index.identity(), plain.identity());
+    }
+
+    /// The application's path, cancelled: before the query is embedded the set is never
+    /// scanned, and once the scan has begun it stops there — the same error either way, and
+    /// the index answers the next query as if nothing had happened.
+    #[test]
+    fn a_cancelled_query_stops_before_the_scan_or_inside_it() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("official_cancel");
+        let (model_path, vectors, model) = installed(&dir);
+        let index =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
+        let text = LINES[1].1;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (result, checkpoints) =
+            probe::checkpoints_of(|| index.search(text, 3, None, &cancelled));
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(checkpoints.is_empty(), "the scan must never have started");
+
+        let cancel = CancellationToken::new();
+        let (result, checkpoints) =
+            probe::cancelling_at(&cancel, 0, || index.search(text, 3, None, &cancel));
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(checkpoints, [0]);
+
+        let hits = index
+            .search(text, 3, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(hits[0].key, ChunkKey::of(text));
+    }
+
+    /// A missing model is not a broken set, and the host has to be able to tell them apart
+    /// — one is fixed by fetching the model, the other by fetching the vectors.
     #[test]
     fn a_missing_model_is_reported_as_an_embedding_error() {
-        let dir = TempDir::new("no_model");
-        let (_, target, _) = installed(&dir);
-
-        let absent = dir.path().join("not-installed.gguf");
-        match OfficialSemanticIndex::open(config_for(&target, &absent))
-            .map(|index| index.vector_count())
+        let dir = TempDir::new("official_no_model");
+        let (_, vectors, model) = installed(&dir);
+        let absent = dir.join("not-installed.onnx");
+        match OfficialSemanticIndex::open(config(&vectors, &absent, &model, "int8"))
+            .map(|i| i.generation())
         {
             Err(SemanticSearchError::EmbeddingRuntime(EmbeddingError::ModelNotFound { path })) => {
-                assert!(path.contains("not-installed.gguf"), "{path}")
+                assert!(path.contains("not-installed.onnx"), "{path}")
             }
             other => panic!("expected a model error, got {other:?}"),
         }
+    }
+
+    /// An install beside an open index changes nothing until it reloads; a reload opens the
+    /// new generation with the same model; and a generation this installation does not
+    /// accept is refused while the open one stays in service.
+    #[test]
+    fn a_reload_opens_the_new_generation_and_keeps_the_old_one_until_it_does() {
+        let dir = TempDir::new("official_reload");
+        let (model_path, vectors, model) = installed(&dir);
+        let mut index =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
+        let first = index.generation();
+        assert_eq!(
+            index.reload_vectors().unwrap(),
+            ReloadOutcome::Unchanged { generation: first }
+        );
+
+        install(&dir, "v31", &vectors, &model_path, &model, 31);
+        assert_eq!(
+            index.set_info().library_version,
+            30,
+            "nothing changes until a reload"
+        );
+        let ReloadOutcome::Reloaded {
+            from_generation,
+            to_generation,
+        } = index.reload_vectors().unwrap()
+        else {
+            panic!("the new generation must be opened")
+        };
+        assert_eq!(from_generation, first);
+        assert!(to_generation > first);
+        assert_eq!(index.generation(), to_generation);
+        assert_eq!(index.set_info().library_version, 31);
+
+        // A base of another family replaces the set on disk; this installation does not
+        // accept it, and goes on serving the generation it has open.
+        let other = ModelIdentity {
+            family_id: "otzaria-other-family".to_string(),
+            ..model.clone()
+        };
+        install(&dir, "other", &vectors, &model_path, &other, 32);
+        let fields = match index.reload_vectors() {
+            Err(SemanticSearchError::Artifact(ArtifactError::IdentityMismatch { mismatches })) => {
+                mismatches
+                    .iter()
+                    .map(|mismatch| mismatch.field)
+                    .collect::<Vec<_>>()
+            }
+            other => panic!("another family must be refused, got {other:?}"),
+        };
+        assert_eq!(fields, [IdentityField::FamilyId]);
+        assert_eq!(index.generation(), to_generation);
+        let hits = index
+            .search(LINES[0].1, 1, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(hits[0].key, ChunkKey::of(LINES[0].1));
     }
 }

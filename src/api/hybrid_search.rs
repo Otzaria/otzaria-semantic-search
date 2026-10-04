@@ -1,7 +1,7 @@
 //! Clean high-level API for Flutter / flutter_rust_bridge.
 //!
 //! Provides domain-level operations for hybrid search and semantic index
-//! lifecycle management. Flutter never sees GGUF, chunking, the vector backend,
+//! lifecycle management. Flutter never sees the model, chunking, the vector backend,
 //! the manifest or the fusion implementation.
 //!
 //! # Scope
@@ -17,6 +17,11 @@
 //! — see `docs/PRODUCT_CONTRACT.md` §4. Model download management is the host
 //! application's job (§5).
 //!
+//! A *search*, on the other hand, can be abandoned:
+//! [`OtzariaHybridEngine::search_cancellable`]. That is not the indexing cancel/resume
+//! ruled out above — it is what lets a search per keystroke drop the queries the next
+//! keystroke made obsolete. See [`crate::cancellation`].
+//!
 //! On a coordinator built over an installed official artifact
 //! ([`HybridCoordinator::with_official_index`]) every one of those operations refuses
 //! by name, with
@@ -25,6 +30,7 @@
 //! what the *application* may call is search and status. Dropping them from the surface
 //! the app links against belongs to the FFI layer, in S5.
 
+use crate::cancellation::CancellationToken;
 use crate::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
 use crate::semantic::types::{
     BookForIndexing, ContentFingerprint, HybridSearchResult, IndexDiff, IndexingSummary,
@@ -51,6 +57,15 @@ pub struct SearchRequest {
     pub force_mode: Option<crate::semantic::types::SearchMode>,
     pub profile: Option<crate::config::profiles::SearchProfile>,
     pub feature_flags: Option<crate::config::feature_flags::FeatureFlags>,
+    /// Every ranking parameter for this search, in place of the preset `profile` names:
+    /// how the host tunes the fusion strategy, RRF's `k`, alpha, BM25's `k`, the semantic
+    /// threshold and the bonuses without a release of this crate. `None` is the preset.
+    ///
+    /// Validated first; a parameter out of range fails the search, naming the parameter.
+    /// See [`HybridSearchParams::ranking`], and
+    /// [`RankingProfile`](crate::config::profiles::RankingProfile) for why the defaults are
+    /// still placeholders.
+    pub ranking: Option<crate::config::profiles::RankingProfile>,
 }
 
 /// Opaque handle over the hybrid coordinator.
@@ -72,7 +87,33 @@ impl OtzariaHybridEngine {
     /// A semantic failure never fails the call: the result reports the mode that
     /// actually ran and why, so the caller can surface a degraded state instead
     /// of an error. See [`HybridSearchResult`].
+    ///
+    /// Cannot be cancelled; [`Self::search_cancellable`] can.
     pub fn search(&self, request: SearchRequest) -> Result<HybridSearchResult, String> {
+        self.search_cancellable(request, &CancellationToken::new())
+            .map_err(|e| e.to_string())
+    }
+
+    /// As [`Self::search`], abandoned once `cancel` is cancelled.
+    ///
+    /// For a search per keystroke: keep a clone of the token, and cancel it when the next
+    /// keystroke's search starts. The superseded search then stops at its next checkpoint
+    /// — within a fraction of a millisecond of scanning, or once the query embedding in
+    /// progress finishes — with
+    /// [`SemanticSearchError::Cancelled`](crate::errors::SemanticSearchError::Cancelled),
+    /// having cached nothing and logged nothing. See [`crate::cancellation`].
+    ///
+    /// The error is the engine's own, not its message as in [`Self::search`], because the
+    /// one outcome a caller must tell apart has to be matched, not parsed: `Cancelled` is
+    /// the caller's own doing, to be dropped silently, while every other error is exactly
+    /// what [`Self::search`] would have reported as text. Hydrating semantic-only results
+    /// happens after this returns, in the caller, so a caller that cancels from another
+    /// thread should look at the token again before it hydrates.
+    pub fn search_cancellable(
+        &self,
+        request: SearchRequest,
+        cancel: &CancellationToken,
+    ) -> Result<HybridSearchResult, crate::errors::SemanticSearchError> {
         let params = HybridSearchParams {
             limit: request.limit.unwrap_or(20) as usize,
             offset: request.offset.unwrap_or(0) as usize,
@@ -81,11 +122,17 @@ impl OtzariaHybridEngine {
             force_mode: request.force_mode,
             profile: request.profile,
             feature_flags: request.feature_flags,
+            ranking: request.ranking,
         };
 
-        self.coordinator
-            .search(&request.query, request.lexical_candidates, &params)
-            .map_err(|e| e.to_string())
+        // The facade serves a self-built index, which resolves its own hits.
+        self.coordinator.search_cancellable(
+            &request.query,
+            request.lexical_candidates,
+            &params,
+            &crate::semantic::resolve::NoResolver,
+            cancel,
+        )
     }
 
     /// Query the current status of the semantic sidecar.

@@ -1,55 +1,64 @@
 //! The official read-only runtime as the application sees it.
 //!
-//! `otzaria_search_engine` is the consumer: it opens the Tantivy index, opens the
-//! installed artifact beside it, and serves queries from both. These tests run that path
-//! through the public API only — the artifact is built the way the packer will build it
-//! (the store backend writes the payload, then the metadata describes it), installed
-//! through [`IndexImporter`], opened through [`OfficialSemanticIndex`], and queried
-//! through [`OtzariaHybridEngine`].
+//! `otzaria_search_engine` is the consumer: it opens the Tantivy index, opens the vector
+//! set installed beside it, and serves queries from both. These tests run that path
+//! through the public API only — a base package built from a tiny corpus by the
+//! deterministic stand-in, installed with [`install_package`], opened through
+//! [`OfficialSemanticIndex`], and queried through [`HybridCoordinator`] with a
+//! [`FakeResolver`] standing in for the application's live index.
 //!
 //! What is asserted here and not in the crate's own tests is the *product* surface: that
-//! a semantic query over an installed artifact reaches fusion and comes back with the
-//! `line_id` the caller has to hydrate, and that every build-side operation the seam still
-//! exposes refuses by name instead of quietly doing nothing.
+//! a semantic query over an installed set reaches fusion with the ids and books the live
+//! index gives its lines — not the ones the vectors were built with — that a line whose
+//! text changed since is never shown for a vector of the old text, that the query cache
+//! follows the live index, and that every build-side operation the seam still exposes
+//! refuses by name instead of quietly doing nothing.
 //!
 //! Driving a query end to end needs an embedding backend, and needs the deterministic
 //! stand-in to be the one actually selected — the fixture's model is a weightless stub
-//! that real inference rightly refuses — hence `mock-embedding` without `llama-backend`,
+//! that real inference rightly refuses — hence `mock-embedding` without `onnx-backend`,
 //! as in `tests/hybrid_integration_test.rs`.
 
-#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+#![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
-use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
-use otzaria_semantic_search::distribution::importer::{ImportConfig, IndexImporter};
-use otzaria_semantic_search::distribution::package::{
-    ArtifactExpectation, IndexPackage, PackageManifest, PayloadDescriptor,
+use otzaria_semantic_search::api::hybrid_search::OtzariaHybridEngine;
+use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::config::profiles::SearchProfile;
+use otzaria_semantic_search::distribution::builder::{
+    build, BuildRequest, RELEASE_MANIFEST_FILENAME, SEGMENT_FILENAME,
 };
-use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
-use otzaria_semantic_search::semantic::backend::MockHashBackend;
-use otzaria_semantic_search::semantic::embedding::{mock, validate_and_checksum_gguf};
+use otzaria_semantic_search::distribution::corpus::{
+    CorpusIdentity, CorpusLine, CorpusLineRecord, JsonlCorpus,
+};
+use otzaria_semantic_search::errors::SemanticSearchError;
+use otzaria_semantic_search::hybrid::coordinator::{HybridCoordinator, HybridSearchParams};
+use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
+use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
+use otzaria_semantic_search::semantic::embedding::{mock, EmbeddingDeployment};
+use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::official_index::{
-    readable_store_identity, LocalModel, OfficialIndexConfig, OfficialSemanticIndex,
+    LocalModel, OfficialIndexConfig, OfficialSemanticIndex, ReloadOutcome,
 };
-use otzaria_semantic_search::semantic::store_backend::VectorStoreBackend;
+use otzaria_semantic_search::semantic::resolve::{
+    BookSet, CandidateResolver, ResolveError, ResolvedLine, SlotRef, VectorHit,
+};
+use otzaria_semantic_search::semantic::segment_set::{
+    install_package, InstallExpectation, InstallSource, SegmentSet,
+};
 use otzaria_semantic_search::semantic::types::{
-    ContentFingerprint, LexicalCandidate, SearchMode, VectorMetadata,
+    ContentFingerprint, LexicalCandidate, SearchFilters, SearchMode,
 };
-use otzaria_semantic_search::semantic::versioning::{CorpusIdentity, IndexVersion, ModelIdentity};
-use otzaria_semantic_search::semantic::zevc_store::{
-    ZevcStore, ZevcStoreConfig, SNAPSHOT_FILENAMES,
-};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
-use std::fs;
+use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 const DIM: u32 = 64;
 const GENESIS: &str = "otzaria/tanach/genesis.txt";
 const BERACHOT: &str = "otzaria/mishna/berachot.txt";
 
-/// `(line_id, book, text)`. The ids are formed the way `document_id_scheme_version` 1
-/// forms them — `((catalogue_order + 1) << 32) + (ordinal + 1)` — because a semantic
-/// result *is* one of these numbers and nothing else.
+/// `(line_id, book, text)`, every one long enough to be embedded as itself.
 const LINES: [(u64, &str, &str); 4] = [
     (4_294_967_297, GENESIS, "בראשית ברא אלהים את השמים ואת הארץ"),
     (
@@ -70,16 +79,16 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(name: &str) -> Self {
         // The clock alone collided: macOS ticks coarser than a test takes to start.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "otzaria_official_runtime_{name}_{}_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
 
@@ -90,250 +99,850 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-/// The corpus identity a caller takes from the Tantivy index it has open.
-fn corpus() -> CorpusIdentity {
+fn facets_of(book: &str) -> Vec<String> {
+    if book == GENESIS {
+        vec!["/מקרא/תורה".to_string()]
+    } else {
+        vec!["/משנה".to_string()]
+    }
+}
+
+fn title_of(book: &str) -> String {
+    if book == GENESIS {
+        "בראשית"
+    } else {
+        "ברכות"
+    }
+    .to_string()
+}
+
+/// The application's index, as far as a search asks it: each book's lines by position,
+/// with the ids and the text the index holds for them now.
+struct FakeResolver {
+    generation: AtomicU64,
+    lines: Mutex<HashMap<(String, u32), (u64, String)>>,
+}
+
+impl FakeResolver {
+    /// The index the vectors were built from: every line where it was, with its id.
+    fn of_the_corpus() -> Self {
+        let mut ordinals: HashMap<&str, u32> = HashMap::new();
+        let lines = LINES
+            .iter()
+            .map(|(line_id, book, text)| {
+                let ordinal = ordinals.entry(book).or_default();
+                let at = (book.to_string(), *ordinal);
+                *ordinal += 1;
+                (at, (*line_id, text.to_string()))
+            })
+            .collect();
+        Self {
+            generation: AtomicU64::new(1),
+            lines: Mutex::new(lines),
+        }
+    }
+
+    /// An index commit: the line at `(book, ordinal)` now has `line_id` and `text`.
+    fn commit(&self, book: &str, ordinal: u32, line_id: u64, text: &str) {
+        self.lines
+            .lock()
+            .unwrap()
+            .insert((book.to_string(), ordinal), (line_id, text.to_string()));
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl CandidateResolver for FakeResolver {
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn admissible_books(
+        &self,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Option<BookSet>, ResolveError> {
+        let Some(compiled) = filters.and_then(SearchFilters::compile) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            [GENESIS, BERACHOT]
+                .into_iter()
+                .filter(|book| compiled.matches_book(book, &facets_of(book), false))
+                .collect(),
+        ))
+    }
+
+    fn resolve(
+        &self,
+        hits: &[VectorHit],
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResolvedLine>, ResolveError> {
+        if cancel.is_cancelled() {
+            return Err(ResolveError::Cancelled);
+        }
+        let compiled = filters.and_then(SearchFilters::compile);
+        let lines = self.lines.lock().unwrap();
+        let mut resolved = Vec::new();
+        for (index, hit) in hits.iter().enumerate() {
+            for record in &hit.records {
+                let Some((line_id, text)) = lines.get(&(record.book.to_string(), record.hint))
+                else {
+                    continue;
+                };
+                // The live line has to hold the text the vector was built from: a line
+                // edited since is not what the vector describes.
+                if ChunkKey::of(text) != hit.key {
+                    continue;
+                }
+                let facets = facets_of(&record.book);
+                if compiled
+                    .as_ref()
+                    .is_some_and(|compiled| !compiled.matches_book(&record.book, &facets, false))
+                {
+                    continue;
+                }
+                resolved.push(ResolvedLine {
+                    hit: index as u32,
+                    line_id: *line_id,
+                    file_path: record.book.to_string(),
+                    section_id: 1,
+                    line_hash: line_id ^ 0xABCD,
+                    segment: u64::from(record.hint),
+                    is_pdf: false,
+                    facets: facets.into(),
+                    title: title_of(&record.book),
+                    reference: String::new(),
+                });
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+fn corpus_identity(library_version: u32) -> CorpusIdentity {
     CorpusIdentity {
-        corpus_id: "4d".repeat(32),
-        library_version: "otzaria-library-2026-08".to_string(),
-        tantivy_schema_version: 3,
+        text: otzaria_semantic_search::semantic::versioning::TextIdentity::with_line_text_version(
+            1,
+        ),
+        library_version,
+        library_release_tag: format!("v{library_version}-20260930120000"),
         document_id_scheme_version: 1,
     }
 }
 
-fn local_model(model_path: &Path) -> LocalModel {
-    LocalModel {
-        model_path: model_path.to_path_buf(),
-        model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
-        model_quantization: "Q4_K_M".to_string(),
+fn model_identity(model_path: &Path) -> ModelIdentity {
+    ModelIdentity {
+        family_id: "otzaria-test-family".to_string(),
+        tokenizer_checksum: mock::stub_tokenizer_checksum(),
+        query_packages: vec![ModelPackage {
+            checksum: validate_model(model_path).unwrap().checksum().to_string(),
+            quantization: "int8".to_string(),
+        }],
         embedding_dim: DIM,
-        pooling: "last-token".to_string(),
+        pooling: "in-graph".to_string(),
         max_tokens: 512,
         embedding_text_version: 1,
         normalization_version: 1,
-        chunking_identity: 0x0BAD_C0DE,
+        chunking_identity: ChunkerConfig::default().identity(),
     }
 }
 
-fn identity(model_path: &Path) -> IndexVersion {
-    let model = local_model(model_path);
-    IndexVersion {
-        corpus: corpus(),
-        model: ModelIdentity {
-            model_id: model.model_id,
-            // What the builder had, computed here from the file the runtime will load.
-            model_checksum: validate_and_checksum_gguf(model_path).unwrap(),
-            model_quantization: model.model_quantization,
-            embedding_backend: MockHashBackend::ID.to_string(),
-            embedding_dim: model.embedding_dim,
-            pooling: model.pooling,
-            max_tokens: model.max_tokens,
-            embedding_text_version: model.embedding_text_version,
-            normalization_version: model.normalization_version,
-            chunking_identity: model.chunking_identity,
-        },
-        store: readable_store_identity(),
-    }
-}
-
-fn metadata(line_id: u64, book: &str) -> VectorMetadata {
-    VectorMetadata {
-        semantic_id: format!("{book}#{line_id}"),
-        source_book_key: book.to_string(),
-        source_doc_key: format!("{book}#{line_id}"),
-        line_id,
-        section_id: line_id,
-        line_hash: line_id.wrapping_mul(31),
-        chunk_hash: format!("chunk-{line_id}"),
-        content_hash: 0,
-        reference: format!("הפניה {line_id}"),
-        segment: 0,
-        is_pdf: false,
-        title: "ספר בדיקה".to_string(),
-        facets: vec!["/מקרא/תורה".to_string()],
-    }
-}
-
-/// Install an artifact into `dir`, and return the model it was built with and the
-/// directory the runtime opens.
-fn install(dir: &TempDir) -> (PathBuf, PathBuf) {
-    let model_path = dir.path().join("model.gguf");
-    mock::write_stub_gguf(&model_path, 3).unwrap();
-
-    let source = dir.path().join("build-output");
-    let store = ZevcStore::open_or_create(ZevcStoreConfig {
-        db_path: source.clone(),
-        embedding_dim: DIM,
-        collection_name: "chunks".to_string(),
-        auto_persist: false,
-    })
+/// Build a base package of `lines` for `library_version` and install it into `vectors`.
+fn build_and_install(
+    dir: &TempDir,
+    name: &str,
+    model_path: &Path,
+    library_version: u32,
+    lines: &[(u64, &str, &str)],
+    vectors: &Path,
+) {
+    let identity_path = dir.path().join(format!("{name}-corpus-identity.json"));
+    let lines_path = dir.path().join(format!("{name}-corpus-lines.jsonl"));
+    std::fs::write(
+        &identity_path,
+        serde_json::to_vec(&corpus_identity(library_version)).unwrap(),
+    )
     .unwrap();
-    store
-        .insert_batch(
-            LINES
-                .iter()
-                .map(|(line_id, book, text)| {
-                    (metadata(*line_id, book), mock::hash_embedding(text, DIM))
-                })
-                .collect(),
-        )
-        .unwrap();
-    store.commit().unwrap();
-
-    let payloads: BTreeMap<String, PayloadDescriptor> = SNAPSHOT_FILENAMES
+    let body: String = lines
         .iter()
-        .map(|name| {
-            (
-                (*name).to_string(),
-                PayloadDescriptor::of_file(&source.join(name)).unwrap(),
-            )
+        .map(|(line_id, book, text)| {
+            serde_json::to_string(&CorpusLineRecord {
+                line_id: *line_id,
+                line: CorpusLine {
+                    source_book_key: book.to_string(),
+                    title: title_of(book),
+                    reference: String::new(),
+                    section_id: 1,
+                    segment: 0,
+                    is_pdf: false,
+                    line_hash: 0,
+                    content_hash: 7,
+                    facets: facets_of(book),
+                    text: text.to_string(),
+                },
+            })
+            .unwrap()
+                + "\n"
         })
         .collect();
-    let package = IndexPackage {
-        manifest: PackageManifest::new(
-            identity(&model_path),
-            "2026-08-06T00:00:00Z".to_string(),
-            2,
-            LINES.len() as u32,
-            payloads.values().map(|payload| payload.size_bytes).sum(),
-        ),
-        payloads,
-    };
-    IndexPackage::write(&source, &package).unwrap();
+    std::fs::write(&lines_path, body).unwrap();
 
-    let target = dir.path().join("semantic_index");
-    let result = IndexImporter::new(ImportConfig {
-        source_path: source,
-        target_store_path: target.clone(),
-    })
-    .import(&ArtifactExpectation::with_published_digest(
-        identity(&model_path),
-        package.digest(),
-    ))
+    let out = dir.path().join(name);
+    let report = build(
+        BuildRequest {
+            output_path: out.clone(),
+            model_path: model_path.to_path_buf(),
+            model: model_identity(model_path),
+            chunking: ChunkerConfig::default(),
+            created_at: "2026-10-01T00:00:00Z".to_string(),
+            batch_size: 2,
+            codec: otzaria_semantic_search::semantic::oxv::codec::CodecSpec::default(),
+            allow_non_semantic_backend: true,
+        },
+        &JsonlCorpus::load(&identity_path, &lines_path).unwrap(),
+    )
     .unwrap();
-    assert_eq!(result.vectors_imported, LINES.len() as u32);
-
-    (model_path, target)
+    install_package(
+        vectors,
+        &InstallSource {
+            segment: &out.join(SEGMENT_FILENAME),
+            manifest_json: &std::fs::read_to_string(out.join(RELEASE_MANIFEST_FILENAME)).unwrap(),
+        },
+        &InstallExpectation {
+            identity: report.manifest.identity.clone(),
+            published_manifest_sha256: Some(report.manifest_sha256),
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
 }
 
-fn open_official(target: &Path, model_path: &Path) -> OfficialSemanticIndex {
+/// The stub model and an installed set of [`LINES`].
+fn install(dir: &TempDir) -> (PathBuf, PathBuf) {
+    let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
+    let vectors = dir.path().join("vectors");
+    build_and_install(dir, "v30", &model_path, 30, &LINES, &vectors);
+    (model_path, vectors)
+}
+
+fn open_official(vectors: &Path, model_path: &Path) -> OfficialSemanticIndex {
     OfficialSemanticIndex::open(OfficialIndexConfig {
-        artifact_path: target.to_path_buf(),
-        corpus: corpus(),
-        model: local_model(model_path),
-        published_digest: None,
+        vectors_dir: vectors.to_path_buf(),
+        text: corpus_identity(30).text,
+        model: LocalModel::of_family(
+            model_path.to_path_buf(),
+            &model_identity(model_path),
+            "int8",
+        ),
+        deployment: EmbeddingDeployment::default(),
+        scan_threads: None,
     })
     .unwrap()
 }
 
-fn lexical(line_id: u64, text: &str, score: f32) -> LexicalCandidate {
+fn lexical(line_id: u64, book: &str, text: &str, score: f32) -> LexicalCandidate {
     LexicalCandidate {
-        line_id,
-        section_id: line_id,
+        title: title_of(book),
+        reference: format!("{book} :: {line_id}"),
         text: text.to_string(),
-        title: "ספר בדיקה".to_string(),
-        reference: format!("הפניה {line_id}"),
-        bm25_score: score,
+        line_id,
+        section_id: 1,
+        line_hash: line_id ^ 0xABCD,
         segment: 0,
         is_pdf: false,
-        file_path: "books/test.txt".to_string(),
-        line_hash: line_id,
+        file_path: book.to_string(),
+        bm25_score: score,
     }
 }
 
-/// Name, length **and SHA-256** of every file in `dir`.
-///
-/// The hash is the point. Without it, "opening changed nothing" would still hold after a
-/// rewrite that kept every length — which is precisely the class of change this stage is
-/// about, so a length-only fingerprint would assert the weakest version of the claim.
-fn fingerprint(dir: &Path) -> Vec<(String, u64, String)> {
-    let mut entries: Vec<(String, u64, String)> = fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            let bytes = fs::read(entry.path()).unwrap();
-            (
-                entry.file_name().to_string_lossy().into_owned(),
-                bytes.len() as u64,
-                format!("{:x}", Sha256::digest(&bytes)),
-            )
-        })
-        .collect();
-    entries.sort();
-    entries
+fn mode(mode: SearchMode) -> HybridSearchParams {
+    HybridSearchParams {
+        force_mode: Some(mode),
+        ..Default::default()
+    }
 }
 
-/// The stage's headline claim, through the seam Otzaria links against: a query over an
-/// installed artifact produces the `line_id` the caller hydrates, in both modes that
-/// consult the semantic path.
-#[test]
-fn a_query_over_an_installed_artifact_returns_the_line_id_it_was_built_from() {
-    let dir = TempDir::new("query");
-    let (model_path, target) = install(&dir);
-    let api = OtzariaHybridEngine::new(HybridCoordinator::with_official_index(open_official(
-        &target,
-        &model_path,
-    )));
+/// Every file of the set with its size and content digest: what "opening it did not write
+/// to it" is checked against.
+fn fingerprint(dir: &Path) -> Vec<(String, u64, String)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, u64, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.push((
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    bytes.len() as u64,
+                    format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
 
-    let status = api.get_semantic_status();
+/// The shortest complete path: a semantic query over an installed set comes back with the
+/// live line the resolver tied its hit to, in both modes that consult the semantic path.
+#[test]
+fn a_query_over_an_installed_set_returns_the_live_line_it_resolves_to() {
+    let dir = TempDir::new("query");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+    let cancel = CancellationToken::new();
+
+    let status = coordinator.status();
     assert!(status.available);
     assert!(status.vectors_persisted);
     assert_eq!(status.vector_count, LINES.len() as u32);
     assert_eq!(status.indexed_book_count, 2);
-    assert!(status.needs_full_reindex.is_none());
+    assert_eq!(status.vector_backend, "otzaria-oxv");
 
-    let (line_id, _, text) = LINES[3];
-    let semantic = api
-        .search(SearchRequest {
-            query: text.to_string(),
+    let (line_id, book, text) = LINES[3];
+    let semantic = coordinator
+        .search_cancellable(
+            text,
             // Deliberately supplied and deliberately discarded: a semantic-only request
             // must not be answered with BM25 wearing a semantic label.
-            lexical_candidates: vec![lexical(999, "שורה לקסיקלית בלבד", 99.0)],
-            force_mode: Some(SearchMode::SemanticOnly),
-            ..Default::default()
-        })
+            vec![lexical(999, GENESIS, "שורה לקסיקלית בלבד", 99.0)],
+            &mode(SearchMode::SemanticOnly),
+            &resolver,
+            &cancel,
+        )
         .unwrap();
-
     assert_eq!(semantic.search_mode, SearchMode::SemanticOnly);
     assert!(semantic.semantic_available);
-    assert_eq!(semantic.results[0].id, line_id);
+    assert!(semantic.fallback_reason.is_none());
+    assert_eq!(
+        (
+            semantic.results[0].id,
+            semantic.results[0].file_path.as_str()
+        ),
+        (line_id, book)
+    );
     assert!(semantic.results.iter().all(|item| item.id != 999));
 
-    // Hybrid: both sources reach fusion over the same id space.
-    let hybrid = api
-        .search(SearchRequest {
-            query: text.to_string(),
-            lexical_candidates: vec![lexical(line_id, text, 18.0)],
-            force_mode: Some(SearchMode::Hybrid),
-            ..Default::default()
-        })
+    // Hybrid: both sources reach fusion over the same lines.
+    let hybrid = coordinator
+        .search_cancellable(
+            text,
+            vec![lexical(line_id, book, text, 18.0)],
+            &mode(SearchMode::Hybrid),
+            &resolver,
+            &cancel,
+        )
         .unwrap();
-
     assert_eq!(hybrid.search_mode, SearchMode::Hybrid);
     assert!(hybrid.fallback_reason.is_none());
     let fused = &hybrid.results[0];
-    assert_eq!(fused.id, line_id);
+    assert_eq!((fused.id, fused.file_path.as_str()), (line_id, book));
     assert!(fused.lexical_score.is_some());
     assert!(fused.semantic_score.is_some());
+
+    // A filter reaches the scan as the books it admits.
+    let filtered = coordinator
+        .search_cancellable(
+            LINES[0].2,
+            vec![],
+            &HybridSearchParams {
+                force_mode: Some(SearchMode::SemanticOnly),
+                filters: Some(SearchFilters {
+                    facets: Some(vec!["/משנה".to_string()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &resolver,
+            &cancel,
+        )
+        .unwrap();
+    assert!(!filtered.results.is_empty());
+    assert!(filtered
+        .results
+        .iter()
+        .all(|item| item.file_path == BERACHOT));
 }
 
-/// An artifact is not something this device may write to, and the seam has to say so
-/// rather than report a no-op: a caller that read the refusal as "no semantic index"
-/// would offer indexing the library as the fix, which is what the product contract rules
-/// out.
+/// The application's index after a text moved: genesis's last line is in berachot now, a
+/// line the set records nowhere in berachot. Under a filter that admits berachot alone, the
+/// scan of berachot's vectors never reaches that text's vector, so this resolver names it
+/// as unreached, and resolves it to the line in berachot that holds it now.
+struct MovedIntoBerachot {
+    index: FakeResolver,
+    moved: SlotRef,
+    /// The set generation each `unreached` was asked for.
+    asked: Mutex<Vec<u64>>,
+}
+
+/// The id the moved line has in berachot.
+const MOVED_LINE: u64 = 8_589_934_594;
+
+impl CandidateResolver for MovedIntoBerachot {
+    fn generation(&self) -> u64 {
+        self.index.generation()
+    }
+
+    fn admissible_books(
+        &self,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Option<BookSet>, ResolveError> {
+        self.index.admissible_books(filters)
+    }
+
+    fn resolve(
+        &self,
+        hits: &[VectorHit],
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResolvedLine>, ResolveError> {
+        let mut lines = self.index.resolve(hits, filters, cancel)?;
+        let admitted = filters
+            .and_then(SearchFilters::compile)
+            .is_none_or(|compiled| compiled.matches_book(BERACHOT, &facets_of(BERACHOT), false));
+        for (index, hit) in hits.iter().enumerate() {
+            if hit.key == self.moved.key && admitted {
+                lines.push(ResolvedLine {
+                    hit: index as u32,
+                    line_id: MOVED_LINE,
+                    file_path: BERACHOT.to_string(),
+                    section_id: 1,
+                    line_hash: MOVED_LINE ^ 0xABCD,
+                    segment: 1,
+                    is_pdf: false,
+                    facets: facets_of(BERACHOT).into(),
+                    title: title_of(BERACHOT),
+                    reference: String::new(),
+                });
+            }
+        }
+        Ok(lines)
+    }
+
+    fn unreached(
+        &self,
+        _filters: Option<&SearchFilters>,
+        set_generation: u64,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<SlotRef>, ResolveError> {
+        self.asked.lock().unwrap().push(set_generation);
+        Ok(vec![self.moved])
+    }
+}
+
+/// A filtered search weighs the vectors the resolver names as unreached, at the scores an
+/// unfiltered search gives them, beside the admitted books' own hits, which stay as they
+/// were; a resolver that names none — the default — searches as before. Only a filtered
+/// search asks.
 #[test]
-fn every_build_side_operation_is_refused_on_an_installed_artifact() {
+fn a_filtered_search_weighs_the_vectors_its_resolver_names_as_unreached() {
+    let dir = TempDir::new("unreached");
+    let (model_path, vectors) = install(&dir);
+    let (_, _, moved_text) = LINES[2];
+    let (own_line, _, _) = LINES[3];
+    let set = SegmentSet::open(&vectors).unwrap();
+    let segment = &set.segments()[0];
+    let moved = (0..segment.slot_count())
+        .map(|slot| SlotRef {
+            seg: 0,
+            slot,
+            key: segment.key(slot),
+        })
+        .find(|slot| slot.key == ChunkKey::of(moved_text))
+        .expect("the set holds genesis's last line");
+    let generation = set.generation();
+    drop(set);
+
+    let filtered = HybridSearchParams {
+        force_mode: Some(SearchMode::SemanticOnly),
+        filters: Some(SearchFilters {
+            facets: Some(vec!["/משנה".to_string()]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    // Each its own coordinator, so that none answers from another's query cache.
+    let search = |resolver: &dyn CandidateResolver, params: &HybridSearchParams| {
+        HybridCoordinator::with_official_index(open_official(&vectors, &model_path))
+            .search_cancellable(moved_text, vec![], params, resolver, &cancel)
+            .unwrap()
+    };
+    let scores = |result: &otzaria_semantic_search::semantic::types::HybridSearchResult| {
+        result
+            .results
+            .iter()
+            .map(|item| ((item.id, item.file_path.clone()), item.semantic_score))
+            .collect::<HashMap<_, _>>()
+    };
+
+    let before = search(&FakeResolver::of_the_corpus(), &filtered);
+    assert!(before.results.iter().all(|item| item.id != MOVED_LINE));
+    let resolver = MovedIntoBerachot {
+        index: FakeResolver::of_the_corpus(),
+        moved,
+        asked: Mutex::new(Vec::new()),
+    };
+    let after = search(&resolver, &filtered);
+    assert_eq!(*resolver.asked.lock().unwrap(), [generation]);
+    let (before, after) = (scores(&before), scores(&after));
+    let own = (own_line, BERACHOT.to_string());
+    assert_eq!(
+        after[&own], before[&own],
+        "the admitted book's own hit stays"
+    );
+    let unfiltered = scores(&search(&resolver, &mode(SearchMode::SemanticOnly)));
+    assert_eq!(
+        *resolver.asked.lock().unwrap(),
+        [generation],
+        "an unfiltered search reaches every vector, and asks nothing"
+    );
+    let moved_line = (MOVED_LINE, BERACHOT.to_string());
+    assert!(after[&moved_line].is_some());
+    assert_eq!(
+        after[&moved_line], unfiltered[&moved_line],
+        "the moved text at the score a full scan gives its vector"
+    );
+}
+
+/// The application's index where berachot's line is in many places: once in each of
+/// [`COPIES`], and [`REPEATS`] times more in berachot itself. Its hit resolves as the
+/// application's resolver orders a text's lines — the line the vector names first, a line of
+/// each other book, then the repeats within a book — and every other hit as the corpus's
+/// index would.
+struct RepeatedText {
+    index: FakeResolver,
+}
+
+/// The books besides berachot that hold its line, once each. Of the mishna as it is, so the
+/// metadata bonus — which favours a primary source by its path — is the same for all.
+const COPIES: [&str; 4] = [
+    "otzaria/mishna/peah.txt",
+    "otzaria/mishna/demai.txt",
+    "otzaria/mishna/kilayim.txt",
+    "otzaria/mishna/sheviit.txt",
+];
+/// How many times more berachot holds its own line.
+const REPEATS: u64 = 25;
+
+impl RepeatedText {
+    /// The lines the repeated text resolves to, `(book, id)`, in the resolver's order. The
+    /// repeats have the lowest ids of all.
+    fn placed() -> Vec<(String, u64)> {
+        let (own, book, _) = LINES[3];
+        std::iter::once((book.to_string(), own))
+            .chain(
+                COPIES
+                    .iter()
+                    .enumerate()
+                    .map(|(n, book)| (book.to_string(), 9_000_000_000 + n as u64)),
+            )
+            .chain((1..=REPEATS).map(|id| (BERACHOT.to_string(), id)))
+            .collect()
+    }
+}
+
+impl CandidateResolver for RepeatedText {
+    fn generation(&self) -> u64 {
+        self.index.generation()
+    }
+
+    fn admissible_books(
+        &self,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Option<BookSet>, ResolveError> {
+        self.index.admissible_books(filters)
+    }
+
+    fn resolve(
+        &self,
+        hits: &[VectorHit],
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResolvedLine>, ResolveError> {
+        let mut lines = self.index.resolve(hits, filters, cancel)?;
+        let (own, _, text) = LINES[3];
+        if let Some(hit) = hits.iter().position(|hit| hit.key == ChunkKey::of(text)) {
+            for (book, line_id) in Self::placed().into_iter().skip(1) {
+                lines.push(ResolvedLine {
+                    hit: hit as u32,
+                    line_id,
+                    // Each in a section of its own, so no bonus sets one above another.
+                    section_id: 1_000 + line_id,
+                    // The same text.
+                    line_hash: own ^ 0xABCD,
+                    segment: line_id,
+                    is_pdf: false,
+                    facets: facets_of(&book).into(),
+                    title: title_of(&book),
+                    reference: String::new(),
+                    file_path: book,
+                });
+            }
+        }
+        Ok(lines)
+    }
+}
+
+/// A text in many places is one vector, and every line it resolves to scores alike. A page
+/// shows them as the resolver placed them — a line of each book before any book's second —
+/// though the repeats have the lowest ids, which ordered them first and filled the page with
+/// one book. In every preset, in both modes that consult the semantic path; the same page on
+/// every call; and the pages of one search neither repeat nor skip a line.
+#[test]
+fn a_repeated_text_shows_a_line_of_each_book_first_on_every_page() {
+    let dir = TempDir::new("repeated");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = RepeatedText {
+        index: FakeResolver::of_the_corpus(),
+    };
+    let cancel = CancellationToken::new();
+    let (_, _, text) = LINES[3];
+    let placed = RepeatedText::placed();
+
+    for preset in [
+        SearchProfile::Fast,
+        SearchProfile::Balanced,
+        SearchProfile::Best,
+    ] {
+        for search_mode in [SearchMode::SemanticOnly, SearchMode::Hybrid] {
+            let page = |offset: usize, limit: usize| {
+                // Every call fuses anew.
+                coordinator.clear_query_cache();
+                coordinator
+                    .search_cancellable(
+                        text,
+                        vec![],
+                        &HybridSearchParams {
+                            limit,
+                            offset,
+                            force_mode: Some(search_mode),
+                            profile: Some(preset),
+                            ..Default::default()
+                        },
+                        &resolver,
+                        &cancel,
+                    )
+                    .unwrap()
+                    .results
+                    .into_iter()
+                    .map(|item| (item.file_path, item.id))
+                    .collect::<Vec<_>>()
+            };
+            let first = page(0, 20);
+            assert_eq!(first, placed[..20], "{preset} {search_mode}");
+            for _ in 0..5 {
+                assert_eq!(page(0, 20), first, "{preset} {search_mode}");
+            }
+
+            let whole = page(0, 100);
+            assert_eq!(whole[..placed.len()], placed[..], "{preset} {search_mode}");
+            let paged: Vec<(String, u64)> = (0..=whole.len())
+                .step_by(7)
+                .flat_map(|offset| page(offset, 7))
+                .collect();
+            assert_eq!(paged, whole, "{preset} {search_mode}");
+        }
+    }
+}
+
+/// The ids a result carries are the live index's. A commit that renumbered a book — or
+/// gave two books one id range — changes nothing about the vectors, and the results follow
+/// the index without a rebuild.
+#[test]
+fn the_ids_are_the_live_index_s_and_two_books_sharing_one_stay_apart() {
+    let dir = TempDir::new("live_ids");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+    let cancel = CancellationToken::new();
+
+    // Berachot's line now has the id genesis's first line has: two books, one id.
+    let (shared, genesis_text) = (LINES[0].0, LINES[0].2);
+    resolver.commit(BERACHOT, 0, shared, LINES[3].2);
+
+    let result = coordinator
+        .search_cancellable(
+            genesis_text,
+            vec![lexical(shared, GENESIS, genesis_text, 18.0)],
+            &HybridSearchParams {
+                force_mode: Some(SearchMode::Hybrid),
+                limit: 10,
+                ..Default::default()
+            },
+            &resolver,
+            &cancel,
+        )
+        .unwrap();
+    let of = |book: &str| {
+        result
+            .results
+            .iter()
+            .find(|item| item.id == shared && item.file_path == book)
+            .unwrap_or_else(|| panic!("line {shared} of {book} is a result of its own"))
+    };
+    assert!(of(GENESIS).lexical_score.is_some() && of(GENESIS).semantic_score.is_some());
+    assert!(
+        of(BERACHOT).lexical_score.is_none() && of(BERACHOT).semantic_score.is_some(),
+        "the lexical hit is genesis's, and must not be fused into berachot's line"
+    );
+}
+
+/// A line whose text changed since the vectors were built is not shown for them: its hit
+/// resolves to nothing, and the telemetry counts it.
+#[test]
+fn a_line_whose_text_changed_is_not_shown_for_the_old_vector() {
+    let dir = TempDir::new("changed_text");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+
+    let (line_id, book, text) = LINES[3];
+    resolver.commit(book, 0, line_id, "שורה שנערכה מאז שנבנו הווקטורים");
+    let result = coordinator
+        .search_cancellable(
+            text,
+            vec![],
+            &mode(SearchMode::SemanticOnly),
+            &resolver,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(result.results.iter().all(|item| item.id != line_id));
+    let telemetry = coordinator.get_telemetry_snapshot();
+    assert_eq!(telemetry.semantic_hits, LINES.len() as u64);
+    assert_eq!(telemetry.semantic_unresolved, 1);
+}
+
+/// A semantic-only query has no lexical input to change when the index commits, so the
+/// query cache has to key on the resolver's generation: without it, a cached result would
+/// carry the ids from before the commit. And a reloaded vector set is a new generation of
+/// its own.
+#[test]
+fn the_query_cache_follows_the_index_and_the_vector_set() {
+    let dir = TempDir::new("cache");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+    let cancel = CancellationToken::new();
+    let (line_id, book, text) = LINES[3];
+    let search = || {
+        coordinator
+            .search_cancellable(
+                text,
+                vec![],
+                &mode(SearchMode::SemanticOnly),
+                &resolver,
+                &cancel,
+            )
+            .unwrap()
+    };
+
+    assert_eq!(search().results[0].id, line_id);
+    assert_eq!(search().results[0].id, line_id);
+    assert_eq!(coordinator.get_telemetry_snapshot().cache_hits, 1);
+
+    // A commit renumbers the line; the next search is answered from the index, not the cache.
+    resolver.commit(book, 0, line_id + 1000, text);
+    assert_eq!(search().results[0].id, line_id + 1000);
+    assert_eq!(coordinator.get_telemetry_snapshot().cache_hits, 1);
+
+    // A new library version installed beside the open set: nothing changes until the
+    // coordinator reloads, and then the new generation answers.
+    let mut changed = LINES;
+    changed[3].2 = "תנו רבנן מאימתי מתחילין לקרות את שמע בשחרית משיכיר בין תכלת ללבן";
+    build_and_install(&dir, "v31", &model_path, 31, &changed, &vectors);
+    let before = coordinator.vector_set_info().unwrap();
+    assert_eq!(before.library_version, 30);
+    match coordinator.reload_semantic_vectors().unwrap() {
+        Some(ReloadOutcome::Reloaded {
+            from_generation,
+            to_generation,
+        }) => assert!(to_generation > from_generation),
+        other => panic!("the new generation must be opened, got {other:?}"),
+    }
+    assert_eq!(coordinator.vector_set_info().unwrap().library_version, 31);
+    assert_eq!(
+        coordinator.reload_semantic_vectors().unwrap(),
+        Some(ReloadOutcome::Unchanged {
+            generation: coordinator.vector_set_info().unwrap().generation
+        })
+    );
+    // The old text has no vector any more, so its line is found by its neighbours' at best.
+    assert!(search()
+        .results
+        .iter()
+        .all(|item| item.id != line_id + 1000 || item.semantic_score.unwrap_or(0.0) < 0.99));
+}
+
+/// The path the application takes on every keystroke: a search over the installed set,
+/// abandoned because the next keystroke superseded it. It must come back as `Cancelled` in
+/// both modes that scan the set — not as a lexical fallback the host would display — and
+/// the set must serve the next query as if nothing had happened.
+#[test]
+fn a_cancelled_query_over_an_installed_set_is_dropped_and_the_next_one_served() {
+    let dir = TempDir::new("cancelled");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+    let (line_id, book, text) = LINES[0];
+
+    for search_mode in [SearchMode::SemanticOnly, SearchMode::Hybrid] {
+        let superseded = CancellationToken::new();
+        let next_keystroke = superseded.clone();
+        std::thread::spawn(move || next_keystroke.cancel())
+            .join()
+            .unwrap();
+        match coordinator.search_cancellable(
+            text,
+            vec![lexical(line_id, book, text, 18.0)],
+            &mode(search_mode),
+            &resolver,
+            &superseded,
+        ) {
+            Err(SemanticSearchError::Cancelled) => {}
+            other => panic!("{search_mode}: a superseded search must be cancelled, got {other:?}"),
+        }
+
+        let served = coordinator
+            .search_cancellable(
+                text,
+                vec![lexical(line_id, book, text, 18.0)],
+                &mode(search_mode),
+                &resolver,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(served.search_mode, search_mode);
+        assert!(served.fallback_reason.is_none());
+        assert_eq!(served.results[0].id, line_id);
+    }
+    assert_eq!(coordinator.get_telemetry_snapshot().total_searches, 2);
+}
+
+/// A vector set is not something this device indexes into, and the seam has to say so
+/// rather than report a no-op: a caller that read the refusal as "no semantic index" would
+/// offer indexing the library as the fix, which is what the product contract rules out.
+#[test]
+fn every_build_side_operation_is_refused_on_an_installed_set() {
     let dir = TempDir::new("refusals");
-    let (model_path, target) = install(&dir);
+    let (model_path, vectors) = install(&dir);
     let api = OtzariaHybridEngine::new(HybridCoordinator::with_official_index(open_official(
-        &target,
+        &vectors,
         &model_path,
     )));
 
-    let before = fingerprint(&target);
+    let before = fingerprint(&vectors);
     let refusals: Vec<(&str, String)> = vec![
         (
             "index_books",
@@ -373,46 +982,36 @@ fn every_build_side_operation_is_refused_on_an_installed_artifact() {
             "{operation}: unhelpful refusal {message:?}"
         );
     }
-
-    // Nothing was half-done, and the index still answers: a refusal is not a failure
-    // state the caller has to recover from.
-    assert_eq!(fingerprint(&target), before);
-    assert_eq!(
-        api.search(SearchRequest {
-            query: LINES[0].2.to_string(),
-            force_mode: Some(SearchMode::SemanticOnly),
-            ..Default::default()
-        })
-        .unwrap()
-        .results[0]
-            .id,
-        LINES[0].0
-    );
+    // Nothing was half-done: a refusal is not a failure state the caller has to recover
+    // from.
+    assert_eq!(fingerprint(&vectors), before);
 }
 
 /// Restart: the same directory opens again and answers the same query, with nothing
-/// rebuilt. This is what `vectors_persisted` is a claim about.
+/// rebuilt and nothing written. This is what `vectors_persisted` is a claim about.
 #[test]
-fn a_restart_opens_the_same_artifact_without_rebuilding_anything() {
+fn a_restart_opens_the_same_set_without_writing_to_it() {
     let dir = TempDir::new("restart");
-    let (model_path, target) = install(&dir);
+    let (model_path, vectors) = install(&dir);
 
-    let before = fingerprint(&target);
-    let (line_id, _, text) = LINES[1];
-
+    let before = fingerprint(&vectors);
+    let (_, book, text) = LINES[1];
+    let mut generations = Vec::new();
     for _ in 0..2 {
-        let index = open_official(&target, &model_path);
-        assert_eq!(index.vector_count(), LINES.len() as u32);
-        // Sorted, not insertion-ordered: `HashMap` order changes between runs.
-        assert_eq!(index.book_keys(), [BERACHOT, GENESIS]);
+        let index = open_official(&vectors, &model_path);
+        assert_eq!(index.set_info().slots_live, LINES.len() as u64);
+        assert_eq!(index.book_count(), 2);
+        generations.push(index.generation());
+        let hit = &index
+            .search(text, 2, None, &CancellationToken::new())
+            .unwrap()[0];
+        assert_eq!(hit.key, ChunkKey::of(text));
+        assert_eq!((&*hit.records[0].book, hit.records[0].hint), (book, 1));
         assert_eq!(
-            index.search(text, 2, None).unwrap()[0].metadata.line_id,
-            line_id
-        );
-        assert_eq!(
-            fingerprint(&target),
+            fingerprint(&vectors),
             before,
-            "opening an artifact must not write to it"
+            "opening a set must not write to it"
         );
     }
+    assert_eq!(generations[0], generations[1]);
 }

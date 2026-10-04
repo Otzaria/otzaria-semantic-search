@@ -9,10 +9,13 @@
 //! semantic path is refused with [`SemanticSearchError::IncompatibleIndex`] (so
 //! the coordinator falls back to BM25) until [`SemanticEngine::reset_index`].
 
+use crate::cancellation::CancellationToken;
 use crate::errors::{ManifestError, SemanticSearchError};
-use crate::semantic::backend::{ensure_pooling_is_implemented, Pooling};
+use crate::semantic::backend::{
+    ensure_pooling_is_implemented, max_tokens_past_any_encoder, Pooling,
+};
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
-use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
 use crate::semantic::manifest::{
     describe_mismatches, BookIndexNeed, ManifestConfig, ManifestMismatch, SemanticManifest,
 };
@@ -33,18 +36,22 @@ pub struct SemanticConfig {
     pub embedding_model_id: String,
     pub embedding_dim: u32,
     pub model_path: PathBuf,
-    /// Pooling strategy the model requires (e.g. `"last-token"`); the manifest
+    /// Where this machine keeps what the model runs on: the ONNX Runtime library, for an
+    /// ONNX model. A deployment fact, never written to the manifest, so changing it
+    /// invalidates no index — see [`EmbeddingDeployment`].
+    pub deployment: EmbeddingDeployment,
+    /// Pooling strategy the model requires (e.g. `"in-graph"`); the manifest
     /// persists it verbatim, so [`SemanticConfig::validate`] refuses both a spelling
     /// [`Pooling`] cannot parse and a strategy no backend implements.
     pub pooling: String,
-    /// Token cap requested per embedded text, EOS included.
+    /// Token cap requested per embedded text: the total sequence length, the special
+    /// tokens the model adds included (a BERT tokenizer's `[CLS]` and `[SEP]`).
     ///
-    /// Enforced by the backend, which may clamp it to the model's trained context;
-    /// the *requested* value is what the manifest records as part of the index's
-    /// identity, so changing it is an incompatibility rather than a silent re-embed
-    /// of half a library under a different cap.
+    /// Enforced by the backend; the *requested* value is what the manifest records as
+    /// part of the index's identity, so changing it is an incompatibility rather than a
+    /// silent re-embed of half a library under a different cap.
     pub embedding_max_tokens: usize,
-    /// Quantization of the model weights (e.g. `"Q4"`); not the stored vectors'
+    /// Quantization of the model weights (e.g. `"int8"`); not the stored vectors'
     /// [`SemanticConfig::vector_precision`].
     pub model_quantization: String,
     /// Precision vectors are stored at (e.g. `"f32"`).
@@ -61,23 +68,31 @@ pub struct SemanticConfig {
     pub store: VectorStoreConfig,
 }
 
+/// The model fields are the production model's — the Meivin Round 2 int8 graph, as
+/// [`EmbeddingConfig::default`] has it and `config/models/meivin-round2-onnx/model.json`
+/// declares it. The chunking is [`ChunkerConfig::default`], text recipe 1: an artifact for
+/// that model is built from its identity files, which pin recipe 2, never from here.
 impl Default for SemanticConfig {
     fn default() -> Self {
         let root = PathBuf::from("semantic_db");
+        let model = EmbeddingConfig::default();
         Self {
             root_dir: root.clone(),
-            embedding_model_id: "EMD123/Otzaria-Embedding-V1-Flash-0.6B".to_string(),
-            embedding_dim: 1024,
-            model_path: PathBuf::from("models/otzaria-embedding-v1-flash-q4.gguf"),
-            pooling: Pooling::LastToken.as_str().to_string(),
-            embedding_max_tokens: 512,
-            model_quantization: "Q4".to_string(),
+            embedding_model_id:
+                "ArieLLL123/judaic-semantic-round2-onnx-zayit@1ec8dc68888bcea774ae9f735b2fe7cd9dc7f3ca"
+                    .to_string(),
+            embedding_dim: model.embedding_dim,
+            model_path: model.model_path,
+            deployment: EmbeddingDeployment::default(),
+            pooling: model.pooling.as_str().to_string(),
+            embedding_max_tokens: model.max_tokens,
+            model_quantization: "int8".to_string(),
             vector_precision: "f32".to_string(),
-            embedding_batch_size: 32,
+            embedding_batch_size: model.batch_size,
             chunking: ChunkerConfig::default(),
             store: VectorStoreConfig {
                 db_path: root.join("vectors"),
-                embedding_dim: 1024,
+                embedding_dim: model.embedding_dim,
                 collection_name: "chunks".to_string(),
             },
         }
@@ -121,23 +136,30 @@ impl SemanticConfig {
         ChunkingAlgorithm::from_version(self.chunking.chunking_version)?;
         EmbeddingTextRecipe::from_version(self.chunking.embedding_text_version)?;
         TextNormalizationRecipe::from_version(self.chunking.normalization_version)?;
-        // 2, not 1: the cap counts the EOS the backend appends, so 1 leaves no room for
-        // content and every text embeds as a bare `[eos]`.
+        // 2, not 1: the cap counts the special tokens the backend adds around the text,
+        // so 1 leaves no room for content and every text embeds as a bare special token.
         if self.embedding_max_tokens < 2 {
             return Err(SemanticSearchError::Config(format!(
-                "embedding_max_tokens is {}; the cap includes the EOS token, so at least 2 \
-                 are needed for any content to reach the model",
+                "embedding_max_tokens is {}; the cap counts the special tokens the model adds \
+                 around the text, so at least 2 are needed for any content to reach the model",
                 self.embedding_max_tokens
             )));
+        }
+        // And a cap past any encoder's context, before the manifest records it.
+        if let Some(reason) =
+            max_tokens_past_any_encoder("embedding_max_tokens", self.embedding_max_tokens)
+        {
+            return Err(SemanticSearchError::Config(reason));
         }
         Ok(())
     }
 
     /// The configured pooling as the typed strategy the runtime needs.
     ///
-    /// Refuses both a spelling [`Pooling`] cannot parse (`"last_token"`) and a
-    /// strategy that parses but no backend implements (`"mean"`); both are the
-    /// caller's [`SemanticSearchError::Config`], not a runtime failure.
+    /// Refuses a spelling [`Pooling`] cannot parse (`"in_graph"`, and `"last-token"`, the
+    /// GGUF backend's, gone with it) and a strategy that parses but no backend implements
+    /// (`"mean"`); each is the caller's [`SemanticSearchError::Config`], not a runtime
+    /// failure.
     pub fn pooling_strategy(&self) -> Result<Pooling, SemanticSearchError> {
         let pooling = Pooling::parse(&self.pooling)
             .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
@@ -319,14 +341,17 @@ impl SemanticEngine {
 
         // No `..Default::default()` tail: a new `EmbeddingConfig` field should fail
         // to compile here rather than silently take a default the caller cannot set.
-        let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-            model_path: self.config.model_path.clone(),
-            embedding_dim: self.config.embedding_dim,
-            // `?` rather than `expect`: a bad spelling must not abort the host.
-            pooling: self.config.pooling_strategy()?,
-            max_tokens: self.config.embedding_max_tokens,
-            batch_size: self.config.embedding_batch_size,
-        });
+        let mut runtime = EmbeddingRuntime::with_deployment(
+            EmbeddingConfig {
+                model_path: self.config.model_path.clone(),
+                embedding_dim: self.config.embedding_dim,
+                // `?` rather than `expect`: a bad spelling must not abort the host.
+                pooling: self.config.pooling_strategy()?,
+                max_tokens: self.config.embedding_max_tokens,
+                batch_size: self.config.embedding_batch_size,
+            },
+            self.config.deployment.clone(),
+        );
 
         if let Err(e) = runtime.load() {
             self.last_error = Some(e.to_string());
@@ -641,8 +666,23 @@ impl SemanticEngine {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        self.search_cancellable(query, top_k, filters, &CancellationToken::new())
+    }
+
+    /// As [`Self::search`], or [`SemanticSearchError::Cancelled`] once `cancel` is
+    /// cancelled: looked at before the query is embedded, after it is, and throughout the
+    /// store's scan. See [`crate::cancellation`].
+    pub fn search_cancellable(
+        &self,
+        query: &str,
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
+        cancel.checkpoint()?;
         let query_vec = self.embed_query(query)?;
-        self.search_vector(&query_vec, top_k, filters)
+        cancel.checkpoint()?;
+        self.search_vector(&query_vec, top_k, filters, cancel)
     }
 
     /// Embed a query separately so the coordinator can safely cache the vector.
@@ -656,9 +696,11 @@ impl SemanticEngine {
         };
 
         // Through the same text recipe the chunker applied to everything it stored: both
-        // sides of a comparison have to reach the model the same way.
-        let (_, _, normalization) = self.chunker.recipe();
-        Ok(runtime.embed_one(&normalization.apply(query))?)
+        // sides of a comparison have to reach the model the same way — normalized alike,
+        // and each marked with its own role when the recipe has roles.
+        let (_, text_recipe, normalization) = self.chunker.recipe();
+        let text = crate::semantic::recipe::query_input(text_recipe, normalization, query)?;
+        Ok(runtime.embed_one(&text)?)
     }
 
     /// Search with a vector already produced by this engine's embedding runtime.
@@ -667,9 +709,12 @@ impl SemanticEngine {
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, SemanticSearchError> {
         self.ensure_index_usable()?;
-        Ok(self.store.search(query_vector, top_k, filters)?)
+        Ok(self
+            .store
+            .search_cancellable(query_vector, top_k, filters, cancel)?)
     }
 
     /// Compare the library's per-book fingerprints against the semantic index.
@@ -846,6 +891,7 @@ fn manifest_config(
 mod tests {
     use super::*;
     use crate::errors::{ArtifactError, EmbeddingError};
+    use crate::semantic::backend::ONNX_MAX_TOKENS_CEILING;
     use crate::semantic::embedding::mock;
     use crate::semantic::types::BookLine;
 
@@ -877,8 +923,7 @@ mod tests {
 
     /// A config rooted at `dir` with a stub model and a small dimension.
     fn config_at(dir: &TempDir) -> SemanticConfig {
-        let model_path = dir.path().join("model.gguf");
-        mock::write_stub_gguf(&model_path, 3).unwrap();
+        let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
         let root = dir.path().join("semantic");
         SemanticConfig {
@@ -974,8 +1019,9 @@ mod tests {
             Ok(_) => panic!("a zero token cap must be refused"),
         }
 
-        // The manifest compares the spelling verbatim, so no aliases.
-        for misspelled in ["last_token", "Last-Token", " last-token ", ""] {
+        // The manifest compares the spelling verbatim, so no aliases — and the GGUF
+        // backend's pooling is no spelling at all now.
+        for misspelled in ["in_graph", "In-Graph", " in-graph ", "", "last-token"] {
             let mut config = config_at(&dir);
             config.pooling = misspelled.to_string();
             match SemanticEngine::open(config) {
@@ -987,6 +1033,40 @@ mod tests {
                 Ok(_) => panic!("pooling {misspelled:?} must be refused"),
             }
         }
+    }
+
+    /// The default configuration names the production model, field for field as its
+    /// identity file declares it, and validates.
+    #[test]
+    fn the_default_configuration_is_the_production_model() {
+        let identity: serde_json::Value = serde_json::from_str(include_str!(
+            "../../config/models/meivin-round2-onnx/model.json"
+        ))
+        .unwrap();
+        let config = SemanticConfig::default();
+        assert_eq!(
+            config.embedding_model_id,
+            identity["family_id"].as_str().unwrap()
+        );
+        // The family's first package is the application's default.
+        assert_eq!(
+            config.model_quantization,
+            identity["query_packages"][0]["quantization"]
+                .as_str()
+                .unwrap()
+        );
+        assert_eq!(
+            u64::from(config.embedding_dim),
+            identity["embedding_dim"].as_u64().unwrap()
+        );
+        assert_eq!(config.store.embedding_dim, config.embedding_dim);
+        assert_eq!(config.pooling, identity["pooling"].as_str().unwrap());
+        assert_eq!(
+            config.embedding_max_tokens as u64,
+            identity["max_tokens"].as_u64().unwrap()
+        );
+        assert_eq!(config.model_path, EmbeddingConfig::default().model_path);
+        assert!(config.validate().is_ok());
     }
 
     /// `"mean"` parses but no backend performs it. The load-bearing half is that
@@ -1005,7 +1085,7 @@ mod tests {
                     "the error must name the configured value, got {msg}"
                 );
                 assert!(
-                    msg.contains("backend") && msg.contains("last-token"),
+                    msg.contains("backend") && msg.contains("in-graph"),
                     "the error must say no backend implements it and what does, \
                      got {msg}"
                 );
@@ -1027,7 +1107,7 @@ mod tests {
         ));
 
         let mut corrected = config;
-        corrected.pooling = "last-token".to_string();
+        corrected.pooling = "in-graph".to_string();
         let mut engine = SemanticEngine::open(corrected).unwrap();
         assert!(engine.incompatibilities().is_empty());
         assert!(engine.status().needs_full_reindex.is_none());
@@ -1037,6 +1117,75 @@ mod tests {
         );
     }
 
+    /// The query side of text recipe 2: every query is embedded marked as one, once, and
+    /// version 1 embeds it as it is.
+    #[test]
+    fn a_query_is_embedded_through_the_text_recipe_of_the_index() {
+        let dir = TempDir::new("query_recipe");
+        let query = "מצות תפילין";
+
+        let reference = {
+            let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
+                model_path: config_at(&dir).model_path,
+                embedding_dim: 64,
+                ..Default::default()
+            });
+            runtime.load().unwrap();
+            runtime
+        };
+
+        let mut v1 = SemanticEngine::open(config_at(&dir)).unwrap();
+        v1.load_model().unwrap();
+        assert_eq!(
+            v1.embed_query(query).unwrap(),
+            reference.embed_one(query).unwrap()
+        );
+
+        let other = TempDir::new("query_recipe_v2");
+        let mut config = config_at(&other);
+        config.chunking.embedding_text_version = 2;
+        let mut v2 = SemanticEngine::open(config).unwrap();
+        v2.load_model().unwrap();
+        let produced = v2.embed_query(query).unwrap();
+        assert_eq!(
+            produced,
+            reference.embed_one(&format!("[QUERY] {query}")).unwrap()
+        );
+        assert_ne!(produced, reference.embed_one(query).unwrap());
+
+        // Nothing to embed is refused, rather than embedded as the bare prefix.
+        assert!(v2.embed_query("  ").is_err());
+    }
+
+    /// A token cap past any encoder's context — `u32::MAX` is what a negative setting
+    /// arrives as — is refused like a pooling no backend performs: while it is a
+    /// configuration, before the manifest records it as the index's identity.
+    #[test]
+    fn a_cap_past_any_encoders_context_is_refused_before_the_manifest_is_written() {
+        let dir = TempDir::new("onnx_cap_ceiling");
+        let mut config = config_at(&dir);
+
+        for cap in [ONNX_MAX_TOKENS_CEILING + 1, u32::MAX as usize] {
+            config.embedding_max_tokens = cap;
+            match SemanticEngine::open(config.clone()) {
+                Err(SemanticSearchError::Config(msg)) => assert!(
+                    msg.contains(&format!("embedding_max_tokens is {cap}"))
+                        && msg.contains(&ONNX_MAX_TOKENS_CEILING.to_string()),
+                    "the error must name the cap and the ceiling: {msg}"
+                ),
+                Err(other) => panic!("expected a config error, got {other}"),
+                Ok(_) => panic!("a cap of {cap} must be refused for an ONNX model"),
+            }
+            assert!(
+                !SemanticManifest::file_path(&config.root_dir).exists(),
+                "a refused configuration must not have persisted an index identity"
+            );
+        }
+
+        config.embedding_max_tokens = ONNX_MAX_TOKENS_CEILING;
+        assert!(config.validate().is_ok(), "the ceiling itself is accepted");
+    }
+
     /// The cap decides how much of a long line the model ever saw, so it is part of
     /// the index's identity: unrecorded, half a library could be embedded under one
     /// cap and half under another with the manifest calling it current.
@@ -1044,7 +1193,7 @@ mod tests {
     fn changing_the_token_cap_makes_the_persisted_index_incompatible() {
         let dir = TempDir::new("token_cap_identity");
         let config = config_at(&dir);
-        assert_eq!(config.embedding_max_tokens, 512);
+        assert_eq!(config.embedding_max_tokens, 256);
 
         {
             let mut engine = SemanticEngine::open(config.clone()).unwrap();
@@ -1069,13 +1218,13 @@ mod tests {
             .needs_full_reindex
             .expect("a changed token cap describes different vectors");
         assert!(
-            reason.contains("512") && reason.contains("8192"),
+            reason.contains("256") && reason.contains("8192"),
             "the report must name both caps, got {reason}"
         );
         assert!(matches!(
             engine.incompatibilities(),
             [ManifestMismatch::MaxTokens {
-                manifest: 512,
+                manifest: 256,
                 config: 8192
             }]
         ));
@@ -1102,8 +1251,8 @@ mod tests {
             "model_checksum": null,
             "embedding_backend": "mock-hash-v1",
             "embedding_dim": config.embedding_dim,
-            "pooling": "last-token",
-            "model_quantization": "Q4",
+            "pooling": config.pooling,
+            "model_quantization": config.model_quantization,
             "vector_precision": "f32",
             "vector_backend": crate::semantic::store::BACKEND_ID,
             "chunking_version": config.chunking.chunking_version,
@@ -1289,7 +1438,7 @@ mod tests {
     fn indexing_a_book_with_no_embeddable_lines_needs_no_model() {
         let dir = TempDir::new("empty_book_no_model");
         let mut config = config_at(&dir);
-        config.model_path = dir.path().join("absent.gguf");
+        config.model_path = dir.path().join("absent.onnx");
 
         let mut engine = SemanticEngine::open(config).unwrap();
         let blank = book("blank.txt", 1, &[(1, 1, "א"), (2, 1, "   ")]);
@@ -1672,13 +1821,59 @@ mod tests {
         ));
     }
 
+    /// The self-built path honours a token as the official one does: refused before the
+    /// store is scanned when the token is already set, stopped inside the scan when it is
+    /// set there.
+    #[test]
+    fn a_cancelled_search_stops_before_the_scan_or_inside_it() {
+        use crate::cancellation::probe;
+
+        let dir = TempDir::new("cancelled_search");
+        let mut engine = SemanticEngine::open(config_at(&dir)).unwrap();
+        let book = three_line_book();
+        engine.index_book(&book).unwrap();
+        let query = &book.lines[2].text;
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (result, checkpoints) =
+            probe::checkpoints_of(|| engine.search_cancellable(query, 3, None, &cancelled));
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(
+            checkpoints.is_empty(),
+            "the store must never have been scanned"
+        );
+
+        let cancel = CancellationToken::new();
+        let (result, checkpoints) = probe::cancelling_at(&cancel, 0, || {
+            engine.search_cancellable(query, 3, None, &cancel)
+        });
+        assert!(
+            matches!(result, Err(SemanticSearchError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(checkpoints, [0]);
+
+        let hits = engine
+            .search_cancellable(query, 3, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(hits[0].metadata.line_id, 3);
+        assert!(
+            engine.status().available,
+            "a cancel leaves the engine usable"
+        );
+    }
+
     // ── model loading ──
 
     #[test]
     fn a_missing_model_file_fails_loudly_and_is_recorded() {
         let dir = TempDir::new("missing_model");
         let mut config = config_at(&dir);
-        config.model_path = dir.path().join("absent.gguf");
+        config.model_path = dir.path().join("absent.onnx");
 
         let mut engine = SemanticEngine::open(config).unwrap();
         assert!(matches!(
@@ -1722,9 +1917,11 @@ mod tests {
             engine.index_book(&three_line_book()).unwrap();
         }
 
-        let mut bytes = std::fs::read(&config.model_path).unwrap();
-        bytes.extend_from_slice(b"different weights entirely");
-        std::fs::write(&config.model_path, bytes).unwrap();
+        std::fs::write(
+            &config.model_path,
+            mock::onnx::stub_graph_named("different weights entirely"),
+        )
+        .unwrap();
 
         let mut engine = SemanticEngine::open(config).unwrap();
         engine.load_model().unwrap();
@@ -2003,7 +2200,7 @@ mod tests {
         }
 
         let mut renamed = config;
-        renamed.embedding_model_id = "EMD123/Some-Other-Model".to_string();
+        renamed.embedding_model_id = "otzaria/some-other-model".to_string();
         let engine = SemanticEngine::open(renamed).unwrap();
 
         let diff = engine.diff_against_tantivy(&HashMap::new());
@@ -2191,89 +2388,14 @@ mod tests {
 
     // ── the backend is a choice, not a constant ──
 
-    fn zevc_config_for(config: &SemanticConfig) -> crate::semantic::zevc_store::ZevcStoreConfig {
-        crate::semantic::zevc_store::ZevcStoreConfig {
-            db_path: config.store.db_path.clone(),
-            embedding_dim: config.embedding_dim,
-            collection_name: config.store.collection_name.clone(),
-            auto_persist: false,
-        }
-    }
-
-    fn zevc_store(config: &SemanticConfig) -> Box<dyn VectorStoreBackend> {
-        Box::new(
-            crate::semantic::zevc_store::ZevcStore::open_or_create(zevc_config_for(config))
-                .unwrap(),
-        )
-    }
-
-    /// The builder half of what S2a splits: handed a persistent backend, an indexing run
-    /// produces something a restart can still read — which is the precondition for an
-    /// artifact being packable from it at all.
-    #[test]
-    fn an_engine_over_a_persistent_backend_keeps_its_vectors_across_a_reopen() {
-        let dir = TempDir::new("persistent_backend");
-        let config = config_at(&dir);
-
-        {
-            let mut engine =
-                SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
-            assert_eq!(
-                engine.index_book(&three_line_book()).unwrap(),
-                IndexOutcome::Indexed { chunks: 3 }
-            );
-            let status = engine.status();
-            assert!(status.vectors_persisted);
-            assert_eq!(status.vector_count, 3);
-        }
-
-        let engine = SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
-        let status = engine.status();
-        assert_eq!(status.vector_count, 3, "the vectors survived the restart");
-        assert_eq!(
-            status.indexed_book_count, 1,
-            "so the manifest's record of them is not stale and must be kept"
-        );
-        assert!(status.needs_full_reindex.is_none());
-        assert!(engine
-            .diff_against_tantivy(&HashMap::from([(
-                "otzaria/tanach/genesis.txt".to_string(),
-                111u64
-            )]))
-            .is_up_to_date());
-    }
-
-    /// The manifest records the backend that is actually open. Without that, reopening a
-    /// persisted index with the volatile backend would answer every query from an empty
-    /// store while the manifest still called the books indexed.
-    #[test]
-    fn reopening_a_persisted_index_with_another_backend_is_an_incompatibility() {
-        let dir = TempDir::new("backend_swap");
-        let config = config_at(&dir);
-
-        {
-            let mut engine =
-                SemanticEngine::with_store(config.clone(), zevc_store(&config)).unwrap();
-            engine.index_book(&three_line_book()).unwrap();
-        }
-
-        let engine = SemanticEngine::open(config).unwrap();
-        let reason = engine
-            .status()
-            .needs_full_reindex
-            .expect("a backend swap must be reported");
-        assert!(reason.contains("Vector backend"), "{reason}");
-        assert!(engine.search("בריאה", 5, None).is_err());
-    }
-
     #[test]
     fn a_backend_whose_dimension_disagrees_with_the_model_is_refused() {
         let dir = TempDir::new("backend_dim");
         let config = config_at(&dir);
 
-        let mut narrower = zevc_config_for(&config);
+        let mut narrower = config.store.clone();
         narrower.embedding_dim = config.embedding_dim / 2;
-        let store = crate::semantic::zevc_store::ZevcStore::open_or_create(narrower).unwrap();
+        let store = VectorStore::open_or_create(narrower).unwrap();
 
         // Mapped to a describable value: an engine is not `Debug`, and a panic message
         // reading "got true" says nothing about what went wrong.

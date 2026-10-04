@@ -1,39 +1,33 @@
 //! Binary CLI interface for `otzaria-semantic-search`.
 //!
 //! Provides a standalone command-line application for querying, indexing, and
-//! inspecting the Otzaria semantic search engine, and the build-side `build`, `pack` and
-//! `validate` commands that produce an official artifact.
+//! inspecting the Otzaria semantic search engine, and the build-side commands: `build`,
+//! which embeds a corpus into a base vector package, and `export-plan` and `embed-shard`,
+//! which cut that work in two for machines that never meet.
 //!
-//! `pack` and `validate` need no embedding backend — they never turn text into a vector —
-//! so they work in a default build, which is the one a release pipeline has. `build` does
-//! turn text into vectors, and so needs one compiled in.
+//! `export-plan` needs no embedding backend — it never turns text into a vector — so it
+//! works in a default build, which is the one a release pipeline has. So does
+//! `model-checksum`, which reads a model without running it. `build` and `embed-shard` do
+//! turn text into vectors, and so need one compiled in.
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
-use otzaria_semantic_search::distribution::builder::{build, BuildRequest, PlannedCorpus};
-use otzaria_semantic_search::distribution::corpus::{CorpusIndex, JsonlCorpus};
-use otzaria_semantic_search::distribution::package::IndexPackage;
-use otzaria_semantic_search::distribution::packer::{
-    pack, read_vector_inputs, validate_artifact, PackReport, PackRequest,
+use otzaria_semantic_search::distribution::builder::{
+    build, BuildRequest, RELEASE_MANIFEST_FILENAME, SEGMENT_FILENAME,
 };
-use otzaria_semantic_search::distribution::reuse::{
-    assemble, ledger_from_artifact, plan_split, verify_shards, LedgerManifest, ReuseEntry,
-    VerifiedBase,
-};
-use otzaria_semantic_search::distribution::shard::{
-    embed_shard, export_plan, read_plan, ShardReport,
-};
+use otzaria_semantic_search::distribution::corpus::JsonlCorpus;
+use otzaria_semantic_search::distribution::package::utc_timestamp;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
 use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
+use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
 use otzaria_semantic_search::semantic::versioning::ModelIdentity;
-use otzaria_semantic_search::semantic::zevc_store::VECTORS_FILENAME;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 fn print_usage() {
     println!(
@@ -47,17 +41,20 @@ Commands:
   status [--dir <path>]               Display search engine index and model status.
   search <query> [options]            Execute a search query against the engine.
   index-text <key> <title> <text>     Index a plain-text book into the database.
-  build [options]                     Embed a corpus and write an official artifact.
-  export-plan [options]               Apply the recipe and write the work out, for a
-                                      machine that will embed it elsewhere.
-  embed-shard [options]               Embed one window of an exported plan.
-  plan-split [options]                Split a plan against a previous release's ledger.
-  assemble [options]                  Gather reused and freshly embedded vectors into one
-                                      pair of files.
-  ledger [options]                    Build the next release's reuse ledger from a packed
-                                      artifact.
-  pack [options]                      Build an official artifact from ready-made vectors.
-  validate [options]                  Verify an artifact against a corpus and a model.
+  build [options]                     Embed a corpus and write a base vector package.
+  plan [options]                      Apply the recipe to a corpus and write a vector
+                                      build's plan, split against the release before.
+  embed-shard [options]               Embed a window of a plan's embed.jsonl on this CPU,
+                                      in one process or several.
+  adopt-shard [options]               Write the v2 manifest of an external worker's output,
+                                      so a warehouse can import it.
+  warehouse-add [options]             Check shards and add their vectors to a warehouse.
+  assemble [options]                  Assemble a base or a delta from a plan and the
+                                      warehouse; with --verify, check gates G1, G5, G7-G10.
+  release-files [options]             List the files a release downloads as, in the shape
+                                      of the updater's patch entries, in its manifest.
+  model-checksum --model-file <path>  Validate a model and print the model_checksum an
+                                      identity has to declare for it.
 
 Options for 'search':
   --dir <path>       Directory holding semantic database (default: "./semantic_db")
@@ -68,130 +65,126 @@ Options for 'status':
   --dir <path>       Directory holding semantic database (default: "./semantic_db")
 
 Options for 'build':
-  --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it
+  --corpus-identity <path>   JSON CorpusIdentity, as the lexical index reports it: its
+                             text identity, library version and release tag, and id scheme
   --corpus-lines <path>      JSONL, one corpus line per document
   --model <path>             JSON ModelIdentity describing how the vectors are produced
-  --model-file <path>        The GGUF the vectors are produced with
+  --model-file <path>        The model the vectors are produced with: an ONNX graph, with
+                             its package beside it (see 'model-checksum')
   --chunking <path>          JSON ChunkerConfig — the recipe itself (see below)
-  --out <dir>                Output directory; must not exist, or be empty
+  --out <dir>                Output directory; must not exist, or be empty. Receives
+                             segment.oxv, the package's manifest.json and payloads.json,
+                             and release.json — the manifest an installation is handed
+                             with the segment
   --batch <N>                Texts per inference call (default: 32)
-  --collection <name>        Collection name in the payload header (default: "chunks")
+  --codec <name>             i8-sym-vec (default: an int8 scale per vector), i8-sym-dim
+                             (a scale per dimension, calibrated) or f32. The application
+                             reads the default only
+  --clip-q <q>               For i8-sym-dim: the quantile each dimension's scale is
+                             calibrated at, in (0, 1] (default: 1, which clips nothing)
   --created-at <timestamp>   Manifest timestamp (default: now, UTC)
-  --allow-non-semantic       Write an artifact from a backend whose vectors mean nothing.
-                             For tests only: such an artifact passes every check here and
+  --allow-non-semantic       Write a package from a backend whose vectors mean nothing.
+                             For tests only: such a package passes every check here and
                              answers nonsense.
 
-Options for 'export-plan':
+Options for 'plan':
   --corpus-identity <path>   As for 'build'
   --corpus-lines <path>      As for 'build'
-  --model <path>             As for 'build'; no model file is opened, and none is needed
+  --model <path>             The family the vectors are for (JSON ModelIdentity)
   --chunking <path>          The recipe to apply
-  --out <dir>                Receives plan.jsonl and export-manifest.json
+  --passage-quantization <q> Which of the family's packages embeds the passages
+                             (default: fp32)
+  --previous-ledger <dir>    The ledger of the release before; omit for a first base
+  --warehouse <dir>          Leave out of embed.jsonl the texts it holds vectors for
+  --out <dir>                Receives records.bin, books.json, embed.jsonl,
+                             embed-manifest.json, tombstones.bin and plan-manifest.json
+  --created-at <timestamp>   Manifest timestamp (default: now, UTC)
 
 Options for 'embed-shard':
-  --plan <path>              plan.jsonl, as 'export-plan' wrote it
-  --model <path>             The identity the plan was exported under
-  --model-file <path>        The GGUF; held to every field the identity declares
+  --plan <dir>               The plan: embed.jsonl and embed-manifest.json. The manifest
+                             names the family and the passage package; nothing else is read
+  --model-file <path>        The ONNX graph of the passage package; held to every field
+                             the family declares, and to the package checksum
   --skip <N>                 Records to skip (default: 0)
   --take <N>                 Records to embed (default: all that remain)
   --batch <N>                Texts per inference call (default: 32)
-  --out <dir>                Receives vectors.f32, records.jsonl, shard-manifest.json.
+  --processes <P>            Split the window among P processes, each writing its own
+                             shard into <out>/shard-NNN (default: 1, a shard in <out>)
+  --threads <T>              ONNX Runtime threads per process (OTZARIA_ONNX_THREADS)
+  --out <dir>                Receives vectors.f32, keys.bin, shard-manifest.json.
                              Leftovers from a session that died are overwritten — retrying a
-                             window is normal — but a directory holding all three is not.
+                             window is normal — but a finished shard is not.
   --allow-non-semantic       As for 'build'
 
-Options for 'plan-split':
-  --plan <path>              plan.jsonl for the release being built
-  --ledger <path>            ledger.jsonl of the release to reuse from. Omit it for a
-                             full baseline: every line then goes to the GPU.
-  --out <dir>                Receives reuse.jsonl and embed.jsonl
+Options for 'adopt-shard':
+  --dir <dir>                Holds vectors.f32 and keys.bin (32 raw bytes a record: rename
+                             a worker's keys.sha256); receives shard-manifest.json
+  --model <path>             The family (JSON ModelIdentity)
+  --passage-quantization <q> The package the vectors were embedded with (default: fp32)
+  --plan-sha256 <hex>        The digest of the plan the worker embedded, for the record
+  --worker-name, --worker-version, --device, --ep, --mode
+                             What ran it: mode `onnxruntime` for ONNX Runtime with the
+                             shipped graph, anything else for a re-implementation
+  --parity-reference <text>, --parity-samples <N>, --parity-min-cosine <x>,
+  --parity-mean-cosine <x>, --parity-document <path>
+                             The parity certificate, required unless ep is cpu and mode is
+                             onnxruntime
+
+Options for 'warehouse-add':
+  --warehouse <dir>          The warehouse
+  --create                   Create it if missing, for --model's --passage-quantization
+  --model <path>             With --create: the family
+  --passage-quantization <q> With --create: the package (default: fp32)
+  --plan <dir>               The plan the shards were cut from; without it, an import:
+                             everything but the plan's own keys is checked
+  --shards <dir>             A shard, or a directory holding shards at any depth; repeat
+  --allow-non-semantic       Accept the stand-in's vectors (tests only)
 
 Options for 'assemble':
-  --shards <dir>             Root holding every shard's output, at any depth
-  --plan-sha256 <hex>        The digest every shard's manifest must name
-  --embed-records <N>        How many records the shards must cover, with no hole
-  --model <path>             The identity every shard must have been embedded under, and
-                             the width every file is strided by. There is no --dim: a
-                             width the model does not declare is not a width.
-  --reuse <path>             reuse.jsonl from 'plan-split'; omit for a full baseline
-  --ledger <path>            With --ledger-manifest and --base-vectors: the release being
-  --ledger-manifest <path>   reused from. All three or none, and --model with them.
-  --base-vectors <path>      vectors.f32 of that release
-  --out <dir>                Receives vectors.f32 and records.jsonl, and may hold neither —
-                             nor a .partial of either. The two files are one fact, and a
-                             record is bound to its vector by position alone, so nothing is
-                             overwritten: to merge again, remove what is there first.
+  --plan <dir>               The plan
+  --warehouse <dir>          The warehouse, holding every vector the release ships
+  --out <dir>                The release: segment.oxv, manifest.json, payloads.json,
+                             release.json, and this version's ledger
+  --kind <base|delta>        What to assemble; without it, --verify checks the release
+                             already in --out
+  --previous <dir>           The ledger of the release the plan was split against:
+                             required for a delta and for --keep-epoch
+  --previous-version <N>     Its version, when the directory holds several
+  --codec <name>             A base's codec epoch: i8-sym-vec (default), i8-sym-dim, f32
+  --clip-q <q>               For i8-sym-dim: the calibration quantile (default: 1)
+  --keep-epoch               A base in the previous release's codec epoch
+  --created-at <time>        The manifest's createdAt (default: now); the same inputs and
+                             time give the same bytes
+  --built-by <json>          The manifest's builtBy, e.g. {{"runId":"..."}}
+  --verify                   Check the gates and write <out>/gates.json; a failed gate
+                             exits with status 2
+  --samples <N>              G5's sample (default: 20000)
 
-Options for 'ledger':
-  --artifact <dir>           A packed artifact; its metadata.jsonl order is the payload's
-  --records <path>           records.jsonl from 'assemble' — the only place the full
-                             64-hex digest exists, since the payload stores 32
-  --artifact-digest <hex>    Optional. The digest published outside the artifact; it is
-                             compared against the computed one, never copied into the
-                             manifest. The model identity comes from the package.
-  --out <path>               ledger.jsonl; the manifest is written beside it, and neither
-                             may exist yet. The pair is published as one fact and two
-                             renames are not one commit, so nothing is overwritten: to
-                             rebuild in place, delete both first.
+Options for 'release-files':
+  --release <path>           An assembled release.json
+  --files <path>             A file the release downloads as, in order; repeat
+  --compression <name>       How they are compressed (default: zstd)
+  --out <path>               The manifest to write, with its files
 
-Build the ledger from the artifact and never from 'assemble': packing sorts the payload by
-semantic_id, so the assembler's order is not the published one.
+Options for 'model-checksum':
+  --model-file <path>        An .onnx graph, its tokenizer.json beside it. No other kind of
+                             model is read: a path that does not end in .onnx is refused.
 
-Options for 'plan-split' (continued):
-  --ledger-manifest <path>   Required with --ledger. Names the artifact digest, the
-                             vectors.bin digest and the model identity the offsets mean
-                             something under.
-  --model <path>             Required with --ledger-manifest, to compare against.
+An ONNX model is a package: the graph, the tokenizer.json beside it and every external-data
+file the graph names, and the checksum is the SHA-256 of a manifest listing each of them
+with its size and SHA-256 — printed here exactly as it is hashed. Nothing else in the
+directory is part of it: not a README, not a second graph, not an ONNX Runtime library.
 
-The reuse key is embedding_text_sha256, not a line id: a vector is a function of the text
-that was embedded and nothing else, so a digest the previous ledger knows names a vector
-that is already correct — whatever id it now carries. It also catches what an id-keyed
-diff misses silently, a line whose own text is unchanged but whose neighbour moved.
-
-A shard is a window of *records*, not of line_ids. Merge by concatenating every shard's
-vectors.f32 and records.jsonl in any order, then 'pack' the pair: it compares the ids it
-was given against the recipe's expected set, so a lost shard is a refusal and not a
-smaller artifact.
-
-Options for 'pack':
-  --vectors <path>           Raw little-endian f32 vectors, count x embedding_dim, no header
-  --records <path>           JSONL, one record per vector, in the same order (see below)
-  --corpus-identity <path>   As above
-  --corpus-lines <path>      As above
-  --model <path>             As above
-  --chunking <path>          Optional; see 'The coverage contract' below
-  --out <dir>                Output directory; must not exist, or be empty
-  --collection <name>        Collection name in the payload header (default: "chunks")
-  --created-at <timestamp>   Manifest timestamp (default: now, UTC)
-
-Options for 'validate':
-  --artifact <dir>           The artifact directory to verify
-  --corpus-identity <path>   As above
-  --corpus-lines <path>      As above
-  --model <path>             As above
-  --chunking <path>          Optional; as for 'pack'
-
-A record is {{"line_id":N,"source_line_sha256":"...","embedding_text_sha256":"..."}}.
-Both digests are lowercase hex SHA-256.
-
-  source_line_sha256     of the corpus line's text. Checked against the corpus: this is
-                         what catches a vector file that drifted out of step with its id
-                         list, which nothing else here would notice.
-  embedding_text_sha256  of the text that was actually embedded, after any title prefix,
-                         neighbour context or truncation. Recorded as the record's
-                         chunk_hash; not checked against anything, because the corpus
-                         holds the line and not the recipe's output.
+A shard is the external embedding interface: docs/VECTOR_BUILD.md describes embed.jsonl,
+vectors.f32, keys.bin and shard-manifest.json exactly, for a worker that is not this CLI.
 
 A chunker configuration is
 {{"min_meaningful_chars":20,"context_window_lines":2,"max_chunk_chars":512,
-  "min_embeddable_chars":5,"chunking_version":1}}, and its hash must be the
-chunking_identity the model declares — an artifact records the hash, and a hash cannot
-be turned back into the recipe.
-
-The coverage contract: with --chunking, the lines that must get a vector are the ones the
-recipe embeds, derived from the corpus. Without it, they are every line in the corpus
-file, so it has to hold exactly the lines that should be embedded. 'build' always derives
-them; there is nothing to declare that it does not apply.
+  "min_embeddable_chars":5,"chunking_version":1,"embedding_text_version":1,
+  "normalization_version":1}}, and its hash must be the chunking_identity the model
+declares — a package records the hash, and a hash cannot be turned back into the recipe.
+Every field is required. embedding_text_version 2 puts "[PASSAGE] " before every passage
+and "[QUERY] " before every query, for a model trained with those role prefixes.
 
 Examples:
   otzaria-semantic-search version
@@ -199,10 +192,8 @@ Examples:
   otzaria-semantic-search search "מצות תפילין" --mode semantic --limit 5
   otzaria-semantic-search index-text "otzaria/demo.txt" "ספר הדגמה" "כל העוסק בתורה בלילה שכינה כנגדו"
   otzaria-semantic-search build --corpus-identity corpus.json --corpus-lines corpus.jsonl \
-      --model model.json --model-file model.gguf --chunking chunking.json --out ./artifact
-  otzaria-semantic-search pack --vectors v.f32 --records v.jsonl \
-      --corpus-identity corpus.json --corpus-lines corpus.jsonl \
-      --model model.json --out ./artifact
+      --model model.json --model-file model.onnx --chunking chunking.json --out ./package
+  otzaria-semantic-search model-checksum --model-file models/meivin/model-fp32.onnx
 "#,
         env!("CARGO_PKG_VERSION")
     );
@@ -219,7 +210,7 @@ fn main() {
     match command.as_str() {
         "version" | "-v" | "--version" => {
             println!("otzaria-semantic-search CLI {}", env!("CARGO_PKG_VERSION"));
-            println!("Engine: Hybrid Tantivy + Local Vector Engine (GGUF MRL support)");
+            println!("Engine: Hybrid Tantivy + Local Vector Engine (ONNX models)");
             println!("Crate Targets: rlib, cdylib, staticlib, binary CLI");
         }
         "status" => {
@@ -284,6 +275,7 @@ fn main() {
                 force_mode,
                 profile: None,
                 feature_flags: None,
+                ranking: None,
             };
 
             match hybrid.search(req) {
@@ -382,13 +374,13 @@ fn main() {
             }
         }
         "build" => run_build(&args),
-        "export-plan" => run_export_plan(&args),
+        "plan" => run_plan(&args),
         "embed-shard" => run_embed_shard(&args),
-        "plan-split" => run_plan_split(&args),
+        "adopt-shard" => run_adopt_shard(&args),
+        "warehouse-add" => run_warehouse_add(&args),
         "assemble" => run_assemble(&args),
-        "ledger" => run_ledger(&args),
-        "pack" => run_pack(&args),
-        "validate" => run_validate(&args),
+        "release-files" => run_release_files(&args),
+        "model-checksum" => run_model_checksum(&args),
         "help" | "-h" | "--help" => {
             print_usage();
         }
@@ -398,6 +390,49 @@ fn main() {
             process::exit(1);
         }
     }
+}
+
+/// Validate a model the way `build` and the runtime will, and print what an identity has
+/// to declare for it.
+///
+/// Opens no backend, so it works in a default build: the checksum is a fact about the
+/// files, and writing `model.json` for a new model should not need the model to run.
+fn run_model_checksum(args: &[String]) {
+    let model_file = PathBuf::from(require_arg(args, "--model-file"));
+    let package = validate_model(&model_file)
+        .unwrap_or_else(|error| exit_with("The model cannot be used", error));
+
+    println!("=== Model checksum ===");
+    println!("Model:           {}", model_file.display());
+    println!("Format:          ONNX");
+    println!("model_checksum:  {}", package.checksum());
+
+    let facts = package.graph_facts();
+    println!("Package root:    {}", package.root().display());
+    println!(
+        "Graph:           IR {}, {} opset import(s), {} input(s), {} output(s), {} \
+         external tensor reference(s)",
+        facts.ir_version,
+        facts.opset_imports,
+        facts.graph_inputs,
+        facts.graph_outputs,
+        facts.external_tensors
+    );
+    println!("\nPackage files ({}):", package.files().len());
+    let width = package
+        .files()
+        .iter()
+        .map(|file| file.relpath.chars().count())
+        .max()
+        .unwrap_or(0);
+    for file in package.files() {
+        println!(
+            "  {:<width$}  {:>12} bytes  sha256 {}",
+            file.relpath, file.size, file.sha256
+        );
+    }
+    println!("\nThe checksum is the SHA-256 of exactly this text:");
+    print!("{}", package.manifest_text());
 }
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
@@ -426,7 +461,7 @@ fn exit_with<E: std::fmt::Display>(context: &str, error: E) -> ! {
 
 /// Read the `ModelIdentity` a build declares for its vectors.
 ///
-/// A file rather than a dozen flags: it is half of the artifact's identity, it is written
+/// A file rather than a dozen flags: it is half of the package's identity, it is written
 /// once per model release, and it belongs under version control beside the model rather
 /// than in a shell history.
 fn read_model(path: &str) -> ModelIdentity {
@@ -448,7 +483,7 @@ fn load_corpus(args: &[String]) -> JsonlCorpus {
 /// Read the recipe a build applies.
 ///
 /// A separate file from the model identity because it is a different kind of fact: the
-/// identity says what the artifact *declares*, and this says what will actually be done to
+/// identity says what the package *declares*, and this says what will actually be done to
 /// the text. The build refuses to proceed unless one hashes to the other.
 fn read_chunking(path: &str) -> ChunkerConfig {
     let json = std::fs::read_to_string(path)
@@ -457,707 +492,542 @@ fn read_chunking(path: &str) -> ChunkerConfig {
         .unwrap_or_else(|error| exit_with(&format!("{path} is not a chunker configuration"), error))
 }
 
-/// Wrap the corpus in the recipe, when one was given.
-///
-/// Without `--chunking` the corpus file is the coverage contract, which is what it has
-/// always been and is exactly as trustworthy as whoever exported it. With one, the lines
-/// that must get a vector are derived by applying the recipe — and the recipe is pinned to
-/// the `chunking_identity` the artifact declares, so an export made under one recipe cannot
-/// be packed under another.
-fn plan_corpus<'a>(
-    args: &[String],
-    corpus: &'a JsonlCorpus,
-    model: &ModelIdentity,
-) -> Option<PlannedCorpus<'a>> {
-    let chunking = read_chunking(&parse_arg(args, "--chunking")?);
-    let planned = PlannedCorpus::new(corpus, &chunking, model)
-        .unwrap_or_else(|error| exit_with("Could not apply the recipe to the corpus", error));
-    println!("Recipe: {} line(s) get a vector", planned.plan().len());
-    Some(planned)
-}
+/// Write a vector build's plan from a corpus transcription.
+fn run_plan(args: &[String]) {
+    use otzaria_semantic_search::distribution::ledger::Ledger;
+    use otzaria_semantic_search::distribution::plan::{plan_from_corpus, PlanRequest};
 
-/// Apply the recipe on the machine that holds the corpus, and write the work out.
-///
-/// No model is opened and none is needed: this is the half of a build that is arithmetic
-/// on strings. What it writes is what a worker with a GPU and no corpus can act on.
-fn run_export_plan(args: &[String]) {
-    let out = PathBuf::from(require_arg(args, "--out"));
     let model = read_model(&require_arg(args, "--model"));
-    let chunking = read_chunking(&require_arg(args, "--chunking"));
+    let quantization = parse_arg(args, "--passage-quantization").unwrap_or_else(|| "fp32".into());
+    let passage_package = model
+        .query_packages
+        .iter()
+        .find(|package| package.quantization == quantization)
+        .cloned()
+        .unwrap_or_else(|| {
+            exit_with(
+                "The family has no such package",
+                format!("no {quantization} package among its query packages"),
+            )
+        });
+    let previous = parse_arg(args, "--previous-ledger").map(|dir| {
+        Ledger::open(Path::new(&dir), None)
+            .unwrap_or_else(|error| exit_with("Could not open the previous ledger", error))
+    });
+    let warehouse = parse_arg(args, "--warehouse").map(|dir| {
+        otzaria_semantic_search::distribution::warehouse::Warehouse::open(Path::new(&dir))
+            .unwrap_or_else(|error| exit_with("Could not open the warehouse", error))
+    });
     let corpus = load_corpus(args);
+    let manifest = plan_from_corpus(
+        &corpus,
+        PlanRequest {
+            out_dir: PathBuf::from(require_arg(args, "--out")),
+            model,
+            chunking: read_chunking(&require_arg(args, "--chunking")),
+            passage_package,
+            previous: previous.as_ref(),
+            warehouse: warehouse.as_ref().map(|warehouse| {
+                warehouse as &dyn otzaria_semantic_search::distribution::plan::HeldVectors
+            }),
+            created_at: parse_arg(args, "--created-at")
+                .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
+        },
+    )
+    .unwrap_or_else(|error| exit_with("Planning failed", error));
 
-    std::fs::create_dir_all(&out)
-        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
-    let plan_path = out.join("plan.jsonl");
-    let file = std::fs::File::create(&plan_path)
-        .unwrap_or_else(|error| exit_with("Could not write the plan", error));
-    let mut sink = std::io::BufWriter::new(file);
-
-    let report = export_plan(&corpus, &chunking, &model, &mut sink)
-        .unwrap_or_else(|error| exit_with("Export failed", error));
-    let manifest = out.join("export-manifest.json");
-    std::fs::write(&manifest, serde_json::to_vec_pretty(&report).unwrap())
-        .unwrap_or_else(|error| exit_with("Could not write the export manifest", error));
-
-    println!("\n=== Exported a build plan ===");
-    println!("Plan:            {}", plan_path.display());
-    println!("Records:         {}", report.records);
-    println!(
-        "line_id range:   {}..={}",
-        report.min_line_id, report.max_line_id
-    );
-    println!("Plan SHA-256:    {}", report.plan_sha256);
-    println!("Chunking:        {}", report.chunking_identity);
-    println!(
-        "\nSplit it by record: --skip and --take name a window, and every record must fall in\n\
-         exactly one. The merge refuses a hole rather than packing around it."
-    );
+    let counts = manifest.counts;
+    println!("\n=== Planned v{} ===", manifest.library_version);
+    println!("Records:         {}", counts.records);
+    println!("Books:           {}", counts.books);
+    println!("Distinct keys:   {}", counts.unique);
+    println!("Reused:          {}", counts.reused);
+    println!("To ship:         {}", counts.to_ship);
+    println!("To embed:        {}", counts.to_embed);
+    println!("Revived:         {}", counts.revived);
+    println!("Tombstones:      {}", counts.tombstones);
+    println!("Foreign pairs:   {}", counts.foreign_pairs);
 }
 
-/// Embed one window of a plan. The half of a build that needs a model and no corpus.
+/// Embed a window of a plan on this machine's CPU: one shard, or — with `--processes` — one
+/// child process per sub-window, each writing its own.
 fn run_embed_shard(args: &[String]) {
-    let out = PathBuf::from(require_arg(args, "--out"));
-    let plan_path = require_arg(args, "--plan");
-    let model = read_model(&require_arg(args, "--model"));
-    let model_file = require_arg(args, "--model-file");
-    let skip: usize = parse_arg(args, "--skip").map_or(0, |value| {
-        value
-            .parse()
-            .unwrap_or_else(|_| exit_with("--skip", "not a number"))
-    });
-    let take: usize = parse_arg(args, "--take").map_or(usize::MAX, |value| {
-        value
-            .parse()
-            .unwrap_or_else(|_| exit_with("--take", "not a number"))
-    });
+    use otzaria_semantic_search::distribution::plan::EmbedManifest;
+    use otzaria_semantic_search::distribution::shard::{embed_shard, WorkerInfo, MODE_MOCK};
 
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let plan_dir = PathBuf::from(require_arg(args, "--plan"));
+    let plan = EmbedManifest::read(&plan_dir)
+        .unwrap_or_else(|error| exit_with("Could not read the plan", error));
+    let number = |flag: &str, default: u64| {
+        parse_arg(args, flag).map_or(default, |value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| exit_with(flag, "not a number"))
+        })
+    };
+    let skip = number("--skip", 0);
+    let take = number("--take", u64::MAX).min(plan.records.saturating_sub(skip));
+    let processes = number("--processes", 1).max(1);
+
+    if processes > 1 {
+        // Sub-windows as even as integers allow; each child is this command with its own.
+        let per = take.div_ceil(processes);
+        let mut children = Vec::new();
+        for index in 0..processes {
+            let from = skip + index * per;
+            let count = per.min((skip + take).saturating_sub(from));
+            if count == 0 {
+                break;
+            }
+            let dir = out.join(format!("shard-{index:03}"));
+            let mut command = process::Command::new(
+                env::current_exe().unwrap_or_else(|error| exit_with("Cannot find myself", error)),
+            );
+            command.args(["embed-shard", "--plan"]).arg(&plan_dir);
+            for flag in ["--model-file", "--batch"] {
+                if let Some(value) = parse_arg(args, flag) {
+                    command.args([flag, &value]);
+                }
+            }
+            command
+                .args(["--skip", &from.to_string(), "--take", &count.to_string()])
+                .arg("--out")
+                .arg(&dir);
+            if args.iter().any(|arg| arg == "--allow-non-semantic") {
+                command.arg("--allow-non-semantic");
+            }
+            if let Some(threads) = parse_arg(args, "--threads") {
+                command.env("OTZARIA_ONNX_THREADS", threads);
+            }
+            let child = command
+                .spawn()
+                .unwrap_or_else(|error| exit_with("Could not start a worker process", error));
+            children.push((dir, child));
+        }
+        let mut failed = 0;
+        for (dir, mut child) in children {
+            let status = child
+                .wait()
+                .unwrap_or_else(|error| exit_with("A worker process was lost", error));
+            if !status.success() {
+                eprintln!("{} failed: {status}", dir.display());
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            exit_with(
+                "Embedding failed",
+                format!("{failed} worker process(es) failed"),
+            );
+        }
+        println!("\n=== Embedded {take} record(s) from {skip} in {processes} processes ===");
+        return;
+    }
+
+    if let Some(threads) = parse_arg(args, "--threads") {
+        env::set_var("OTZARIA_ONNX_THREADS", threads);
+    }
     let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-        model_path: PathBuf::from(&model_file),
-        embedding_dim: model.embedding_dim,
-        max_tokens: model.max_tokens,
+        model_path: PathBuf::from(require_arg(args, "--model-file")),
+        embedding_dim: plan.model.embedding_dim,
+        max_tokens: plan.model.max_tokens,
         batch_size: parse_arg(args, "--batch")
             .and_then(|value| value.parse().ok())
             .unwrap_or(32),
-        pooling: Pooling::parse(&model.pooling).unwrap_or_else(|error| {
-            exit_with("The model declares a pooling nothing performs", error)
+        pooling: Pooling::parse(&plan.model.pooling).unwrap_or_else(|error| {
+            exit_with("The family declares a pooling nothing performs", error)
         }),
     });
     runtime
         .load()
         .unwrap_or_else(|error| exit_with("Could not load the model", error));
-
-    // The same five comparisons `build` makes, for the same reason: a worker that embeds
-    // with a different file or a different width produces vectors the merge cannot use,
-    // and it should learn that in the second it takes rather than at the end of the shard.
-    for (field, declared, loaded) in [
-        (
-            "model_checksum",
-            model.model_checksum.clone(),
-            runtime.model_checksum().unwrap_or_default().to_string(),
-        ),
-        (
-            "embedding_backend",
-            model.embedding_backend.clone(),
-            runtime.backend_id().unwrap_or_default().to_string(),
-        ),
-        (
-            "embedding_dim",
-            model.embedding_dim.to_string(),
-            runtime.dim().to_string(),
-        ),
-        (
-            "pooling",
-            model.pooling.clone(),
-            runtime.pooling().to_string(),
-        ),
-        (
-            "max_tokens",
-            model.max_tokens.to_string(),
-            runtime.max_tokens().to_string(),
-        ),
-    ] {
-        if declared != loaded {
-            exit_with(
-                "The model file is not the one the plan was made for",
-                format!("{field}: declared {declared}, loaded {loaded}"),
-            );
-        }
-    }
-    if !runtime.backend_is_semantic() && !args.iter().any(|arg| arg == "--allow-non-semantic") {
+    let semantic = runtime.backend_is_semantic();
+    if !semantic && !args.iter().any(|arg| arg == "--allow-non-semantic") {
         exit_with(
             "This backend's vectors mean nothing",
             runtime.backend_id().unwrap_or("none").to_string(),
         );
     }
-
-    std::fs::create_dir_all(&out)
-        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
-    let plan = std::io::BufReader::new(
-        std::fs::File::open(&plan_path)
-            .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
-    );
-    // A finished shard is three files, and this refuses to write over one. Unlike the merge,
-    // *re-running* is normal here — a session that timed out gets retried on another account
-    // — so a directory holding leftovers is fair game and only a complete shard is protected.
-    // Overwriting one silently discarded an hour of GPU time and reported success.
-    let manifest_path = out.join("shard-manifest.json");
-    if [
-        &out.join("vectors.f32"),
-        &out.join("records.jsonl"),
-        &manifest_path,
-    ]
-    .iter()
-    .all(|path| path.symlink_metadata().is_ok())
-    {
-        exit_with(
-            &format!("{} already holds a finished shard", out.display()),
-            "its vectors, records and manifest are all there; embed into another directory, \
-             or remove them to re-run this window",
-        );
-    }
-    // `.partial` until the counts and digests are known: a shard killed by a session
-    // timeout must not leave a file the merge could mistake for a finished one.
-    let vectors_partial = out.join("vectors.f32.partial");
-    let records_partial = out.join("records.jsonl.partial");
-    let mut vectors = std::io::BufWriter::new(
-        std::fs::File::create(&vectors_partial)
-            .unwrap_or_else(|error| exit_with("Could not write the vectors", error)),
-    );
-    let mut records = std::io::BufWriter::new(
-        std::fs::File::create(&records_partial)
-            .unwrap_or_else(|error| exit_with("Could not write the records", error)),
-    );
-
-    // The plan's own digest travels into the manifest, so the merge can tell a shard of
-    // this export from a shard of another export with the same window.
-    let plan_sha256 = sha256_of(Path::new(&plan_path));
-    let report = embed_shard(
-        read_plan(plan, skip, take),
-        (plan_sha256, skip, take),
-        &model,
+    let worker = WorkerInfo {
+        name: env!("CARGO_PKG_NAME").to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        device: otzaria_semantic_search::semantic::embedding::cpu_description(),
+        ep: "cpu".to_string(),
+        mode: if semantic {
+            otzaria_semantic_search::distribution::shard::MODE_ONNXRUNTIME.to_string()
+        } else {
+            MODE_MOCK.to_string()
+        },
+    };
+    let manifest = embed_shard(
+        &plan_dir,
+        &plan,
+        skip,
+        take,
         &runtime,
         runtime.batch_size(),
-        &mut vectors,
-        &mut records,
+        worker,
+        &out,
     )
     .unwrap_or_else(|error| exit_with("The shard failed", error));
-    // Onto the disk before either name is published, and the manifest last: it is the digest
-    // witness for both files, so a crash between the renames leaves a pair with the previous
-    // manifest — which `verify_shards` refuses, loudly, because the digests will not match.
-    for writer in [vectors, records] {
-        writer
-            .into_inner()
-            .unwrap_or_else(|error| exit_with("Could not finish writing the shard", error))
-            .sync_all()
-            .unwrap_or_else(|error| exit_with("Could not flush the shard to disk", error));
-    }
-    for (partial, final_name) in [
-        (&vectors_partial, "vectors.f32"),
-        (&records_partial, "records.jsonl"),
-    ] {
-        std::fs::rename(partial, out.join(final_name))
-            .unwrap_or_else(|error| exit_with("Could not publish the shard", error));
-    }
-    write_and_sync(&manifest_path, &serde_json::to_vec_pretty(&report).unwrap());
-    sync_directory(&out);
 
     println!("\n=== Embedded a shard ===");
     println!("Path:            {}", out.display());
-    println!("Records:         {} (skip {skip})", report.records);
-    println!("Dimension:       {}", report.embedding_dim);
-    println!("vectors SHA-256: {}", report.vectors_sha256);
-    println!("records SHA-256: {}", report.records_sha256);
+    println!("Records:         {} (skip {skip})", manifest.records);
+    println!("Dimension:       {}", manifest.dim);
+    println!("vectors SHA-256: {}", manifest.vectors_sha256);
+    println!("keys SHA-256:    {}", manifest.keys_sha256);
 }
 
-/// Split a plan against the previous release's ledger.
-///
-/// The half of an update that decides what does not have to be embedded again. Reads no
-/// model and touches no GPU: it is a digest lookup per line.
-fn run_plan_split(args: &[String]) {
-    let out = PathBuf::from(require_arg(args, "--out"));
-    let plan = require_arg(args, "--plan");
-
-    std::fs::create_dir_all(&out)
-        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
-    let plan = std::io::BufReader::new(
-        std::fs::File::open(&plan)
-            .unwrap_or_else(|error| exit_with("Could not read the plan", error)),
-    );
-    // A ledger without its manifest, its vectors and the model is a set of integers
-    // nothing can check, so reuse requires all of them or none. No ledger at all is the
-    // first build rather than a mistake.
-    let base = verified_base(args);
-    let mut reuse = std::io::BufWriter::new(
-        std::fs::File::create(out.join("reuse.jsonl"))
-            .unwrap_or_else(|error| exit_with("Could not write reuse.jsonl", error)),
-    );
-    let mut embed = std::io::BufWriter::new(
-        std::fs::File::create(out.join("embed.jsonl"))
-            .unwrap_or_else(|error| exit_with("Could not write embed.jsonl", error)),
-    );
-
-    let report = plan_split(plan, base.as_ref(), &mut reuse, &mut embed)
-        .unwrap_or_else(|error| exit_with("The split failed", error));
-
-    println!("\n=== Split a plan against a ledger ===");
-    println!("Planned:   {}", report.planned);
-    println!("Reused:    {}", report.reused);
-    println!("To embed:  {}", report.to_embed);
+/// Every value of a repeated flag.
+fn parse_args_all(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
-/// Assemble one release's vectors from what was reused and what was embedded.
-///
-/// Shard directories are taken in sorted order, and each is expected to hold a
-/// `vectors.f32` and a `records.jsonl` of matching length — a pair that disagrees is
-/// refused rather than shifting every pairing after it.
-fn run_assemble(args: &[String]) {
-    let out = PathBuf::from(require_arg(args, "--out"));
-    let shard_root = PathBuf::from(require_arg(args, "--shards"));
-    // Before the base artifact is hashed and every shard is read, not after: this is the one
-    // refusal that can be decided in a second, and deciding it late meant tens of gigabytes
-    // of verification followed by "already exists".
-    //
-    // Nothing here overwrites, for the reason the ledger does not: the two files are one
-    // fact and two renames are not one commit. Into a directory that already holds a pair, a
-    // crash after the first rename would leave the new vectors beside the *old* records —
-    // and a record is bound to its vector by position alone, so nothing downstream can prove
-    // the floats do not belong to those ids.
-    let vectors_final = out.join("vectors.f32");
-    let records_final = out.join("records.jsonl");
-    let vectors_partial = out.join("vectors.f32.partial");
-    let records_partial = out.join("records.jsonl.partial");
-    require_free(
-        &[
-            &vectors_final,
-            &records_final,
-            &vectors_partial,
-            &records_partial,
-        ],
-        "the merged vectors and their records are published as a pair",
-    );
-    // The width comes from the identity the shards were verified against, not from the
-    // command line. It was a `--dim` argument, and a `--dim` that disagreed with the model
-    // made every stride through the base and the shards the wrong length — while the
-    // identity the artifact publishes still said the model's number.
-    let shard_model = read_model(&require_arg(args, "--model"));
-    let embedding_dim = shard_model.embedding_dim as usize;
-    if let Some(given) = parse_arg(args, "--dim") {
-        if given.parse::<usize>() != Ok(embedding_dim) {
-            exit_with(
-                "--dim disagrees with the model and is no longer needed",
-                format!("{given} against the model's {embedding_dim}"),
-            );
-        }
-    }
-
-    let reuse: Vec<ReuseEntry> = match parse_arg(args, "--reuse") {
-        Some(path) => std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| exit_with("Could not read the reuse list", error))
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str(line)
-                    .unwrap_or_else(|error| exit_with("A reuse entry is malformed", error))
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    // The same verified bundle `plan-split` used. Reuse cannot be handed a bare file.
-    let base = verified_base(args);
-
-    // Every `vectors.f32` under the root, at any depth: a shard produced by a
-    // multi-GPU session is a directory of directories, and flattening it here means the
-    // caller does not have to.
-    let mut shards = Vec::new();
-    collect_shards(&shard_root, &mut shards);
-    shards.sort();
-    println!(
-        "Shards: {} half-shard(s) under {}",
-        shards.len(),
-        shard_root.display()
-    );
-    // Read every manifest and hold the set to the plan before a byte is copied. Opening
-    // the two files directly — which is what this did — left the manifests as decoration:
-    // a shard from another export, a corrupted vector that stayed finite, or two shards
-    // covering one window and none covering another all merged without a word.
-    let manifests: Vec<(PathBuf, ShardReport)> = shards
+/// The package of `model` whose quantization is `--passage-quantization` (default fp32).
+fn passage_package_of(
+    args: &[String],
+    model: &ModelIdentity,
+) -> otzaria_semantic_search::semantic::versioning::ModelPackage {
+    let quantization = parse_arg(args, "--passage-quantization").unwrap_or_else(|| "fp32".into());
+    model
+        .query_packages
         .iter()
-        .map(|dir| {
-            let path = dir.join("shard-manifest.json");
-            let manifest: ShardReport =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                    exit_with(&format!("Could not read {}", path.display()), error)
-                }))
-                .unwrap_or_else(|error| {
-                    exit_with(
-                        &format!("{} is not a shard manifest", path.display()),
-                        error,
-                    )
-                });
-            (dir.clone(), manifest)
+        .find(|package| package.quantization == quantization)
+        .cloned()
+        .unwrap_or_else(|| {
+            exit_with(
+                "The family has no such package",
+                format!("no {quantization} package among its query packages"),
+            )
         })
-        .collect();
-    let plan_sha256 = require_arg(args, "--plan-sha256");
-    let expected: usize = require_arg(args, "--embed-records")
-        .parse()
-        .unwrap_or_else(|_| exit_with("--embed-records", "not a number"));
-    let opened = verify_shards(&manifests, &plan_sha256, &shard_model, expected)
-        .unwrap_or_else(|error| exit_with("The shards do not cover this plan", error));
-    println!("Shards verified: {expected} record(s), one plan, one model, no hole");
-
-    std::fs::create_dir_all(&out)
-        .unwrap_or_else(|error| exit_with("Could not create the output directory", error));
-    // `.partial` until the merge has finished, like a shard's own output. `assemble` writes
-    // as it reads, so anything it refuses part-way through has already put bytes on disk —
-    // and a truncated pair under the final names is one a later `pack` would read as the
-    // whole release.
-    let mut vectors = std::io::BufWriter::new(
-        std::fs::File::create(&vectors_partial)
-            .unwrap_or_else(|error| exit_with("Could not write vectors.f32", error)),
-    );
-    let mut records = std::io::BufWriter::new(
-        std::fs::File::create(&records_partial)
-            .unwrap_or_else(|error| exit_with("Could not write records.jsonl", error)),
-    );
-    let outcome = assemble(
-        reuse,
-        base.as_ref(),
-        opened,
-        embedding_dim,
-        &mut vectors,
-        &mut records,
-    );
-    let abandon = |what: &str, why: String| -> ! {
-        let _ = std::fs::remove_file(&vectors_partial);
-        let _ = std::fs::remove_file(&records_partial);
-        exit_with(what, why)
-    };
-    let report = match outcome {
-        Ok(report) => report,
-        Err(error) => {
-            drop((vectors, records));
-            abandon("Assembly failed", error.to_string())
-        }
-    };
-    // Both files onto the disk before either name is published: a rename that survives a
-    // power loss while its contents do not is the same half-published pair by another route.
-    for writer in [vectors, records] {
-        writer
-            .into_inner()
-            .unwrap_or_else(|error| abandon("Could not finish the merge", error.to_string()))
-            .sync_all()
-            .unwrap_or_else(|error| {
-                abandon("Could not flush the merge to disk", error.to_string())
-            });
-    }
-    // `abandon` here too, not a plain exit: if the first rename lands and the second fails,
-    // what is left is a published `vectors.f32` and a stray `records.jsonl.partial`. The
-    // guard above proves the directory held neither file, so this cannot be the dangerous
-    // pairing — but leaving the partial would make the next run refuse for the wrong reason.
-    for (partial, published) in [
-        (&vectors_partial, &vectors_final),
-        (&records_partial, &records_final),
-    ] {
-        std::fs::rename(partial, published).unwrap_or_else(|error| {
-            abandon("Could not publish the merged vectors", error.to_string())
-        });
-    }
-    sync_directory(&out);
-
-    println!("\n=== Assembled a release's vectors ===");
-    println!("Vectors:   {}", report.vectors);
-    println!("Reused:    {}", report.reused);
-    println!("Embedded:  {}", report.embedded);
-    println!("Dimension: {}", report.embedding_dim);
-    println!(
-        "\nPack them against the corpus next; nothing here checked them against it — and \
-         build the\nledger from the packed artifact, not from this, because packing \
-         reorders the payload."
-    );
 }
 
-/// Build the ledger the next release will reuse from, out of the artifact that was
-/// published.
-///
-/// A separate command from `assemble`, and that is the whole point: `pack` sorts the
-/// payload by `semantic_id`, so the order `assemble` wrote is not the order anybody can
-/// download. A ledger built from the assembler's order was published once and every one
-/// of its offsets named a different line.
-fn run_ledger(args: &[String]) {
-    let artifact = PathBuf::from(require_arg(args, "--artifact"));
-    let records = require_arg(args, "--records");
-    let out = PathBuf::from(require_arg(args, "--out"));
-    let manifest_path = out.with_extension("manifest.json");
-
-    // A ledger and its manifest are one fact in two files, and two `rename` calls are not
-    // one commit: a crash between them would leave a new ledger beside the manifest of the
-    // *previous* one. `VerifiedBase` refuses that pairing — the digests will not match — so
-    // it is not silent, but it is a release nobody can build from and no message says why.
-    //
-    // Writing only where there is nothing to overwrite removes the case entirely. A crash
-    // then leaves a ledger with no manifest, which is a missing file and unambiguous, and
-    // the caller who really wants to rebuild in place deletes them first — deliberately,
-    // which is the point.
-    require_free(
-        &[&out, &manifest_path, &out.with_extension("partial")],
-        "a ledger and its manifest are published as a pair",
-    );
-
-    // The artifact first, and every byte of it. Nothing about the ledger is worth deriving
-    // from an artifact that does not verify, and the identity below has to come from the
-    // package rather than from the caller: `--model` and `--artifact-digest` used to be
-    // copied into the manifest unchecked, which let a manifest declare model B over
-    // vectors built by model A of the same width — and `VerifiedBase` would then verify
-    // the ledger perfectly against that lie.
-    let package = IndexPackage::read(&artifact)
-        .unwrap_or_else(|error| exit_with("The artifact could not be read", error));
-    println!("Verifying the artifact: reading every payload…");
-    package
-        .verify_integrity(&artifact)
-        .unwrap_or_else(|error| exit_with("The artifact does not verify", error));
-    let identity = package.manifest.identity.clone();
-    let digest = package.digest();
-    // An external anchor is compared, not copied. If the caller has the published digest,
-    // a mismatch means this is not the artifact they think it is — and it is worth learning
-    // that before the ledger is derived rather than after.
-    if let Some(published) = parse_arg(args, "--artifact-digest") {
-        if published != digest {
-            exit_with(
-                "This is not the artifact that digest was published for",
-                format!("published {published}, computed {digest}"),
-            );
-        }
-    }
-    // Already read and checked by `verify_integrity`, one line above. Hashing the file a
-    // second time cost another pass over 23.5 GB and could only agree.
-    let vectors_sha256 = package
-        .payloads
-        .get(VECTORS_FILENAME)
-        .map(|payload| payload.sha256.clone())
-        .unwrap_or_else(|| exit_with("The artifact has no vectors payload", VECTORS_FILENAME));
-
-    let metadata = std::io::BufReader::new(
-        std::fs::File::open(artifact.join("metadata.jsonl")).unwrap_or_else(|error| {
-            exit_with("Could not read the artifact's metadata.jsonl", error)
-        }),
-    );
-    let records = std::io::BufReader::new(
-        std::fs::File::open(&records)
-            .unwrap_or_else(|error| exit_with("Could not read the records", error)),
-    );
-    // Written to `.partial` and renamed, so an interrupted derivation is not a file under
-    // the published name, and removed if anything below refuses — a `.partial` left in a
-    // CI workspace is the next run's confusion.
-    let partial = out.with_extension("partial");
-    let mut sink = std::io::BufWriter::new(
-        std::fs::File::create(&partial)
-            .unwrap_or_else(|error| exit_with("Could not write the ledger", error)),
-    );
-    let abandon = |what: &str, why: String| -> ! {
-        let _ = std::fs::remove_file(&partial);
-        exit_with(what, why)
+/// Write the v2 shard manifest of an external worker's output.
+fn run_adopt_shard(args: &[String]) {
+    use otzaria_semantic_search::distribution::shard::{
+        ParityCertificate, ShardManifest, WorkerInfo, KEYS_FILE, SHARD_FORMAT,
+        SHARD_FORMAT_VERSION, SHARD_MANIFEST_FILE, VECTORS_FILE,
     };
-
-    let entries = ledger_from_artifact(metadata, records, &mut sink)
-        .unwrap_or_else(|error| abandon("The ledger could not be built", error.to_string()));
-    std::io::Write::flush(&mut sink)
-        .unwrap_or_else(|error| abandon("Could not finish writing the ledger", error.to_string()));
-    sink.into_inner()
-        .unwrap_or_else(|error| abandon("Could not finish writing the ledger", error.to_string()))
-        .sync_all()
-        .unwrap_or_else(|error| abandon("Could not flush the ledger to disk", error.to_string()));
-
-    if entries != package.manifest.vector_count as usize {
-        abandon(
-            "The ledger does not describe this artifact",
+    let dir = PathBuf::from(require_arg(args, "--dir"));
+    let model = read_model(&require_arg(args, "--model"));
+    let passage_package = passage_package_of(args, &model);
+    let digest = |name: &str| {
+        let path = dir.join(name);
+        let length = std::fs::metadata(&path)
+            .unwrap_or_else(|error| exit_with(&format!("Could not read {}", path.display()), error))
+            .len();
+        (length, sha256_file(&path))
+    };
+    let (keys_length, keys_sha256) = digest(KEYS_FILE);
+    let (vectors_length, vectors_sha256) = digest(VECTORS_FILE);
+    let records = keys_length / 32;
+    if keys_length % 32 != 0 || vectors_length != records * u64::from(model.embedding_dim) * 4 {
+        exit_with(
+            "The files do not describe one set of records",
             format!(
-                "{entries} entry(ies) against {} vector(s)",
-                package.manifest.vector_count
+                "{KEYS_FILE} is {keys_length} bytes and {VECTORS_FILE} {vectors_length}, \
+                 for {}-wide vectors",
+                model.embedding_dim
             ),
         );
     }
-    let manifest = LedgerManifest {
-        artifact_digest: digest,
-        vectors_sha256,
-        // The bytes that are about to be renamed into place, which are the bytes
-        // `VerifiedBase` will hash when it opens them.
-        ledger_sha256: sha256_of(&partial),
-        vector_count: entries,
-        embedding_dim: identity.model.embedding_dim,
-        model: identity.model,
+    let float = |flag: &str| {
+        parse_arg(args, flag).map(|value| {
+            value
+                .parse::<f64>()
+                .unwrap_or_else(|_| exit_with(flag, "not a number"))
+        })
     };
-    let manifest_partial = out.with_extension("manifest.partial");
-    write_and_sync(
-        &manifest_partial,
-        &serde_json::to_vec_pretty(&manifest).unwrap(),
+    let parity = parse_arg(args, "--parity-reference").map(|reference| ParityCertificate {
+        reference,
+        samples: parse_arg(args, "--parity-samples")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| exit_with("--parity-samples", "required with a certificate")),
+        min_cosine: float("--parity-min-cosine")
+            .unwrap_or_else(|| exit_with("--parity-min-cosine", "required with a certificate")),
+        mean_cosine: float("--parity-mean-cosine")
+            .unwrap_or_else(|| exit_with("--parity-mean-cosine", "required with a certificate")),
+        document_sha256: parse_arg(args, "--parity-document")
+            .map(|path| sha256_file(Path::new(&path))),
+    });
+    let manifest = ShardManifest {
+        format: SHARD_FORMAT.to_string(),
+        version: SHARD_FORMAT_VERSION,
+        plan_sha256: require_arg(args, "--plan-sha256"),
+        skip: 0,
+        take: records,
+        records,
+        dim: model.embedding_dim,
+        vectors_sha256,
+        keys_sha256,
+        model,
+        passage_package,
+        worker: WorkerInfo {
+            name: require_arg(args, "--worker-name"),
+            version: require_arg(args, "--worker-version"),
+            device: require_arg(args, "--device"),
+            ep: require_arg(args, "--ep"),
+            mode: require_arg(args, "--mode"),
+        },
+        parity,
+    };
+    std::fs::write(
+        dir.join(SHARD_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("a manifest serializes"),
+    )
+    .unwrap_or_else(|error| exit_with("Could not write the shard manifest", error));
+    println!(
+        "\n=== Adopted {} record(s) in {} ===",
+        records,
+        dir.display()
     );
-    std::fs::rename(&partial, &out)
-        .unwrap_or_else(|error| exit_with("Could not put the ledger in place", error));
-    std::fs::rename(&manifest_partial, &manifest_path)
-        .unwrap_or_else(|error| exit_with("Could not put the ledger manifest in place", error));
-    // The renames themselves, so a power loss after this command returns cannot lose the
-    // directory entries it just created.
-    sync_directory(out.parent().unwrap_or(Path::new(".")));
-
-    println!("\n=== Built a ledger from the artifact ===");
-    println!("Ledger:   {}", out.display());
-    println!("Manifest: {}", manifest_path.display());
-    println!("Entries:  {entries}");
 }
 
-/// Refuse if any of these paths is taken, naming the first one that is.
-///
-/// `symlink_metadata`, not `exists`: `exists` follows a link, so a dangling symlink under
-/// one of the published names reads as "free" and the write then lands wherever the link
-/// points — outside the directory the caller named.
-fn require_free(paths: &[&Path], published_as: &str) {
-    for path in paths {
-        if path.symlink_metadata().is_ok() {
-            exit_with(
-                &format!("{} already exists", path.display()),
-                format!(
-                    "{published_as}; name a destination that holds none of them, or remove \
-                     them first"
-                ),
+/// Add shards to a warehouse, creating it when asked.
+fn run_warehouse_add(args: &[String]) {
+    use otzaria_semantic_search::distribution::shard::{ShardPolicy, SHARD_MANIFEST_FILE};
+    use otzaria_semantic_search::distribution::warehouse::{Warehouse, WarehouseIdentity};
+
+    let dir = PathBuf::from(require_arg(args, "--warehouse"));
+    if args.iter().any(|arg| arg == "--create") && !dir.join("warehouse.json").exists() {
+        let model = read_model(&require_arg(args, "--model"));
+        let package = passage_package_of(args, &model);
+        Warehouse::create(&dir, WarehouseIdentity::of(&model, &package))
+            .unwrap_or_else(|error| exit_with("Could not create the warehouse", error));
+    }
+    fn collect(root: &Path, found: &mut Vec<PathBuf>) {
+        if root.join(SHARD_MANIFEST_FILE).exists() {
+            found.push(root.to_path_buf());
+            return;
+        }
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(root)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        entries.sort();
+        for entry in entries.into_iter().filter(|path| path.is_dir()) {
+            collect(&entry, found);
+        }
+    }
+    let mut shards = Vec::new();
+    for root in parse_args_all(args, "--shards") {
+        collect(Path::new(&root), &mut shards);
+    }
+    if shards.is_empty() {
+        exit_with("Nothing to add", "no shard-manifest.json under --shards");
+    }
+    let mut warehouse = Warehouse::open_for_append(&dir)
+        .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    let plan = parse_arg(args, "--plan").map(PathBuf::from);
+    let report = warehouse
+        .add_shards(
+            plan.as_deref(),
+            &shards,
+            &ShardPolicy {
+                allow_non_semantic: args.iter().any(|arg| arg == "--allow-non-semantic"),
+            },
+            utc_timestamp(SystemTime::now()),
+        )
+        .unwrap_or_else(|error| exit_with("The shards were refused", error));
+    println!("\n=== Added to {} ===", dir.display());
+    println!("Shards:          {}", report.shards);
+    println!("Records:         {}", report.records);
+    println!("Added:           {}", report.added);
+    println!("Held already:    {}", report.held);
+    println!("Warehouse:       {} record(s)", report.total);
+}
+
+fn run_assemble(args: &[String]) {
+    use otzaria_semantic_search::distribution::assemble::{
+        assemble, AssembleRequest, EpochChoice, RELEASE_FILE,
+    };
+    use otzaria_semantic_search::distribution::gates::{
+        verify_release, GateStatus, VerifyRequest, G5_SAMPLES,
+    };
+    use otzaria_semantic_search::distribution::ledger::Ledger;
+    use otzaria_semantic_search::distribution::package::PackageKind;
+    use otzaria_semantic_search::distribution::plan::Plan;
+    use otzaria_semantic_search::distribution::warehouse::Warehouse;
+    use otzaria_semantic_search::semantic::oxv::codec::CodecSpec;
+
+    let flag = |name: &str| args.iter().any(|arg| arg == name);
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let plan = Plan::open(Path::new(&require_arg(args, "--plan")))
+        .unwrap_or_else(|error| exit_with("Could not open the plan", error));
+    let warehouse = Warehouse::open(Path::new(&require_arg(args, "--warehouse")))
+        .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    let previous = parse_arg(args, "--previous").map(|dir| {
+        let version = parse_arg(args, "--previous-version").map(|value| {
+            value
+                .parse::<u32>()
+                .unwrap_or_else(|_| exit_with("--previous-version", "not a number"))
+        });
+        Ledger::open(Path::new(&dir), version)
+            .unwrap_or_else(|error| exit_with("Could not open the previous ledger", error))
+    });
+    if let Some(kind) = parse_arg(args, "--kind") {
+        let kind = match kind.as_str() {
+            "base" => PackageKind::Base,
+            "delta" => PackageKind::Delta,
+            other => exit_with("--kind", format!("{other:?} is neither base nor delta")),
+        };
+        let epoch = if flag("--keep-epoch") {
+            EpochChoice::Previous
+        } else {
+            let clip_q = parse_arg(args, "--clip-q").map_or(1.0, |value| {
+                value
+                    .parse::<f32>()
+                    .unwrap_or_else(|_| exit_with("--clip-q", "not a number"))
+            });
+            let name = parse_arg(args, "--codec").unwrap_or_else(|| "i8-sym-vec".to_string());
+            EpochChoice::New(
+                CodecSpec::parse(&name, clip_q).unwrap_or_else(|error| exit_with("--codec", error)),
+            )
+        };
+        let built_by = parse_arg(args, "--built-by").map(|json| {
+            serde_json::from_str(&json).unwrap_or_else(|error| exit_with("--built-by", error))
+        });
+        let report = assemble(&AssembleRequest {
+            plan: &plan,
+            warehouse: &warehouse,
+            kind,
+            previous: previous.as_ref(),
+            epoch,
+            out_dir: out.clone(),
+            created_at: parse_arg(args, "--created-at")
+                .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
+            built_by,
+        })
+        .unwrap_or_else(|error| exit_with("Assembly failed", error));
+        let manifest = &report.manifest;
+        println!("\n=== Assembled {} ===", out.display());
+        println!("Kind:            {:?}", manifest.kind);
+        println!(
+            "Library:         v{} -> v{} ({})",
+            manifest.from_library_version,
+            manifest.to_library_version,
+            manifest.library_release_tag
+        );
+        println!(
+            "Codec:           {}",
+            manifest.identity.store.vector_precision
+        );
+        println!(
+            "Counts:          {} slot(s), {} extra(s), {} foreign, {} tombstone(s), {} book(s)",
+            manifest.counts.slots,
+            manifest.counts.extras,
+            manifest.counts.foreign,
+            manifest.counts.tombstones,
+            manifest.counts.books
+        );
+        println!(
+            "Segment:         {} bytes, SHA-256 {}",
+            manifest.segment.size, manifest.segment.sha256
+        );
+        println!("Package digest:  {}", manifest.package_digest);
+        println!("Manifest SHA-256 {}", report.manifest_sha256);
+        println!(
+            "Clipped:         {} component(s)",
+            report.clipped_components
+        );
+        println!(
+            "Ledger:          v{}, {} key(s), {} pair(s)",
+            report.ledger.library_version, report.ledger.keys.count, report.ledger.pairs.count
+        );
+    } else if !flag("--verify") {
+        exit_with(
+            "Nothing to do",
+            "give --kind to assemble, --verify to check, or both",
+        );
+    } else if !out.join(RELEASE_FILE).exists() {
+        exit_with(
+            "Nothing to verify",
+            format!("{} holds no {RELEASE_FILE}", out.display()),
+        );
+    }
+    if flag("--verify") {
+        let samples = parse_arg(args, "--samples").map_or(G5_SAMPLES, |value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| exit_with("--samples", "not a number"))
+        });
+        let report = verify_release(&VerifyRequest {
+            release_dir: &out,
+            plan: &plan,
+            warehouse: &warehouse,
+            previous: previous.as_ref(),
+            scratch_dir: out.with_extension("g8"),
+            samples,
+        })
+        .unwrap_or_else(|error| exit_with("The release could not be verified", error));
+        std::fs::write(
+            out.join("gates.json"),
+            serde_json::to_vec_pretty(&report).expect("a report serializes"),
+        )
+        .unwrap_or_else(|error| exit_with("Could not write gates.json", error));
+        println!("\n=== Gates ===");
+        for gate in &report.gates {
+            println!(
+                "{:<4} {}  {}",
+                gate.gate,
+                match gate.status {
+                    GateStatus::Passed => "pass",
+                    GateStatus::Failed => "FAIL",
+                    GateStatus::NotApplicable => "n/a ",
+                },
+                gate.detail
             );
+        }
+        if !report.passed() {
+            process::exit(2);
         }
     }
 }
 
-/// Flush a directory entry, so a rename this command has already reported survives a power
-/// loss.
-///
-/// Unix only, and fatal there rather than best-effort — the same rule
-/// [`crate::semantic::manifest`] follows: Windows cannot open a directory as a file, so the
-/// rename is left as the filesystem's own guarantee, and where the call *is* available a
-/// failure is not quietly downgraded to "probably durable".
-#[cfg(unix)]
-fn sync_directory(dir: &Path) {
-    let handle = std::fs::File::open(dir).unwrap_or_else(|error| {
-        exit_with(
-            &format!("Could not open {} to flush its entries", dir.display()),
-            error,
-        )
-    });
-    handle.sync_all().unwrap_or_else(|error| {
-        exit_with(
-            &format!("Could not flush the directory entries of {}", dir.display()),
-            error,
-        )
-    });
+fn run_release_files(args: &[String]) {
+    use otzaria_semantic_search::distribution::assemble::{asset_stem, release_with_files};
+    let files: Vec<PathBuf> = parse_args_all(args, "--files")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    if files.is_empty() {
+        exit_with("Nothing to list", "give each file with --files");
+    }
+    let (manifest, sha256) = release_with_files(
+        Path::new(&require_arg(args, "--release")),
+        &files,
+        &parse_arg(args, "--compression").unwrap_or_else(|| "zstd".to_string()),
+        Path::new(&require_arg(args, "--out")),
+    )
+    .unwrap_or_else(|error| exit_with("Could not list the files", error));
+    println!("\n=== {} ===", asset_stem(&manifest));
+    for file in &manifest.files {
+        println!("{}  {} bytes  {}", file.file, file.size, file.sha256);
+    }
+    println!("Manifest SHA-256 {sha256}");
 }
 
-/// See the Unix implementation. Nothing to do here; documented, not silent.
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) {}
-
-/// Write a small file and get it onto the disk before anything renames it into place.
-fn write_and_sync(path: &Path, bytes: &[u8]) {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)
-        .unwrap_or_else(|error| exit_with(&format!("Could not write {}", path.display()), error));
-    file.write_all(bytes)
-        .unwrap_or_else(|error| exit_with(&format!("Could not write {}", path.display()), error));
-    file.sync_all()
-        .unwrap_or_else(|error| exit_with(&format!("Could not flush {}", path.display()), error));
-}
-
-/// SHA-256 of a file, streamed.
-fn sha256_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
+/// SHA-256 of a file, streamed; exits naming the file when it cannot be read.
+fn sha256_file(path: &Path) -> String {
+    use std::io::Read;
     let mut file = std::fs::File::open(path)
         .unwrap_or_else(|error| exit_with(&format!("Could not read {}", path.display()), error));
-    let mut hasher = Sha256::new();
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
-        let read = std::io::Read::read(&mut file, &mut buffer)
-            .unwrap_or_else(|error| exit_with("Could not read the file to hash it", error));
+        let read = file.read(&mut buffer).unwrap_or_else(|error| {
+            exit_with(&format!("Could not read {}", path.display()), error)
+        });
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        sha2::Digest::update(&mut hasher, &buffer[..read]);
     }
-    format!("{:x}", hasher.finalize())
-}
-
-/// Open the base artifact both `plan-split` and `assemble` reuse from, or nothing.
-///
-/// Every argument or none: a ledger names offsets, the manifest says what they mean, the
-/// vectors are what they point into, and the model is what makes them comparable. Three
-/// out of four is a check that cannot be performed, so it is refused rather than skipped.
-fn verified_base(
-    args: &[String],
-) -> Option<otzaria_semantic_search::distribution::reuse::VerifiedBase> {
-    let ledger = parse_arg(args, "--ledger");
-    let manifest = parse_arg(args, "--ledger-manifest");
-    let vectors = parse_arg(args, "--base-vectors");
-    let model = parse_arg(args, "--model");
-    // Asking for reuse at all means asking for all of it. Returning early on a missing
-    // `--ledger` ignored the other two in silence, so `--ledgr ledger.jsonl` — with the
-    // manifest and the vectors both correctly named — read as "there is no base" and spent
-    // a full rebuild on a typo.
-    let named: Vec<&str> = [
-        ("--ledger", ledger.is_some()),
-        ("--ledger-manifest", manifest.is_some()),
-        ("--base-vectors", vectors.is_some()),
-    ]
-    .iter()
-    .filter_map(|(name, given)| given.then_some(*name))
-    .collect();
-    if !named.is_empty() && named.len() < 3 {
-        exit_with(
-            "Reuse needs --ledger, --ledger-manifest, --base-vectors and --model together",
-            format!(
-                "only {} was given, and offsets cannot be checked without the file they \
-                 index and the identity they were built under",
-                named.join(", ")
-            ),
-        )
-    }
-    if named.is_empty() {
-        return None;
-    }
-    let (Some(manifest_path), Some(vectors_path), Some(model_path)) = (manifest, vectors, model)
-    else {
-        exit_with(
-            "Reuse also needs --model",
-            "the identity the base was built under is what makes its vectors comparable \
-             with the ones about to be embedded",
-        )
-    };
-    let manifest: LedgerManifest = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path)
-            .unwrap_or_else(|error| exit_with("Could not read the ledger manifest", error)),
-    )
-    .unwrap_or_else(|error| exit_with("That is not a ledger manifest", error));
-    let model = read_model(&model_path);
-
-    println!("Verifying the base artifact: hashing its ledger and its vectors…");
-    let base = VerifiedBase::open(
-        manifest,
-        Path::new(ledger.as_deref().expect("named holds all three")),
-        Path::new(&vectors_path),
-        &model,
-    )
-    .unwrap_or_else(|error| exit_with("The base artifact cannot be reused", error));
-    println!("Base verified: artifact {}", base.artifact_digest());
-    Some(base)
-}
-
-/// Every directory holding a `vectors.f32`, depth-first.
-fn collect_shards(root: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    if root.join("vectors.f32").is_file() {
-        found.push(root.to_path_buf());
-        return;
-    }
-    for entry in entries.flatten() {
-        if entry.path().is_dir() {
-            collect_shards(&entry.path(), found);
-        }
-    }
+    format!("{:x}", sha2::Digest::finalize(hasher))
 }
 
 fn run_build(args: &[String]) {
@@ -1175,146 +1045,51 @@ fn run_build(args: &[String]) {
             chunking,
             created_at: parse_arg(args, "--created-at")
                 .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
-            collection_name: parse_arg(args, "--collection")
-                .unwrap_or_else(|| "chunks".to_string()),
             batch_size: parse_arg(args, "--batch")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(32),
+            codec: otzaria_semantic_search::semantic::oxv::codec::CodecSpec::parse(
+                &parse_arg(args, "--codec").unwrap_or_else(|| "i8-sym-vec".to_string()),
+                parse_arg(args, "--clip-q").map_or(1.0, |value| {
+                    value
+                        .parse()
+                        .unwrap_or_else(|_| exit_with("--clip-q", "not a number"))
+                }),
+            )
+            .unwrap_or_else(|error| exit_with("--codec", error)),
             allow_non_semantic_backend: args.iter().any(|arg| arg == "--allow-non-semantic"),
         },
         &corpus,
     )
     .unwrap_or_else(|error| exit_with("Build failed", error));
 
-    println!("\n=== Built an official artifact ===");
-    print_report(&report);
-}
-
-fn run_pack(args: &[String]) {
-    let vectors = require_arg(args, "--vectors");
-    let records = require_arg(args, "--records");
-    let out = require_arg(args, "--out");
-    let model = read_model(&require_arg(args, "--model"));
-    let corpus = load_corpus(args);
-    let planned = plan_corpus(args, &corpus, &model);
-    let target: &dyn CorpusIndex = planned.as_ref().map_or(&corpus, |planned| planned);
-
-    let inputs = read_vector_inputs(
-        Path::new(&vectors),
-        Path::new(&records),
-        model.embedding_dim,
-    )
-    .unwrap_or_else(|error| exit_with("Could not read the vectors", error));
-
-    let report = pack(
-        PackRequest {
-            output_path: PathBuf::from(&out),
-            model,
-            created_at: parse_arg(args, "--created-at")
-                .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
-            collection_name: parse_arg(args, "--collection")
-                .unwrap_or_else(|| "chunks".to_string()),
-        },
-        inputs,
-        target,
-    )
-    .unwrap_or_else(|error| exit_with("Packing failed", error));
-
-    println!("\n=== Packed an official artifact ===");
-    print_report(&report);
-}
-
-fn run_validate(args: &[String]) {
-    let artifact = require_arg(args, "--artifact");
-    let model = read_model(&require_arg(args, "--model"));
-    let corpus = load_corpus(args);
-    let planned = plan_corpus(args, &corpus, &model);
-    let target: &dyn CorpusIndex = planned.as_ref().map_or(&corpus, |planned| planned);
-
-    let report = validate_artifact(Path::new(&artifact), &model, target)
-        .unwrap_or_else(|error| exit_with("Validation failed", error));
-
-    println!("\n=== Artifact verified ===");
-    print_report(&report);
-}
-
-fn print_report(report: &PackReport) {
-    println!("Path:            {}", report.artifact_path.display());
-    println!("Vectors:         {}", report.vector_count);
-    println!("Books:           {}", report.book_count);
-    println!("Payload bytes:   {}", report.total_size_bytes);
-    println!("Identity:        {}", report.identity);
-    println!("Digest:          {}", report.digest);
-    // The digest is only a trust anchor once it travels outside the package: recomputing
-    // it from the package proves the package agrees with itself and nothing more.
+    let manifest = &report.manifest;
+    println!("\n=== Built a base vector package ===");
+    println!("Path:            {}", report.output_path.display());
     println!(
-        "\nPublish that digest outside the artifact. Verified without it, an install \
-         detects damage\nand the wrong artifact, but not one deliberately rebuilt to \
-         match."
+        "Segment:         {} ({} bytes, SHA-256 {})",
+        SEGMENT_FILENAME, manifest.segment.size, manifest.segment.sha256
     );
-}
-
-/// `YYYY-MM-DDTHH:MM:SSZ`, for the manifest's `created_at`.
-///
-/// Hand-rolled because this crate carries no date dependency and needs one string in one
-/// place. The value is excluded from the artifact digest, so it cannot make a build
-/// irreproducible — but it is what a human reads off a manifest, and seconds since an
-/// epoch is not that.
-fn utc_timestamp(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs() as i64);
-    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
-    let second_of_day = seconds.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        second_of_day / 3600,
-        (second_of_day % 3600) / 60,
-        second_of_day % 60
-    )
-}
-
-/// Days since 1970-01-01 → civil date. Howard Hinnant's `civil_from_days`, which is
-/// exact for the whole proleptic Gregorian calendar and needs no lookup tables.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    // Shift the epoch to 0000-03-01, so leap days land at the end of the cycle.
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097); // [0, 146096]
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
-    let month_position = (5 * day_of_year + 2) / 153; // [0, 11], March = 0
-    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    } as u32;
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Anchored on dates that are checkable by hand, including the boundary the
-    /// March-based arithmetic exists to get right.
-    #[test]
-    fn the_timestamp_matches_known_instants() {
-        for (seconds, expected) in [
-            (0, "1970-01-01T00:00:00Z"),
-            (1_000_000_000, "2001-09-09T01:46:40Z"),
-            (1_582_934_400, "2020-02-29T00:00:00Z"),
-            (1_583_020_800, "2020-03-01T00:00:00Z"),
-            (1_609_459_199, "2020-12-31T23:59:59Z"),
-            (1_609_459_200, "2021-01-01T00:00:00Z"),
-        ] {
-            assert_eq!(
-                utc_timestamp(UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
-                expected
-            );
-        }
-    }
+    println!("Lines embedded:  {}", report.planned_lines);
+    println!("Vectors:         {}", manifest.counts.slots);
+    println!("Further records: {}", manifest.counts.extras);
+    println!("Books:           {}", manifest.counts.books);
+    println!(
+        "Clipped:         {} component(s)",
+        report.clipped_components
+    );
+    println!("Identity:        {}", manifest.identity);
+    println!("Identity digest: {}", manifest.identity_digest);
+    println!("Package digest:  {}", manifest.package_digest);
+    println!(
+        "Manifest:        {} (SHA-256 {})",
+        RELEASE_MANIFEST_FILENAME, report.manifest_sha256
+    );
+    // The digest is only a trust anchor once it travels outside the release: recomputing
+    // it from the manifest proves the manifest agrees with itself and nothing more.
+    println!(
+        "\nPublish the manifest's SHA-256 outside it. Installed without it, a release is \
+         checked for damage\nand for the wrong identity, but not for one deliberately \
+         rebuilt to match."
+    );
 }

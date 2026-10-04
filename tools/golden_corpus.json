@@ -1,6 +1,6 @@
 {
   "corpus_version": 2,
-  "description": "Input corpus for tools/generate_golden_vectors.py. Reviewable and extensible without touching code. Each entry becomes one record in tests/data/golden_vectors.json. Add entries freely; regenerating the golden file is the only step required.",
+  "description": "The texts tools/onnx_golden_cases.json takes by id for the ONNX goldens (tools/generate_onnx_golden_vectors.py). Written for the GGUF goldens, which were removed with the GGUF backend after 62f0c44: every field beyond id and text -- truncate, expect_total_tokens, tags, notes, deliberately_uncovered, relations -- and the GGUF and Qwen tokenizer remarks in the notes are theirs, and nothing reads them now. Never rename an id or change a text an ONNX case takes: that changes the ONNX goldens.",
   "field_docs": {
     "id": "Stable, unique, ASCII identifier. Never rename an existing id -- Stage 4 tests may reference it by name.",
     "text": "The exact input string, verbatim. Invisible/ambiguous characters MUST be written as \\uXXXX escapes so the corpus stays reviewable in a diff.",

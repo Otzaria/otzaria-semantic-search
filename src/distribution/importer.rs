@@ -374,8 +374,8 @@ impl IndexImporter {
         staged?;
 
         Ok(ImportResult {
-            books_imported: verified.book_count(),
-            vectors_imported: verified.vector_count(),
+            books_imported: verified.counts().books,
+            vectors_imported: verified.counts().slots.min(u64::from(u32::MAX)) as u32,
             bytes_imported: verified.manifest().total_size_bytes,
             import_duration_ms: start_time.elapsed().as_millis(),
         })
@@ -662,9 +662,9 @@ mod tests {
         let package = IndexPackage {
             manifest: PackageManifest::new(
                 identity,
+                crate::distribution::package::test_description(5, 50),
+                crate::semantic::versioning::test_provenance(),
                 "2026-08-06T00:00:00Z".to_string(),
-                5,
-                50,
                 payload.len() as u64,
             ),
             payloads: BTreeMap::from([(
@@ -742,13 +742,13 @@ mod tests {
         install(&source, &target).unwrap();
 
         let mut other_corpus = test_identity();
-        other_corpus.corpus.corpus_id = "d".repeat(64);
+        other_corpus.text.line_text_version = 2;
         let replacement = dir.path().join("replacement");
         write_package(&replacement, other_corpus, b"second");
 
         match install(&replacement, &target) {
             Err(ArtifactError::IdentityMismatch { mismatches }) => {
-                assert_eq!(mismatches[0].field, IdentityField::CorpusId)
+                assert_eq!(mismatches[0].field, IdentityField::LineTextVersion)
             }
             other => panic!("expected an identity rejection, got {other:?}"),
         }

@@ -22,26 +22,17 @@ default = []
 # build fails with `BackendUnavailable` instead of serving fake vectors.
 mock-embedding = []
 
-# Real GGUF inference. Non-default because it compiles llama.cpp and ggml through
-# cmake in every downstream build.
+# Real ONNX inference, through ONNX Runtime and the Hugging Face tokenizer — the only
+# inference this crate has. Non-default: real inference is opt-in, and a default build
+# must be unable to produce embeddings at all (`tests/production_backend_gate.rs`). A
+# model is an ONNX graph, `*.onnx`; any other model path is refused as an invalid model
+# before a backend is asked (`semantic::model_package::ensure_onnx_model_path`).
 #
-# Its crates are declared under `cfg(not(target_arch = "arm"))`: a 0.6B model at
-# Q4 is unusable on 32-bit ARM, and `llama-cpp-sys-2`'s build script panics there
-# anyway — it `.expect()`s `CARGO_CFG_TARGET_FEATURE`, which cargo omits for
-# `armv7-linux-androideabi` (zero target features). The feature can therefore be
-# on with no backend behind it; `semantic::backend` gates on the same condition.
-llama-backend = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
-
-# CUDA offload, for the build machine that produces the library's vectors — never
-# for the application, which ships no CUDA runtime.
-#
-# It does not change what the artifact declares: `LlamaCppBackend::ID` names the
-# implementation and the wiring, deliberately not the ggml backend, exactly as
-# `n_gpu_layers` on Metal does not change it today. What it does change is the
-# arithmetic, at the same order as the CPU-vs-Metal divergence
-# `docs/P2_REFERENCE_VECTORS.md` §5 already measures, so a build that uses it owes
-# the same parity evidence against the goldens.
-cuda = ["llama-backend", "llama-cpp-2/cuda"]
+# Nothing is linked: ONNX Runtime is a shared library loaded when the first ONNX model
+# is (see the `ort` declaration below), so this feature adds no build-time download and
+# no native code to the binary. Its crates are declared for desktop targets only; on
+# every other target the feature is on with no backend behind it.
+onnx-backend = ["dep:ort", "dep:tokenizers", "dep:libloading"]
 
 [[bench]]
 name = "vector_search"
@@ -57,60 +48,90 @@ serde_json = "1.0"
 log = "0.4"
 sha2 = "0.10"
 
-# Optional, behind `llama-backend`. See `src/semantic/llama_backend.rs` and
-# `docs/P2_INFERENCE_SPIKE.md`.
+# The vector store (`semantic::oxv`): segments are mapped rather than read into the heap,
+# and every 1 MiB block of one carries a CRC-32. Both crates are already in the
+# application's dependency graph through tantivy, at these versions (memmap2 0.9.11,
+# crc32fast 1.5.0 in otzaria_search_engine's lockfile), so they add no crate to it. The
+# requirements stay ranges so cargo unifies them with tantivy's.
+memmap2 = "0.9"
+crc32fast = "1.5"
+
+# Optional, behind `onnx-backend`. See `src/semantic/onnx_backend.rs` and
+# `docs/ONNX_BACKEND.md`.
 #
-# Pinned exactly, for three reasons — read them before bumping:
+# Pinned exactly, for two reasons — read them before bumping:
 #
-# 1. It vendors a specific llama.cpp commit, and the stored vectors depend on it
-#    (agreement between two builds is cosine 0.9948, not 1.0). The manifest records
-#    the backend as index identity, so the version cannot move implicitly.
-# 2. `llama_backend::tokenizer` derives the model pointer from `LlamaModel`'s
-#    `repr(transparent)` layout, which upstream documents nowhere and explicitly
-#    disclaims for sibling types. The pin is what makes that cast sound; the
-#    runtime cross-checks only detect a break after the fact. Read
-#    `llama_backend::tokenizer::RawVocab` first.
-# 3. `llama_backend::micro_batch_for` lowers `n_ubatch` below `n_ctx`, which is
-#    legal only for a causal model — llama.cpp aborts otherwise. Its list of
-#    non-causal architectures is correct for this commit only; re-check with
-#    `grep -rn 'causal_attn = false' llama.cpp/src/models/`.
+# 1. The API is still moving between release candidates: rc.10 made `Session::run`
+#    take `&mut self` (why the backend keeps a pool of sessions), rc.12 introduced the
+#    `api-*` features and rc.13 gated execution providers at compile time. A
+#    resolver-chosen rc.14 is a different API.
+# 2. It is part of what produces the stored vectors — the session options it applies
+#    and the ONNX Runtime API level it requests — and the manifest records the backend
+#    as index identity, so the version cannot move implicitly.
 #
-# `default-features = false` because upstream defaults to
-# `["openmp", "android-shared-stdcxx", "common"]` and this crate builds on five
-# toolchains through Cargokit:
+# `default-features = false, features = ["std", "load-dynamic"]`: the runtime is a
+# shared library loaded at run time — from the path the application passes, else
+# `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and never
+# linked. The default, `download-binaries`, links pyke's static builds, and each of those
+# disqualifies itself:
 #
-# * `android-shared-stdcxx` kept — sets `ANDROID_STL=c++_shared`, inert elsewhere.
-#   A process holding both a static and a shared libc++ crashes obscurely.
-# * `openmp` omitted — ggml has its own thread pool, and Apple clang ships no
-#   `libomp`.
-# * `common` omitted — it only gates grammar samplers, `json_schema_to_grammar`,
-#   speculative decoding and memory reporting. Re-check if a stage wants generation.
+# * Windows x64: compiled with `/arch:AVX2` into `search_engine.dll`, where AVX2 code
+#   can run at DLL load, so a pre-Haswell CPU loses the whole application — lexical
+#   search included — rather than semantic search alone;
+# * Linux: they need glibc >= 2.38, newer than the CI container (bookworm, 2.36) and
+#   than Ubuntu 22.04, Debian 12 and RHEL 9;
+# * Apple: they raise the application's floor to macOS 13.4 / iOS 15.1 and link
+#   CoreML into it;
+# * the build: they are fetched from cdn.pyke.io while cargo runs, which this build
+#   network cannot reach.
 #
-# No GPU feature is requested, but on Apple Silicon `llama-cpp-2` attaches
-# `metal` to its sys crate unconditionally, and Metal is then compiled *and used*:
-# a 270.61 MiB MTL0 compute buffer per context and `graph splits = 2`.
-# `n_gpu_layers = 0` keeps the weights on the CPU, not the backend out of the graph.
-# Consequence: CPU-versus-Metal agreement is cosine 0.99491, so this platform and a
-# CPU-only Android build may not produce identical vectors.
+# Loaded instead, a missing or unusable runtime is `OnnxRuntimeUnavailable` for semantic
+# search and nothing else. No `api-*` feature: the default API level, 17, is all the
+# backend uses, so any runtime from ONNX Runtime 1.17 on loads; the reference is
+# Microsoft's official 1.28.0 release, which dispatches CPU features at run time.
 #
-# Vendored: upstream's own `llama-cpp-sys-2` declaration omits
-# `default-features = false`, so sys's `default = ["common"]` came back on
-# regardless of what is set here, and the unlinkable `cpp-httplib` dependency
-# it drags in breaks the Apple app link. See vendor/llama-cpp-2/README-VENDORED.md.
-[target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-2]
-path = "vendor/llama-cpp-2"
-version = "=0.1.153"
+# Declared for desktop targets only — macOS, Linux (glibc) and Windows (MSVC), each on
+# aarch64 and x86_64 — the platforms Microsoft publishes that runtime for. iOS and
+# Android have no runtime to load in v1: an iOS app cannot load code it did not ship
+# signed, and shipping a runtime on either is future work. Elsewhere the feature is on
+# with no backend behind it and an ONNX model gets `BackendUnavailable`.
+# `semantic/mod.rs`, `semantic::backend` and
+# `tests/onnx_backend.rs` carry the same condition, and a test in the last holds all
+# the spellings together.
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.ort]
+version = "=2.0.0-rc.13"
 default-features = false
-features = ["android-shared-stdcxx"]
+features = ["std", "load-dynamic"]
 optional = true
 
-# Reached directly for the one call `llama-cpp-2` does not expose: `llama_tokenize`
-# with `parse_special = false`. It hardcodes `true`, which promotes a literal
-# `<|endoftext|>` inside a book to a control token (measured: 162 tokens -> 158).
+# Pinned exactly for the reason `ort` is, with the tokenizer's own twist: token ids are
+# the primary correctness gate — the goldens compare them exactly — and this crate is
+# what turns `tokenizer.json` into them.
 #
-# Version-locked to `llama-cpp-2` so cargo unifies both on one build of llama.cpp;
-# a mismatch would compile ggml twice and hand the tokenizer a foreign vocabulary.
-[target.'cfg(not(target_arch = "arm"))'.dependencies.llama-cpp-sys-2]
-version = "=0.1.153"
+# `default-features = false` drops `onig` (C, built through `cc`), `esaxx_fast` (C++)
+# and `progressbar`. Exactly one regex engine has to be enabled or the crate refuses to
+# compile, hence `fancy-regex`, which is pure Rust — and the engine is not idle: the
+# production tokenizer's normalizer runs five regex `Replace` rules (niqqud and
+# cantillation, bidi and zero-width controls, the two quote marks, dashes). They are
+# plain character classes, which both engines read the same way, and measured so: 57,348
+# inputs from the library, niqqud, cantillation and all, gave ids identical to the
+# Python package (onig). Changing the engine means re-running that comparison; see
+# `docs/ONNX_BACKEND.md`. The same targets as `ort`, since nothing else uses it.
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.tokenizers]
+version = "=0.23.2"
 default-features = false
+features = ["fancy-regex"]
+optional = true
+
+# Reached directly to open the runtime *before* `ort` does: `ort` 2.0.0-rc.13 cannot
+# recover from refusing a library (a failed load still completes its `OnceLock`, and the
+# next call panics), so the backend loads the file itself, checks that it exports
+# `OrtGetApiBase` and reports a version `ort` accepts, and only then calls
+# `ort::init_from` — which opens the same file again, bumping a reference count. The same
+# open reads `GetVersionString`, which `ort` checks and does not expose; the load log
+# names it. The handle is kept for the life of the process. See
+# `onnx_backend::ensure_runtime`. Unpinned: it decides no vector, and a range lets cargo
+# unify it with `ort`'s own.
+[target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.libloading]
+version = "0.9"
 optional = true
