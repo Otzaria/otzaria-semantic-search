@@ -198,6 +198,11 @@ its text. It makes a codec change, a new base and a revived key free of GPU work
   `warehouse-add` re-hash every batch and check that `index.bin` is exactly `keys.bin`'s.
   Bad data is refused and never repaired; a bad index over sound keys is rebuilt by the
   next add or by `warehouse-verify --repair`.
+- **Cost**, at 6.35M records: a check hashes 6.7 GB, about 12 s with sha2's portable code
+  (0.57 GB/s on an Apple M4). On x86-64 sha2 0.10.9 uses SHA-NI at run time, which Intel
+  client CPUs before Ice Lake lack (13–20 s there). The mapped index and keys hold about
+  460 MB of reclaimable page cache, and `--repair` allocates about 254 MB. A build checks
+  3 times (2 when nothing is embedded), 4 once the plugin pins this sidecar, through G6.
 
 ```sh
 otzaria-semantic-search warehouse-add --warehouse <dir> [--create --model <model.json>] \
