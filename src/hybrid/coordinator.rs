@@ -41,10 +41,11 @@ use crate::semantic::types::{
     is_foundational, BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling,
     HybridResultItem, HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate,
     ResultSource, SearchFilters, SearchMode, SemanticCandidate, SemanticStatus, VectorMetadata,
+    FOUNDATIONAL_FACET,
 };
 use crate::telemetry::SearchTelemetry;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
 
 /// Upper bound on semantic candidates fetched for one query.
@@ -156,6 +157,111 @@ impl SemanticSide {
             Self::SelfBuilt(engine) => engine.embed_query(query),
             Self::Official(index) => index.embed_query(query),
         }
+    }
+
+    fn embed_passages(
+        &self,
+        texts: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
+        match self {
+            Self::SelfBuilt(engine) => engine.embed_passages(texts, cancel),
+            Self::Official(index) => index.embed_passages(texts, cancel),
+        }
+    }
+
+    /// Query the foundational books with `share` of `top_k` and append the lines `main`
+    /// lacks; the hits that query scanned, 0 when it did not run or failed.
+    ///
+    /// Its filter is `filters` and the foundational facet, a subset of the main query's, so
+    /// an appended line's place in `main` is its rank among them all. Skipped when `filters`
+    /// already restricts the foundational dimension.
+    #[allow(clippy::too_many_arguments)]
+    fn append_foundational(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+        share: f32,
+        resolver: &dyn CandidateResolver,
+        cancel: &CancellationToken,
+        telemetry: &mut SearchTelemetry,
+        main: &mut Vec<SemanticCandidate>,
+    ) -> Result<u32, SemanticSearchError> {
+        let user_facets = filters
+            .and_then(|filters| filters.facets.as_deref())
+            .unwrap_or_default();
+        if share.is_nan() || share <= 0.0 || is_foundational(user_facets) {
+            return Ok(0);
+        }
+        let base_top_k = (top_k as f64 * f64::from(share.min(1.0))).ceil() as usize;
+        let mut base_filters = filters.cloned().unwrap_or_default();
+        base_filters
+            .facets
+            .get_or_insert_with(Vec::new)
+            .push(FOUNDATIONAL_FACET.to_string());
+
+        let mut base_telemetry = SearchTelemetry::default();
+        let extras = match self.candidates(
+            query_vector,
+            base_top_k,
+            Some(&base_filters),
+            resolver,
+            cancel,
+            &mut base_telemetry,
+        ) {
+            Ok(extras) => extras,
+            Err(SemanticSearchError::Cancelled) => return Err(SemanticSearchError::Cancelled),
+            Err(error) => {
+                log::warn!(
+                    "The foundational-books query failed: {error}. Serving the main query's \
+                     candidates."
+                );
+                return Ok(0);
+            }
+        };
+        let hits = match self {
+            Self::SelfBuilt(_) => count_u32(extras.len()),
+            Self::Official(_) => base_telemetry.semantic_hits,
+        };
+        telemetry.semantic_hits = telemetry
+            .semantic_hits
+            .saturating_add(base_telemetry.semantic_hits);
+        telemetry.semantic_unresolved = telemetry
+            .semantic_unresolved
+            .saturating_add(base_telemetry.semantic_unresolved);
+        for (total, base) in [
+            (&mut telemetry.scan_ms, base_telemetry.scan_ms),
+            (&mut telemetry.resolve_ms, base_telemetry.resolve_ms),
+        ] {
+            if let Some(base) = base {
+                *total = Some(total.unwrap_or(0) + base);
+            }
+        }
+
+        fn line(candidate: &SemanticCandidate) -> (&str, u64) {
+            (
+                candidate.metadata.source_book_key.as_str(),
+                candidate.metadata.line_id,
+            )
+        }
+        let kept: Vec<bool> = {
+            let mut seen: HashSet<(&str, u64)> = HashSet::with_capacity(main.len() + extras.len());
+            seen.extend(main.iter().map(line));
+            extras
+                .iter()
+                .map(|extra| seen.insert(line(extra)))
+                .collect()
+        };
+        let before = main.len();
+        main.extend(
+            extras
+                .into_iter()
+                .zip(kept)
+                .filter_map(|(extra, kept)| kept.then_some(extra)),
+        );
+        telemetry.foundational_candidates = count_u32(main.len() - before);
+        Ok(hits)
     }
 
     /// The semantic candidates for one query vector.
@@ -309,6 +415,54 @@ pub struct HybridCoordinator {
     metadata_ranker: crate::hybrid::metadata_ranker::MetadataRanker,
 }
 
+/// What every search computes before it looks anything up.
+#[derive(Debug)]
+struct SearchSetup {
+    started: std::time::Instant,
+    requested: SearchMode,
+    ranking_profile: RankingProfile,
+    normalized_query: String,
+    query_features: QueryFeatures,
+    requested_alpha: f32,
+    telemetry_per_query: bool,
+    telemetry: SearchTelemetry,
+}
+
+/// The semantic half of a search, from [`HybridCoordinator::prepare_semantic`], waiting for
+/// its lexical half in [`HybridCoordinator::fuse_prepared`].
+#[derive(Debug)]
+pub struct PreparedSemantic {
+    setup: SearchSetup,
+    /// The main query's candidates, then the foundational-books query's that it lacked.
+    semantic: SemanticOutcome,
+    fresh_embedding: Option<Vec<f32>>,
+    top_k: u32,
+    semantic_hits: u32,
+    foundational_hits: u32,
+}
+
+impl PreparedSemantic {
+    /// Whether the semantic path ran and returned; `false` when it was skipped or failed.
+    pub fn healthy(&self) -> bool {
+        self.semantic.healthy
+    }
+
+    /// How many of [`Self::top_k`] the main query's scan filled; fewer means it ran out.
+    pub fn semantic_hits(&self) -> u32 {
+        self.semantic_hits
+    }
+
+    /// How many hits the foundational-books query scanned; 0 when it did not run or failed.
+    pub fn foundational_hits(&self) -> u32 {
+        self.foundational_hits
+    }
+
+    /// The main query's candidate window.
+    pub fn top_k(&self) -> u32 {
+        self.top_k
+    }
+}
+
 struct FusionContext<'a> {
     alpha: f32,
     mode: SearchMode,
@@ -398,7 +552,182 @@ impl HybridCoordinator {
         cancel: &CancellationToken,
     ) -> Result<HybridSearchResult, SemanticSearchError> {
         cancel.checkpoint()?;
-        let start_time = std::time::Instant::now();
+        let mut setup = self.setup(query, params)?;
+        setup.telemetry.lexical_candidates = count_u32(lexical_candidates.len());
+
+        // §1.1 + §3.4: Do not read from or write to the cache for empty or
+        // very short queries. Empty queries cannot be embedded and will always
+        // degrade to lexical-only; caching that would poison future lookups.
+        // Single-character queries from live typing are almost never reused.
+        let cacheable = setup.ranking_profile.query_cache_enabled
+            && setup.normalized_query.chars().count() >= MIN_CACHEABLE_QUERY_LEN;
+        setup.telemetry.cache_lookup = cacheable;
+
+        // Recover rather than propagate a poisoned lock: a panic in one query
+        // must not disable the semantic path for the rest of the session.
+        let semantic_guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+
+        // The lexical candidates are inputs, not state owned by this coordinator.
+        // Hashing them prevents a cache hit after Tantivy produced a new window — and the
+        // two generations, one after an index commit or a vector set reload: a
+        // semantic-only search has no lexical input to change with them.
+        let inputs_hash = hash_search_inputs(
+            &params.filters,
+            &lexical_candidates,
+            &setup.ranking_profile,
+            &params.feature_flags,
+            [
+                resolver.generation(),
+                semantic_guard
+                    .as_ref()
+                    .map_or(0, SemanticSide::vectors_generation),
+            ],
+        );
+        let cache_key = crate::hybrid::cache::QueryCache::compute_key(
+            query,
+            inputs_hash,
+            &setup.requested.to_string(),
+            &format!("{:?}", params.grouping),
+            params.limit,
+            params.offset,
+        );
+        if cacheable {
+            if let Some(mut cached_result) = self.query_cache.get(cache_key) {
+                let mut telemetry_record = setup.telemetry;
+                let latency_ms = setup.started.elapsed().as_millis() as u64;
+                cached_result.latency_ms = latency_ms;
+                telemetry_record.cache_hit = true;
+                telemetry_record.search_mode = cached_result.search_mode.to_string();
+                if cached_result.search_mode != SearchMode::Hybrid {
+                    telemetry_record.fusion_strategy = "SingleSource".to_string();
+                }
+                telemetry_record.semantic_candidates = cached_result
+                    .telemetry
+                    .as_ref()
+                    .map_or(0, |record| record.semantic_candidates);
+                telemetry_record.fused_candidates = cached_result
+                    .telemetry
+                    .as_ref()
+                    .map_or(cached_result.total_count, |record| record.fused_candidates);
+                telemetry_record.latency_ms = latency_ms;
+                telemetry_record.confidence = cached_result.confidence;
+
+                if setup.ranking_profile.telemetry_enabled {
+                    self.telemetry.record_search(&telemetry_record);
+                }
+                cached_result.telemetry = (setup.ranking_profile.telemetry_enabled
+                    && setup.telemetry_per_query)
+                    .then_some(telemetry_record);
+                return Ok(cached_result);
+            }
+        }
+
+        let prepared =
+            self.prepare_with(setup, semantic_guard.as_ref(), params, resolver, cancel)?;
+        let (final_result, telemetry_record) =
+            self.fuse(lexical_candidates, prepared, params, cancel)?;
+
+        // §1.1 + §3.4: Only cache queries with enough substance to be reused.
+        if cacheable {
+            // Keep the complete telemetry record internally even when the
+            // caller opted out of per-query telemetry.  A later cache hit
+            // still needs the original candidate counts for aggregate stats.
+            let mut cached_result = final_result.clone();
+            cached_result.telemetry = Some(telemetry_record);
+            self.query_cache.insert_with_capacity(
+                cache_key,
+                cached_result,
+                params
+                    .feature_flags
+                    .as_ref()
+                    .and_then(|flags| flags.query_cache_capacity)
+                    .unwrap_or(100),
+            );
+        }
+
+        Ok(final_result)
+    }
+
+    /// The semantic half of [`Self::search_cancellable`] — embedding, scan, resolution — for
+    /// a host that runs its lexical search beside it and then calls [`Self::fuse_prepared`]
+    /// with the same `params`.
+    ///
+    /// The query cache is not consulted or written on this path. With a profile's
+    /// [`foundational_candidate_share`](RankingProfile::foundational_candidate_share), a
+    /// second query restricted to the foundational books appends its candidates after the
+    /// main query's; if it fails the main query's are served, but a cancellation is returned.
+    pub fn prepare_semantic(
+        &self,
+        query: &str,
+        params: &HybridSearchParams,
+        resolver: &dyn CandidateResolver,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedSemantic, SemanticSearchError> {
+        cancel.checkpoint()?;
+        let setup = self.setup(query, params)?;
+        let semantic_guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        self.prepare_with(setup, semantic_guard.as_ref(), params, resolver, cancel)
+    }
+
+    /// Fuse `lexical` with what [`Self::prepare_semantic`] found, as
+    /// [`Self::search_cancellable`] would have: the same result, telemetry and caching of
+    /// the query's embedding, but no query cache.
+    pub fn fuse_prepared(
+        &self,
+        lexical: Vec<LexicalCandidate>,
+        prepared: PreparedSemantic,
+        params: &HybridSearchParams,
+        cancel: &CancellationToken,
+    ) -> Result<HybridSearchResult, SemanticSearchError> {
+        self.fuse(lexical, prepared, params, cancel)
+            .map(|(result, _)| result)
+    }
+
+    /// The query's vector as a search embeds it — normalized, from the embedding cache when
+    /// it holds it — caching one it had to embed.
+    pub fn embed_query_cached(
+        &self,
+        query: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<f32>, SemanticSearchError> {
+        cancel.checkpoint()?;
+        let normalized_query = self.normalizer.normalize(query);
+        if let Some(vector) = self.embedding_cache.get(&normalized_query) {
+            return Ok(vector);
+        }
+        let semantic_guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        let vector = semantic_guard
+            .as_ref()
+            .ok_or_else(no_semantic_index)?
+            .embed_query(&normalized_query)?;
+        drop(semantic_guard);
+        cancel.checkpoint()?;
+        self.embedding_cache
+            .insert(&normalized_query, vector.clone());
+        Ok(vector)
+    }
+
+    /// Each text embedded as a stored passage is, by the runtime that embeds queries, so
+    /// the two compare; in order, one vector per text.
+    pub fn embed_passages(
+        &self,
+        texts: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
+        let semantic_guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        semantic_guard
+            .as_ref()
+            .ok_or_else(no_semantic_index)?
+            .embed_passages(texts, cancel)
+    }
+
+    /// What every search computes before it looks anything up.
+    fn setup(
+        &self,
+        query: &str,
+        params: &HybridSearchParams,
+    ) -> Result<SearchSetup, SemanticSearchError> {
+        let started = std::time::Instant::now();
         let requested = params.force_mode.unwrap_or(SearchMode::Hybrid);
         let flags = params.feature_flags.clone().unwrap_or_default();
         let ranking_profile = match &params.ranking {
@@ -423,96 +752,43 @@ impl HybridCoordinator {
                 compute_alpha_with(&query_features, &ranking_profile.alpha_by_query_type)
             })
             .clamp(0.0, 1.0);
-        let telemetry_per_query = flags.telemetry_per_query.unwrap_or(true);
 
-        let mut telemetry_record = crate::telemetry::SearchTelemetry {
+        let telemetry = SearchTelemetry {
             query_type: query_features.estimated_type.to_string(),
             search_mode: requested.to_string(),
             fusion_strategy: ranking_profile.fusion_strategy.to_string(),
             alpha: requested_alpha,
-            lexical_candidates: lexical_candidates.len().min(u32::MAX as usize) as u32,
-            semantic_candidates: 0,
-            fused_candidates: 0,
-            cache_lookup: false,
-            cache_hit: false,
-            latency_ms: 0,
-            embedding_latency_ms: None,
-            fusion_latency_ms: 0,
-            confidence: None,
             profile: ranking_profile.profile.to_string(),
-            semantic_hits: 0,
-            semantic_unresolved: 0,
-            scan_ms: None,
-            resolve_ms: None,
+            ..SearchTelemetry::default()
         };
 
-        // §1.1 + §3.4: Do not read from or write to the cache for empty or
-        // very short queries. Empty queries cannot be embedded and will always
-        // degrade to lexical-only; caching that would poison future lookups.
-        // Single-character queries from live typing are almost never reused.
-        let cacheable = ranking_profile.query_cache_enabled
-            && normalized_query.chars().count() >= MIN_CACHEABLE_QUERY_LEN;
-        telemetry_record.cache_lookup = cacheable;
+        Ok(SearchSetup {
+            started,
+            requested,
+            telemetry_per_query: flags.telemetry_per_query.unwrap_or(true),
+            ranking_profile,
+            normalized_query,
+            query_features,
+            requested_alpha,
+            telemetry,
+        })
+    }
 
-        // Recover rather than propagate a poisoned lock: a panic in one query
-        // must not disable the semantic path for the rest of the session.
-        let semantic_guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
-
-        // The lexical candidates are inputs, not state owned by this coordinator.
-        // Hashing them prevents a cache hit after Tantivy produced a new window — and the
-        // two generations, one after an index commit or a vector set reload: a
-        // semantic-only search has no lexical input to change with them.
-        let inputs_hash = hash_search_inputs(
-            &params.filters,
-            &lexical_candidates,
-            &ranking_profile,
-            &params.feature_flags,
-            [
-                resolver.generation(),
-                semantic_guard
-                    .as_ref()
-                    .map_or(0, SemanticSide::vectors_generation),
-            ],
-        );
-        let cache_key = crate::hybrid::cache::QueryCache::compute_key(
-            query,
-            inputs_hash,
-            &requested.to_string(),
-            &format!("{:?}", params.grouping),
-            params.limit,
-            params.offset,
-        );
-        if cacheable {
-            if let Some(mut cached_result) = self.query_cache.get(cache_key) {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                cached_result.latency_ms = latency_ms;
-                telemetry_record.cache_hit = true;
-                telemetry_record.search_mode = cached_result.search_mode.to_string();
-                if cached_result.search_mode != SearchMode::Hybrid {
-                    telemetry_record.fusion_strategy = "SingleSource".to_string();
-                }
-                telemetry_record.semantic_candidates = cached_result
-                    .telemetry
-                    .as_ref()
-                    .map_or(0, |record| record.semantic_candidates);
-                telemetry_record.fused_candidates = cached_result
-                    .telemetry
-                    .as_ref()
-                    .map_or(cached_result.total_count, |record| record.fused_candidates);
-                telemetry_record.latency_ms = latency_ms;
-                telemetry_record.confidence = cached_result.confidence;
-
-                if ranking_profile.telemetry_enabled {
-                    self.telemetry.record_search(&telemetry_record);
-                }
-                cached_result.telemetry = (ranking_profile.telemetry_enabled
-                    && telemetry_per_query)
-                    .then_some(telemetry_record);
-                return Ok(cached_result);
-            }
-        }
-
-        let skip_semantic_for_exact = requested == SearchMode::Hybrid && requested_alpha >= 1.0;
+    /// The semantic half of a search, over the side the caller holds the lock on.
+    fn prepare_with(
+        &self,
+        mut setup: SearchSetup,
+        side: Option<&SemanticSide>,
+        params: &HybridSearchParams,
+        resolver: &dyn CandidateResolver,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedSemantic, SemanticSearchError> {
+        let requested = setup.requested;
+        let skip_semantic_for_exact =
+            requested == SearchMode::Hybrid && setup.requested_alpha >= 1.0;
+        let top_k = self.semantic_top_k(params, &setup.ranking_profile);
+        let mut semantic_hits = 0;
+        let mut foundational_hits = 0;
 
         // A vector this query had to embed, kept out of the embedding cache until the last
         // checkpoint has passed: a cancelled search writes to neither cache.
@@ -523,22 +799,23 @@ impl HybridCoordinator {
             // not a degradation.
             SemanticOutcome::skipped()
         } else {
-            match semantic_guard.as_ref() {
+            match side {
                 None => SemanticOutcome::failed("no semantic index is configured".to_string()),
                 Some(side) => {
                     let embedding_start = std::time::Instant::now();
-                    let cached_vector = ranking_profile
+                    let cached_vector = setup
+                        .ranking_profile
                         .embedding_cache_enabled
-                        .then(|| self.embedding_cache.get(&normalized_query))
+                        .then(|| self.embedding_cache.get(&setup.normalized_query))
                         .flatten();
 
                     let query_vector = match cached_vector {
                         Some(vector) => Ok(vector),
                         None => {
-                            let result = side.embed_query(&normalized_query);
-                            telemetry_record.embedding_latency_ms =
+                            let result = side.embed_query(&setup.normalized_query);
+                            setup.telemetry.embedding_latency_ms =
                                 Some(embedding_start.elapsed().as_millis() as u64);
-                            if ranking_profile.embedding_cache_enabled {
+                            if setup.ranking_profile.embedding_cache_enabled {
                                 if let Ok(vector) = &result {
                                     fresh_embedding = Some(vector.clone());
                                 }
@@ -553,14 +830,31 @@ impl HybridCoordinator {
                     match query_vector.and_then(|vector| {
                         side.candidates(
                             &vector,
-                            self.semantic_top_k(params, &ranking_profile),
+                            top_k,
                             params.filters.as_ref(),
                             resolver,
                             cancel,
-                            &mut telemetry_record,
+                            &mut setup.telemetry,
                         )
+                        .map(|candidates| (vector, candidates))
                     }) {
-                        Ok(candidates) => SemanticOutcome::ok(candidates),
+                        Ok((vector, mut candidates)) => {
+                            semantic_hits = match side {
+                                SemanticSide::SelfBuilt(_) => count_u32(candidates.len()),
+                                SemanticSide::Official(_) => setup.telemetry.semantic_hits,
+                            };
+                            foundational_hits = side.append_foundational(
+                                &vector,
+                                top_k,
+                                params.filters.as_ref(),
+                                setup.ranking_profile.foundational_candidate_share,
+                                resolver,
+                                cancel,
+                                &mut setup.telemetry,
+                                &mut candidates,
+                            )?;
+                            SemanticOutcome::ok(candidates)
+                        }
                         // Abandoned, not failed: nothing to degrade to, because nobody is
                         // waiting for the lexical results either.
                         Err(SemanticSearchError::Cancelled) => {
@@ -576,9 +870,46 @@ impl HybridCoordinator {
                 }
             }
         };
+
+        Ok(PreparedSemantic {
+            setup,
+            semantic,
+            fresh_embedding,
+            top_k: count_u32(top_k),
+            semantic_hits,
+            foundational_hits,
+        })
+    }
+
+    /// Fusion, grouping and the page, then the bookkeeping of a search that completed: the
+    /// result and the full telemetry record, which the query cache keeps.
+    fn fuse(
+        &self,
+        lexical_candidates: Vec<LexicalCandidate>,
+        prepared: PreparedSemantic,
+        params: &HybridSearchParams,
+        cancel: &CancellationToken,
+    ) -> Result<(HybridSearchResult, SearchTelemetry), SemanticSearchError> {
         // Fusion is cheap next to the scan behind it, but its result would only be thrown
         // away.
         cancel.checkpoint()?;
+        let PreparedSemantic {
+            setup,
+            semantic,
+            fresh_embedding,
+            ..
+        } = prepared;
+        let SearchSetup {
+            started: start_time,
+            requested,
+            ranking_profile,
+            normalized_query,
+            query_features,
+            requested_alpha,
+            telemetry_per_query,
+            telemetry: mut telemetry_record,
+        } = setup;
+        telemetry_record.lexical_candidates = count_u32(lexical_candidates.len());
 
         let mode = match requested {
             SearchMode::LexicalOnly => SearchMode::LexicalOnly,
@@ -715,21 +1046,7 @@ impl HybridCoordinator {
             self.embedding_cache.insert(&normalized_query, vector);
         }
 
-        // §1.1 + §3.4: Only cache queries with enough substance to be reused.
-        if cacheable {
-            // Keep the complete telemetry record internally even when the
-            // caller opted out of per-query telemetry.  A later cache hit
-            // still needs the original candidate counts for aggregate stats.
-            let mut cached_result = final_result.clone();
-            cached_result.telemetry = Some(telemetry_record.clone());
-            self.query_cache.insert_with_capacity(
-                cache_key,
-                cached_result,
-                flags.query_cache_capacity.unwrap_or(100),
-            );
-        }
-
-        Ok(final_result)
+        Ok((final_result, telemetry_record))
     }
 
     /// How many semantic candidates to fetch for one page of results.
@@ -1258,6 +1575,7 @@ impl HybridCoordinator {
 }
 
 /// Outcome of consulting the semantic path for one query.
+#[derive(Debug)]
 struct SemanticOutcome {
     candidates: Vec<SemanticCandidate>,
     /// Whether the semantic path ran and returned successfully. Finding nothing
@@ -1293,6 +1611,14 @@ impl SemanticOutcome {
             failure: None,
         }
     }
+}
+
+fn count_u32(count: usize) -> u32 {
+    count.min(u32::MAX as usize) as u32
+}
+
+fn no_semantic_index() -> SemanticSearchError {
+    SemanticSearchError::Config("no semantic index is configured".to_string())
 }
 
 /// Convert a fused candidate into the frontend-facing result item.
@@ -3504,6 +3830,60 @@ mod tests {
     }
 
     const BASE_BOOK: &str = "otzaria/base/onkelos.txt";
+    const BASE_LINE: &str = "בקדמין ברא יי ית שמיא וית ארעא";
+
+    /// A book among the foundational ones, beside [`mock_book`].
+    fn base_book() -> BookForIndexing {
+        BookForIndexing {
+            source_book_key: BASE_BOOK.to_string(),
+            title: "אונקלוס".to_string(),
+            content_fingerprint: 123456,
+            is_pdf: false,
+            topics: "/base/תרגום".to_string(),
+            extra_facets: Vec::new(),
+            lines: vec![
+                BookLine {
+                    line_id: 1,
+                    section_id: 1,
+                    text: BASE_LINE.to_string(),
+                    line_hash: 1,
+                    reference: "אונקלוס א:א".to_string(),
+                    segment: 1,
+                },
+                BookLine {
+                    line_id: 2,
+                    section_id: 1,
+                    text: "וארעא הות צדיא וריקניא וחשוכא על אפי תהומא".to_string(),
+                    line_hash: 2,
+                    reference: "אונקלוס א:ב".to_string(),
+                    segment: 2,
+                },
+            ],
+        }
+    }
+
+    fn with_base_book(dir: &TempDir) -> HybridCoordinator {
+        let coordinator = semantic_coordinator(dir);
+        coordinator
+            .index_books(&[mock_book(), base_book()])
+            .unwrap()
+            .unwrap();
+        coordinator
+    }
+
+    fn prepared_lines(prepared: &PreparedSemantic) -> Vec<(&str, u64)> {
+        prepared
+            .semantic
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.metadata.source_book_key.as_str(),
+                    candidate.metadata.line_id,
+                )
+            })
+            .collect()
+    }
 
     /// The foundational bonus is added once to a foundational book's line — whether one side
     /// found it or both — in every strategy and mode, and to no other line.
@@ -3657,5 +4037,240 @@ mod tests {
             scores(&fuse(lexical, Vec::new(), SearchMode::LexicalOnly, 1.0)),
             [(7, 1.0 / 61.0), (8, 1.0 / 62.0)]
         );
+    }
+
+    /// The split path is the whole search: prepared and fused apart, a search returns what
+    /// `search_cancellable` returns for it, in every mode and preset, and with the
+    /// foundational query and bonus on.
+    #[test]
+    fn a_search_prepared_and_fused_apart_is_the_same_search() {
+        let dir = TempDir::new("split_search");
+        let coordinator = with_base_book(&dir);
+        let cancel = CancellationToken::new();
+        let foundational = RankingProfile {
+            fusion_strategy: FusionStrategy::RRF { k: 60 },
+            foundational_bonus: 0.002,
+            foundational_candidate_share: 0.5,
+            ..RankingProfile::default()
+        };
+        let rankings = [
+            None,
+            Some(RankingProfile::from_profile(SearchProfile::Fast)),
+            Some(RankingProfile::from_profile(SearchProfile::Best)),
+            Some(foundational),
+        ];
+        let lexical = vec![
+            lexical(1, LINE_ONE, 12.0),
+            LexicalCandidate {
+                file_path: BASE_BOOK.to_string(),
+                facets: vec!["/base/תרגום".to_string()],
+                ..lexical(2, BASE_LINE, 7.0)
+            },
+        ];
+        let mut compared = 0;
+        for ranking in &rankings {
+            for mode in [
+                SearchMode::Hybrid,
+                SearchMode::SemanticOnly,
+                SearchMode::LexicalOnly,
+            ] {
+                for query in [LINE_ONE, "בראשית ברא", "\"בראשית ברא\""] {
+                    let params = HybridSearchParams {
+                        limit: 3,
+                        force_mode: Some(mode),
+                        ranking: ranking.clone(),
+                        grouping: Some(GroupingMode::SameSection),
+                        ..Default::default()
+                    };
+                    coordinator.clear_query_cache();
+                    let whole = coordinator
+                        .search_cancellable(query, lexical.clone(), &params, &NoResolver, &cancel)
+                        .unwrap();
+                    let prepared = coordinator
+                        .prepare_semantic(query, &params, &NoResolver, &cancel)
+                        .unwrap();
+                    assert_eq!(prepared.healthy(), whole.semantic_available);
+                    let split = coordinator
+                        .fuse_prepared(lexical.clone(), prepared, &params, &cancel)
+                        .unwrap();
+
+                    let case = format!("{ranking:?} {mode} {query:?}");
+                    assert_eq!(ranked(&split), ranked(&whole), "{case}");
+                    assert_eq!(split.total_count, whole.total_count, "{case}");
+                    assert_eq!(split.group_count, whole.group_count, "{case}");
+                    assert_eq!(split.search_mode, whole.search_mode, "{case}");
+                    assert_eq!(split.fallback_reason, whole.fallback_reason, "{case}");
+                    assert_eq!(split.confidence, whole.confidence, "{case}");
+                    let (split, whole) = (split.telemetry.unwrap(), whole.telemetry.unwrap());
+                    assert_eq!(split.alpha.to_bits(), whole.alpha.to_bits(), "{case}");
+                    assert_eq!(split.fusion_strategy, whole.fusion_strategy, "{case}");
+                    assert_eq!(split.lexical_candidates, whole.lexical_candidates, "{case}");
+                    assert_eq!(
+                        split.semantic_candidates, whole.semantic_candidates,
+                        "{case}"
+                    );
+                    assert_eq!(split.fused_candidates, whole.fused_candidates, "{case}");
+                    assert_eq!(
+                        split.foundational_candidates, whole.foundational_candidates,
+                        "{case}"
+                    );
+                    assert!(!split.cache_lookup && !split.cache_hit, "{case}");
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 4 * 3 * 3);
+    }
+
+    /// The foundational query appends the foundational lines the main query did not reach,
+    /// after its own and never twice; it runs under the user's filter AND-ed with the
+    /// foundational facet, and not at all when that filter already restricts the
+    /// foundational books or the share is 0.
+    #[test]
+    fn the_foundational_query_appends_what_the_main_query_lacked() {
+        let dir = TempDir::new("foundational_extras");
+        let coordinator = with_base_book(&dir);
+        let cancel = CancellationToken::new();
+        let params = |share: f32, facets: Option<&[&str]>| HybridSearchParams {
+            limit: 1,
+            force_mode: Some(SearchMode::SemanticOnly),
+            filters: facets.map(|facets| SearchFilters {
+                facets: Some(facets.iter().map(|facet| facet.to_string()).collect()),
+                ..Default::default()
+            }),
+            ranking: Some(RankingProfile {
+                candidate_window_multiplier: 1.0,
+                foundational_candidate_share: share,
+                ..RankingProfile::default()
+            }),
+            ..Default::default()
+        };
+        let prepare = |query: &str, params: HybridSearchParams| {
+            coordinator
+                .prepare_semantic(query, &params, &NoResolver, &cancel)
+                .unwrap()
+        };
+        let genesis = "otzaria/tanach/genesis.txt";
+
+        let main = prepare(LINE_ONE, params(0.0, None));
+        assert_eq!(prepared_lines(&main), [(genesis, 1)]);
+        assert_eq!((main.top_k(), main.semantic_hits()), (1, 1));
+        assert_eq!(main.foundational_hits(), 0);
+
+        let extended = prepare(LINE_ONE, params(1.0, None));
+        let lines = prepared_lines(&extended);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], (genesis, 1));
+        assert_eq!(lines[1].0, BASE_BOOK);
+        assert_eq!(
+            (extended.semantic_hits(), extended.foundational_hits()),
+            (1, 1)
+        );
+        assert_eq!(extended.setup.telemetry.foundational_candidates, 1);
+        let result = coordinator
+            .fuse_prepared(Vec::new(), extended, &params(1.0, None), &cancel)
+            .unwrap();
+        assert_eq!(result.total_count, 2);
+
+        // The main query already holds the foundational line: it is not added again.
+        let held = prepare(BASE_LINE, params(1.0, None));
+        assert_eq!(prepared_lines(&held), [(BASE_BOOK, 1)]);
+        assert_eq!(held.foundational_hits(), 1);
+        assert_eq!(held.setup.telemetry.foundational_candidates, 0);
+
+        // A filter on another dimension is kept: the author of Genesis wrote no Targum.
+        let by_author = prepare(LINE_ONE, params(1.0, Some(&["/author/משה רבנו"][..])));
+        assert_eq!(prepared_lines(&by_author), [(genesis, 1)]);
+        assert_eq!(by_author.foundational_hits(), 0);
+
+        for facets in [["/base"], ["/base/תרגום"], ["/base/"]] {
+            let facets = &facets[..];
+            let restricted = prepare(LINE_ONE, params(1.0, Some(facets)));
+            assert_eq!(restricted.foundational_hits(), 0, "{facets:?}");
+            assert_eq!(prepared_lines(&restricted).len(), 1, "{facets:?}");
+        }
+    }
+
+    /// A search abandoned before it is prepared, or between preparing and fusing, is
+    /// cancelled, and fusing it caches nothing.
+    #[test]
+    fn a_split_search_cancelled_at_either_end_is_cancelled() {
+        let dir = TempDir::new("split_cancel");
+        let coordinator = with_base_book(&dir);
+        let params = HybridSearchParams {
+            ranking: Some(RankingProfile {
+                foundational_candidate_share: 1.0,
+                ..RankingProfile::default()
+            }),
+            ..Default::default()
+        };
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            coordinator.prepare_semantic(LINE_ONE, &params, &NoResolver, &cancelled),
+            Err(SemanticSearchError::Cancelled)
+        ));
+
+        let cancel = CancellationToken::new();
+        let prepared = coordinator
+            .prepare_semantic(LINE_TWO, &params, &NoResolver, &cancel)
+            .unwrap();
+        cancel.cancel();
+        assert!(matches!(
+            coordinator.fuse_prepared(Vec::new(), prepared, &params, &cancel),
+            Err(SemanticSearchError::Cancelled)
+        ));
+        assert_eq!(coordinator.embedding_cache_stats().size, 0);
+    }
+
+    /// A passage embedded through the coordinator is the vector its line was stored with, and
+    /// under the default recipe the query of the same text is that vector too.
+    #[test]
+    fn an_embedded_passage_is_the_vector_its_line_was_stored_with() {
+        let dir = TempDir::new("embed_passages");
+        let coordinator = indexed_coordinator(&dir);
+        let cancel = CancellationToken::new();
+        let texts = [LINE_ONE, LINE_TWO, LINE_THREE];
+        let vectors = coordinator.embed_passages(&texts, &cancel).unwrap();
+        assert_eq!(vectors.len(), 3);
+        let guard = coordinator.semantic.read().unwrap();
+        let engine = guard.as_ref().unwrap().builder_ref("test").unwrap();
+        for (line_id, vector) in (1..).zip(&vectors) {
+            let top = engine.search_vector(vector, 1, None, &cancel).unwrap();
+            assert_eq!(top[0].metadata.line_id, line_id);
+            assert!(
+                top[0].similarity_score > 0.9999,
+                "{}",
+                top[0].similarity_score
+            );
+        }
+        drop(guard);
+
+        assert_eq!(
+            coordinator.embed_query_cached(LINE_ONE, &cancel).unwrap(),
+            vectors[0]
+        );
+        assert_eq!(coordinator.embedding_cache_stats().size, 1);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            coordinator.embed_passages(&texts, &cancelled),
+            Err(SemanticSearchError::Cancelled)
+        ));
+        assert!(matches!(
+            HybridCoordinator::new(None).embed_passages(&texts, &cancel),
+            Err(SemanticSearchError::Config(_))
+        ));
+    }
+
+    /// The host runs the lexical phase on another thread while it prepares the semantic one.
+    #[test]
+    fn the_split_search_can_cross_threads() {
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<PreparedSemantic>();
+        send::<&dyn CandidateResolver>();
+        sync::<HybridCoordinator>();
     }
 }

@@ -318,6 +318,23 @@ impl OfficialSemanticIndex {
         Ok(self.runtime.embed_one(&text)?)
     }
 
+    /// Each text embedded as a stored passage is, under the recipe these vectors were built
+    /// with, so it compares with a query this index embeds; one vector per text, in order.
+    pub fn embed_passages(
+        &self,
+        texts: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        for text in texts {
+            cancel.checkpoint()?;
+            let normalized = self.normalization.apply(text);
+            let input = self.text_recipe.passage_text(&normalized);
+            vectors.push(self.runtime.embed_one(&input)?);
+        }
+        Ok(vectors)
+    }
+
     /// Open the generation `CURRENT` names now, if it is not the open one, keeping the
     /// model. The new generation is held to the same identity; until it opens, the old
     /// one stays in service.

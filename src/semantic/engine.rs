@@ -703,6 +703,29 @@ impl SemanticEngine {
         Ok(runtime.embed_one(&text)?)
     }
 
+    /// Each text embedded as the chunker's recipe embeds a stored passage, so it compares
+    /// with a query this engine embeds; one vector per text, in order.
+    pub fn embed_passages(
+        &self,
+        texts: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
+        let Some(runtime) = &self.runtime else {
+            return Err(SemanticSearchError::Config(
+                "Embedding model is not loaded".to_string(),
+            ));
+        };
+        let (_, text_recipe, normalization) = self.chunker.recipe();
+        let mut vectors = Vec::with_capacity(texts.len());
+        for text in texts {
+            cancel.checkpoint()?;
+            let normalized = normalization.apply(text);
+            let input = text_recipe.passage_text(&normalized);
+            vectors.push(runtime.embed_one(&input)?);
+        }
+        Ok(vectors)
+    }
+
     /// Search with a vector already produced by this engine's embedding runtime.
     pub(crate) fn search_vector(
         &self,
