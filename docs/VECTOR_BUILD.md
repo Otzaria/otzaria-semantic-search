@@ -323,4 +323,4 @@ gives it these pieces in `distribution::gates`:
   (G6).
 
 On empty input, `coverage` of a plan with no record is complete, and `recall` of an empty
-`exact` is 1.0: a validator that must not pass those checks for them itself.
+`exact` is 1.0: a validator must refuse empty input itself rather than rely on them.

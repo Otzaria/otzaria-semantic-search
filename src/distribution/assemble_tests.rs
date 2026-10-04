@@ -269,7 +269,7 @@ fn delta_equals_rebuild() {
         for gate in &report.gates {
             let sized = release == "delta2" && gate.gate == "G7";
             assert!(
-                gate.passed || sized,
+                gate.passed() || sized,
                 "{release} {}: {}",
                 gate.gate,
                 gate.detail
@@ -623,9 +623,10 @@ fn a_delta_that_ships_no_vector_passes_the_gates() {
             assert_eq!(report.gates.len(), 6);
             for gate in &report.gates {
                 assert!(
-                    gate.passed,
+                    gate.passed(),
                     "{name} {what}: {} failed: {}",
-                    gate.gate, gate.detail
+                    gate.gate,
+                    gate.detail
                 );
             }
             assert!(report.passed(), "{name} {what}");
@@ -699,7 +700,7 @@ fn a_gate_with_nothing_to_measure_fails_unless_it_does_not_apply() {
     })
     .unwrap();
     let g5 = g5_of(&report);
-    assert_eq!((g5.passed, g5.status), (false, GateStatus::Failed));
+    assert_eq!((g5.passed(), g5.status), (false, GateStatus::Failed));
     assert_eq!(
         g5.detail,
         "2 slot(s) have no vector in the warehouse; no vector of the 2 slot(s) was sampled: \
@@ -771,7 +772,7 @@ fn i8_sym_dim_calibration_is_exact_and_its_clip_rate_is_gated() {
         );
         assert_eq!(report.clipped_components == 0, passes);
         let g1 = machine.verify(&p1, &out, None).gates.remove(0);
-        assert_eq!((g1.gate, g1.passed), ("G1", passes), "{}", g1.detail);
+        assert_eq!((g1.gate, g1.passed()), ("G1", passes), "{}", g1.detail);
     }
 }
 
@@ -869,7 +870,7 @@ fn a_changed_release_fails_its_gates_and_files_are_listed() {
     let failed: Vec<&str> = report
         .gates
         .iter()
-        .filter(|gate| !gate.passed)
+        .filter(|gate| !gate.passed())
         .map(|gate| gate.gate)
         .collect();
     assert_eq!(failed, ["G5", "G8", "G9"]);

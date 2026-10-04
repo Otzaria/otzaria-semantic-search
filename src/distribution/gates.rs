@@ -51,14 +51,31 @@ pub const G7_MAX_DELTA_RATIO: f64 = 0.15;
 /// next release should be a base. Reported, not enforced.
 pub const G10_MAX_GROWTH: f64 = 1.3;
 
-/// One gate's verdict.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// One gate's verdict; its JSON adds `passed`, derived from `status`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Gate {
     pub gate: &'static str,
-    /// False only when `status` is `Failed`.
-    pub passed: bool,
     pub status: GateStatus,
     pub detail: String,
+}
+
+impl Gate {
+    /// False exactly when `status` is `Failed`.
+    pub fn passed(&self) -> bool {
+        self.status != GateStatus::Failed
+    }
+}
+
+impl Serialize for Gate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut gate = serializer.serialize_struct("Gate", 4)?;
+        gate.serialize_field("gate", self.gate)?;
+        gate.serialize_field("passed", &self.passed())?;
+        gate.serialize_field("status", &self.status)?;
+        gate.serialize_field("detail", &self.detail)?;
+        gate.end()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -81,7 +98,7 @@ pub struct GateReport {
 
 impl GateReport {
     pub fn passed(&self) -> bool {
-        self.gates.iter().all(|gate| gate.passed)
+        self.gates.iter().all(Gate::passed)
     }
 }
 
@@ -193,7 +210,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 fn gate(gate: &'static str, passed: bool, detail: String) -> Gate {
     Gate {
         gate,
-        passed,
         status: if passed {
             GateStatus::Passed
         } else {
@@ -206,7 +222,6 @@ fn gate(gate: &'static str, passed: bool, detail: String) -> Gate {
 fn not_applicable(gate: &'static str, detail: String) -> Gate {
     Gate {
         gate,
-        passed: true,
         status: GateStatus::NotApplicable,
         detail,
     }
@@ -768,7 +783,7 @@ mod tests {
     fn g5_measures_what_there_is_and_fails_what_it_cannot() {
         let gate = g5(&content(0, Vec::new()), PackageKind::Delta);
         assert_eq!(
-            (gate.passed, gate.status),
+            (gate.passed(), gate.status),
             (true, GateStatus::NotApplicable)
         );
         assert_eq!(
@@ -779,7 +794,7 @@ mod tests {
 
         for kind in [PackageKind::Base, PackageKind::Compacted] {
             let gate = g5(&content(0, Vec::new()), kind);
-            assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+            assert_eq!((gate.passed(), gate.status), (false, GateStatus::Failed));
             assert_eq!(
                 gate.detail,
                 format!("the {kind} ships no vector: its fidelity could not be checked")
@@ -788,7 +803,7 @@ mod tests {
 
         for kind in [PackageKind::Base, PackageKind::Delta] {
             let gate = g5(&content(3, Vec::new()), kind);
-            assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+            assert_eq!((gate.passed(), gate.status), (false, GateStatus::Failed));
             assert_eq!(
                 gate.detail,
                 "no vector of the 3 slot(s) was sampled: the cosines could not be measured"
@@ -798,18 +813,18 @@ mod tests {
         // A NaN mean is under no floor: it used to pass.
         for odd in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let gate = g5(&content(3, vec![1.0, odd, 1.0]), PackageKind::Base);
-            assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+            assert_eq!((gate.passed(), gate.status), (false, GateStatus::Failed));
             assert_eq!(gate.detail, "1 of 3 sampled cosine(s) are not finite");
         }
 
         let gate = g5(&content(2, vec![1.0, 1.0]), PackageKind::Delta);
-        assert_eq!((gate.passed, gate.status), (true, GateStatus::Passed));
+        assert_eq!((gate.passed(), gate.status), (true, GateStatus::Passed));
         assert_eq!(
             gate.detail,
             "2 slot(s) encode their vectors; on 2 sampled, cosine mean 1.000000, p0.1 1.000000"
         );
         let gate = g5(&content(2, vec![1.0, 0.9]), PackageKind::Base);
-        assert_eq!((gate.passed, gate.status), (false, GateStatus::Failed));
+        assert_eq!((gate.passed(), gate.status), (false, GateStatus::Failed));
         assert_eq!(
             gate.detail,
             "cosine mean 0.950000 and p0.1 0.900000, under 0.9995 and 0.998"
@@ -820,31 +835,50 @@ mod tests {
         };
         let gate = g5(&missing, PackageKind::Delta);
         assert_eq!(
-            (gate.passed, gate.detail.as_str()),
+            (gate.passed(), gate.detail.as_str()),
             (false, "1 slot(s) have no vector in the warehouse")
         );
     }
 
     #[test]
     fn a_gate_that_does_not_apply_is_no_failure() {
-        let report = GateReport {
-            segment_id: String::new(),
+        let mut report = GateReport {
+            segment_id: "s".to_string(),
             gates: vec![
-                gate("G1", true, String::new()),
-                not_applicable("G5", String::new()),
+                gate("G1", true, "a".to_string()),
+                not_applicable("G5", "b".to_string()),
+                gate("G7", false, "c".to_string()),
             ],
         };
+        assert!(!report.passed());
+        // The bytes gates.json is written with.
+        assert_eq!(
+            serde_json::to_string_pretty(&report).unwrap(),
+            r#"{
+  "segmentId": "s",
+  "gates": [
+    {
+      "gate": "G1",
+      "passed": true,
+      "status": "passed",
+      "detail": "a"
+    },
+    {
+      "gate": "G5",
+      "passed": true,
+      "status": "notApplicable",
+      "detail": "b"
+    },
+    {
+      "gate": "G7",
+      "passed": false,
+      "status": "failed",
+      "detail": "c"
+    }
+  ]
+}"#
+        );
+        report.gates.pop();
         assert!(report.passed());
-        let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["gates"][0]["status"], "passed");
-        assert_eq!(json["gates"][1]["status"], "notApplicable");
-        assert_eq!(json["gates"][1]["passed"], true);
-        let failed = gate("G7", false, String::new());
-        assert_eq!(failed.status, GateStatus::Failed);
-        assert!(!GateReport {
-            gates: vec![failed],
-            ..report
-        }
-        .passed());
     }
 }
