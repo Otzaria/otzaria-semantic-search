@@ -542,10 +542,34 @@ fn a_reader_between_an_adds_index_and_its_count_is_told_so() {
     before["batches"].as_array_mut().unwrap().pop();
     std::fs::write(&path, serde_json::to_vec(&before).unwrap()).unwrap();
 
+    let started = std::time::Instant::now();
     let error = Warehouse::open(&at).err().unwrap().to_string();
+    let waited = started.elapsed().as_secs_f64();
     assert!(error.contains("may be being added to"), "{error}");
+    assert!((1.0..2.0).contains(&waited), "waited {waited} s");
     std::fs::write(&path, committed).unwrap();
     assert_eq!(Warehouse::open(&at).unwrap().len(), 4);
+}
+
+/// An index header no add leaves, behind the count or without its magic, is refused at
+/// once, with the repair alone.
+#[test]
+fn an_index_header_no_add_leaves_is_refused_at_once() {
+    let (_dir, at) = two_batches("warehouse_index_behind");
+    let original = std::fs::read(at.join("index.bin")).unwrap();
+    for (case, at_byte, value) in [("behind", 8, 3u8), ("no magic", 0, b'X')] {
+        let mut index = original.clone();
+        index[at_byte] = value;
+        std::fs::write(at.join("index.bin"), index).unwrap();
+        let started = std::time::Instant::now();
+        let error = Warehouse::open(&at).err().unwrap().to_string();
+        assert!(started.elapsed().as_secs_f64() < 0.5, "{case}: it waited");
+        assert!(
+            error.contains("warehouse-verify --repair, rebuilds it")
+                && !error.contains("being added to"),
+            "{case}: {error}"
+        );
+    }
 }
 
 /// Batches that do not tile the count, in order and without a gap, are refused on open.

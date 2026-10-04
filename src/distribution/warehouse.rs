@@ -40,6 +40,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub const WAREHOUSE_FORMAT: &str = "otzaria-vector-warehouse";
 pub const WAREHOUSE_FORMAT_VERSION: u32 = 1;
@@ -213,19 +214,22 @@ impl Warehouse {
     /// Open to read: what `warehouse.json` counts, whatever a crash left past it. Checks
     /// sizes and headers only; [`Self::verify`] checks the contents.
     pub fn open(dir: &Path) -> Result<Self, PackError> {
-        let mut waited = 0;
+        let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let mut warehouse = Self::unmapped(dir, read_manifest(dir)?);
-            warehouse.map_data()?;
-            let Err(error) = warehouse.map_index() else {
-                return Ok(warehouse);
-            };
-            // An add renames its index into place before it writes the count: wait up to 1 s.
-            if waited == 50 || !index_ahead(dir, warehouse.manifest.records) {
-                return Err(error);
+            let manifest = read_manifest(dir)?;
+            let records = manifest.records;
+            // An add renames its index into place before it writes the count: wait up to 1 s
+            // for the count, holding no map.
+            let wait = || Instant::now() < deadline && index_ahead(dir, records);
+            if !wait() {
+                let mut warehouse = Self::unmapped(dir, manifest);
+                match warehouse.map() {
+                    Err(_) if wait() => {}
+                    result => return result.map(|()| warehouse),
+                }
             }
-            waited += 1;
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            let left = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(left.min(Duration::from_millis(20)));
         }
     }
 
@@ -338,13 +342,18 @@ impl Warehouse {
     fn map_index(&mut self) -> Result<(), PackError> {
         let path = self.dir.join(INDEX);
         let index = map_file(&path)?;
-        if let Some(fault) = header_fault(&index, self.manifest.records) {
+        let records = self.manifest.records;
+        if let Some(fault) = header_fault(&index, records) {
+            let ahead = header_count(&index).is_some_and(|count| count > records);
+            let added_to = if ahead {
+                "the warehouse may be being added to; if not, "
+            } else {
+                ""
+            };
             return Err(malformed(format!(
-                "{} is not the index of the warehouse's {} records ({fault}): the warehouse may \
-                 be being added to; if not, adding to it, or warehouse-verify --repair, \
-                 rebuilds the index",
-                path.display(),
-                self.manifest.records
+                "{} is not the index of the warehouse's {records} records ({fault}): {added_to}\
+                 adding to the warehouse, or warehouse-verify --repair, rebuilds it",
+                path.display()
             )));
         }
         self.index = Some(index);
@@ -806,16 +815,20 @@ fn index_ahead(dir: &Path, records: u64) -> bool {
     File::open(dir.join(INDEX))
         .and_then(|mut file| file.read_exact(&mut header))
         .is_ok()
-        && header[..8] == INDEX_MAGIC[..]
-        && u64::from_le_bytes(header[8..].try_into().expect("8")) > records
+        && header_count(&header).is_some_and(|count| count > records)
+}
+
+/// The count an index header holds, if `index` starts with one.
+fn header_count(index: &[u8]) -> Option<u64> {
+    (index.len() >= HEADER && index[..8] == INDEX_MAGIC[..])
+        .then(|| u64::from_le_bytes(index[8..HEADER].try_into().expect("8")))
 }
 
 /// Why `index`'s header is not that of `records` entries, if it is not.
 fn header_fault(index: &[u8], records: u64) -> Option<String> {
-    if index.len() < HEADER || &index[..8] != INDEX_MAGIC {
+    let Some(count) = header_count(index) else {
         return Some("no index header".to_string());
-    }
-    let count = u64::from_le_bytes(index[8..16].try_into().expect("8"));
+    };
     let entries = (index.len() - HEADER) as u64;
     (count != records || entries != records * ENTRY as u64)
         .then(|| format!("it counts {count} entries in {} bytes", index.len()))
