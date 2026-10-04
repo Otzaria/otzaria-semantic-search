@@ -16,7 +16,7 @@
 
 use super::files::{self, io_error, Durable, SetLock, SetSegment, STAGING_DIR};
 use super::install::{full_or_io, NewGeneration};
-use super::{recover, space, SegmentSet, SetInfo};
+use super::{recover, retry, space, SegmentSet, SetInfo};
 use crate::cancellation::CancellationToken;
 use crate::distribution::package::PackageKind;
 use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
@@ -361,7 +361,7 @@ pub fn compact(
     let written = match written {
         Ok(written) => written,
         Err(error) => {
-            let _ = fs::remove_file(&partial);
+            let _ = retry::remove_file(&partial);
             return Err(error);
         }
     };
@@ -414,7 +414,8 @@ pub fn compact(
         .into()
     })?;
     if placed == files::Placed::Kept {
-        fs::remove_file(&partial).map_err(io_error(format!("removing {}", partial.display())))?;
+        retry::remove_file(&partial)
+            .map_err(io_error(format!("removing {}", partial.display())))?;
     }
     let segment = Segment::open(&target)?;
     let mut generation = NewGeneration::empty(&document.identity, &document.codec_params_sha256);

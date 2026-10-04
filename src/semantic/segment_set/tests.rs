@@ -571,7 +571,7 @@ fn garbage_goes_after_a_flip_and_an_open_reader_keeps_its_generation() {
     let mut v40 = v30();
     v40.version = 40;
     install(&dir, &release(&work, &v40, None)).unwrap();
-    assert!(dir.join(format!("segments/{base_id}.oxv")).exists() || cfg!(windows));
+    assert!(dir.join(format!("segments/{base_id}.oxv")).exists());
     let mut v41 = v40.clone();
     v41.version = 41;
     v41.books.get_mut("id:3").unwrap().insert(9, 99);
@@ -587,10 +587,8 @@ fn garbage_goes_after_a_flip_and_an_open_reader_keeps_its_generation() {
         generations,
         BTreeSet::from(["gen-000003".to_string(), "gen-000004".to_string()])
     );
-    if !cfg!(windows) {
-        // On Windows the reader's mapping keeps the file until it is closed.
-        assert!(!dir.join(format!("segments/{base_id}.oxv")).exists());
-    }
+    // Collected though the reader maps it.
+    assert!(!dir.join(format!("segments/{base_id}.oxv")).exists());
     // The reader opened before all of it still answers from its own generation.
     assert_eq!(everything(&reader, 3), before);
     drop(reader);
@@ -2352,9 +2350,7 @@ fn a_scrub_or_a_compaction_cancelled_on_damage_records_nothing() {
 
 /// An install replaces a segment while a scrub reads it: the scrub finds a block that fails
 /// in bytes the file no longer holds. It condemns nothing, and says so — a report marked
-/// `superseded` rather than a `Corrupted` that would send a host downloading for nothing. On
-/// Unix alone: Windows replaces no file that is mapped, so there it cannot happen.
-#[cfg(unix)]
+/// `superseded` rather than a `Corrupted` that would send a host downloading for nothing.
 #[test]
 fn a_scrub_of_bytes_an_install_replaced_reports_it_superseded() {
     let work = TempDir::new("set_scrub_superseded");
@@ -2395,4 +2391,433 @@ fn a_full_disk_is_insufficient_space() {
         install::full_or_io(other, Path::new("x"), 1, 0),
         SemanticSearchError::Artifact(ArtifactError::Io { .. })
     ));
+}
+
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x1;
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x2;
+
+/// `path` opened as a scanner or an indexer opens it: shared for reading, or reading and
+/// writing, and never for deletion.
+#[cfg(windows)]
+fn held_without_delete_sharing(path: &Path, share: u32) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(share)
+        .open(path)
+        .unwrap_or_else(|error| panic!("holding {}: {error}", path.display()))
+}
+
+/// `file`, closed on another thread after 300 ms.
+#[cfg(windows)]
+fn released_soon(file: std::fs::File) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(file);
+    })
+}
+
+/// Run `work` with `hook` called at every step an install reaches; the threads the hook
+/// started are joined after.
+#[cfg(windows)]
+fn at_step<T>(
+    mut hook: impl FnMut(Step) -> Option<std::thread::JoinHandle<()>> + 'static,
+    work: impl FnOnce() -> T,
+) -> T {
+    let started = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let threads = started.clone();
+    install::AT_STEP.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |step| {
+            threads.borrow_mut().extend(hook(step));
+        }))
+    });
+    let result = work();
+    install::AT_STEP.with(|slot| *slot.borrow_mut() = None);
+    for thread in started.take() {
+        thread.join().unwrap();
+    }
+    result
+}
+
+#[cfg(windows)]
+fn forget_refusals() {
+    retry::REFUSED.with(|refused| refused.borrow_mut().clear());
+}
+
+/// How often an operation on `path` was refused on this thread: the one under test only, so
+/// a scanner's refusals elsewhere do not count.
+#[cfg(windows)]
+fn refusals_on(path: &Path) -> usize {
+    retry::REFUSED.with(|refused| refused.borrow().iter().filter(|p| *p == path).count())
+}
+
+/// Windows refuses to replace `CURRENT` while another process holds it without delete
+/// sharing, whether it shares reading and writing or reading alone. The flip waits until the
+/// handle is closed, and the install lands.
+#[cfg(windows)]
+#[test]
+fn windows_current_held_open_briefly_is_flipped_once_released() {
+    for share in [FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SHARE_READ] {
+        let work = TempDir::new("set_current_held");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        let delta = release(&work, &v30(), Some(&v29()));
+        let current = dir.join(CURRENT);
+        let held = current.clone();
+        forget_refusals();
+        let report = at_step(
+            move |step| {
+                (step == Step::PreviousWritten)
+                    .then(|| released_soon(held_without_delete_sharing(&held, share)))
+            },
+            || install(&dir, &delta),
+        )
+        .unwrap_or_else(|error| panic!("share {share}: {error}"));
+        assert!(
+            refusals_on(&current) > 0,
+            "share {share}: the flip never met the handle"
+        );
+        assert_eq!((report.generation, report.library_version), (2, 30));
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!((set.generation(), set.info().library_version), (2, 30));
+        assert!(!set.info().recovered_from_previous);
+    }
+}
+
+/// Windows refuses to move a file another process holds without delete sharing: a scan of a
+/// fresh download, or of the copy an install just wrote to `staging/`. Placing the segment
+/// waits until the handle is closed, and the install lands.
+#[cfg(windows)]
+#[test]
+fn windows_a_segment_held_open_briefly_is_placed_once_released() {
+    for in_incoming in [true, false] {
+        let work = TempDir::new("set_segment_held");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        let delta = release(&work, &v30(), Some(&v29()));
+        let (source, held) = match in_incoming {
+            true => {
+                let download = downloaded(&dir, &delta, "delta.oxv");
+                (download.clone(), download.0)
+            }
+            false => {
+                let id = manifest_of(&delta).segment_id;
+                (delta, dir.join(STAGING_DIR).join(format!("{id}.oxv")))
+            }
+        };
+        let moved = held.clone();
+        forget_refusals();
+        let report = at_step(
+            move |step| {
+                (step == Step::Staged).then(|| {
+                    released_soon(held_without_delete_sharing(
+                        &held,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ))
+                })
+            },
+            || install(&dir, &source),
+        )
+        .unwrap_or_else(|error| panic!("in incoming/ {in_incoming}: {error}"));
+        assert!(
+            refusals_on(&moved) > 0,
+            "in incoming/ {in_incoming}: never met the handle"
+        );
+        assert_eq!((report.generation, report.library_version), (2, 30));
+        assert!(
+            !moved.exists(),
+            "in incoming/ {in_incoming}: moved into the set"
+        );
+        assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 2);
+    }
+}
+
+/// The temporary files of `CURRENT` and `PREVIOUS` in `dir`.
+fn pointer_temporaries(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| {
+            files::is_temporary_of(name, CURRENT) || files::is_temporary_of(name, PREVIOUS)
+        })
+        .collect()
+}
+
+/// The install's own error, and Windows' code in it.
+#[cfg(windows)]
+fn os_error_of(result: Result<ApplyReport, SemanticSearchError>) -> Option<i32> {
+    match result {
+        Err(SemanticSearchError::Artifact(ArtifactError::Io { source, .. })) => {
+            source.raw_os_error()
+        }
+        other => panic!("not an I/O error: {other:?}"),
+    }
+}
+
+/// `CURRENT` held past every retry: the install fails with Windows' refusal after the whole
+/// backoff, `CURRENT` names the generation it named, and that generation still serves — while
+/// the handle is open and after. The install, repeated, lands.
+#[cfg(windows)]
+#[test]
+fn windows_current_held_past_the_retries_fails_and_the_old_generation_serves() {
+    let work = TempDir::new("set_current_held_long");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let before = everything(&SegmentSet::open(&dir).unwrap(), 4);
+    let pointer = std::fs::read(dir.join(CURRENT)).unwrap();
+    let delta = release(&work, &v30(), Some(&v29()));
+
+    let held = held_without_delete_sharing(&dir.join(CURRENT), FILE_SHARE_READ | FILE_SHARE_WRITE);
+    forget_refusals();
+    let started = std::time::Instant::now();
+    assert_eq!(os_error_of(install(&dir, &delta)), Some(5));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1_888));
+    assert_eq!(refusals_on(&dir.join(CURRENT)), retry::DELAYS.len() + 1);
+    assert_eq!(std::fs::read(dir.join(CURRENT)).unwrap(), pointer);
+    let reader = SegmentSet::open_without_recovery(&dir).unwrap();
+    assert_eq!(reader.generation(), 1);
+    assert_eq!(everything(&reader, 4), before);
+    drop(reader);
+    drop(held);
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert!(!set.info().recovered_from_previous);
+    assert_eq!(everything(&set, 4), before);
+    drop(set);
+    assert!(
+        pointer_temporaries(&dir).is_empty(),
+        "recovery removes the pointer that was never flipped"
+    );
+    let report = install(&dir, &delta).unwrap();
+    assert_eq!(report.library_version, 30);
+    assert_eq!(SegmentSet::open(&dir).unwrap().info().library_version, 30);
+}
+
+/// A download held past every retry: the install fails with Windows' refusal, the download is
+/// left where the host put it, byte for byte, and the set serves what it served. Once the
+/// handle is closed, the same download installs.
+#[cfg(windows)]
+#[test]
+fn windows_a_download_held_past_the_retries_stays_and_the_old_generation_serves() {
+    let work = TempDir::new("set_download_held_long");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let before = everything(&SegmentSet::open(&dir).unwrap(), 4);
+    let (download, json) = downloaded(&dir, &release(&work, &v30(), Some(&v29())), "delta.oxv");
+    let bytes = std::fs::read(&download).unwrap();
+
+    let held = held_without_delete_sharing(&download, FILE_SHARE_READ | FILE_SHARE_WRITE);
+    forget_refusals();
+    let refused = os_error_of(install(&dir, &(download.clone(), json.clone())));
+    assert!(matches!(refused, Some(5 | 32)), "{refused:?}");
+    assert_eq!(refusals_on(&download), retry::DELAYS.len() + 1);
+    drop(held);
+    assert_eq!(
+        std::fs::read(&download).unwrap(),
+        bytes,
+        "the download is lost"
+    );
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 1);
+    assert_eq!(everything(&set, 4), before);
+    drop(set);
+    let report = install(&dir, &(download.clone(), json)).unwrap();
+    assert_eq!((report.generation, report.library_version), (2, 30));
+    assert!(!download.exists(), "taken into the set");
+}
+
+/// A reader still maps a segment an install replaces: the damaged base of a condemned set,
+/// mapped before the scrub. On NTFS `std::fs::rename` falls back to POSIX semantics when
+/// `MoveFileExW` refuses, so the file is replaced as on Unix: the reader keeps the bytes it
+/// mapped, and the set opens on the repair.
+#[cfg(windows)]
+#[test]
+fn windows_a_segment_a_reader_maps_is_replaced_and_the_reader_keeps_its_bytes() {
+    let work = TempDir::new("set_mapped_segment");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let file = dir.join(format!("segments/{id}.oxv"));
+    let damaged = damage_last_byte(&file);
+    assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
+    let mapped = unsafe { memmap2::Mmap::map(&std::fs::File::open(&file).unwrap()) }.unwrap();
+    let again = republished(&work, &v29(), None);
+    let (download, json) = downloaded(&dir, &again, "repair.oxv");
+
+    let report = install(&dir, &(download.clone(), json))
+        .unwrap_or_else(|error| panic!("the repair must install: {error}"));
+    assert_eq!((report.generation, report.library_version), (2, 29));
+    assert_eq!(
+        &mapped[..],
+        &damaged[..],
+        "the reader keeps the bytes it mapped"
+    );
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        manifest_of(&again).segment.sha256
+    );
+    assert!(!download.exists(), "taken into the set");
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    assert!(!set.info().recovered_from_previous);
+    drop(set);
+    drop(mapped);
+}
+
+/// Nothing recovery removes — `staging/`, a pointer's temporary file — is read by an open, so a
+/// recovery that fails is logged and the open goes on; the next open that recovers cleans up.
+/// An install needs it, and refuses.
+#[test]
+fn an_open_goes_on_when_recovery_fails() {
+    let work = TempDir::new("set_recovery_fails");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let left = dir.join(STAGING_DIR).join("left.oxv");
+    std::fs::create_dir_all(left.parent().unwrap()).unwrap();
+    std::fs::write(&left, b"half").unwrap();
+    for name in ["CURRENT.tmp", "PREVIOUS.7-3.tmp"] {
+        std::fs::write(dir.join(name), b"{").unwrap();
+    }
+
+    RECOVERY_FAILS.with(|fails| fails.set(true));
+    let set = SegmentSet::open(&dir).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(set.generation(), 1);
+    drop(set);
+    assert!(left.exists());
+    assert_eq!(pointer_temporaries(&dir).len(), 2);
+
+    RECOVERY_FAILS.with(|fails| fails.set(true));
+    assert!(matches!(
+        install(&dir, &release(&work, &v30(), Some(&v29()))),
+        Err(SemanticSearchError::Artifact(ArtifactError::Io { .. }))
+    ));
+
+    SegmentSet::open(&dir).unwrap();
+    assert!(!dir.join(STAGING_DIR).exists());
+    assert_eq!(pointer_temporaries(&dir), Vec::<String>::new());
+}
+
+/// An open needs no lock to read. Under another holder's lock it opens and recovers nothing,
+/// as it always did; where no lock can be taken at all — a read-only directory — it opens
+/// without recovery rather than failing.
+#[test]
+fn an_open_goes_on_without_the_lock() {
+    let work = TempDir::new("set_open_without_lock");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let left = dir.join(STAGING_DIR).join("left.oxv");
+    std::fs::create_dir_all(left.parent().unwrap()).unwrap();
+    std::fs::write(&left, b"half").unwrap();
+
+    let held = files::SetLock::take(&dir).unwrap();
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+    assert!(
+        left.exists(),
+        "nothing is recovered under another holder's lock"
+    );
+    drop(held);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::remove_file(dir.join(files::LOCK_FILE)).unwrap();
+        let mode = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        // Root writes anywhere, so there the lock is taken and there is nothing to test.
+        let refused = files::SetLock::try_take(&dir).is_err();
+        let opened = SegmentSet::open(&dir).map(|set| set.generation());
+        mode(0o755).unwrap();
+        if refused {
+            assert_eq!(opened.unwrap_or_else(|error| panic!("{error}")), 1);
+            assert!(left.exists(), "nothing is recovered without the lock");
+        }
+    }
+}
+
+/// `staging/` as a crash left it, a file in it held by a scanner for a moment: recovery waits
+/// until the handle is closed, and removes it.
+#[cfg(windows)]
+#[test]
+fn windows_staging_held_open_briefly_is_recovered_once_released() {
+    let work = TempDir::new("set_staging_held");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let staging = dir.join(STAGING_DIR);
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("left.oxv"), b"half").unwrap();
+
+    forget_refusals();
+    let released = released_soon(held_without_delete_sharing(
+        &staging.join("left.oxv"),
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    ));
+    let set = SegmentSet::open(&dir).unwrap();
+    released.join().unwrap();
+    assert!(refusals_on(&staging) > 0, "recovery never met the handle");
+    assert!(!staging.exists());
+    assert_eq!(set.generation(), 1);
+}
+
+/// Held past every retry, `staging/` stays, and the open goes on with the generation it
+/// serves; the next open recovers.
+#[cfg(windows)]
+#[test]
+fn windows_staging_held_past_the_retries_does_not_stop_an_open() {
+    let work = TempDir::new("set_staging_held_long");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let staging = dir.join(STAGING_DIR);
+    let left = staging.join("left.oxv");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(&left, b"half").unwrap();
+
+    let held = held_without_delete_sharing(&left, FILE_SHARE_READ | FILE_SHARE_WRITE);
+    forget_refusals();
+    let set = SegmentSet::open(&dir).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(refusals_on(&staging), retry::DELAYS.len() + 1);
+    assert_eq!(set.generation(), 1);
+    assert!(left.exists());
+    drop(set);
+    drop(held);
+    SegmentSet::open(&dir).unwrap();
+    assert!(!staging.exists());
+}
+
+/// A verdict a scanner holds for a moment: the install that verifies the segment again waits
+/// until the handle is closed, and withdraws it.
+#[cfg(windows)]
+#[test]
+fn windows_a_verdict_held_open_briefly_is_withdrawn_once_released() {
+    let work = TempDir::new("set_verdict_held");
+    let dir = work.join("vectors");
+    let base = release(&work, &v29(), None);
+    install(&dir, &base).unwrap();
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    let verdict = files::verdict_path(&dir, &id);
+    std::fs::write(&verdict, b"condemned by hand").unwrap();
+    assert!(is_corrupt(SegmentSet::open(&dir)));
+
+    let held = verdict.clone();
+    forget_refusals();
+    let report = at_step(
+        move |step| {
+            (step == Step::Staged).then(|| {
+                released_soon(held_without_delete_sharing(
+                    &held,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ))
+            })
+        },
+        || install(&dir, &base),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(refusals_on(&verdict) > 0, "never met the handle");
+    assert!(!verdict.exists());
+    assert_eq!(report.generation, 2);
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 2);
 }

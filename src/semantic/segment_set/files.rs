@@ -19,8 +19,9 @@
 //! place, and its directory is flushed before a pointer names it — a segment taken from
 //! `incoming/`, which the set did not write, is flushed too; the two pointer files are the
 //! only ones ever replaced, and `std::fs::rename` replaces atomically on every platform the
-//! crate builds for (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows).
+//! crate builds for.
 
+use super::retry;
 use crate::cancellation::CancellationToken;
 use crate::distribution::package::{sync_dir, PackageKind};
 use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
@@ -112,7 +113,7 @@ pub(crate) fn next_generation(dir: &Path) -> Result<u64, ArtifactError> {
 pub(crate) fn write_pointer(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let path = dir.join(name);
     if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-        fs::remove_dir(&path)?;
+        retry::remove_dir(&path)?;
     }
     write_atomically(&path, bytes)
 }
@@ -496,24 +497,53 @@ pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
 
 /// Rename a flushed file into place.
 pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)?;
+    retry::rename(from, to)?;
     note(|| Durable::Renamed(from.to_path_buf(), to.to_path_buf()));
     Ok(())
 }
 
-/// Write `bytes` to `path` under a temporary name, flush, rename into place, and flush the
-/// directory.
+/// `<name>.<pid>-<n>.tmp` beside `path`: no other writer's, since a scrub writes verdicts
+/// without the set's lock.
+fn temporary_path(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}-{next}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Whether `name` is a temporary file [`write_atomically`] writes for `file`, or wrote under
+/// the single name it once used.
+pub(crate) fn is_temporary_of(name: &str, file: &str) -> bool {
+    name.strip_prefix(file)
+        .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fail the next [`write_atomically`] on this thread once its temporary file is written.
+    pub(crate) static WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Write `bytes` to `path` under a temporary name of its own, flush, rename into place, and
+/// flush the directory. A write that fails removes its temporary file: nothing else would.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension(match path.extension() {
-        Some(extension) => format!("{}.tmp", extension.to_string_lossy()),
-        None => "tmp".to_string(),
-    });
-    {
-        let mut file = File::create(&temporary)?;
+    let temporary = temporary_path(path);
+    let mut file = File::create(&temporary)?;
+    let placed = (|| {
         file.write_all(bytes)?;
         sync_file(&file, &temporary)?;
+        drop(file);
+        #[cfg(test)]
+        if WRITE_FAILS.with(|fails| fails.replace(false)) {
+            return Err(io::Error::other("injected write failure"));
+        }
+        rename_into_place(&temporary, path)
+    })();
+    if placed.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    rename_into_place(&temporary, path)?;
+    placed?;
     if let Some(parent) = path.parent() {
         sync_set_dir(parent)?;
     }
@@ -776,7 +806,7 @@ pub(crate) fn place_segment(
         .and_then(|()| settle_verdict(dir, id, sha256));
     if let Err(error) = settled {
         if placed != Placed::Kept {
-            let _ = fs::rename(&target, staged);
+            let _ = retry::rename(&target, staged);
         }
         return Err(error.into());
     }
@@ -787,7 +817,7 @@ pub(crate) fn place_segment(
 /// whole. Whether there was one.
 pub(crate) fn clear_verdict(dir: &Path, id: &str) -> Result<bool, ArtifactError> {
     let path = verdict_path(dir, id);
-    match fs::remove_file(&path) {
+    match retry::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(io_error(format!("removing {}", path.display()))(error)),
@@ -900,6 +930,44 @@ mod tests {
         drop(held);
         assert!(SetLock::try_take(work.path()).unwrap().is_some());
         drop(inherited);
+    }
+
+    #[test]
+    fn every_write_has_a_temporary_name_of_its_own() {
+        let path = Path::new("segments").join("abc.corrupt");
+        let (first, second) = (temporary_path(&path), temporary_path(&path));
+        assert_ne!(first, second);
+        for temporary in [&first, &second] {
+            assert_eq!(temporary.parent(), path.parent());
+            let name = temporary.file_name().unwrap().to_str().unwrap();
+            assert!(is_temporary_of(name, "abc.corrupt"), "{name}");
+            assert!(
+                name.contains(&format!(".{}-", std::process::id())),
+                "{name}"
+            );
+        }
+        assert!(is_temporary_of("CURRENT.tmp", CURRENT));
+        assert!(!is_temporary_of("CURRENT", CURRENT));
+        assert!(!is_temporary_of("CURRENTLY.tmp", CURRENT));
+        assert!(!is_temporary_of("PREVIOUS.1-0.tmp", CURRENT));
+    }
+
+    /// A write that fails leaves neither its file nor its temporary one.
+    #[test]
+    fn a_failed_write_removes_its_temporary_file() {
+        let dir = crate::semantic::oxv::testing::TempDir::new("write_fails");
+        let path = dir.join("abc.corrupt");
+        WRITE_FAILS.with(|fails| fails.set(true));
+        assert!(write_atomically(&path, b"{}").is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        write_atomically(&path, b"{}").unwrap();
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["abc.corrupt"]);
     }
 
     #[test]
