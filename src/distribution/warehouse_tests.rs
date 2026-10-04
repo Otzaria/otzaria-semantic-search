@@ -528,6 +528,12 @@ fn an_empty_batch_with_another_digest_names_warehouse_json() {
         "{error}"
     );
     assert!(!error.contains("keys.bin"), "{error}");
+    assert!(
+        error.contains("restore warehouse.json")
+            && error.contains("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            && !error.contains("move it aside"),
+        "{error}"
+    );
 }
 
 /// Between an add's index and its count, a reader is told the warehouse may be being added

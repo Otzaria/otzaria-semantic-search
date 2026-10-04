@@ -137,6 +137,8 @@ pub struct Verified {
 /// verified keys can rebuild.
 struct Faults {
     data: Vec<String>,
+    /// Every data fault is a digest recorded for a batch of no records.
+    manifest_only: bool,
     index: Option<String>,
 }
 
@@ -436,6 +438,9 @@ impl Warehouse {
             wrong.extend(found?);
         }
         wrong.sort_unstable();
+        let manifest_only = wrong
+            .iter()
+            .all(|(at, ..)| self.manifest.batches[*at].records == 0);
         let data = wrong
             .into_iter()
             .map(|(at, name, actual, recorded)| {
@@ -455,7 +460,11 @@ impl Warehouse {
                 )
             })
             .collect();
-        Ok(Faults { data, index })
+        Ok(Faults {
+            data,
+            manifest_only,
+            index,
+        })
     }
 
     fn refusal(&self, faults: Faults) -> PackError {
@@ -466,6 +475,9 @@ impl Warehouse {
         let remedy = if faults.data.is_empty() {
             "the keys are sound, so adding to the warehouse, or warehouse-verify --repair, \
              rebuilds the index from them"
+        } else if faults.manifest_only {
+            "the data is sound: restore warehouse.json, or set that digest to SHA-256 of nothing, \
+             e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         } else {
             "data that fails its digest is not repaired: restore the warehouse from a copy, or \
              move it aside and the next build embeds every text again"
