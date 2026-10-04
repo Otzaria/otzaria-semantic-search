@@ -149,10 +149,10 @@ impl SegmentSet {
     /// `CURRENT`'s does not open — which [`SetInfo::recovered_from_previous`] then says.
     ///
     /// Recovery runs first when nothing else holds the set's lock: what a crashed install
-    /// left in `staging/` is removed, and so is garbage; a recovery that fails is logged,
-    /// and the open goes on. Opening reads every small section
-    /// of every segment and every derived file, and checks each segment against the
-    /// generation that names it; the vectors are mapped, not read.
+    /// left in `staging/` is removed, and so is garbage. A lock that cannot be taken — a
+    /// read-only directory, say — or a recovery that fails is logged, and the open goes on.
+    /// Opening reads every small section of every segment and every derived file, and checks
+    /// each segment against the generation that names it; the vectors are mapped, not read.
     ///
     /// # Errors
     ///
@@ -160,14 +160,21 @@ impl SegmentSet {
     /// [`ArtifactError::IdentityMismatch`] naming `store.backend_id` for a directory that
     /// holds a v1 artifact; [`VectorStoreError::Corrupted`] when neither generation opens.
     pub fn open(dir: &Path) -> Result<Self, SemanticSearchError> {
-        if let Some(_lock) = SetLock::try_take(dir)? {
-            // Nothing recovery removes is read here, so its failure does not stop an open.
-            if let Err(error) = recover(dir) {
-                log::warn!(
-                    "Recovery of {} failed, and the set opens without it: {error}",
-                    dir.display()
-                );
+        // An open reads nothing recovery removes, and needs no lock to read.
+        match SetLock::try_take(dir) {
+            Ok(Some(_lock)) => {
+                if let Err(error) = recover(dir) {
+                    log::warn!(
+                        "Recovery of {} failed, and the set opens without it: {error}",
+                        dir.display()
+                    );
+                }
             }
+            Ok(None) => {}
+            Err(error) => log::warn!(
+                "The lock of {} cannot be taken, and the set opens without recovery: {error}",
+                dir.display()
+            ),
         }
         Self::open_unlocked(dir)
     }
@@ -186,8 +193,8 @@ impl SegmentSet {
     /// - A generation an install's garbage collection removes while it is being opened —
     ///   which takes two flips during one open — fails the open, and the caller may simply
     ///   open again.
-    /// - On Unix a segment already mapped stays readable after it is unlinked, so a set
-    ///   opened this way keeps answering from its generation whatever is collected after.
+    /// - A segment already mapped stays readable after it is unlinked, so a set opened this
+    ///   way keeps answering from its generation whatever is collected after.
     ///
     /// # Errors
     ///
@@ -662,7 +669,8 @@ pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
         retry::remove_dir_all(&staging)
             .map_err(io_error(format!("removing {}", staging.display())))?;
     }
-    // Pointers are written under the lock only, so a temporary file of one is a crash's.
+    // Pointers are written under the lock only, so a temporary file of one is a crash's or a
+    // failed flip's.
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if [CURRENT, PREVIOUS]

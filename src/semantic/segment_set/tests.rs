@@ -2702,6 +2702,43 @@ fn an_open_goes_on_when_recovery_fails() {
     assert_eq!(pointer_temporaries(&dir), Vec::<String>::new());
 }
 
+/// An open needs no lock to read. Under another holder's lock it opens and recovers nothing,
+/// as it always did; where no lock can be taken at all — a read-only directory — it opens
+/// without recovery rather than failing.
+#[test]
+fn an_open_goes_on_without_the_lock() {
+    let work = TempDir::new("set_open_without_lock");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let left = dir.join(STAGING_DIR).join("left.oxv");
+    std::fs::create_dir_all(left.parent().unwrap()).unwrap();
+    std::fs::write(&left, b"half").unwrap();
+
+    let held = files::SetLock::take(&dir).unwrap();
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 1);
+    assert!(
+        left.exists(),
+        "nothing is recovered under another holder's lock"
+    );
+    drop(held);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::remove_file(dir.join(files::LOCK_FILE)).unwrap();
+        let mode = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        // Root writes anywhere, so there the lock is taken and there is nothing to test.
+        let refused = files::SetLock::try_take(&dir).is_err();
+        let opened = SegmentSet::open(&dir).map(|set| set.generation());
+        mode(0o755).unwrap();
+        if refused {
+            assert_eq!(opened.unwrap_or_else(|error| panic!("{error}")), 1);
+            assert!(left.exists(), "nothing is recovered without the lock");
+        }
+    }
+}
+
 /// `staging/` as a crash left it, a file in it held by a scanner for a moment: recovery waits
 /// until the handle is closed, and removes it.
 #[cfg(windows)]

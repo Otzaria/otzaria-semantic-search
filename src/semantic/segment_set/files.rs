@@ -519,16 +519,31 @@ pub(crate) fn is_temporary_of(name: &str, file: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fail the next [`write_atomically`] on this thread once its temporary file is written.
+    pub(crate) static WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Write `bytes` to `path` under a temporary name of its own, flush, rename into place, and
-/// flush the directory.
+/// flush the directory. A write that fails removes its temporary file: nothing else would.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = temporary_path(path);
-    {
-        let mut file = File::create(&temporary)?;
+    let mut file = File::create(&temporary)?;
+    let placed = (|| {
         file.write_all(bytes)?;
         sync_file(&file, &temporary)?;
+        drop(file);
+        #[cfg(test)]
+        if WRITE_FAILS.with(|fails| fails.replace(false)) {
+            return Err(io::Error::other("injected write failure"));
+        }
+        rename_into_place(&temporary, path)
+    })();
+    if placed.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    rename_into_place(&temporary, path)?;
+    placed?;
     if let Some(parent) = path.parent() {
         sync_set_dir(parent)?;
     }
@@ -915,6 +930,24 @@ mod tests {
         assert!(!is_temporary_of("CURRENT", CURRENT));
         assert!(!is_temporary_of("CURRENTLY.tmp", CURRENT));
         assert!(!is_temporary_of("PREVIOUS.1-0.tmp", CURRENT));
+    }
+
+    /// A write that fails leaves neither its file nor its temporary one.
+    #[test]
+    fn a_failed_write_removes_its_temporary_file() {
+        let dir = crate::semantic::oxv::testing::TempDir::new("write_fails");
+        let path = dir.join("abc.corrupt");
+        WRITE_FAILS.with(|fails| fails.set(true));
+        assert!(write_atomically(&path, b"{}").is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        write_atomically(&path, b"{}").unwrap();
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["abc.corrupt"]);
     }
 
     #[test]
