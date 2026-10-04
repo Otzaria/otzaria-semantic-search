@@ -150,7 +150,10 @@ pub fn quoted_phrases(query: &str) -> Vec<String> {
                 None => open = Some(at + c.len_utf8()),
             }
         }
-        previous = Some(c);
+        // Nikud and teamim sit between the letter and the gershayim: רַמְבַּ"ם.
+        if !matches!(c, '\u{0591}'..='\u{05BD}' | '\u{05BF}'..='\u{05C7}') {
+            previous = Some(c);
+        }
     }
     phrases
 }
@@ -280,9 +283,11 @@ mod tests {
     /// a pair of delimiters quotes a phrase.
     #[test]
     fn only_a_pair_of_delimiters_quotes_a_phrase_and_an_acronym_is_text() {
-        let cases: [(&str, &[&str]); 12] = [
+        let cases: [(&str, &[&str]); 14] = [
             ("רמב\"ם", &[]),
             ("רמב״ם", &[]),
+            ("רַמְבַּ\"ם", &[]),
+            ("\"רַמְבַּ\"ם\"", &["רַמְבַּ\"ם"]),
             ("\"רמב\"ם\"", &["רמב\"ם"]),
             ("“רמב״ם”", &["רמב״ם"]),
             ("\"ויאמר משה\"", &["ויאמר משה"]),
