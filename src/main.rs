@@ -845,7 +845,9 @@ fn run_assemble(args: &[String]) {
     use otzaria_semantic_search::distribution::assemble::{
         assemble, AssembleRequest, EpochChoice, RELEASE_FILE,
     };
-    use otzaria_semantic_search::distribution::gates::{verify_release, VerifyRequest, G5_SAMPLES};
+    use otzaria_semantic_search::distribution::gates::{
+        verify_release, GateStatus, VerifyRequest, G5_SAMPLES,
+    };
     use otzaria_semantic_search::distribution::ledger::Ledger;
     use otzaria_semantic_search::distribution::package::PackageKind;
     use otzaria_semantic_search::distribution::plan::Plan;
@@ -972,7 +974,11 @@ fn run_assemble(args: &[String]) {
             println!(
                 "{:<4} {}  {}",
                 gate.gate,
-                if gate.passed { "pass" } else { "FAIL" },
+                match gate.status {
+                    GateStatus::Passed => "pass",
+                    GateStatus::Failed => "FAIL",
+                    GateStatus::NotApplicable => "n/a ",
+                },
                 gate.detail
             );
         }

@@ -298,10 +298,13 @@ book's records. It goes with the next base.
 `gates.json` and exits with status 2 if a gate fails. Without `--kind`, it checks a
 release that was already assembled.
 
+`gates.json` is `{segmentId, gates: [{gate, passed, status, detail}]}`, `status` one of
+`passed`, `failed` (also: could not check) and `notApplicable` (nothing to check; passes).
+
 | Gate | Checks |
 |------|--------|
 | G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped |
-| G5 | Every slot holds its key's warehouse vector, encoded. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals has a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998 |
+| G5 | Every slot holds its key's warehouse vector, encoded. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998. Not applicable to a delta with no slot; any other empty sample fails |
 | G7 | A base is ≤ 2.0 × 10⁹ bytes; a delta is ≤ 0.15 × its base, otherwise publish a base |
 | G8 | Assembling again into `<out>.g8` gives the same segment, package, release manifest and ledger, byte for byte |
 | G9 | `verify_for_install` passes, reading every payload byte, under the manifest's `packageDigest`; the segment is the manifest's |
@@ -318,3 +321,6 @@ gives it these pieces in `distribution::gates`:
 * `ExactReference::new(set, warehouse).top_k(query, k, threads)` is the exact f32 scan
   of the set's live keys. `recall(found, exact)` compares it with the set's own scan
   (G6).
+
+On empty input, `coverage` of a plan with no record is complete, and `recall` of an empty
+`exact` is 1.0: a validator must refuse empty input itself rather than rely on them.
