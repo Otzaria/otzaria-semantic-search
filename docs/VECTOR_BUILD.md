@@ -192,13 +192,23 @@ its text. It makes a codec change, a new base and a revived key free of GPU work
   parity certificate.
 - `warehouse.json` is the commit point. An add appends both data files, writes a new
   index under a temporary name, renames it, and only then records the new count; the next
-  add truncates whatever a crash left past the count and rebuilds an index that is not the
-  count's.
+  add truncates whatever a crash left past the count.
 - A key the warehouse holds is not added again.
+- **Verified before reuse.** The batches must tile `0..records`. `assemble`, `assemble
+  --verify`, the gates' `ExactReference` (G6) and `warehouse-add` re-hash every batch's
+  bytes in both data files against its recorded digests, and check that `index.bin` is
+  exactly `keys.bin`'s: its count, keys strictly ascending, every record pointer counted
+  and holding the entry's key. Data that fails its digest is refused, naming the batch and
+  its records, and never repaired. A bad index over sound keys is rebuilt by the next add
+  or by `warehouse-verify --repair`; reading refuses it. Each lookup also checks
+  `keys.bin` at the record it found, so a corrupt pointer finds nothing rather than another
+  text's vector. For the 6.35M-record warehouse a check hashes 6.7 GB: about 12 s at the
+  0.55 GB/s sha2's portable code reaches on an Apple M4, less on x86-64 with SHA-NI.
 
 ```sh
 otzaria-semantic-search warehouse-add --warehouse <dir> [--create --model <model.json>] \
     [--passage-quantization fp32] [--plan <plan dir>] --shards <dir> [--shards <dir> …]
+otzaria-semantic-search warehouse-verify --warehouse <dir> [--repair]
 ```
 
 With `--plan`, the shards are held to the plan (§3); without it — an import — to
