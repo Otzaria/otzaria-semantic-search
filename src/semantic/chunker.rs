@@ -8,12 +8,21 @@
 //! neighbour context helps at all, is an open question that stage S1 measures on a
 //! labelled query set — the current behaviour is the starting point, not a validated
 //! choice.
+//!
+//! The recipe has one implementation and two entry points. [`Chunker::chunk_book`] is the
+//! build machine's: whole chunks, with the metadata a record carried. The application's
+//! index needs only what a line embeds as and the [`ChunkKey`] that names its vector —
+//! [`Chunker::embedded_text`] and [`Chunker::chunk_keys`], over the lines it stores — and
+//! gets them from the same code, so a key computed on a device and a key computed when the
+//! vectors were built are one function of one text.
 
 use crate::errors::ArtifactError;
+use crate::semantic::chunk_key::{ChunkKey, LineRef};
 use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingTextRecipe, TextNormalizationRecipe};
-use crate::semantic::types::{BookForIndexing, SemanticChunk};
+use crate::semantic::types::{BookForIndexing, BookLine, SemanticChunk};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 /// Serializable because a build declares its recipe in a file: `chunking_identity` in the
 /// artifact is a hash, and a hash cannot be turned back into these five numbers. Whoever
@@ -146,6 +155,37 @@ impl Chunker {
         }
     }
 
+    /// The exact string `lines[index]` is embedded as, or `None` when the recipe does not
+    /// embed it — the text [`Self::chunk_book`] puts in that line's chunk, prefix included.
+    ///
+    /// `lines` is the book's lines in order, as the index stores them, or any window of
+    /// them that holds the line and its `context_window_lines` neighbours on each side
+    /// (fewer only where the book ends): nothing further out ever reaches a line's text. That
+    /// is what lets the application re-check one result from five stored lines rather than
+    /// from the whole book.
+    ///
+    /// # Panics
+    ///
+    /// When `index` is not inside `lines`, as slice indexing does.
+    pub fn embedded_text(&self, lines: &[LineRef<'_>], index: usize) -> Option<String> {
+        match self.algorithm {
+            ChunkingAlgorithm::AnchoredLine => self.anchored_text(lines, index),
+        }
+    }
+
+    /// Every line's key, in order: `Some` for a line the recipe embeds, `None` for one it
+    /// skips. The keys are exactly the `chunk_hash`es [`Self::chunk_book`] would give the
+    /// same lines — one recipe, one implementation, used by the build machine and by the
+    /// application alike.
+    pub fn chunk_keys(&self, lines: &[LineRef<'_>]) -> Vec<Option<ChunkKey>> {
+        (0..lines.len())
+            .map(|index| {
+                self.embedded_text(lines, index)
+                    .map(|text| ChunkKey::of(&text))
+            })
+            .collect()
+    }
+
     /// One chunk per line, anchored on the line and borrowing context when it is short.
     fn chunk_book_anchored(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
         let mut chunks = Vec::with_capacity(book.lines.len());
@@ -154,28 +194,9 @@ impl Chunker {
         let chunking_identity = self.config.identity();
 
         for (i, line) in book.lines.iter().enumerate() {
-            // Trimmed, so a line made of spaces or a lone newline is skipped
-            // rather than embedded: it has no tokens, and a text with no tokens
-            // yields a zero vector, which is a direction-less point that matches
-            // nothing and pollutes the index.
-            let char_count = line.text.trim().chars().count();
-
-            if char_count < self.config.min_embeddable_chars {
+            let Some(embedded_text) = self.anchored_text(book.lines.as_slice(), i) else {
                 continue;
-            }
-
-            let embedding_text = self.embedding_text_for(book, i, char_count);
-
-            let truncated_text =
-                truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars);
-            // Normalized *before* the digest, because the digest has to describe the string
-            // the model is given. Hashing the pre-normalization text would put a digest of
-            // something nothing was built from into every record — the same fault
-            // `chunk_hash` describing the corpus line instead of the embedded text would be.
-            let embedded_text = self.normalization.apply(&truncated_text).into_owned();
-            if embedded_text.trim().is_empty() {
-                continue;
-            }
+            };
             let chunk_hash = compute_chunk_hash(&embedded_text);
             let semantic_id =
                 compute_semantic_id(&book.source_book_key, line.line_id, chunking_identity);
@@ -202,39 +223,80 @@ impl Chunker {
         chunks
     }
 
-    /// What the model is given for one line.
+    /// What version 1 of the algorithm embeds for one line, over either shape of lines.
+    ///
+    /// The one implementation: [`Self::chunk_book`] and [`Self::embedded_text`] both come
+    /// here, so the vectors a build produces and the keys an index computes cannot be two
+    /// readings of the recipe.
+    fn anchored_text<L: Lines + ?Sized>(&self, lines: &L, index: usize) -> Option<String> {
+        let text = lines.text(index);
+        // Trimmed, so a line made of spaces or a lone newline is skipped
+        // rather than embedded: it has no tokens, and a text with no tokens
+        // yields a zero vector, which is a direction-less point that matches
+        // nothing and pollutes the index.
+        let char_count = text.trim().chars().count();
+
+        if char_count < self.config.min_embeddable_chars {
+            return None;
+        }
+
+        let embedding_text = self.embedding_text_for(lines, index, char_count);
+
+        let truncated_text = truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars);
+        // Normalized *before* the digest, because the digest has to describe the string
+        // the model is given. Hashing the pre-normalization text would put a digest of
+        // something nothing was built from into every record — the same fault
+        // `chunk_hash` describing the corpus line instead of the embedded text would be.
+        let normalized = self.normalization.apply(&truncated_text);
+        // Judged before any role prefix: a prefix is not content, and a line with none
+        // must not embed as the prefix alone.
+        if normalized.trim().is_empty() {
+            return None;
+        }
+        // The recipe's last word, after the cap and the normalization, so the content
+        // is what version 1 embeds — under version 2 without the space a cap can leave
+        // at its end — and is hashed as given, prefix included, because the digest
+        // describes the string the model is given. See
+        // `EmbeddingTextRecipe::passage_text`.
+        Some(self.text_recipe.passage_text(&normalized).into_owned())
+    }
+
+    /// The content the model is given for one line, before the cap, the normalization and
+    /// the recipe's role prefix.
     ///
     /// The `match` is the point: whether a title prefix or a reference prefix helps is
-    /// S1's measurement, and the answer becomes a second
-    /// [`EmbeddingTextRecipe`] with an arm here. Until one exists, `embedding_text_version`
-    /// can only be 1 — which is what stops an artifact declaring a recipe nobody wrote.
-    fn embedding_text_for(
+    /// S1's measurement, and the answer becomes another [`EmbeddingTextRecipe`] with an
+    /// arm here. Only a variant with an arm can be accepted as `embedding_text_version` —
+    /// which is what stops an artifact declaring a recipe nobody wrote. Version 2 shares
+    /// version 1's arm on purpose: its passage is version 1's text, trimmed and prefixed
+    /// afterwards.
+    fn embedding_text_for<'a, L: Lines + ?Sized>(
         &self,
-        book: &BookForIndexing,
+        lines: &'a L,
         index: usize,
         char_count: usize,
-    ) -> String {
+    ) -> Cow<'a, str> {
         match self.text_recipe {
-            EmbeddingTextRecipe::LineOrNeighbourContext => {
+            EmbeddingTextRecipe::LineOrNeighbourContext
+            | EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext => {
                 if char_count < self.config.min_meaningful_chars {
-                    self.build_context_text(book, index)
+                    Cow::Owned(self.build_context_text(lines, index))
                 } else {
-                    book.lines[index].text.clone()
+                    Cow::Borrowed(lines.text(index))
                 }
             }
         }
     }
 
-    fn build_context_text(&self, book: &BookForIndexing, index: usize) -> String {
-        let current_line = &book.lines[index];
-        let section_id = current_line.section_id;
+    fn build_context_text<L: Lines + ?Sized>(&self, lines: &L, index: usize) -> String {
+        let section_id = lines.section(index);
 
         let mut start_idx = index;
         for _ in 0..self.config.context_window_lines {
             if start_idx == 0 {
                 break;
             }
-            if book.lines[start_idx - 1].section_id != section_id {
+            if lines.section(start_idx - 1) != section_id {
                 break;
             }
             start_idx -= 1;
@@ -242,10 +304,10 @@ impl Chunker {
 
         let mut end_idx = index;
         for _ in 0..self.config.context_window_lines {
-            if end_idx + 1 >= book.lines.len() {
+            if end_idx + 1 >= lines.len() {
                 break;
             }
-            if book.lines[end_idx + 1].section_id != section_id {
+            if lines.section(end_idx + 1) != section_id {
                 break;
             }
             end_idx += 1;
@@ -253,10 +315,44 @@ impl Chunker {
 
         let mut context_lines = Vec::new();
         for i in start_idx..=end_idx {
-            context_lines.push(book.lines[i].text.as_str());
+            context_lines.push(lines.text(i));
         }
 
         context_lines.join(" ")
+    }
+}
+
+/// The two shapes a book's lines arrive in: a builder's [`BookLine`]s, and the
+/// [`LineRef`]s an index hands over from what it stores. The recipe reads a line's text,
+/// its section, and how many lines there are — nothing else, which is why one
+/// implementation serves both.
+trait Lines {
+    fn len(&self) -> usize;
+    fn text(&self, index: usize) -> &str;
+    fn section(&self, index: usize) -> u64;
+}
+
+impl Lines for [BookLine] {
+    fn len(&self) -> usize {
+        <[BookLine]>::len(self)
+    }
+    fn text(&self, index: usize) -> &str {
+        &self[index].text
+    }
+    fn section(&self, index: usize) -> u64 {
+        self[index].section_id
+    }
+}
+
+impl Lines for [LineRef<'_>] {
+    fn len(&self) -> usize {
+        <[LineRef<'_>]>::len(self)
+    }
+    fn text(&self, index: usize) -> &str {
+        self[index].text
+    }
+    fn section(&self, index: usize) -> u64 {
+        self[index].section
     }
 }
 
@@ -277,16 +373,10 @@ pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_identit
     hex
 }
 
+/// 32 lowercase hex digits: [`ChunkKey::of`] the embedded text, as the records have always
+/// carried it.
 pub fn compute_chunk_hash(text: &str) -> String {
-    use std::fmt::Write;
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let result = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for b in &result[..16] {
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
+    ChunkKey::of(text).to_hex()
 }
 
 pub fn truncate_to_chars(s: &str, max_chars: usize) -> String {
@@ -300,7 +390,6 @@ pub fn truncate_to_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::types::BookLine;
 
     /// Every test here drives a configuration this build implements, so the resolution
     /// [`Chunker::new`] performs is not what any of them is about.
@@ -512,6 +601,138 @@ mod tests {
         assert_eq!(chunk.source_doc_key, "book1.txt:1");
     }
 
+    /// A book that exercises every branch of version 1: a line standing alone, a short
+    /// line borrowing its neighbours, a line too short to embed, and a line cut by the
+    /// character cap.
+    fn every_branch_book() -> BookForIndexing {
+        dummy_book(vec![
+            (1, "a line that stands alone"),
+            (1, "short one"),
+            (1, "no"),
+            (2, "abcdefghijklmnopqrstuvwxyz0123456789"),
+        ])
+    }
+
+    /// Version 1 is byte-identical to the recipe as it was before a second version
+    /// existed. The expected texts are written out, and their digests were computed
+    /// outside this crate (Python's hashlib), so neither can drift with the code.
+    #[test]
+    fn version_one_embeds_exactly_what_it_always_has() {
+        let chunker = chunker(ChunkerConfig {
+            max_chunk_chars: 30,
+            ..ChunkerConfig::default()
+        });
+        let chunks = chunker.chunk_book(&every_branch_book());
+        let produced: Vec<(u64, &str, &str)> = chunks
+            .iter()
+            .map(|c| (c.line_id, c.embedding_text.as_str(), c.chunk_hash.as_str()))
+            .collect();
+        assert_eq!(
+            produced,
+            vec![
+                (
+                    1,
+                    "a line that stands alone",
+                    "d5e703cd670772730f9f85bd4e17353c"
+                ),
+                // Borrowed from both neighbours in its section, then capped at 30.
+                (
+                    2,
+                    "a line that stands alone short",
+                    "2b7b0d10688b8fdebefd9b9d5b132a17"
+                ),
+                (
+                    4,
+                    "abcdefghijklmnopqrstuvwxyz0123",
+                    "0bf245c7abbd87326a228aa4178257fb"
+                ),
+            ]
+        );
+    }
+
+    /// Version 2 is version 1's text, trimmed, with `[PASSAGE] ` in front, once, on every
+    /// chunk — the same lines, the cap spent on content, the digest over what the model is
+    /// given.
+    #[test]
+    fn version_two_prefixes_every_passage_once_and_changes_nothing_else() {
+        let v1 = chunker(ChunkerConfig {
+            max_chunk_chars: 30,
+            ..ChunkerConfig::default()
+        });
+        let v2 = chunker(ChunkerConfig {
+            max_chunk_chars: 30,
+            embedding_text_version: EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext
+                .version(),
+            ..ChunkerConfig::default()
+        });
+        let book = every_branch_book();
+        let (before, after) = (v1.chunk_book(&book), v2.chunk_book(&book));
+
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the prefix decides no line's fate"
+        );
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(new.line_id, old.line_id);
+            assert_eq!(
+                new.embedding_text,
+                format!("[PASSAGE] {}", old.embedding_text.trim()),
+                "line {}",
+                old.line_id
+            );
+            assert_eq!(new.embedding_text.matches("[PASSAGE]").count(), 1);
+            assert_eq!(new.chunk_hash, compute_chunk_hash(&new.embedding_text));
+            assert_ne!(new.chunk_hash, old.chunk_hash);
+            assert_eq!(
+                new.anchor_text, old.anchor_text,
+                "the anchor is the line itself"
+            );
+            // The identity folds the version in, so the two never share an id.
+            assert_ne!(new.semantic_id, old.semantic_id);
+        }
+    }
+
+    /// The character cap can end a line on a space. Version 1 embeds that space, as it
+    /// always has; version 2 does not — the space would reach a Metaspace tokenizer as a
+    /// lone `▁` — and its digest describes the text without it, since that is what the
+    /// model is given.
+    #[test]
+    fn version_two_drops_the_space_a_truncation_leaves_and_version_one_keeps_it() {
+        let config = |embedding_text_version| ChunkerConfig {
+            max_chunk_chars: 11,
+            embedding_text_version,
+            ..ChunkerConfig::default()
+        };
+        // Long enough to stand alone, and cut by the cap right after a space.
+        let book = dummy_book(vec![(1, "abcdefghij klmnopqrstuvwxyz0123")]);
+
+        let v1 = chunker(config(1)).chunk_book(&book);
+        assert_eq!(
+            v1[0].embedding_text, "abcdefghij ",
+            "version 1 is unchanged"
+        );
+
+        let v2 = chunker(config(2)).chunk_book(&book);
+        assert_eq!(v2[0].embedding_text, "[PASSAGE] abcdefghij");
+        assert_eq!(v2[0].chunk_hash, compute_chunk_hash("[PASSAGE] abcdefghij"));
+    }
+
+    /// A line whose text already reads like a prefix is content: it is embedded with the
+    /// role prefix in front of it, not instead of it.
+    #[test]
+    fn a_line_that_looks_like_a_prefix_is_still_content() {
+        let v2 = chunker(ChunkerConfig {
+            embedding_text_version: 2,
+            ..ChunkerConfig::default()
+        });
+        let chunks = v2.chunk_book(&dummy_book(vec![(1, "[PASSAGE] a line about passages")]));
+        assert_eq!(
+            chunks[0].embedding_text,
+            "[PASSAGE] [PASSAGE] a line about passages"
+        );
+    }
+
     #[test]
     fn an_empty_book_yields_no_chunks() {
         let chunker = chunker(ChunkerConfig::default());
@@ -526,5 +747,257 @@ mod tests {
         assert_eq!(truncate_to_chars("abcdef", 5), "abcde");
         assert_eq!(truncate_to_chars("שלום", 0), "");
         assert_eq!(truncate_to_chars("שלום עולם", 4), "שלום");
+    }
+
+    // ── one recipe, two entry points ──
+
+    /// The recipe as it was written before [`Chunker::embedded_text`] existed, kept
+    /// verbatim as the oracle the shared core is held to. The point of the property tests
+    /// below is that the core *is not* this code: a refactor that changed one character of
+    /// what a line embeds as fails here, on random books, before any key ships.
+    fn reference_chunk_texts(
+        config: &ChunkerConfig,
+        book: &BookForIndexing,
+    ) -> Vec<(usize, String)> {
+        let text_recipe = EmbeddingTextRecipe::from_version(config.embedding_text_version).unwrap();
+        let normalization =
+            TextNormalizationRecipe::from_version(config.normalization_version).unwrap();
+        let mut out = Vec::new();
+        for (i, line) in book.lines.iter().enumerate() {
+            let char_count = line.text.trim().chars().count();
+            if char_count < config.min_embeddable_chars {
+                continue;
+            }
+            let embedding_text = if char_count < config.min_meaningful_chars {
+                let section_id = line.section_id;
+                let mut start_idx = i;
+                for _ in 0..config.context_window_lines {
+                    if start_idx == 0 || book.lines[start_idx - 1].section_id != section_id {
+                        break;
+                    }
+                    start_idx -= 1;
+                }
+                let mut end_idx = i;
+                for _ in 0..config.context_window_lines {
+                    if end_idx + 1 >= book.lines.len()
+                        || book.lines[end_idx + 1].section_id != section_id
+                    {
+                        break;
+                    }
+                    end_idx += 1;
+                }
+                (start_idx..=end_idx)
+                    .map(|j| book.lines[j].text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                line.text.clone()
+            };
+            let truncated = truncate_to_chars(embedding_text.trim(), config.max_chunk_chars);
+            let normalized = normalization.apply(&truncated);
+            if normalized.trim().is_empty() {
+                continue;
+            }
+            out.push((i, text_recipe.passage_text(&normalized).into_owned()));
+        }
+        out
+    }
+
+    /// splitmix64: a few lines of deterministic randomness, so a failing book can be
+    /// reproduced from its seed.
+    struct Random(u64);
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound.max(1)
+        }
+    }
+
+    /// A line of the kinds a book holds: blank, whitespace only, a few letters, a sentence,
+    /// and now and then one long enough for the 512-character cap.
+    fn random_line(random: &mut Random) -> String {
+        const PIECES: [&str; 12] = [
+            "א",
+            "בראשית",
+            "ברא",
+            " ",
+            "  ",
+            "\t",
+            "\u{00a0}",
+            "abc",
+            "שלום עולם",
+            ".",
+            "׃",
+            "x",
+        ];
+        let length = match random.below(10) {
+            0 => 0,
+            1 => 1,
+            2..=5 => random.below(6) as usize,
+            6..=8 => 4 + random.below(16) as usize,
+            _ => 120 + random.below(200) as usize,
+        };
+        (0..length)
+            .map(|_| PIECES[random.below(PIECES.len() as u64) as usize])
+            .collect()
+    }
+
+    fn random_book(random: &mut Random) -> BookForIndexing {
+        let lines = random.below(40) as usize;
+        let mut section = 1u64;
+        let mut book = dummy_book(Vec::new());
+        for i in 0..lines {
+            // Section edges as the index makes them: a run of lines, then a new heading.
+            if random.below(5) == 0 {
+                section += 1 + random.below(3);
+            }
+            book.lines.push(BookLine {
+                line_id: i as u64 + 1,
+                section_id: section,
+                text: random_line(random),
+                line_hash: 0,
+                reference: String::new(),
+                segment: i as u64,
+            });
+        }
+        book
+    }
+
+    fn random_config(random: &mut Random) -> ChunkerConfig {
+        if random.below(3) == 0 {
+            return ChunkerConfig {
+                embedding_text_version: 1 + random.below(2) as u32,
+                ..ChunkerConfig::default()
+            };
+        }
+        ChunkerConfig {
+            min_meaningful_chars: random.below(30) as usize,
+            context_window_lines: random.below(4) as usize,
+            max_chunk_chars: 1 + random.below(600) as usize,
+            min_embeddable_chars: random.below(8) as usize,
+            embedding_text_version: 1 + random.below(2) as u32,
+            ..ChunkerConfig::default()
+        }
+    }
+
+    fn line_refs(book: &BookForIndexing) -> Vec<LineRef<'_>> {
+        book.lines
+            .iter()
+            .map(|line| LineRef {
+                text: &line.text,
+                section: line.section_id,
+            })
+            .collect()
+    }
+
+    /// The property S1 promises the application: over random books — blank lines, section
+    /// edges, the cap, short lines borrowing context — `chunk_keys` and `embedded_text`
+    /// reproduce `chunk_book` exactly, and `chunk_book` reproduces the recipe as it was
+    /// written before either existed.
+    #[test]
+    fn keys_and_texts_reproduce_chunk_book_on_random_books() {
+        let mut random = Random(0x0715_2026);
+        let mut embedded = 0usize;
+        let mut skipped = 0usize;
+        for case in 0..3000 {
+            let config = random_config(&mut random);
+            let book = random_book(&mut random);
+            let chunker = chunker(config.clone());
+            let refs = line_refs(&book);
+
+            let expected = reference_chunk_texts(&config, &book);
+            let chunks = chunker.chunk_book(&book);
+            assert_eq!(chunks.len(), expected.len(), "case {case}: {config:?}");
+            for (chunk, (index, text)) in chunks.iter().zip(&expected) {
+                assert_eq!(chunk.line_id, book.lines[*index].line_id, "case {case}");
+                assert_eq!(&chunk.embedding_text, text, "case {case}, line {index}");
+                assert_eq!(chunk.chunk_hash, compute_chunk_hash(text), "case {case}");
+            }
+
+            let keys = chunker.chunk_keys(&refs);
+            assert_eq!(keys.len(), book.lines.len());
+            let mut expected = expected.iter().peekable();
+            for (index, key) in keys.iter().enumerate() {
+                let text = chunker.embedded_text(&refs, index);
+                match expected.next_if(|(at, _)| *at == index) {
+                    Some((_, want)) => {
+                        embedded += 1;
+                        assert_eq!(text.as_deref(), Some(want.as_str()), "case {case}");
+                        assert_eq!(*key, Some(ChunkKey::of(want)), "case {case}");
+                        assert_eq!(key.unwrap().to_hex(), compute_chunk_hash(want));
+                    }
+                    None => {
+                        skipped += 1;
+                        assert_eq!(text, None, "case {case}, line {index}");
+                        assert_eq!(*key, None, "case {case}, line {index}");
+                    }
+                }
+            }
+        }
+        // Both branches were exercised in earnest, or the property proved little.
+        assert!(
+            embedded > 10_000 && skipped > 10_000,
+            "{embedded} / {skipped}"
+        );
+    }
+
+    /// What the application relies on to verify a result: the line and its
+    /// `context_window_lines` neighbours on each side are all a line's text depends on.
+    #[test]
+    fn a_window_of_neighbours_gives_the_same_text_as_the_whole_book() {
+        let mut random = Random(0x5EED);
+        for case in 0..2000 {
+            let config = random_config(&mut random);
+            let book = random_book(&mut random);
+            let chunker = chunker(config.clone());
+            let refs = line_refs(&book);
+            let reach = config.context_window_lines;
+            for index in 0..refs.len() {
+                let low = index.saturating_sub(reach);
+                let high = (index + reach).min(refs.len() - 1);
+                assert_eq!(
+                    chunker.embedded_text(&refs[low..=high], index - low),
+                    chunker.embedded_text(&refs, index),
+                    "case {case}, line {index}"
+                );
+            }
+        }
+    }
+
+    /// The production recipe on a fixed book, against digests Python's hashlib computed: a
+    /// line alone, a short line with context, a line cut at the cap, blank lines skipped.
+    #[test]
+    fn the_production_recipe_keys_a_fixed_book_as_python_does() {
+        let chunker = chunker(ChunkerConfig {
+            embedding_text_version: 2,
+            max_chunk_chars: 30,
+            ..ChunkerConfig::default()
+        });
+        let book = every_branch_book();
+        let refs = line_refs(&book);
+        let keys: Vec<Option<String>> = chunker
+            .chunk_keys(&refs)
+            .into_iter()
+            .map(|key| key.map(ChunkKey::to_hex))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                Some("0429557a367f9f5e6681647f940ff66e".to_string()),
+                Some(compute_chunk_hash(
+                    "[PASSAGE] a line that stands alone short"
+                )),
+                None,
+                Some(compute_chunk_hash(
+                    "[PASSAGE] abcdefghijklmnopqrstuvwxyz0123"
+                )),
+            ]
+        );
     }
 }

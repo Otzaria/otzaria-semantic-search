@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # For the golden-vector job, which needs the gated 396 MB model.
+  # For the golden-vector jobs, which need the gated models.
   # No inputs by design: the credential belongs in a secret, and inputs are not
   # secrets — they land in the event payload and are not redacted.
   workflow_dispatch:
@@ -62,23 +62,25 @@ jobs:
       # that reports a failure and exits zero is one somebody reads by eye, and that is
       # how four accounts with no GPU were scheduled work during the v1 campaign.
       #
-      # Linux only. These are operator scripts run from one machine against Kaggle, not
-      # anything the crate ships, so a second platform adds no signal — and `python3` is
-      # not reliably on PATH on the Windows runner without `setup-python`.
+      # The ONNX package checksum has a second implementation in Python, for the build
+      # machine and for CI to check a download with, and its test reproduces the digest
+      # `model_package.rs` pins from the same bytes. Two implementations that drift apart
+      # name different files with values that look equally right.
+      #
+      # Linux only. These are operator scripts run from one machine, not anything the
+      # crate ships, so a second platform adds no signal — and `python3` is not reliably
+      # on PATH on the Windows runner without `setup-python`.
       - name: Test the operational tools
         if: runner.os == 'Linux'
         run: |
           python3 -m pip install --quiet pytest
-          python3 -m pytest tools/kaggle/test_queue.py -q
+          python3 -m pytest tools/kaggle/test_queue.py tools/test_onnx_package_checksum.py -q
 
-      # Also the only step in this job that compiles llama.cpp.
-      #
-      # The feature list is spelled out rather than `--all-features`, because `cuda`
-      # cannot be one of them: it sets `GGML_CUDA=ON`, and a runner without `nvcc`
-      # fails cmake configure before a single doc comment is read. Cargo has no way to
-      # hold a feature back from `--all-features`, so the caller has to.
+      # Also the step in this job that compiles the ONNX backend on every platform. That
+      # needs no runtime and no network: ONNX Runtime is loaded when a model is, never
+      # linked.
       - name: Check Documentation
-        run: cargo doc --no-deps --features mock-embedding,llama-backend
+        run: cargo doc --no-deps --features mock-embedding,onnx-backend
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -87,17 +89,38 @@ jobs:
       - name: Build Release
         run: cargo build --release --all-targets
 
-  # Separate job: `llama-backend` builds llama.cpp through cmake, which is minutes
-  # of C++ per runner, and its failures are almost never OS-specific. ubuntu for
-  # the general coverage, macos because it is the only runner compiling the Metal
-  # path. Windows gets the backend via the `cargo doc` step above.
-  llama-backend:
-    name: Inference Backend (${{ matrix.os }})
+  # Separate job, on all three runners. Nothing native is built here — ONNX Runtime is
+  # a shared library the backend loads at run time, never links — so what differs by
+  # platform is exactly what this job exercises: finding that library, loading it and
+  # running a graph through it. The tests that run a graph skip without
+  # `OTZARIA_ONNX_RUNTIME`, so the runtime is fetched first, or this job would be green
+  # having run none of them.
+  #
+  # The runtime is Microsoft's official 1.28.0 release, the backend's reference: it
+  # needs glibc >= 2.27 and dispatches CPU features at run time. Asset names and SHA-256
+  # digests are from the v1.28.0 release page, pinned for the reason the actions are
+  # pinned: a re-uploaded asset is a different runtime. Not cached — 9 to 79 MB, and a
+  # verified download is as good as a cache hit.
+  onnx-backend:
+    name: ONNX Backend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            ort_archive: onnxruntime-linux-x64-1.28.0.tgz
+            ort_sha256: a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407
+            ort_library: onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+          # arm64: there is no macOS x86_64 build of 1.28.0.
+          - os: macos-latest
+            ort_archive: onnxruntime-osx-arm64-1.28.0.tgz
+            ort_sha256: 1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8
+            ort_library: onnxruntime-osx-arm64-1.28.0/lib/libonnxruntime.1.28.0.dylib
+          - os: windows-latest
+            ort_archive: onnxruntime-win-x64-1.28.0.zip
+            ort_sha256: abef733dacbe2f571547a7150b479b5cb9cc0df22f96c24983a42cadb1b4f8bc
+            ort_library: onnxruntime-win-x64-1.28.0/lib/onnxruntime.dll
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -107,48 +130,329 @@ jobs:
         with:
           components: clippy
 
-      # Keyed separately: this cache holds the cmake build of llama.cpp.
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: llama-backend
+          key: onnx-backend
 
-      - name: Clippy (llama-backend)
-        run: cargo clippy --all-targets --features llama-backend -- -D warnings
+      # Only the library is extracted from the archive.
+      - name: Fetch ONNX Runtime 1.28.0
+        if: runner.os != 'Windows'
+        run: |
+          archive="$RUNNER_TEMP/${{ matrix.ort_archive }}"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/${{ matrix.ort_archive }}"
+          echo "${{ matrix.ort_sha256 }}  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" "${{ matrix.ort_library }}"
+          test -f "$RUNNER_TEMP/${{ matrix.ort_library }}"
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/${{ matrix.ort_library }}" >> "$GITHUB_ENV"
 
-      # The model-gated tests are `#[ignore]`d and also skip loudly without
-      # `OTZARIA_TEST_MODEL`, so the missing GGUF cannot redden this.
-      - name: Test (llama-backend)
-        run: cargo test --lib --tests --features llama-backend
+      # PowerShell and .NET's zip reader rather than bash: the Windows runner's bash has
+      # no dependable zip tool, and the archive also holds a 408 MB PDB that extracting
+      # everything would write out. The path handed on is a native Windows one, which
+      # the loader needs; an MSYS-style `/d/a/...` is not.
+      - name: Fetch ONNX Runtime 1.28.0 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP '${{ matrix.ort_archive }}'
+          curl.exe -fSL --retry 5 --retry-all-errors --output $archive `
+            'https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/${{ matrix.ort_archive }}'
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne '${{ matrix.ort_sha256 }}') {
+            Write-Output "::error::${{ matrix.ort_archive }}: SHA-256 $actual, expected ${{ matrix.ort_sha256 }}"
+            exit 1
+          }
+          $member = '${{ matrix.ort_library }}'
+          $folder = $member.Substring(0, $member.LastIndexOf('/'))
+          $target = Join-Path $env:RUNNER_TEMP ($folder -replace '/', '\')
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            foreach ($entry in $zip.Entries) {
+              if ($entry.FullName -like "$folder/*.dll") {
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $target $entry.Name), $true)
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          $library = Join-Path $env:RUNNER_TEMP ($member -replace '/', '\')
+          if (-not (Test-Path -LiteralPath $library)) {
+            Write-Output "::error::$member is not in ${{ matrix.ort_archive }}"
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "OTZARIA_ONNX_RUNTIME=$library"
 
-      # The combination is the only configuration that exercises `select_backend`'s
-      # `Option<Result<..>>`: a real backend that fails to load must report why
-      # rather than falling through to the stand-in. `tests/backend_selection.rs`
-      # asserts it.
-      - name: Clippy (mock-embedding + llama-backend)
-        run: cargo clippy --all-targets --features mock-embedding,llama-backend -- -D warnings
+      - name: Clippy (onnx-backend)
+        run: cargo clippy --all-targets --features onnx-backend -- -D warnings
 
-      - name: Test (mock-embedding + llama-backend)
-        run: cargo test --lib --tests --features mock-embedding,llama-backend
+      # The real-model tests are `#[ignore]`d and skip loudly without
+      # `OTZARIA_TEST_ONNX_MODEL`; everything else runs the fixture packages in
+      # tests/data/onnx_fixture/ through the runtime fetched above.
+      - name: Test (onnx-backend)
+        run: cargo test --lib --tests --features onnx-backend
 
-  # `token_ids` exact equality against tests/data/golden_vectors.json is the primary
-  # correctness gate for the backend (docs/P2_INFERENCE_SPIKE.md §2) — it catches a
-  # prepended BOS, a missing EOS, `parse_special = true` and off-by-one truncation,
-  # none of which the cosine tolerances can see. It needs the gated 396 MB model, so it
-  # runs on every push and same-repo PR off the OTZARIA_HF_TOKEN secret.
+      # With the stand-in compiled in, an `.onnx` model must still reach the real ONNX
+      # row first, and a real backend that refuses a model must say why rather than
+      # fall through to the stand-in.
+      - name: Clippy (mock-embedding + onnx-backend)
+        run: cargo clippy --all-targets --features mock-embedding,onnx-backend -- -D warnings
+
+      - name: Test (mock-embedding + onnx-backend)
+        run: cargo test --lib --tests --features mock-embedding,onnx-backend
+
+  # The ONNX backend's parity gates, one per graph of the Meivin Round 2 package: the int8
+  # graph, which is the default identity, and the fp32 graph it was quantized from. Each has
+  # its golden file — tests/data/onnx_golden_vectors_int8.json and onnx_golden_vectors.json,
+  # the Python reference's answers (`tools/generate_onnx_golden_vectors.py`) — and
+  # `semantic::onnx_backend::golden`, which picks the file by the graph's SHA-256, requires
+  # the same token ids exactly, then every vector within the graph's cosine bound (see
+  # `MIN_COSINE` there: int8 vectors depend on the CPU's int8 kernels, fp32 ones do not).
+  # Truncation at the 256-token cap, the role tokens and special-token matching are all
+  # decided before the graph runs, and the ids are where an error in any of them shows.
+  # After the gates, the build path runs against the int8 graph: one real artifact, built
+  # and verified end to end.
   #
-  # If the secret is unset the job fails rather than skipping: a green tick here must
-  # never mean "the tokenizer was not checked".
+  # The model is gated, so the job runs off the OTZARIA_HF_TOKEN secret on every push and
+  # same-repo PR. If the secret is unset the job fails rather than skipping: a green tick
+  # here must never mean "the tokenizer was not checked". It is skipped only for pull
+  # requests from forks, which GitHub deliberately denies secrets; those need a maintainer
+  # `workflow_dispatch` on the branch before merge — the one case where this gate is not
+  # automatic.
   #
-  # Skipped only for pull requests from forks, which GitHub deliberately denies
-  # secrets. Those need a maintainer `workflow_dispatch` on the branch before merge —
-  # the one case where this gate is not automatic.
-  golden-vectors:
-    name: Golden Vectors (real model)
+  # The files come from the project's private mirror,
+  # `otzaria/judaic-semantic-round2-onnx-zayit` (99b8a61, byte-identical to the source in
+  # all eight files), never from the gated original
+  # (`ArieLLL123/judaic-semantic-round2-onnx-zayit`), whose access is one person's manual
+  # approval. The mirror is private: the Hugging Face account behind the OTZARIA_HF_TOKEN
+  # secret needs read access to it, or every download below answers 401 and the job fails.
+  # The SHA-256 checks are what say the bytes are the goldens' ones.
+  #
+  # Linux x64 only. Every x86 CPU computes the int8 products exactly — through its VNNI
+  # kernels, or through `session.x64quantprecision` where its kernels saturate (`X86Int8` in
+  # src/semantic/onnx_backend.rs) — so a Windows runner would run the same arithmetic through
+  # Microsoft's other build of the same sources. Doing it robustly needs more than a matrix
+  # row: a native path for the model (Git Bash hands on `/d/a/...`, and a path the test cannot
+  # open makes it skip, green), a Python on PATH for the checks, the `onnx-backend` job's zip
+  # extraction, and a second 210 MB gated download per run. The CPUs the runners do not have
+  # are `golden-onnx-emulated`'s.
+  golden-onnx:
+    name: Golden Vectors (ONNX model)
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Runner CPUs differ from run to run, and an int8 vector depends on the int8 kernels
+      # the CPU gets (src/semantic/onnx_backend.rs, `X86Int8`): ONNX Runtime's U8S8 kernels
+      # sum product pairs in saturating 16 bits (VPMADDUBSW) unless the CPU has VNNI or AMX,
+      # which sum in 32, and the backend sets `session.x64quantprecision` wherever they
+      # saturate. So every run says first which CPU its numbers are from, which U8S8 kernel
+      # ONNX Runtime 1.28.0 picks for it, and whether the backend sets the entry there —
+      # derived from the kernel's flags in the order `X86Int8::of` takes them, which is
+      # mlas/lib/platform.cpp's own — and the golden steps are handed that answer as
+      # OTZARIA_EXPECT_X86_INT8_PRECISION: the backend's own detection has to agree with it.
+      - name: The runner's CPU and its int8 instructions
+        id: cpu
+        run: |
+          model=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1)
+          flags=" $(sed -n 's/^flags[[:space:]]*: //p' /proc/cpuinfo | head -n 1) "
+          has() { case "$flags" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+          echo "CPU: ${model:-unknown}, $(nproc) logical CPUs"
+          for flag in avx fma avx2 f16c avx_vnni avx512f avx512bw avx512dq avx512vl avx512_vnni avx_vnni_int8 amx_int8; do
+            if has "$flag"; then echo "  $flag: present"; else echo "  $flag: absent"; fi
+          done
+          amx=""
+          if has amx_int8; then amx=", or AMX's tiles"; fi
+          if ! { has avx && has fma && has avx2; }; then
+            kernel="no AVX2: SSE kernels, which widen to 16 bits first in this Linux build"; entry="set"
+          elif ! has f16c; then
+            kernel="AVX2 without F16C: undetermined, since the backend cannot see AVX-512 then"; entry="set"
+          elif has avx512f && has avx512bw && has avx512dq && has avx512vl; then
+            if has avx512_vnni; then
+              kernel="AVX-512 VNNI$amx: products summed in 32 bits, exact"; entry="unset"
+            else
+              kernel="AVX-512 without VNNI: VPMADDUBSW saturates"; entry="set"
+            fi
+          elif has avx_vnni; then
+            kernel="AVX-VNNI: products summed in 32 bits, exact"; entry="unset"
+          else
+            kernel="AVX2 without VNNI: VPMADDUBSW saturates"; entry="set"
+          fi
+          echo "U8S8 int8 kernel: $kernel; session.x64quantprecision: $entry"
+          echo "::notice title=golden-onnx CPU::${model:-unknown}; U8S8 int8 kernel: $kernel; session.x64quantprecision: $entry"
+          echo "x86_int8=$entry" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: onnx-backend
+
+      # Both graphs — 42 MB and 168 MB — and the tokenizer.json they share, downloaded fresh
+      # every run and deliberately NOT cached: an Actions cache on `main` is readable by a
+      # run from a fork's pull request, and caching these would publish a gated model to
+      # anyone who opens one. The URL is public; only the token is secret, and it reaches
+      # curl through a config on stdin, never argv — no process listing, no `set -x`.
+      #
+      # `--retry` because HuggingFace answers 429 on a run whose token is valid: a rate
+      # limit, not a refusal, and since nothing is cached an occasional one is expected.
+      # curl counts 429 as transient and backs off exponentially; `--retry-all-errors`
+      # extends that to a connection dropped mid-transfer, and `-f` is what makes the HTTP
+      # status visible to the retry logic at all. Deliberately not raised further: a genuine
+      # 401 must still fail fast and loudly, and five attempts cannot turn a revoked token
+      # into a pass.
+      - name: Fetch the model package
+        id: model
+        env:
+          HF_TOKEN: ${{ secrets.OTZARIA_HF_TOKEN }}
+        run: |
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The ONNX golden gate cannot run, and is NOT being reported as passing."
+            exit 1
+          fi
+          mkdir -p onnx-model
+          for file in seforim-embed-round2-int8.onnx seforim-embed-round2-fp32.onnx tokenizer.json; do
+            printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+              curl -fSL --retry 5 --retry-all-errors --output "onnx-model/$file" -K - \
+                "https://huggingface.co/otzaria/judaic-semantic-round2-onnx-zayit/resolve/main/$file"
+          done
+          # A mismatch must read as "wrong model" rather than as confusing id and vector diffs.
+          verify() {
+            expected=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header'][sys.argv[2]])" "tests/data/$2" "$3")
+            actual=$(sha256sum "onnx-model/$1" | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::$1: SHA-256 mismatch. $2 expects $expected, got $actual."
+              exit 1
+            fi
+          }
+          verify seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json graph_sha256
+          verify seforim-embed-round2-fp32.onnx onnx_golden_vectors.json graph_sha256
+          verify tokenizer.json onnx_golden_vectors_int8.json tokenizer_sha256
+          verify tokenizer.json onnx_golden_vectors.json tokenizer_sha256
+          echo "int8=$(pwd)/onnx-model/seforim-embed-round2-int8.onnx" >> "$GITHUB_OUTPUT"
+          echo "fp32=$(pwd)/onnx-model/seforim-embed-round2-fp32.onnx" >> "$GITHUB_OUTPUT"
+
+      # The linux-x64 row of the `onnx-backend` matrix; bump the two together.
+      - name: Fetch ONNX Runtime 1.28.0
+        id: runtime
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+          echo "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
+
+      # A package checksum is what the family's identity lists among its `query_packages`,
+      # and it has two implementations: the crate's and tools/onnx_package_checksum.py. For
+      # each graph both must reach the value its golden file records — from the real
+      # package; the unit tests only reach it from a 241-byte one — and the family must
+      # declare that value for the package of that quantization.
+      - name: The package checksums, by both implementations
+        run: |
+          check() {
+            graph="onnx-model/$1"
+            recorded=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header']['package_checksum'])" "tests/data/$2")
+            if [ -n "${3:-}" ]; then
+              declared=$(python3 -c "import json,sys; print(next(p['checksum'] for p in json.load(open(sys.argv[1]))['query_packages'] if p['quantization'] == sys.argv[2]))" "$3" "$4")
+              if [ "$declared" != "$recorded" ]; then
+                echo "::error::$3 declares $declared for its $4 package, and $2 records $recorded."
+                exit 1
+              fi
+            fi
+            python3 tools/onnx_package_checksum.py --expect "$recorded" "$graph"
+            computed=$(cargo run --quiet --features onnx-backend -- model-checksum --model-file "$graph" | awk '$1 == "model_checksum:" { print $2 }')
+            if [ "$computed" != "$recorded" ]; then
+              echo "::error::The crate computes model_checksum '$computed' for $1; $2 records $recorded."
+              exit 1
+            fi
+          }
+          check seforim-embed-round2-int8.onnx onnx_golden_vectors_int8.json config/models/meivin-round2-onnx/model.json int8
+          check seforim-embed-round2-fp32.onnx onnx_golden_vectors.json config/models/meivin-round2-onnx/model.json fp32
+
+      # `--ignored` is what selects them; the name selects the ONNX gate alone. The gate
+      # picks each graph's goldens by its hash. One test at a time, so that the output reads
+      # in order and the timings it prints measure one test, not four.
+      #
+      # Each step runs whenever what it needs is in place — the verified package and the
+      # runtime — so a failure in one never hides the other's numbers. The int8 step prints
+      # every vector against the fp32 graph's goldens too, before its gate can fail, and a
+      # test of its own prints what the x86 entry changes on this CPU, whatever the gate
+      # decides; the fp32 step is the reference they are read against. Both hold the
+      # backend's x86 int8 decision to the one the CPU step derived.
+      - name: Golden parity, int8 (the default identity)
+        if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: ${{ steps.cpu.outputs.x86_int8 }}
+        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture --test-threads=1
+
+      - name: Golden parity, fp32 (the reference graph)
+        if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.fp32 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: ${{ steps.cpu.outputs.x86_int8 }}
+        run: cargo test --lib --features onnx-backend onnx_backend::golden -- --ignored --nocapture --test-threads=1
+
+      # The build path, against the int8 graph. Every other builder test runs on the
+      # deterministic stand-in, which is constructed from the configuration and echoes its
+      # width, pooling and token cap straight back — so the half of the model check that
+      # only real weights can drive is exercised nowhere else, and neither is the recipe
+      # applied to text a real tokenizer sees.
+      - name: A real artifact, built and verified end to end
+        if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+        run: cargo test --test artifact_builder --features onnx-backend -- --ignored --nocapture
+
+  # The x86 int8 decision (`X86Int8` in src/semantic/onnx_backend.rs) on CPUs the runners do
+  # not have. The backend leaves `session.x64quantprecision` off where ONNX Runtime's U8S8
+  # kernels are VNNI ones, which are exact, and sets it where they saturate; the one runner
+  # CPU recorded so far, an AMD EPYC 7763, is of the second kind. Intel's Software
+  # Development Emulator runs the same test binary as three other CPUs — answering CPUID as
+  # they do, emulating what the host lacks — and each step names the decision it expects
+  # (OTZARIA_EXPECT_X86_INT8_PRECISION), so that a wrong detection fails instead of passing
+  # down the other path:
+  #
+  # * Ice Lake (`-icl`): AVX-512 with VNNI, its kernel exact — the entry left off;
+  # * Alder Lake (`-adl`): AVX-VNNI without AVX-512, its kernel exact — left off;
+  # * Skylake-SP (`-skx`): AVX-512 without VNNI, whose kernel saturates — set.
+  #
+  # Each step runs three tests: the decision on its own; the int8 gate, which holds the
+  # backend's vectors to the goldens' cross-machine bound; and the entry's test, which runs
+  # the goldens through a session with the entry and one without and, where the backend
+  # leaves it off, requires the two to agree bit for bit — the claim leaving it off rests on.
+  # The emulator's timings measure the emulator, so that test times nothing here.
+  #
+  # SDE is free for any use under the Intel Simplified Software License; the kit comes from
+  # Intel's download mirror by a pinned URL and SHA-256, for the reason the runtime does. The
+  # gated model is fetched under `golden-onnx`'s policy — the secret, every push and same-repo
+  # PR, failing rather than skipping — the int8 graph and the tokenizer alone.
+  golden-onnx-emulated:
+    name: Golden Vectors (ONNX model, emulated x86 CPUs)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # A named image rather than `-latest`: the emulator works through the kernel's ptrace.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # The three tests, by exact name — the decision's is not `#[ignore]`d — one at a time.
+      EMULATED_TESTS: >-
+        --exact --include-ignored --nocapture --test-threads=1
+        semantic::onnx_backend::tests::this_machine_gets_the_x86_int8_decision_its_cpu_implies
+        semantic::onnx_backend::golden::token_ids_match_the_reference_exactly_and_vectors_agree
+        semantic::onnx_backend::golden::what_the_x86_int8_entry_changes_on_this_cpu_is_reported
+      OTZARIA_X86_INT8_TIMED_PASSES: "0"
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -159,58 +463,99 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: llama-backend
+          key: onnx-backend
 
-      # Downloaded fresh every run, deliberately NOT cached. An Actions cache on `main`
-      # is readable by a workflow run from a fork's pull request, so caching the file
-      # would republish a `gated: manual` model to anyone who opens a PR.
-      #
-      # The URL is public; only the token is secret, and it reaches curl through a
-      # config on stdin rather than argv — no process listing, no `set -x`.
-      #
-      # `--retry` because HuggingFace answered 429 on a run whose token was valid and
-      # whose download was unchanged: a rate limit, not a refusal. Since the file is
-      # not cached, every run fetches 396 MB, so an occasional 429 is expected rather
-      # than exceptional — and without a retry it reads as a failed gate. curl counts
-      # 429 as transient and backs off exponentially; `--retry-all-errors` extends that
-      # to a dropped connection mid-transfer. `-f` is what makes the HTTP status
-      # visible to the retry logic at all.
-      #
-      # Deliberately not raised further: a genuine 401 must still fail fast and loudly,
-      # and five attempts cannot turn a revoked token into a pass.
-      - name: Fetch the model
+      # `golden-onnx`'s download and checks, for the int8 graph and the tokenizer alone.
+      - name: Fetch the int8 graph and its tokenizer
         id: model
         env:
           HF_TOKEN: ${{ secrets.OTZARIA_HF_TOKEN }}
         run: |
           if [ -z "${HF_TOKEN:-}" ]; then
-            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The golden gate cannot run, and is NOT being reported as passing."
+            echo "::error::The OTZARIA_HF_TOKEN secret is not set. The emulated ONNX golden gate cannot run, and is NOT being reported as passing."
             exit 1
           fi
-          printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
-            curl -fSL --retry 5 --retry-all-errors --output model.gguf -K - \
-              https://huggingface.co/EMD123/Otzaria-Embedding-V1-Flash-0.6B-GGUF/resolve/main/Otzaria-Embedding-V1-Flash-0.6B-Q4_K_M.gguf
-          # A mismatch must read as "wrong model" rather than as confusing vector diffs.
-          expected=$(python3 -c "import json;print(json.load(open('tests/data/golden_vectors.json'))['header']['model_sha256'])")
-          actual=$(sha256sum model.gguf | cut -d' ' -f1)
-          if [ "$expected" != "$actual" ]; then
-            echo "::error::Model SHA-256 mismatch. Goldens expect $expected, got $actual."
-            exit 1
-          fi
-          echo "path=$(pwd)/model.gguf" >> "$GITHUB_OUTPUT"
+          mkdir -p onnx-model
+          for file in seforim-embed-round2-int8.onnx tokenizer.json; do
+            printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" |
+              curl -fSL --retry 5 --retry-all-errors --output "onnx-model/$file" -K - \
+                "https://huggingface.co/otzaria/judaic-semantic-round2-onnx-zayit/resolve/main/$file"
+          done
+          verify() {
+            expected=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['header'][sys.argv[2]])" tests/data/onnx_golden_vectors_int8.json "$2")
+            actual=$(sha256sum "onnx-model/$1" | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::$1: SHA-256 mismatch. onnx_golden_vectors_int8.json expects $expected, got $actual."
+              exit 1
+            fi
+          }
+          verify seforim-embed-round2-int8.onnx graph_sha256
+          verify tokenizer.json tokenizer_sha256
+          echo "int8=$(pwd)/onnx-model/seforim-embed-round2-int8.onnx" >> "$GITHUB_OUTPUT"
 
-      # `--ignored` is what selects them; without it the job would be meaningless.
-      - name: Golden parity (token_ids exact, then vector tolerances)
-        env:
-          OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
-        run: cargo test --lib --features llama-backend -- --ignored --nocapture
+      # The linux-x64 row of the `onnx-backend` matrix, as in `golden-onnx`; bump all three
+      # together.
+      - name: Fetch ONNX Runtime 1.28.0
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+          echo "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407  $archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
 
-      # The build path, against the same weights. Every other builder test runs on the
-      # deterministic stand-in, which is constructed from the configuration and echoes its
-      # width, pooling and token cap straight back — so the half of the model check that
-      # only real weights can drive is exercised nowhere else, and neither is the recipe
-      # applied to text a real tokenizer sees.
-      - name: A real artifact, built and verified end to end
+      # Intel SDE 10.13.1 (2026-07-28), Linux. Its installation notes: "On Ubuntu systems,
+      # you must disable yama" — it injects itself by a ptrace attach to its parent, which
+      # Ubuntu's default ptrace scope forbids.
+      - name: Fetch Intel SDE 10.13.1
+        run: |
+          archive="$RUNNER_TEMP/sde-external-10.13.1-2026-07-28-lin.tar.xz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+          echo "94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50  $archive" | shasum -a 256 -c -
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          sde="$RUNNER_TEMP/sde-external-10.13.1-2026-07-28-lin/sde64"
+          test -x "$sde"
+          echo "SDE=$sde" >> "$GITHUB_ENV"
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+
+      # Built once, natively; only running it is emulated.
+      - name: The test binary
+        id: binary
+        run: |
+          binary=$(cargo test --lib --features onnx-backend --no-run --message-format=json-render-diagnostics |
+            jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable')
+          test -x "$binary"
+          echo "TEST_BINARY=$binary" >> "$GITHUB_ENV"
+
+      # Each leg runs whatever the one before it did, so one failure never hides another's
+      # numbers.
+      - name: Emulated Ice Lake (AVX-512 VNNI) — the entry left off
+        if: ${{ !cancelled() && steps.binary.outcome == 'success' }}
+        timeout-minutes: 45
         env:
-          OTZARIA_TEST_MODEL: ${{ steps.model.outputs.path }}
-        run: cargo test --test artifact_builder --features llama-backend -- --ignored --nocapture
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: unset
+        run: |
+          read -ra tests <<< "$EMULATED_TESTS"
+          "$SDE" -icl -- "$TEST_BINARY" "${tests[@]}"
+
+      - name: Emulated Alder Lake (AVX-VNNI, no AVX-512) — the entry left off
+        if: ${{ !cancelled() && steps.binary.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: unset
+        run: |
+          read -ra tests <<< "$EMULATED_TESTS"
+          "$SDE" -adl -- "$TEST_BINARY" "${tests[@]}"
+
+      - name: Emulated Skylake-SP (AVX-512 without VNNI) — the entry set
+        if: ${{ !cancelled() && steps.binary.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
+          OTZARIA_EXPECT_X86_INT8_PRECISION: set
+        run: |
+          read -ra tests <<< "$EMULATED_TESTS"
+          "$SDE" -skx -- "$TEST_BINARY" "${tests[@]}"

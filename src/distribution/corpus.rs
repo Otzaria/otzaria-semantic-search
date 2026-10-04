@@ -1,29 +1,29 @@
-//! The lexical index a packer joins its vectors against, as a port.
+//! The lexical index a build reads its lines from, as a port.
 //!
-//! A semantic result is a `line_id` and nothing else, so an artifact is only worth
-//! anything if every one of its ids names a real document in the corpus the application
-//! will hydrate from. That check needs the corpus, and the corpus is Tantivy — which this
+//! A semantic result is a key and the books and positions of the lines it was built
+//! from, so a package is only worth anything if those are the corpus the application will
+//! resolve them against. That needs the corpus, and the corpus is Tantivy — which this
 //! crate does not depend on and must not: the index lives in `otzaria_search_engine`,
-//! together with the schema and the id scheme that produced the ids in the first place.
+//! together with the schema and the id scheme.
 //!
-//! So the packer takes a [`CorpusIndex`] rather than a directory. Two consequences, and
-//! both are the point:
+//! So a build takes a [`CorpusIndex`] rather than a directory. Three consequences, and
+//! all of them are the point:
 //!
-//! * **The corpus identity comes from the corpus.** `corpus_id`, `library_version` and
-//!   the two scheme versions are read off the index that is actually open, never typed
-//!   into a configuration file beside the vectors. An artifact cannot be labelled for a
-//!   catalogue it was not built from.
-//! * **Every field of a record comes from the corpus too** — except the one only the
-//!   producer can know, which is a digest of the text it embedded. The title, reference,
-//!   section, facets and the rest are whatever the corpus says today, so there is no
-//!   second description of a book to drift from the first.
+//! * **The corpus identity comes from the corpus.** The line recipe its text was produced
+//!   by, the library edition it holds and its id scheme are read off the index that is
+//!   actually open, never typed into a configuration file beside the vectors. A package
+//!   cannot be labelled for lines it was not built from.
+//! * **Nothing about a line is stored but its book, its position and the key of its
+//!   text.** The title, reference, section, facets and the rest are whatever the corpus
+//!   says when a result is resolved, so there is no second description of a book to drift
+//!   from the first.
 //! * **The corpus says which vectors there should be.** [`CorpusIndex::expected_line_ids`]
-//!   is what makes "complete artifact" a checkable claim rather than a hope: without it a
-//!   packer can only vouch for the vectors it was handed, and one good vector would pack
-//!   into a valid-looking artifact for a six-million-line library. It takes the model
-//!   identity, because the set is a function of the recipe the artifact declares — "which
-//!   lines exist" and "which lines get embedded" are different questions, and only the
-//!   second one is coverage.
+//!   is what makes "complete package" a checkable claim rather than a hope: without it a
+//!   build can only vouch for the vectors it produced, and one good vector would make a
+//!   valid-looking package for a six-million-line library. It takes the model identity,
+//!   because the set is a function of the recipe the package declares — "which lines
+//!   exist" and "which lines get embedded" are different questions, and only the second
+//!   one is coverage.
 //!
 //! [`CorpusBooks`] adds the one thing per-line access cannot express: the corpus's
 //! *shape*. A recipe decides what to embed by looking at a line together with its
@@ -35,16 +35,37 @@
 //! [`JsonlCorpus`] is the implementation this crate can offer: a transcription of the
 //! index into two files. It is what makes the CLI usable without Tantivy, and what the
 //! tests drive. The implementation that reads a live Tantivy index belongs to
-//! `otzaria_search_engine` (S4b/S5) — and lands on the same [`crate::distribution::packer`]
-//! behind it.
+//! `otzaria_search_engine`.
 
 use crate::errors::PackError;
-use crate::semantic::versioning::{CorpusIdentity, ModelIdentity};
+use crate::semantic::versioning::{ModelIdentity, TextIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+
+/// What a corpus says about itself to a build.
+///
+/// Not an artifact's identity: that is [`IndexVersion`](crate::semantic::versioning::IndexVersion),
+/// and only `text` reaches it. The library edition places the artifact in a chain of
+/// releases, and the id scheme is what the join below relies on to read a `line_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusIdentity {
+    /// How the library was turned into the lines this corpus holds, and how a line is
+    /// keyed — the text group of every artifact built from it.
+    pub text: TextIdentity,
+    /// The library edition (`db_version`) the corpus holds.
+    pub library_version: u32,
+    /// The release that edition was published as, for people.
+    pub library_release_tag: String,
+    /// Version of the scheme that composes a `line_id`.
+    ///
+    /// Version 1 is what `otzaria_search_engine` builds today, matching the app's
+    /// `buildCatalogueDocumentId`: `((catalogue_order + 1) << 32) + (ordinal + 1)`. Both
+    /// halves are 1-based, so no live document has id 0.
+    pub document_id_scheme_version: u32,
+}
 
 /// What the corpus holds for one line.
 ///
@@ -83,19 +104,19 @@ pub struct CorpusLine {
 /// real index can: a read error and "there is no such line" are different answers and
 /// stay different — the first is a broken build input, the second is a broken pairing.
 pub trait CorpusIndex {
-    /// Identity of the corpus, as the index reports it. This is what the artifact
-    /// declares and what the runtime will compare against; a packer never composes it.
+    /// Identity of the corpus, as the index reports it. This is what the package
+    /// declares and what the runtime will compare against; a build never composes it.
     fn identity(&self) -> Result<CorpusIdentity, PackError>;
 
-    /// Every `line_id` an artifact built under `model` must carry a vector for — no more
+    /// Every `line_id` a package built under `model` must carry a vector for — no more
     /// and no fewer.
     ///
     /// **This is the completeness contract, and there is no way to opt out of it.**
-    /// Without it a packer can only check the vectors it was given, so one good vector
-    /// out of six million would produce a perfectly valid "official artifact": the
+    /// Without it a build can only check the vectors it produced, so one good vector
+    /// out of six million would produce a perfectly valid "official package": the
     /// counts, the checksums and the identity would all agree, and the library would be
     /// missing from itself. The comparison runs in both directions, because an extra
-    /// vector is its own fault — a line the recipe skips acquiring one means the artifact
+    /// vector is its own fault — a line the recipe skips acquiring one means the package
     /// was built by a recipe other than the one it declares.
     ///
     /// **It is not "every document in the index".** The embedding recipe decides what gets
@@ -131,13 +152,13 @@ pub trait CorpusIndex {
 /// it. That is the only thing this trait adds — and it is why it is a separate trait
 /// rather than three more methods everything must implement.
 ///
-/// **It answers no question about a line's contents**, on purpose. Every field an
-/// artifact stores comes from [`CorpusIndex::line`] and from nowhere else, so a book has
+/// **It answers no question about a line's contents**, on purpose. Everything a build
+/// reads about a line comes from [`CorpusIndex::line`] and from nowhere else, so a book has
 /// exactly one description and there is no second one for it to drift from. What comes
 /// through here is structure: a list of keys, and a list of ids.
 ///
-/// The cost is that a build reads each line twice — once to derive the text to embed, and
-/// once when the packer joins the finished vector back to the corpus. That is deliberate:
+/// The cost is that a build reads each line twice — once to plan, and once to derive the
+/// text it embeds. That is deliberate:
 /// the second read is what proves the corpus still says what the first read assumed, and
 /// this runs on a build machine.
 pub trait CorpusBooks: CorpusIndex {
@@ -175,7 +196,7 @@ pub struct CorpusLineRecord {
 /// corpus-lines.jsonl     one CorpusLineRecord per line, in any order
 /// ```
 ///
-/// **What this is for.** It lets a packer run without linking Tantivy — the CLI in this
+/// **What this is for.** It lets a build run without linking Tantivy — the CLI in this
 /// crate, and every test here. It is a *transcription*, so it is exactly as trustworthy
 /// as whatever wrote it; the authoritative join is the one an implementation over the
 /// live index performs. That is why the trait exists and why this type is not the only
@@ -189,10 +210,10 @@ pub struct CorpusLineRecord {
 /// will need to.
 ///
 /// **What it costs.** Every line is held in memory, text included. At library scale that
-/// is not affordable — but neither is the payload writer this feeds, which holds every
-/// vector in RAM until it commits (see [`zevc_store`](crate::semantic::zevc_store)).
-/// Both are the same S2b measurement, and neither is hidden behind an interface that
-/// implies otherwise.
+/// is not affordable — but neither is the one-process build this feeds, which holds every
+/// distinct vector until it calibrates (see [`builder`](crate::distribution::builder)).
+/// Both are development paths, and neither is hidden behind an interface that implies
+/// otherwise.
 /// The one id scheme whose ordering a transcription can reconstruct.
 ///
 /// Scheme 1 composes an id as `((catalogue_order + 1) << 32) + (ordinal + 1)`, so within
@@ -401,9 +422,9 @@ mod tests {
 
     fn identity() -> CorpusIdentity {
         CorpusIdentity {
-            corpus_id: "7a".repeat(32),
-            library_version: "otzaria-library-2026-08".to_string(),
-            tantivy_schema_version: 3,
+            text: TextIdentity::with_line_text_version(1),
+            library_version: 30,
+            library_release_tag: "v30-20260930120000".to_string(),
             document_id_scheme_version: 1,
         }
     }

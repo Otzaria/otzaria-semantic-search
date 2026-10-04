@@ -1,3 +1,4 @@
+use crate::config::profiles::QueryTypeAlphas;
 use std::fmt;
 
 /// Type of query based on heuristics
@@ -142,17 +143,27 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
 /// Short/exact -> 0.7-0.9
 /// Conceptual -> 0.2-0.4
 /// Mixed -> 0.5
+///
+/// [`compute_alpha_with`] over the default table, [`QueryTypeAlphas::default`]: the numbers
+/// this function has always returned.
 pub fn compute_alpha(features: &QueryFeatures) -> f32 {
+    compute_alpha_with(features, &QueryTypeAlphas::default())
+}
+
+/// The alpha `alphas` gives this query's type: what the coordinator uses, with the table in
+/// the search's [`RankingProfile`](crate::config::profiles::RankingProfile).
+pub fn compute_alpha_with(features: &QueryFeatures, alphas: &QueryTypeAlphas) -> f32 {
     match features.estimated_type {
         // §3.1: A quoted phrase is a verbatim lookup — the lexical engine is
         // authoritative and the semantic embedding adds only latency.
-        // Returning 1.0 lets the coordinator skip the semantic path entirely.
-        QueryType::ExactReference if features.has_quoted_phrase => 1.0,
-        QueryType::ExactReference => 0.85,
-        QueryType::Short => 0.7,
-        QueryType::Mixed => 0.5,
-        QueryType::Conceptual => 0.3,
-        QueryType::Unknown => 0.5,
+        // An alpha of 1.0, the default, lets the coordinator skip the semantic path
+        // entirely.
+        QueryType::ExactReference if features.has_quoted_phrase => alphas.quoted_phrase,
+        QueryType::ExactReference => alphas.exact_reference,
+        QueryType::Short => alphas.short,
+        QueryType::Mixed => alphas.mixed,
+        QueryType::Conceptual => alphas.conceptual,
+        QueryType::Unknown => alphas.unknown,
     }
 }
 
@@ -161,6 +172,10 @@ pub fn compute_alpha(features: &QueryFeatures) -> f32 {
 /// These values are unmeasured heuristics. Calibrating them — or dropping weighted
 /// fusion for RRF, where they would not apply — needs the labelled relevance set
 /// that stage S1 produces. Until then, treat the numbers as placeholders.
+///
+/// The coordinator does not read this struct: the bonuses a search applies are its
+/// [`RankingProfile`](crate::config::profiles::RankingProfile)'s, which a host can pass
+/// per search, and that is where calibrated values go.
 #[derive(Debug, Clone)]
 pub struct BonusConfig {
     /// Added to a candidate that both engines returned.
@@ -318,5 +333,52 @@ mod tests {
         let rare_tokens = vec!["המולקולה".to_string()];
         let bonus = compute_rare_term_bonus(text, &rare_tokens);
         assert_eq!(bonus, 1.0);
+    }
+
+    /// One query of each type, with the alpha `compute_alpha` has always given it.
+    const ONE_OF_EACH_TYPE: [(&str, f32); 6] = [
+        ("\"בראשית ברא\"", 1.0),
+        ("ברכות 20", 0.85),
+        ("שלום עולם", 0.7),
+        ("ברכות דף כ", 0.5),
+        ("מה המשמעות של החיים ביקום לפי הקבלה", 0.3),
+        ("", 0.5),
+    ];
+
+    #[test]
+    fn the_default_table_gives_every_query_type_the_alpha_it_always_had() {
+        for (query, alpha) in ONE_OF_EACH_TYPE {
+            let features = analyze_query(query);
+            assert_eq!(
+                compute_alpha(&features).to_bits(),
+                alpha.to_bits(),
+                "{query:?}"
+            );
+            assert_eq!(
+                compute_alpha_with(&features, &QueryTypeAlphas::default()).to_bits(),
+                alpha.to_bits(),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_passed_in_decides_the_alpha_of_each_query_type() {
+        let table = QueryTypeAlphas {
+            quoted_phrase: 0.91,
+            exact_reference: 0.81,
+            short: 0.61,
+            mixed: 0.41,
+            conceptual: 0.21,
+            unknown: 0.11,
+        };
+        let expected = [0.91, 0.81, 0.61, 0.41, 0.21, 0.11];
+        for ((query, _), alpha) in ONE_OF_EACH_TYPE.into_iter().zip(expected) {
+            assert_eq!(
+                compute_alpha_with(&analyze_query(query), &table),
+                alpha,
+                "{query:?}"
+            );
+        }
     }
 }

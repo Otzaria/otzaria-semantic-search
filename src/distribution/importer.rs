@@ -374,8 +374,8 @@ impl IndexImporter {
         staged?;
 
         Ok(ImportResult {
-            books_imported: verified.book_count(),
-            vectors_imported: verified.vector_count(),
+            books_imported: verified.counts().books,
+            vectors_imported: verified.counts().slots.min(u64::from(u32::MAX)) as u32,
             bytes_imported: verified.manifest().total_size_bytes,
             import_duration_ms: start_time.elapsed().as_millis(),
         })
@@ -662,9 +662,9 @@ mod tests {
         let package = IndexPackage {
             manifest: PackageManifest::new(
                 identity,
+                crate::distribution::package::test_description(5, 50),
+                crate::semantic::versioning::test_provenance(),
                 "2026-08-06T00:00:00Z".to_string(),
-                5,
-                50,
                 payload.len() as u64,
             ),
             payloads: BTreeMap::from([(
@@ -730,6 +730,40 @@ mod tests {
         assert!(!staging_path(&target).unwrap().exists());
     }
 
+    /// Windows refuses to rename a directory while a file in it is mapped, as a runtime maps
+    /// the payload of the artifact it opened. The swap's first rename fails, so the install is
+    /// a clean error: the installed artifact stays whole, and nothing is left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_an_artifact_a_reader_maps_is_not_swapped_out() {
+        let dir = TempDir::new("mapped");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let target = dir.path().join("target");
+        write_package(&first, test_identity(), b"first");
+        write_package(&second, test_identity(), b"second!");
+        install(&first, &target).unwrap();
+        let payload = File::open(target.join("vectors.bin")).unwrap();
+        let mapped = unsafe { memmap2::Mmap::map(&payload) }.unwrap();
+        drop(payload);
+
+        let error = install(&second, &target).unwrap_err();
+        assert!(
+            matches!(&error, ArtifactError::Io { source, .. }
+                if matches!(source.raw_os_error(), Some(5 | 32))),
+            "{error}"
+        );
+        assert_eq!(&mapped[..], b"first");
+        assert_eq!(payload_of(&target), b"first");
+        assert!(IndexPackage::verify_for_install(&target, &expectation()).is_ok());
+        assert!(!previous_path(&target).unwrap().exists());
+        assert!(!staging_path(&target).unwrap().exists());
+
+        drop(mapped);
+        install(&second, &target).unwrap();
+        assert_eq!(payload_of(&target), b"second!");
+    }
+
     /// The gate: a package for another corpus is refused, and the previous artifact is
     /// still the one on disk afterwards.
     #[test]
@@ -742,13 +776,13 @@ mod tests {
         install(&source, &target).unwrap();
 
         let mut other_corpus = test_identity();
-        other_corpus.corpus.corpus_id = "d".repeat(64);
+        other_corpus.text.line_text_version = 2;
         let replacement = dir.path().join("replacement");
         write_package(&replacement, other_corpus, b"second");
 
         match install(&replacement, &target) {
             Err(ArtifactError::IdentityMismatch { mismatches }) => {
-                assert_eq!(mismatches[0].field, IdentityField::CorpusId)
+                assert_eq!(mismatches[0].field, IdentityField::LineTextVersion)
             }
             other => panic!("expected an identity rejection, got {other:?}"),
         }

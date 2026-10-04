@@ -3,10 +3,13 @@
 //! ```text
 //! cargo bench
 //! cargo bench -- --vectors 1000000 --dim 256
+//! cargo bench -- --store oxv --vectors 1000000 --dim 256 --threads 8
 //! ```
 //!
-//! Measures [`VectorStore`] directly, so it needs no embedding backend and runs
-//! in a default build.
+//! Measures [`VectorStore`] directly, or with `--store oxv` the vector store's int8
+//! segments: one is written to a temporary directory (`--dir` to choose where), mapped,
+//! and scanned on one thread and on `--threads`, unfiltered and under a filter on 5% of
+//! the books. Either way it needs no embedding backend and runs in a default build.
 //!
 //! Deliberately not Criterion: this exists so a performance claim about this
 //! crate can be re-run and checked, and pulling a benchmarking framework (and its
@@ -41,6 +44,11 @@ struct Options {
     dim: usize,
     top_k: usize,
     queries: usize,
+    store: String,
+    /// For `--store oxv`: `i8-sym-vec` (the default), `i8-sym-dim` or `f32`.
+    codec: String,
+    threads: usize,
+    dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -52,6 +60,10 @@ impl Default for Options {
             dim: 1024,
             top_k: 40,
             queries: 50,
+            store: "memory".to_string(),
+            codec: "i8-sym-vec".to_string(),
+            threads: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+            dir: None,
         }
     }
 }
@@ -73,6 +85,10 @@ fn parse_options() -> Options {
             "--dim" => options.dim = parsed("--dim"),
             "--top-k" => options.top_k = parsed("--top-k"),
             "--queries" => options.queries = parsed("--queries"),
+            "--threads" => options.threads = parsed("--threads"),
+            "--store" => options.store = value.cloned().unwrap_or_default(),
+            "--codec" => options.codec = value.cloned().unwrap_or_default(),
+            "--dir" => options.dir = value.map(std::path::PathBuf::from),
             // cargo bench passes its own flags; ignore what is not ours.
             _ => {
                 index += 1;
@@ -153,11 +169,138 @@ impl std::fmt::Display for Timings {
 
 fn main() {
     let options = parse_options();
+    match options.store.as_str() {
+        "memory" => memory(options),
+        "oxv" => oxv(options),
+        other => panic!("--store is memory or oxv, not {other:?}"),
+    }
+}
+
+/// The int8 segment store: write, open, scan.
+fn oxv(options: Options) {
+    use otzaria_semantic_search::cancellation::CancellationToken;
+    use otzaria_semantic_search::distribution::package::PackageKind;
+    use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
+    use otzaria_semantic_search::semantic::oxv::reader::Segment;
+    use otzaria_semantic_search::semantic::oxv::scan::{scan_segments, ScanRequest};
+    use otzaria_semantic_search::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
+    use otzaria_semantic_search::semantic::resolve::BookSet;
+
     let Options {
         vectors,
         dim,
         top_k,
         queries,
+        threads,
+        dir,
+        codec,
+        ..
+    } = options;
+    let codec_name = codec.as_str();
+    const BOOKS: usize = 5_000;
+    println!("otzaria-semantic-search — vector search benchmark, oxv segment ({codec_name})");
+    println!("  vectors: {vectors}\n  dim:     {dim}\n  top_k:   {top_k}\n  queries: {queries}");
+
+    let unit = |seed: usize| {
+        let raw = vector(seed, dim);
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.into_iter().map(|x| x / norm).collect::<Vec<f32>>()
+    };
+    let sample: Vec<Vec<f32>> = (0..vectors.min(20_000)).map(unit).collect();
+    let refs: Vec<&[f32]> = sample.iter().map(Vec::as_slice).collect();
+    let codec = otzaria_semantic_search::semantic::oxv::codec::CodecSpec::parse(codec_name, 0.9999)
+        .and_then(|spec| spec.build(dim, &refs))
+        .expect("the codec");
+
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join("otzaria_bench_oxv"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("bench directory");
+    let path = dir.join("bench.oxv");
+    let started = Instant::now();
+    let mut builder = SegmentBuilder::new(
+        SegmentSpec {
+            kind: PackageKind::Base,
+            identity_digest: [0x42; 32],
+            from_library_version: 0,
+            to_library_version: 1,
+            library_release_tag: "bench".to_string(),
+        },
+        codec,
+    );
+    let per_book = vectors.div_ceil(BOOKS);
+    let mut slot = 0usize;
+    for book in 0..BOOKS {
+        let count = per_book.min(vectors - slot.min(vectors));
+        let primary: Vec<(ChunkKey, u32)> = (0..count)
+            .map(|i| (ChunkKey::of(&format!("{}", slot + i)), i as u32))
+            .collect();
+        builder
+            .add_book(&format!("id:{book:05}"), &primary, &[], &[])
+            .expect("book");
+        slot += count;
+    }
+    let mut sink = builder.write(&path).expect("segment");
+    for index in 0..vectors {
+        sink.push_f32(&unit(index)).expect("vector");
+    }
+    let written = sink.finish().expect("finish");
+    println!(
+        "\nwrite: {:.2?} for {vectors} vectors, {:.1} MiB",
+        started.elapsed(),
+        written.size as f64 / (1024.0 * 1024.0)
+    );
+
+    let started = Instant::now();
+    let segment = Segment::open(&path).expect("open");
+    println!("open:  {:.2?}", started.elapsed());
+
+    let cancel = CancellationToken::new();
+    let run = |threads: usize, books: Option<&BookSet>| {
+        let request = ScanRequest {
+            top_k,
+            books,
+            threads,
+        };
+        for _ in 0..3 {
+            scan_segments(&[&segment], &unit(usize::MAX / 3), &request, &cancel).expect("scan");
+        }
+        let mut timings = Vec::with_capacity(queries);
+        for round in 0..queries {
+            let query = unit(round + 1);
+            let started = Instant::now();
+            let hits = scan_segments(&[&segment], &query, &request, &cancel).expect("scan");
+            timings.push(started.elapsed());
+            assert!(!hits.is_empty());
+        }
+        summarize(timings)
+    };
+    let one = run(1, None);
+    println!("scan, 1 thread:        {one}");
+    println!(
+        "  → {:.1} ns per vector; extrapolated to {LIBRARY_LINE_COUNT} lines: {:.2?}",
+        one.min.as_secs_f64() * 1e9 / vectors as f64,
+        Duration::from_secs_f64(one.min.as_secs_f64() * LIBRARY_LINE_COUNT as f64 / vectors as f64)
+    );
+    let many = run(threads, None);
+    println!("scan, {threads} threads:      {many}");
+    let filter: BookSet = (0..BOOKS / 20)
+        .map(|book| format!("id:{:05}", book * 20))
+        .collect();
+    let filtered = run(threads, Some(&filter));
+    println!("scan, 5% of the books: {filtered}");
+
+    drop(segment);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The in-memory store of the self-built path.
+fn memory(options: Options) {
+    let Options {
+        vectors,
+        dim,
+        top_k,
+        queries,
+        ..
     } = options;
 
     println!("otzaria-semantic-search — vector search benchmark");

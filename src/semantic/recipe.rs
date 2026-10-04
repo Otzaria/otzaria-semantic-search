@@ -18,7 +18,8 @@
 //! * [`ChunkingAlgorithm`] selects how a book becomes chunks, in
 //!   [`Chunker::chunk_book`](crate::semantic::chunker::Chunker::chunk_book).
 //! * [`EmbeddingTextRecipe`] selects what text a chunk carries to the model, in the same
-//!   place.
+//!   place — and what text a query carries, through [`query_input`], the one function
+//!   every query path embeds through.
 //! * [`TextNormalizationRecipe`] selects what is done to a text before it reaches the
 //!   model — on the build side inside the chunker, and on the query side before the one
 //!   string a search embeds.
@@ -50,9 +51,10 @@
 //! `chunking_version` is refused at the build, which is the only place that number is ever
 //! more than an opaque input to a digest.
 
-use crate::errors::ArtifactError;
+use crate::errors::{ArtifactError, EmbeddingError};
 use crate::semantic::chunker::ChunkerConfig;
 use crate::semantic::versioning::ModelIdentity;
+use std::borrow::Cow;
 
 /// How a book becomes chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,14 +65,105 @@ pub enum ChunkingAlgorithm {
     AnchoredLine,
 }
 
-/// What text a chunk carries to the model.
+/// What text a chunk carries to the model, and what text a query does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingTextRecipe {
     /// The line itself, or the line surrounded by its neighbours when it is too short to
     /// carry meaning alone. No title prefix and no reference prefix — whether either helps
-    /// is S1's measurement, and the recipe that wins there becomes a second variant here
-    /// rather than an edit to this one.
+    /// is S1's measurement, and the recipe that wins there becomes a variant here rather
+    /// than an edit to this one. A query is embedded as it is.
     LineOrNeighbourContext,
+    /// Version 1's text, marked with the role it plays: [`PASSAGE_PREFIX`] before every
+    /// stored passage and [`QUERY_PREFIX`] before every query — for a model trained to
+    /// tell the two apart, whose prefixes are learned special tokens (Meivin Round 2).
+    ///
+    /// The prefix goes on **last**: after the neighbour context, the character cap and
+    /// the text normalization. The passage is therefore version 1's text, trimmed — the
+    /// cap can leave a space at its end — the cap is spent on content alone, and no
+    /// normalization can alter the prefix. The token cap is another matter — it counts the
+    /// prefix, because the model does. A query is trimmed before its prefix just the same
+    /// ([`Self::passage_text`], [`Self::query_text`]): neither side hands the model
+    /// whitespace at either end.
+    ///
+    /// Without the prefix on either side a query lands elsewhere in the space than the
+    /// passages it should find, and nothing about either vector says so. That is why the
+    /// query side is part of the recipe and not a detail of the caller.
+    RolePrefixedLineOrNeighbourContext,
+}
+
+/// What [`EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext`] puts before every
+/// stored passage.
+pub const PASSAGE_PREFIX: &str = "[PASSAGE] ";
+
+/// What [`EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext`] puts before every
+/// query.
+pub const QUERY_PREFIX: &str = "[QUERY] ";
+
+impl EmbeddingTextRecipe {
+    /// The text a stored passage carries to the model, from `text` — what version 1
+    /// embeds for it, already capped and normalized.
+    ///
+    /// Borrowed when the recipe changes nothing, so version 1 costs no allocation and is,
+    /// byte for byte, what it was before a second version existed.
+    ///
+    /// Version 2 trims that text ([`str::trim`], Unicode whitespace) behind the prefix —
+    /// the passage-side twin of [`Self::query_text`]. The chunker trims a line before it
+    /// caps it, so in practice only the end can carry whitespace: the character cap can
+    /// fall just after a space, and a Metaspace tokenizer — the production model's —
+    /// would give that space a `▁` token of its own before `[SEP]`.
+    pub fn passage_text(self, text: &str) -> Cow<'_, str> {
+        match self {
+            Self::LineOrNeighbourContext => Cow::Borrowed(text),
+            Self::RolePrefixedLineOrNeighbourContext => {
+                Cow::Owned(format!("{PASSAGE_PREFIX}{}", text.trim()))
+            }
+        }
+    }
+
+    /// The text a query carries to the model, from the query as the text normalization
+    /// left it. The identity for version 1. Call [`query_input`], which applies the
+    /// normalization first, rather than this.
+    ///
+    /// Version 2 trims the query ([`str::trim`], Unicode whitespace) before the prefix,
+    /// as the chunker trims every stored line before its cap: whitespace at either end is
+    /// not content, and a Metaspace tokenizer — the production model's — would give a
+    /// space after `[QUERY] ` a `▁` token of its own. Version 1 is left byte for byte as
+    /// it was.
+    pub fn query_text(self, normalized_query: &str) -> Cow<'_, str> {
+        match self {
+            Self::LineOrNeighbourContext => Cow::Borrowed(normalized_query),
+            Self::RolePrefixedLineOrNeighbourContext => {
+                Cow::Owned(format!("{QUERY_PREFIX}{}", normalized_query.trim()))
+            }
+        }
+    }
+}
+
+/// The one string a search embeds for `query`: normalized as the stored text was, then
+/// marked as a query by the text recipe — the same two steps, in the same order, as a
+/// stored passage went through.
+///
+/// Shared by every path that embeds a query, so no two of them can disagree about it.
+///
+/// # Errors
+///
+/// [`EmbeddingError::InferenceFailed`] for a query with no text once normalized. It has
+/// nothing to embed, and refusing it here makes that true for every model and recipe:
+/// before, it depended on the backend returning a degenerate vector for an empty string,
+/// and a role prefix would have turned nothing into a confident query for `[QUERY]`.
+pub fn query_input(
+    text: EmbeddingTextRecipe,
+    normalization: TextNormalizationRecipe,
+    query: &str,
+) -> Result<String, EmbeddingError> {
+    let normalized = normalization.apply(query);
+    if normalized.trim().is_empty() {
+        return Err(EmbeddingError::InferenceFailed {
+            reason: "the query holds no text once normalized, so there is nothing to embed"
+                .to_string(),
+        });
+    }
+    Ok(text.query_text(&normalized).into_owned())
 }
 
 /// What is done to a text before the model sees it.
@@ -151,6 +244,7 @@ recipe_versions!(ChunkingAlgorithm, "chunking_version", {
 });
 recipe_versions!(EmbeddingTextRecipe, "embedding_text_version", {
     LineOrNeighbourContext => 1,
+    RolePrefixedLineOrNeighbourContext => 2,
 });
 recipe_versions!(TextNormalizationRecipe, "normalization_version", {
     AsSuppliedByCorpus => 1,
@@ -237,31 +331,37 @@ mod tests {
     /// message says which axis and what this build does implement.
     #[test]
     fn a_version_no_variant_implements_is_refused_by_name() {
-        for (field, error) in [
+        for (field, error, unimplemented, supported) in [
             (
                 "chunking_version",
                 ChunkingAlgorithm::from_version(2).unwrap_err(),
+                2,
+                "1",
             ),
             (
                 "embedding_text_version",
-                EmbeddingTextRecipe::from_version(2).unwrap_err(),
+                EmbeddingTextRecipe::from_version(3).unwrap_err(),
+                3,
+                "1, 2",
             ),
             (
                 "normalization_version",
                 TextNormalizationRecipe::from_version(2).unwrap_err(),
+                2,
+                "1",
             ),
         ] {
             match error {
                 ArtifactError::UnsupportedRecipeVersion {
                     field: named,
                     found,
-                    supported,
+                    supported: listed,
                 } => {
                     assert_eq!(named, field);
-                    assert_eq!(found, 2);
-                    assert_eq!(supported, "1");
+                    assert_eq!(found, unimplemented);
+                    assert_eq!(listed, supported);
                 }
-                other => panic!("{field} 2 must be refused as unsupported, got {other:?}"),
+                other => panic!("{field} {unimplemented} must be refused, got {other:?}"),
             }
         }
 
@@ -291,6 +391,128 @@ mod tests {
                 assert_eq!(declared, model.embedding_text_version);
             }
             other => panic!("the two copies must be compared, got {other:?}"),
+        }
+    }
+
+    /// Version 1 is the identity on both sides — borrowed, so provably the very bytes it
+    /// was handed.
+    #[test]
+    fn version_one_changes_neither_side() {
+        let recipe = EmbeddingTextRecipe::LineOrNeighbourContext;
+        assert_eq!(recipe.version(), 1);
+        for text in ["בראשית ברא אלהים", "[PASSAGE] already there", " padded "] {
+            assert!(matches!(recipe.passage_text(text), Cow::Borrowed(t) if t == text));
+            assert!(matches!(recipe.query_text(text), Cow::Borrowed(t) if t == text));
+        }
+        assert_eq!(
+            query_input(
+                recipe,
+                TextNormalizationRecipe::AsSuppliedByCorpus,
+                "מצות תפילין"
+            )
+            .unwrap(),
+            "מצות תפילין"
+        );
+    }
+
+    /// Each side gets its own prefix, once, and nothing else changes.
+    #[test]
+    fn version_two_prefixes_each_side_with_its_role_exactly_once() {
+        let recipe = EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext;
+        assert_eq!(recipe.version(), 2);
+        assert_eq!(PASSAGE_PREFIX, "[PASSAGE] ");
+        assert_eq!(QUERY_PREFIX, "[QUERY] ");
+
+        let line = "ויאמר אלהים יהי אור";
+        assert_eq!(recipe.passage_text(line), format!("[PASSAGE] {line}"));
+        assert_eq!(recipe.query_text(line), format!("[QUERY] {line}"));
+        let query = query_input(recipe, TextNormalizationRecipe::AsSuppliedByCorpus, line).unwrap();
+        assert_eq!(query, format!("[QUERY] {line}"));
+        assert_eq!(query.matches("[QUERY]").count(), 1);
+        assert!(!query.contains("[PASSAGE]"));
+    }
+
+    /// Under version 2 a query loses its leading and trailing whitespace before the
+    /// prefix, as a stored line does before the chunker caps it. Kept, it reaches the
+    /// model: a Metaspace tokenizer turns a space after `[QUERY] ` — or a no-break space,
+    /// which NFKC makes one — into a lone `▁` token of its own, and a trailing one into
+    /// another. Version 1 keeps the query byte for byte, as it always has.
+    #[test]
+    fn version_two_trims_the_query_before_the_prefix_and_version_one_does_not() {
+        let v2 = EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext;
+        let v1 = EmbeddingTextRecipe::LineOrNeighbourContext;
+        let normalization = TextNormalizationRecipe::AsSuppliedByCorpus;
+        let query = "מצות תפילין";
+
+        for padded in [
+            " מצות תפילין",
+            "מצות תפילין ",
+            "\t מצות תפילין\n",
+            "\u{00A0}מצות תפילין\u{3000}",
+        ] {
+            assert_eq!(
+                v2.query_text(padded),
+                format!("[QUERY] {query}"),
+                "{padded:?}"
+            );
+            assert_eq!(
+                query_input(v2, normalization, padded).unwrap(),
+                format!("[QUERY] {query}"),
+                "{padded:?}"
+            );
+
+            assert!(
+                matches!(v1.query_text(padded), Cow::Borrowed(t) if t == padded),
+                "{padded:?}"
+            );
+            assert_eq!(query_input(v1, normalization, padded).unwrap(), padded);
+        }
+
+        // Whitespace inside the query is content, and stays.
+        assert_eq!(
+            v2.query_text("מצות  תפילין"),
+            "[QUERY] מצות  תפילין".to_string()
+        );
+    }
+
+    /// The passage side of the same rule. The chunker trims a line before capping it, but
+    /// the cap can end the text on a space — "abcdefghij klm…" cut at 11 is "abcdefghij "
+    /// — and a Metaspace tokenizer gives that space a `▁` token of its own. Version 2
+    /// drops it behind the prefix; version 1 keeps the text byte for byte.
+    #[test]
+    fn version_two_trims_a_passage_as_it_trims_a_query_and_version_one_does_not() {
+        let v2 = EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext;
+        let v1 = EmbeddingTextRecipe::LineOrNeighbourContext;
+        for capped in ["מצות תפילין ", "מצות תפילין\u{00A0}", "מצות תפילין \t"]
+        {
+            assert_eq!(
+                v2.passage_text(capped),
+                "[PASSAGE] מצות תפילין",
+                "{capped:?}"
+            );
+            assert!(
+                matches!(v1.passage_text(capped), Cow::Borrowed(t) if t == capped),
+                "{capped:?}"
+            );
+        }
+        // Whitespace inside the passage is content, and stays.
+        assert_eq!(v2.passage_text("מצות  תפילין"), "[PASSAGE] מצות  תפילין");
+    }
+
+    /// An empty query has nothing to embed, whatever the recipe — and under version 2 a
+    /// prefix would otherwise make it a query for the prefix itself.
+    #[test]
+    fn a_query_with_no_text_is_refused_under_every_recipe() {
+        for recipe in EmbeddingTextRecipe::ALL {
+            for empty in ["", "   ", "\t\n"] {
+                assert!(
+                    matches!(
+                        query_input(*recipe, TextNormalizationRecipe::AsSuppliedByCorpus, empty),
+                        Err(EmbeddingError::InferenceFailed { .. })
+                    ),
+                    "{recipe:?} must refuse {empty:?}"
+                );
+            }
         }
     }
 

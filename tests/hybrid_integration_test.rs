@@ -4,8 +4,8 @@
 //!
 //! Driving the engine end to end requires an embedding backend, and requires the
 //! deterministic stand-in to be the one actually *selected* — every fixture builds
-//! its model with [`mock::write_stub_gguf`], a weightless stub that real inference
-//! rightly refuses — hence `mock-embedding` without `llama-backend`.
+//! its model with [`mock::write_stub_onnx_package`], a weightless stub that real
+//! inference rightly refuses — hence `mock-embedding` without `onnx-backend`.
 //!
 //! Consequently the hybrid pipeline is not exercised in a build holding both
 //! backends. That is acceptable: fusion, grouping, paging, filters and the manifest
@@ -14,9 +14,12 @@
 //! — a default build refusing to embed at all — in
 //! `tests/production_backend_gate.rs`.
 
-#![cfg(all(feature = "mock-embedding", not(feature = "llama-backend")))]
+#![cfg(all(feature = "mock-embedding", not(feature = "onnx-backend")))]
 
 use otzaria_semantic_search::api::hybrid_search::{OtzariaHybridEngine, SearchRequest};
+use otzaria_semantic_search::cancellation::CancellationToken;
+use otzaria_semantic_search::config::profiles::{FusionStrategy, RankingProfile};
+use otzaria_semantic_search::errors::SemanticSearchError;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::embedding::mock;
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
@@ -68,8 +71,7 @@ impl Drop for TempDir {
 
 /// A configuration rooted in `dir`, with a small embedding dimension for speed.
 fn config_at(dir: &TempDir) -> SemanticConfig {
-    let model_path = dir.path().join("model.gguf");
-    mock::write_stub_gguf(&model_path, 3).unwrap();
+    let model_path = mock::write_stub_onnx_package(&dir.path().join("model"));
 
     let root = dir.path().join("semantic");
     SemanticConfig {
@@ -318,7 +320,7 @@ fn a_lexical_only_search_never_touches_the_semantic_index() {
 fn lexical_search_keeps_working_when_the_semantic_model_is_missing() {
     let dir = TempDir::new("degraded");
     let mut config = config_at(&dir);
-    config.model_path = dir.path().join("never-downloaded.gguf");
+    config.model_path = dir.path().join("never-downloaded.onnx");
 
     let engine = SemanticEngine::open(config).unwrap();
     let api = OtzariaHybridEngine::new(HybridCoordinator::new(Some(engine)));
@@ -777,9 +779,11 @@ fn a_swapped_model_file_behind_the_same_id_is_detected() {
     }
 
     // Same path, same model id, different bytes.
-    let mut bytes = std::fs::read(&config.model_path).unwrap();
-    bytes.extend_from_slice(b"a completely different set of weights");
-    std::fs::write(&config.model_path, bytes).unwrap();
+    std::fs::write(
+        &config.model_path,
+        mock::onnx::stub_graph_named("a completely different set of weights"),
+    )
+    .unwrap();
 
     let mut engine = SemanticEngine::open(config).unwrap();
     engine.load_model().unwrap();
@@ -988,4 +992,98 @@ fn paging_covers_every_result_exactly_once() {
     let first_ids: Vec<u64> = first.results.iter().map(|r| r.id).collect();
     let again_ids: Vec<u64> = page(0).results.iter().map(|r| r.id).collect();
     assert_eq!(first_ids, again_ids);
+}
+
+// ───────────────────────── cancellation ─────────────────────────
+
+/// What the host does with every keystroke: hand the search a token and, when the next
+/// keystroke arrives, cancel it. The abandoned search must come back as something the host
+/// can match on — not a message to parse, and not a degraded result it would display.
+#[test]
+fn a_search_cancelled_through_the_api_is_told_apart_from_a_failure() {
+    let dir = TempDir::new("cancelled");
+    let api = indexed_api(config_at(&dir));
+    let request = SearchRequest {
+        query: LINE_ONE.to_string(),
+        lexical_candidates: vec![lexical_hit(1, LINE_ONE, 15.5)],
+        ..Default::default()
+    };
+
+    // Cancelled from another thread, as the host will, before this search reached a
+    // checkpoint.
+    let cancel = CancellationToken::new();
+    let remote = cancel.clone();
+    std::thread::spawn(move || remote.cancel()).join().unwrap();
+    match api.search_cancellable(request.clone(), &cancel) {
+        Err(SemanticSearchError::Cancelled) => {}
+        other => panic!("a cancelled search must say so, got {other:?}"),
+    }
+    assert_eq!(api.get_telemetry_snapshot().total_searches, 0);
+
+    // A token nobody cancels is the plain search, and the plain search is unchanged.
+    let with_token = api
+        .search_cancellable(request.clone(), &CancellationToken::new())
+        .unwrap();
+    let plain = api.search(request).unwrap();
+    assert_eq!(with_token.search_mode, SearchMode::Hybrid);
+    assert_eq!(plain.search_mode, SearchMode::Hybrid);
+    let ids = |result: &otzaria_semantic_search::semantic::types::HybridSearchResult| {
+        result
+            .results
+            .iter()
+            .map(|item| (item.id, item.fused_score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&with_token), ids(&plain));
+    assert!(
+        !with_token.telemetry.unwrap().cache_hit,
+        "the cancelled search must not have cached a result"
+    );
+    assert!(plain.telemetry.unwrap().cache_hit);
+}
+
+// ───────────────────────── ranking parameters ─────────────────────────
+
+/// The host tunes the ranking per search, without a release of the engine: a profile passed
+/// with the request is the one the search ranks by, the preset passed as a profile changes
+/// nothing, and a parameter out of range is refused by name instead of clamped.
+#[test]
+fn a_ranking_profile_passed_with_a_request_is_the_one_it_ranks_by() {
+    let dir = TempDir::new("ranking");
+    let api = indexed_api(config_at(&dir));
+    let search = |ranking: Option<RankingProfile>| {
+        api.clear_query_cache();
+        api.search(SearchRequest {
+            query: LINE_ONE.to_string(),
+            lexical_candidates: vec![lexical_hit(1, LINE_ONE, 15.5)],
+            ranking,
+            ..Default::default()
+        })
+    };
+    let scores = |result: &otzaria_semantic_search::semantic::types::HybridSearchResult| {
+        result
+            .results
+            .iter()
+            .map(|item| (item.id, item.fused_score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+
+    let preset = search(None).unwrap();
+    let passed = search(Some(RankingProfile::default())).unwrap();
+    assert_eq!(scores(&passed), scores(&preset));
+
+    let rrf = search(Some(RankingProfile {
+        fusion_strategy: FusionStrategy::RRF { k: 60 },
+        ..RankingProfile::default()
+    }))
+    .unwrap();
+    assert_eq!(rrf.telemetry.as_ref().unwrap().fusion_strategy, "RRF(k=60)");
+    assert_ne!(scores(&rrf), scores(&preset));
+
+    let error = search(Some(RankingProfile {
+        alpha_override: Some(f32::NAN),
+        ..RankingProfile::default()
+    }))
+    .unwrap_err();
+    assert!(error.contains("alpha_override"), "{error}");
 }

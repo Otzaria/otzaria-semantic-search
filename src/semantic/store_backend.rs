@@ -1,20 +1,20 @@
-//! What a vector backend provides, in two halves: what the runtime may do, and what
-//! only a builder may do.
+//! What a vector backend of the development path provides, in two halves: what a search
+//! may do, and what only indexing may do.
 //!
-//! The split is the contract, not a convenience. The official index is built on a build
-//! machine and opened read-only on the user's device, so the runtime path is handed a
-//! [`VectorSearchBackend`] — which has no `insert`, no `remove` and no `clear` to call.
-//! That is a property of the type rather than a rule a caller has to remember, and it is
-//! why [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex)
-//! cannot write to an artifact even by mistake.
+//! The split is the contract, not a convenience: a search is handed a
+//! [`VectorSearchBackend`], which has no `insert`, no `remove` and no `clear` to call, so
+//! read-only is a property of the type rather than a rule a caller has to remember.
+//! [`VectorStoreBackend`] adds the mutations, and is what the indexing path in
+//! [`SemanticEngine`](crate::semantic::engine::SemanticEngine) gets.
 //!
-//! [`VectorStoreBackend`] adds the mutations, and is what a builder and the prototype
-//! indexing path in [`SemanticEngine`](crate::semantic::engine::SemanticEngine) get.
+//! The official path goes through neither: it opens an installed vector set, which
+//! nothing on a device writes to — see
+//! [`OfficialSemanticIndex`](crate::semantic::official_index::OfficialSemanticIndex).
 //!
-//! Note what neither trait implies: neither implementation is an approximate-nearest-
-//! neighbour index. Both scan every stored vector. Whether a full scan meets the latency
-//! and memory budget at library scale is what S2b measures.
+//! Note what neither trait implies: an approximate-nearest-neighbour index. The backend
+//! here scans every stored vector.
 
+use crate::cancellation::CancellationToken;
 use crate::errors::VectorStoreError;
 use crate::semantic::types::{SearchFilters, SemanticCandidate, VectorMetadata};
 
@@ -37,11 +37,34 @@ pub trait VectorSearchBackend: Send + Sync {
     fn count(&self) -> u32;
 
     /// Search for the top-k most similar vectors to a query.
+    ///
+    /// [`Self::search_cancellable`] with a token nobody cancels — the same scan, the same
+    /// answer.
     fn search(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+    ) -> Result<Vec<SemanticCandidate>, VectorStoreError> {
+        self.search_cancellable(query_vector, top_k, filters, &CancellationToken::new())
+    }
+
+    /// Search for the top-k most similar vectors to a query, or stop with
+    /// [`VectorStoreError::Cancelled`] once `cancel` is cancelled.
+    ///
+    /// The method a backend implements, and it has no default on purpose. The scan is the
+    /// expensive part of a query — every stored vector, with nothing to narrow it — so it
+    /// is where a cancel has to be noticed: an implementation looks at the token before its
+    /// first record and every
+    /// [`SCAN_CHECK_INTERVAL`](crate::cancellation::SCAN_CHECK_INTERVAL) records after
+    /// that, not just once before it starts. A default that only looked first would let a
+    /// new backend compile and still finish every abandoned scan.
+    fn search_cancellable(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
     ) -> Result<Vec<SemanticCandidate>, VectorStoreError>;
 
     /// Book keys that have vectors stored, in a deterministic order.

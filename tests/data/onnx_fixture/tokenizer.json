@@ -1,0 +1,358 @@
+{
+  "version": "1.0",
+  "truncation": {
+    "direction": "Right",
+    "max_length": 512,
+    "strategy": "LongestFirst",
+    "stride": 0
+  },
+  "padding": {
+    "strategy": {
+      "Fixed": 16
+    },
+    "direction": "Right",
+    "pad_to_multiple_of": null,
+    "pad_id": 0,
+    "pad_type_id": 0,
+    "pad_token": "[PAD]"
+  },
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "[PAD]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "[CLS]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "[SEP]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "[MASK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 5,
+      "content": "[QUERY]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 6,
+      "content": "[PASSAGE]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": null,
+    "lowercase": true
+  },
+  "pre_tokenizer": {
+    "type": "BertPreTokenizer"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "[CLS]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "SpecialToken": {
+          "id": "[CLS]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "[SEP]",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "[CLS]": {
+        "id": "[CLS]",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "[CLS]"
+        ]
+      },
+      "[SEP]": {
+        "id": "[SEP]",
+        "ids": [
+          3
+        ],
+        "tokens": [
+          "[SEP]"
+        ]
+      }
+    }
+  },
+  "decoder": {
+    "type": "WordPiece",
+    "prefix": "##",
+    "cleanup": true
+  },
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[PAD]": 0,
+      "[UNK]": 1,
+      "[CLS]": 2,
+      "[SEP]": 3,
+      "[MASK]": 4,
+      "[QUERY]": 5,
+      "[PASSAGE]": 6,
+      "the": 7,
+      "quick": 8,
+      "brown": 9,
+      "fox": 10,
+      "jumps": 11,
+      "over": 12,
+      "lazy": 13,
+      "dog": 14,
+      "in": 15,
+      "beginning": 16,
+      "god": 17,
+      "created": 18,
+      "heaven": 19,
+      "earth": 20,
+      "and": 21,
+      "query": 22,
+      "passage": 23,
+      "cls": 24,
+      "בראשית": 25,
+      "ברא": 26,
+      "אלהים": 27,
+      "את": 28,
+      "השמים": 29,
+      "ואת": 30,
+      "הארץ": 31,
+      "תורה": 32,
+      "משה": 33,
+      "ישראל": 34,
+      "שלום": 35,
+      "ספר": 36,
+      "א": 37,
+      "ב": 38,
+      "ג": 39,
+      "ד": 40,
+      "ה": 41,
+      "ו": 42,
+      "ז": 43,
+      "ח": 44,
+      "ט": 45,
+      "י": 46,
+      "כ": 47,
+      "ך": 48,
+      "ל": 49,
+      "מ": 50,
+      "ם": 51,
+      "נ": 52,
+      "ן": 53,
+      "ס": 54,
+      "ע": 55,
+      "פ": 56,
+      "ף": 57,
+      "צ": 58,
+      "ץ": 59,
+      "ק": 60,
+      "ר": 61,
+      "ש": 62,
+      "ת": 63,
+      "##א": 64,
+      "##ב": 65,
+      "##ג": 66,
+      "##ד": 67,
+      "##ה": 68,
+      "##ו": 69,
+      "##ז": 70,
+      "##ח": 71,
+      "##ט": 72,
+      "##י": 73,
+      "##כ": 74,
+      "##ך": 75,
+      "##ל": 76,
+      "##מ": 77,
+      "##ם": 78,
+      "##נ": 79,
+      "##ן": 80,
+      "##ס": 81,
+      "##ע": 82,
+      "##פ": 83,
+      "##ף": 84,
+      "##צ": 85,
+      "##ץ": 86,
+      "##ק": 87,
+      "##ר": 88,
+      "##ש": 89,
+      "##ת": 90,
+      "a": 91,
+      "b": 92,
+      "c": 93,
+      "d": 94,
+      "e": 95,
+      "f": 96,
+      "g": 97,
+      "h": 98,
+      "i": 99,
+      "j": 100,
+      "k": 101,
+      "l": 102,
+      "m": 103,
+      "n": 104,
+      "o": 105,
+      "p": 106,
+      "q": 107,
+      "r": 108,
+      "s": 109,
+      "t": 110,
+      "u": 111,
+      "v": 112,
+      "w": 113,
+      "x": 114,
+      "y": 115,
+      "z": 116,
+      "##a": 117,
+      "##b": 118,
+      "##c": 119,
+      "##d": 120,
+      "##e": 121,
+      "##f": 122,
+      "##g": 123,
+      "##h": 124,
+      "##i": 125,
+      "##j": 126,
+      "##k": 127,
+      "##l": 128,
+      "##m": 129,
+      "##n": 130,
+      "##o": 131,
+      "##p": 132,
+      "##q": 133,
+      "##r": 134,
+      "##s": 135,
+      "##t": 136,
+      "##u": 137,
+      "##v": 138,
+      "##w": 139,
+      "##x": 140,
+      "##y": 141,
+      "##z": 142,
+      "0": 143,
+      "1": 144,
+      "2": 145,
+      "3": 146,
+      "4": 147,
+      "5": 148,
+      "6": 149,
+      "7": 150,
+      "8": 151,
+      "9": 152,
+      "##0": 153,
+      "##1": 154,
+      "##2": 155,
+      "##3": 156,
+      "##4": 157,
+      "##5": 158,
+      "##6": 159,
+      "##7": 160,
+      "##8": 161,
+      "##9": 162,
+      ".": 163,
+      ",": 164,
+      "!": 165,
+      "?": 166,
+      ":": 167,
+      ";": 168,
+      "-": 169,
+      "(": 170,
+      ")": 171,
+      "[": 172,
+      "]": 173,
+      "'": 174,
+      "\"": 175
+    }
+  }
+}
