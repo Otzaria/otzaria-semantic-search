@@ -213,9 +213,20 @@ impl Warehouse {
     /// Open to read: what `warehouse.json` counts, whatever a crash left past it. Checks
     /// sizes and headers only; [`Self::verify`] checks the contents.
     pub fn open(dir: &Path) -> Result<Self, PackError> {
-        let mut warehouse = Self::unmapped(dir, read_manifest(dir)?);
-        warehouse.map()?;
-        Ok(warehouse)
+        let mut waited = 0;
+        loop {
+            let mut warehouse = Self::unmapped(dir, read_manifest(dir)?);
+            warehouse.map_data()?;
+            let Err(error) = warehouse.map_index() else {
+                return Ok(warehouse);
+            };
+            // An add renames its index into place before it writes the count: wait up to 1 s.
+            if waited == 50 || !index_ahead(dir, warehouse.manifest.records) {
+                return Err(error);
+            }
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     fn unmapped(dir: &Path, manifest: WarehouseManifest) -> Self {
@@ -329,8 +340,9 @@ impl Warehouse {
         let index = map_file(&path)?;
         if let Some(fault) = header_fault(&index, self.manifest.records) {
             return Err(malformed(format!(
-                "{} is not the index of the warehouse's {} records ({fault}); adding to the \
-                 warehouse, or warehouse-verify --repair, rebuilds it",
+                "{} is not the index of the warehouse's {} records ({fault}): the warehouse may \
+                 be being added to; if not, adding to it, or warehouse-verify --repair, \
+                 rebuilds the index",
                 path.display(),
                 self.manifest.records
             )));
@@ -779,6 +791,16 @@ fn read_manifest(dir: &Path) -> Result<WarehouseManifest, PackError> {
         )));
     }
     Ok(manifest)
+}
+
+/// Whether `index.bin` counts more than `records`, as between an add's index and its count.
+fn index_ahead(dir: &Path, records: u64) -> bool {
+    let mut header = [0u8; HEADER];
+    File::open(dir.join(INDEX))
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header[..8] == INDEX_MAGIC[..]
+        && u64::from_le_bytes(header[8..].try_into().expect("8")) > records
 }
 
 /// Why `index`'s header is not that of `records` entries, if it is not.

@@ -499,6 +499,24 @@ fn a_flipped_key_is_refused_and_no_index_is_rebuilt_from_it() {
     assert_eq!(files(&at), before);
 }
 
+/// Between an add's index and its count, a reader is told the warehouse may be being added
+/// to; once the count is written, it opens.
+#[test]
+fn a_reader_between_an_adds_index_and_its_count_is_told_so() {
+    let (_dir, at) = two_batches("warehouse_mid_add");
+    let path = at.join("warehouse.json");
+    let committed = std::fs::read(&path).unwrap();
+    let mut before: serde_json::Value = serde_json::from_slice(&committed).unwrap();
+    before["records"] = 2.into();
+    before["batches"].as_array_mut().unwrap().pop();
+    std::fs::write(&path, serde_json::to_vec(&before).unwrap()).unwrap();
+
+    let error = Warehouse::open(&at).err().unwrap().to_string();
+    assert!(error.contains("may be being added to"), "{error}");
+    std::fs::write(&path, committed).unwrap();
+    assert_eq!(Warehouse::open(&at).unwrap().len(), 4);
+}
+
 /// Batches that do not tile the count, in order and without a gap, are refused on open.
 #[test]
 fn batches_that_do_not_tile_the_count_are_refused() {
