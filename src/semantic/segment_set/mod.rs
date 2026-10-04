@@ -30,6 +30,7 @@
 mod compact;
 mod files;
 mod install;
+mod retry;
 mod space;
 #[cfg(test)]
 mod tests;
@@ -638,13 +639,13 @@ fn refuse_a_v1_artifact(dir: &Path) -> Result<(), ArtifactError> {
 pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
     let staging = dir.join(STAGING_DIR);
     if staging.exists() {
-        fs::remove_dir_all(&staging)
+        retry::remove_dir_all(&staging)
             .map_err(io_error(format!("removing {}", staging.display())))?;
     }
     for name in [format!("{CURRENT}.tmp"), format!("{PREVIOUS}.tmp")] {
         let path = dir.join(name);
         if path.exists() {
-            fs::remove_file(&path).map_err(io_error(format!("removing {}", path.display())))?;
+            retry::remove_file(&path).map_err(io_error(format!("removing {}", path.display())))?;
         }
     }
     collect_garbage(dir);

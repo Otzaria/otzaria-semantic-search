@@ -21,6 +21,7 @@
 //! only ones ever replaced, and `std::fs::rename` replaces atomically on every platform the
 //! crate builds for (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows).
 
+use super::retry;
 use crate::cancellation::CancellationToken;
 use crate::distribution::package::{sync_dir, PackageKind};
 use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
@@ -112,7 +113,7 @@ pub(crate) fn next_generation(dir: &Path) -> Result<u64, ArtifactError> {
 pub(crate) fn write_pointer(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let path = dir.join(name);
     if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-        fs::remove_dir(&path)?;
+        retry::remove_dir(&path)?;
     }
     write_atomically(&path, bytes)
 }
@@ -496,7 +497,7 @@ pub(crate) fn sync_set_dir(path: &Path) -> io::Result<()> {
 
 /// Rename a flushed file into place.
 pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)?;
+    retry::rename(from, to)?;
     note(|| Durable::Renamed(from.to_path_buf(), to.to_path_buf()));
     Ok(())
 }
@@ -776,7 +777,7 @@ pub(crate) fn place_segment(
         .and_then(|()| settle_verdict(dir, id, sha256));
     if let Err(error) = settled {
         if placed != Placed::Kept {
-            let _ = fs::rename(&target, staged);
+            let _ = retry::rename(&target, staged);
         }
         return Err(error.into());
     }
@@ -787,7 +788,7 @@ pub(crate) fn place_segment(
 /// whole. Whether there was one.
 pub(crate) fn clear_verdict(dir: &Path, id: &str) -> Result<bool, ArtifactError> {
     let path = verdict_path(dir, id);
-    match fs::remove_file(&path) {
+    match retry::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(io_error(format!("removing {}", path.display()))(error)),

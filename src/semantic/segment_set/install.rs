@@ -28,7 +28,7 @@ use super::files::{
     Pointer, SetDocument, SetLock, SetSegment, SetStats, CURRENT, INCOMING_DIR, PREVIOUS,
     SEGMENTS_DIR, SET_FILE, SET_FORMAT, SET_FORMAT_VERSION, STAGING_DIR,
 };
-use super::{collect_garbage, recover, space, CompactionPolicy, SegmentSet};
+use super::{collect_garbage, recover, retry, space, CompactionPolicy, SegmentSet};
 use crate::cancellation::CancellationToken;
 use crate::distribution::package::{
     utc_timestamp, IndexPackage, PackageCounts, PackageDescription, PackageKind, PackageManifest,
@@ -233,12 +233,24 @@ pub(crate) enum Step {
 }
 
 #[cfg(test)]
+pub(crate) type StepHook = Box<dyn FnMut(Step)>;
+
+#[cfg(test)]
 thread_local! {
     pub(crate) static CRASH_AT: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
+    /// What a test does at each step an install reaches.
+    pub(crate) static AT_STEP: std::cell::RefCell<Option<StepHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Stop here, as a crash would, when a test asked for it; nothing outside a test build.
 fn reached(step: Step) -> Result<(), ArtifactError> {
+    #[cfg(test)]
+    AT_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
     #[cfg(test)]
     if CRASH_AT.with(|crash| crash.get()) == Some(step) {
         return Err(ArtifactError::InterruptedInstall {
@@ -456,7 +468,7 @@ pub fn install_package(
         Err(error) => {
             if taking && placed != Placed::Kept {
                 let placed_at = dir.join(segment_file(&manifest.segment_id));
-                if let Err(back) = fs::rename(&placed_at, source.segment) {
+                if let Err(back) = retry::rename(&placed_at, source.segment) {
                     log::warn!(
                         "{} could not go back to {}: {back}",
                         placed_at.display(),
@@ -470,7 +482,7 @@ pub fn install_package(
     if placed == Placed::Kept {
         // The same segment, installed before and still on disk — mapped, perhaps: the staged
         // copy, or the host's download, is not needed.
-        let _ = fs::remove_file(&staged);
+        let _ = retry::remove_file(&staged);
     }
 
     let bytes_on_disk = document.stats.bytes;
@@ -999,7 +1011,7 @@ fn copy_hashing(
         Ok(format!("{:x}", hasher.finalize()))
     })();
     if result.is_err() {
-        let _ = fs::remove_file(to);
+        let _ = retry::remove_file(to);
     }
     result
 }
