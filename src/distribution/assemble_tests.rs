@@ -945,6 +945,122 @@ fn a_corrupt_warehouse_fails_assembly_the_gates_and_the_exact_reference() {
     assert!(!machine.dir.join("again").exists());
 }
 
+/// Package metadata can change without changing any vector or batch digest. Consumers
+/// must compare it with the plan and installed release, including an allowed alternative
+/// export of the same family: that export is suitable for queries, not this reference.
+#[test]
+fn warehouse_metadata_is_checked_against_independent_plan_and_set_identities() {
+    let machine = Machine::new("assemble_warehouse_metadata");
+    let alternative = machine.model.query_packages[0].clone();
+    let plan = machine.plan("p1", 1, &v1(), None);
+    let base = machine.assemble(&plan, PackageKind::Base, None, NEW, "base1");
+    let set = simulate_device(&machine.dir.join("device"), &[&base.out_dir]).unwrap();
+    let path = machine.warehouse.join("warehouse.json");
+    let original: super::warehouse::WarehouseManifest = super::files::read_json(&path).unwrap();
+    for change in [
+        "checksum",
+        "quantization",
+        "allowed export",
+        "family",
+        "tokenizer",
+    ] {
+        let mut manifest = original.clone();
+        let expected_error = match change {
+            "checksum" => {
+                let first = manifest.identity.passage_package.checksum.as_bytes()[0];
+                manifest
+                    .identity
+                    .passage_package
+                    .checksum
+                    .replace_range(..1, if first == b'0' { "1" } else { "0" });
+                "not one of the family's"
+            }
+            "quantization" => {
+                manifest.identity.passage_package.quantization = "gp32".to_string();
+                "not one of the family's"
+            }
+            "allowed export" => {
+                manifest.identity.passage_package = alternative.clone();
+                "passage package does not match"
+            }
+            "family" => {
+                manifest.identity.family_id.push_str("-other");
+                "vector identity does not match"
+            }
+            "tokenizer" => {
+                manifest.identity.tokenizer_checksum = "b".repeat(64);
+                "vector identity does not match"
+            }
+            _ => unreachable!(),
+        };
+        super::files::write_json(&path, &manifest).unwrap();
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        // Standalone byte integrity cannot establish which export produced the vectors.
+        warehouse.verify().unwrap();
+        let assembled = assemble(&AssembleRequest {
+            plan: &plan,
+            warehouse: &warehouse,
+            kind: PackageKind::Base,
+            previous: None,
+            epoch: NEW,
+            out_dir: machine.dir.join("refused"),
+            created_at: CREATED.to_string(),
+            built_by: None,
+        })
+        .err()
+        .unwrap();
+        let verified = verify_release(&VerifyRequest {
+            release_dir: &base.out_dir,
+            plan: &plan,
+            warehouse: &warehouse,
+            previous: None,
+            scratch_dir: machine.dir.join("base1-again"),
+            samples: G5_SAMPLES,
+        })
+        .err()
+        .unwrap();
+        let exact = ExactReference::new(&set, &warehouse).err().unwrap();
+        for error in [assembled, verified, exact] {
+            assert!(
+                error.to_string().contains(expected_error),
+                "{change}: {error}"
+            );
+        }
+        assert!(!machine.dir.join("refused").exists());
+    }
+    super::files::write_json(&path, &original).unwrap();
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    ExactReference::new(&set, &warehouse).unwrap();
+    assert!(machine.verify(&plan, "base1", None).passed());
+}
+
+/// The pipeline package declaration must still be the file hashed by the plan, even
+/// when its edited package is another member of the same family.
+#[test]
+fn assembly_checks_the_embed_manifest_digest_before_using_its_package() {
+    let machine = Machine::new("assemble_embed_manifest_digest");
+    let alternative = machine.model.query_packages[0].clone();
+    let plan = machine.plan("p1", 1, &v1(), None);
+    let mut embed = super::plan::EmbedManifest::read(&plan.dir).unwrap();
+    embed.passage_package = alternative;
+    super::files::write_json(&plan.dir.join(super::plan::EMBED_MANIFEST_FILE), &embed).unwrap();
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    let error = assemble(&AssembleRequest {
+        plan: &plan,
+        warehouse: &warehouse,
+        kind: PackageKind::Base,
+        previous: None,
+        epoch: NEW,
+        out_dir: machine.dir.join("refused"),
+        created_at: CREATED.to_string(),
+        built_by: None,
+    })
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("embed-manifest.json"), "{error}");
+    assert!(!machine.dir.join("refused").exists());
+}
+
 /// Assembly's heap grows with the slots it ships, by much less than a vector each: the
 /// vectors stream from the mapped warehouse.
 #[test]

@@ -30,8 +30,8 @@ use crate::distribution::ledger::{
     classify, write_ledger, BaseRecord, Disposition, Ledger, LedgerManifest,
 };
 use crate::distribution::package::{IndexPackage, PackageKind};
-use crate::distribution::plan::Plan;
-use crate::distribution::warehouse::{Warehouse, WarehouseIdentity};
+use crate::distribution::plan::{EmbedManifest, Plan, EMBED_MANIFEST_FILE};
+use crate::distribution::warehouse::Warehouse;
 use crate::errors::PackError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::{Codec, CodecSpec};
@@ -98,19 +98,37 @@ pub fn release_identity(plan_identity: &IndexVersion, codec: &Codec) -> IndexVer
     identity
 }
 
+/// Check the warehouse against the plan's independent identity and, when present, its
+/// digest-bound embed manifest. Plans without an embed manifest still require a package
+/// declared by the family.
+pub(crate) fn check_warehouse(plan: &Plan, warehouse: &Warehouse) -> Result<(), PackError> {
+    warehouse
+        .identity()
+        .ensure_model(&plan.manifest.identity.model)?;
+    if let Some(digest) = plan.manifest.files.get(EMBED_MANIFEST_FILE) {
+        digest.verify(&plan.dir.join(EMBED_MANIFEST_FILE))?;
+        let embed = EmbedManifest::read(&plan.dir)?;
+        if embed.model != plan.manifest.identity.model {
+            return Err(malformed(
+                "the embed manifest's model does not match the plan's",
+            ));
+        }
+        if embed.passage_package != warehouse.identity().passage_package {
+            return Err(malformed(
+                "the warehouse's passage package does not match the plan's embed manifest",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Assemble the release `request` describes. See the module documentation.
 pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackError> {
     let plan = request.plan;
     let warehouse = request.warehouse;
+    check_warehouse(plan, warehouse)?;
     warehouse.verify()?;
     let package = &warehouse.identity().passage_package;
-    if WarehouseIdentity::of(&plan.manifest.identity.model, package) != *warehouse.identity() {
-        return Err(malformed(format!(
-            "the warehouse holds vectors of family {}, and the plan is of {}",
-            warehouse.identity().family_id,
-            plan.manifest.identity.model.family_id
-        )));
-    }
     let delta = match request.kind {
         PackageKind::Delta => Some(
             request

@@ -78,6 +78,25 @@ impl WarehouseIdentity {
             passage_package: package.clone(),
         }
     }
+
+    /// Check against an independently declared family, including both fields of the
+    /// passage package. Reconstructing an identity with an unchecked package from this
+    /// warehouse would only compare that package with itself.
+    pub fn ensure_model(&self, model: &ModelIdentity) -> Result<(), PackError> {
+        if !model.query_packages.contains(&self.passage_package) {
+            return Err(malformed(format!(
+                "the warehouse's passage package {} ({}) is not one of the family's",
+                self.passage_package.checksum, self.passage_package.quantization
+            )));
+        }
+        if Self::of(model, &self.passage_package) != *self {
+            return Err(malformed(format!(
+                "the warehouse's vector identity does not match family {}",
+                model.family_id
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// One batch a warehouse took in.

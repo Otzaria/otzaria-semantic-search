@@ -15,7 +15,7 @@
 
 use crate::cancellation::CancellationToken;
 use crate::distribution::assemble::{
-    assemble, AssembleRequest, EpochChoice, RELEASE_FILE, SEGMENT_FILE,
+    assemble, check_warehouse, AssembleRequest, EpochChoice, RELEASE_FILE, SEGMENT_FILE,
 };
 use crate::distribution::files::{hex, malformed, read_json, sha256, FileDigest};
 use crate::distribution::ledger::{manifest_file_name, Ledger};
@@ -120,8 +120,14 @@ pub struct VerifyRequest<'a> {
 /// all, as against a warehouse that fails [`Warehouse::verify`]; a gate that fails is in the report.
 pub fn verify_release(request: &VerifyRequest<'_>) -> Result<GateReport, PackError> {
     let dir = request.release_dir;
+    check_warehouse(request.plan, request.warehouse)?;
     request.warehouse.verify()?;
     let manifest: ReleaseManifest = read_json(&dir.join(RELEASE_FILE))?;
+    if manifest.provenance.passage_package != request.warehouse.identity().passage_package {
+        return Err(malformed(
+            "the warehouse's passage package does not match the release's provenance",
+        ));
+    }
     let segment = Segment::open(&dir.join(SEGMENT_FILE))?;
     let content = content_pass(&segment, request.warehouse, request.samples);
     let gates = vec![
@@ -651,8 +657,20 @@ pub struct ExactReference<'a> {
 
 impl<'a> ExactReference<'a> {
     /// Every live key of `set`. Refused if the warehouse fails [`Warehouse::verify`] or
-    /// lacks one's vector.
+    /// lacks one's vector, or disagrees with the set's family or a live segment's passage
+    /// package. An exact reference must come from the same export that made the vectors.
     pub fn new(set: &SegmentSet, warehouse: &'a Warehouse) -> Result<Self, PackError> {
+        warehouse.identity().ensure_model(&set.identity().model)?;
+        for segment in &set.info().segments {
+            if segment.slots > segment.slots_dead
+                && segment.provenance.passage_package != warehouse.identity().passage_package
+            {
+                return Err(malformed(format!(
+                    "the warehouse's passage package does not match segment {}'s provenance",
+                    segment.id
+                )));
+            }
+        }
         warehouse.verify()?;
         let mut entries = Vec::new();
         for (seg, segment) in set.segments().iter().enumerate() {
