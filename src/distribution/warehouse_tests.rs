@@ -1,7 +1,7 @@
 use super::files::sha256;
-use super::plan::{plan_from_corpus, EmbedManifest, PlanRequest};
+use super::plan::{plan_from_corpus, EmbedManifest, HeldVectors, PlanRequest};
 use super::shard::*;
-use super::testing::{corpus, family, passage_package, stub_model, TempDir, DIM};
+use super::testing::{corpus, family, passage_package, raw_shard, stub_model, TempDir, DIM};
 use super::warehouse::{Warehouse, WarehouseIdentity};
 use crate::semantic::backend::Pooling;
 use crate::semantic::chunker::ChunkerConfig;
@@ -310,4 +310,231 @@ fn fixture_with(dir: &TempDir, text: &str) -> PathBuf {
     )
     .unwrap();
     out
+}
+
+/// A warehouse of `TEXTS` in two batches, records 0..2 and 2..4, verified sound.
+fn two_batches(name: &str) -> (TempDir, PathBuf) {
+    let dir = TempDir::new(name);
+    let model_path = stub_model(dir.path());
+    let (model, package) = (family(&model_path), passage_package(&model_path));
+    let at = dir.join("warehouse");
+    Warehouse::create(&at, WarehouseIdentity::of(&model, &package)).unwrap();
+    for (n, texts) in TEXTS.chunks(2).enumerate() {
+        let lines: Vec<(u64, &str, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(line, text)| (line as u64 + 1, "otzaria/a.txt", *text))
+            .collect();
+        let plan = dir.join(&format!("plan{n}"));
+        plan_from_corpus(
+            &corpus(dir.path(), &format!("c{n}"), 1, &lines),
+            PlanRequest {
+                out_dir: plan.clone(),
+                model: model.clone(),
+                chunking: ChunkerConfig::default(),
+                passage_package: package.clone(),
+                previous: None,
+                warehouse: None,
+                created_at: "2026-10-02T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        let shard = raw_shard(&plan, &dir.join(&format!("shard{n}")));
+        Warehouse::open_for_append(&at)
+            .unwrap()
+            .add_shards(Some(&plan), &[shard], &POLICY, "now".into())
+            .unwrap();
+    }
+    let warehouse = Warehouse::open(&at).unwrap();
+    let verified = warehouse.verify().unwrap();
+    assert_eq!(
+        (verified.records, verified.batches, verified.bytes),
+        (4, 2, 4 * (DIM as u64 * 4 + 32))
+    );
+    for (record, text) in TEXTS.iter().enumerate() {
+        assert_eq!(
+            warehouse.find(&sha256(text.as_bytes())),
+            Some(record as u64)
+        );
+    }
+    (dir, at)
+}
+
+fn flip(path: &Path, at: usize, mask: u8) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[at] ^= mask;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Every file of the warehouse, to show that a refusal changed none.
+fn files(at: &Path) -> Vec<Vec<u8>> {
+    ["warehouse.json", "vectors.f32", "keys.bin", "index.bin"]
+        .iter()
+        .map(|name| std::fs::read(at.join(name)).unwrap())
+        .collect()
+}
+
+/// Where `text`'s entry starts in `index.bin`.
+fn entry_of(at: &Path, text: &str) -> usize {
+    let index = std::fs::read(at.join("index.bin")).unwrap();
+    let key = sha256(text.as_bytes());
+    (16..index.len())
+        .step_by(40)
+        .find(|&entry| index[entry..entry + 32] == key)
+        .unwrap()
+}
+
+fn prefix(text: &str) -> [u8; 16] {
+    sha256(text.as_bytes())[..16].try_into().unwrap()
+}
+
+/// The audit's first case: one bit of one vector flipped. Opening to read checks sizes
+/// only, but verifying refuses it, naming the batch, and an append refuses it before
+/// writing anything.
+#[test]
+fn a_flipped_vector_bit_is_refused_naming_its_batch() {
+    let (_dir, at) = two_batches("warehouse_vector_bit");
+    flip(&at.join("vectors.f32"), 3 * DIM as usize * 4 + 5, 0x40);
+    let before = files(&at);
+
+    let warehouse = Warehouse::open(&at).unwrap();
+    let error = warehouse.verify().unwrap_err().to_string();
+    assert!(
+        error.contains("batch 1 (records 2..4, added now): vectors.f32 hashes to"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("batch 0") && !error.contains("keys.bin hashes"),
+        "{error}"
+    );
+    assert!(error.contains("not repaired"), "{error}");
+    drop(warehouse);
+
+    let error = Warehouse::open_for_append(&at).err().unwrap().to_string();
+    assert!(error.contains("batch 1 (records 2..4"), "{error}");
+    assert_eq!(files(&at), before, "a refused warehouse is left as it was");
+}
+
+/// The audit's second case: an index entry pointing at another text's record, both data
+/// files intact. A lookup finds nothing rather than the other vector, verifying names
+/// the entry, and an append rebuilds the index from the verified keys.
+#[test]
+fn an_index_pointing_at_another_record_finds_nothing_until_an_append_rebuilds_it() {
+    let (_dir, at) = two_batches("warehouse_index_pointer");
+    let entry = entry_of(&at, TEXTS[1]);
+    flip(&at.join("index.bin"), entry + 32, 1);
+    let before = files(&at);
+
+    let warehouse = Warehouse::open(&at).unwrap();
+    let key = sha256(TEXTS[1].as_bytes());
+    assert_eq!(warehouse.find(&key), None);
+    assert_eq!(warehouse.find_key(&prefix(TEXTS[1])), None);
+    assert!(!warehouse.holds(&key));
+    assert_eq!(warehouse.find(&sha256(TEXTS[0].as_bytes())), Some(0));
+    let error = warehouse.verify().unwrap_err().to_string();
+    assert!(
+        error.contains("index.bin is not the index of keys.bin")
+            && error.contains("at record 0, which holds key"),
+        "{error}"
+    );
+    assert!(error.contains("rebuilds the index"), "{error}");
+    drop(warehouse);
+    assert_eq!(files(&at), before, "reading repairs nothing");
+
+    let repaired = Warehouse::open_for_append(&at).unwrap();
+    let rebuilt = repaired.verify().unwrap().index_rebuilt.unwrap();
+    assert!(rebuilt.contains("at record 0"), "{rebuilt}");
+    assert_eq!(repaired.find(&key), Some(1));
+    drop(repaired);
+    assert_eq!(files(&at)[..3], before[..3], "only the index is rewritten");
+
+    let reopened = Warehouse::open(&at).unwrap();
+    assert_eq!(reopened.verify().unwrap().index_rebuilt, None);
+    assert_eq!(reopened.find_key(&prefix(TEXTS[1])), Some(1));
+}
+
+/// A flipped byte of an index entry's key: the text is no longer found, the entry finds
+/// nothing either, and an append rebuilds the index.
+#[test]
+fn a_flipped_index_key_byte_is_caught_and_rebuilt() {
+    let (_dir, at) = two_batches("warehouse_index_key");
+    let entry = entry_of(&at, TEXTS[2]);
+    flip(&at.join("index.bin"), entry + 31, 0x01);
+    let mut flipped = sha256(TEXTS[2].as_bytes());
+    flipped[31] ^= 0x01;
+
+    let warehouse = Warehouse::open(&at).unwrap();
+    assert_eq!(warehouse.find(&sha256(TEXTS[2].as_bytes())), None);
+    assert_eq!(warehouse.find(&flipped), None);
+    let error = warehouse.verify().unwrap_err().to_string();
+    assert!(
+        error.contains("index.bin is not the index of keys.bin"),
+        "{error}"
+    );
+    drop(warehouse);
+
+    let repaired = Warehouse::open_for_append(&at).unwrap();
+    assert!(repaired.verify().unwrap().index_rebuilt.is_some());
+    assert_eq!(repaired.find(&sha256(TEXTS[2].as_bytes())), Some(2));
+}
+
+/// A flipped byte of keys.bin fails its batch's digest. The index cannot be rebuilt from
+/// keys that are not sound, so an append refuses and changes nothing.
+#[test]
+fn a_flipped_key_is_refused_and_no_index_is_rebuilt_from_it() {
+    let (_dir, at) = two_batches("warehouse_key_byte");
+    flip(&at.join("keys.bin"), 7, 0x10);
+    let before = files(&at);
+
+    let warehouse = Warehouse::open(&at).unwrap();
+    assert_eq!(warehouse.find(&sha256(TEXTS[0].as_bytes())), None);
+    let error = warehouse.verify().unwrap_err().to_string();
+    assert!(
+        error.contains("batch 0 (records 0..2, added now): keys.bin hashes to"),
+        "{error}"
+    );
+    assert!(error.contains("not repaired"), "{error}");
+    drop(warehouse);
+
+    let error = Warehouse::open_for_append(&at).err().unwrap().to_string();
+    assert!(error.contains("keys.bin hashes to"), "{error}");
+    assert_eq!(files(&at), before);
+}
+
+/// Batches that do not tile the count, in order and without a gap, are refused on open.
+#[test]
+fn batches_that_do_not_tile_the_count_are_refused() {
+    let (_dir, at) = two_batches("warehouse_tiling");
+    let path = at.join("warehouse.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let refused = |case: &str, edit: &dyn Fn(&mut serde_json::Value), expected: &str| {
+        let mut manifest = original.clone();
+        edit(&mut manifest);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let before = files(&at);
+        for error in [
+            Warehouse::open(&at).err(),
+            Warehouse::open_for_append(&at).err(),
+        ] {
+            let error = error.unwrap().to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+        }
+        assert_eq!(files(&at), before, "{case}: nothing is truncated");
+    };
+    refused(
+        "a gap",
+        &|manifest| manifest["batches"][1]["first"] = 3.into(),
+        "batch 1 starts at record 3, and the batches before it end at 2",
+    );
+    refused(
+        "an overlap",
+        &|manifest| manifest["batches"][0]["records"] = 3.into(),
+        "batch 1 starts at record 2, and the batches before it end at 3",
+    );
+    refused(
+        "a count past the batches",
+        &|manifest| manifest["records"] = 5.into(),
+        "the batches cover records 0..4, and it counts 5",
+    );
 }

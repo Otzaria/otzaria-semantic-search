@@ -102,6 +102,7 @@ pub fn release_identity(plan_identity: &IndexVersion, codec: &Codec) -> IndexVer
 pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackError> {
     let plan = request.plan;
     let warehouse = request.warehouse;
+    warehouse.verify()?;
     let package = &warehouse.identity().passage_package;
     if WarehouseIdentity::of(&plan.manifest.identity.model, package) != *warehouse.identity() {
         return Err(malformed(format!(
