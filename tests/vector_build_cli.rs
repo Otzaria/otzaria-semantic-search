@@ -495,3 +495,109 @@ fn a_delta_that_ships_no_vector_verifies_through_the_cli() {
         ]
     );
 }
+
+/// The audit's two corruptions of a warehouse, through the CLI. A flipped vector bit fails
+/// assembly, the gates and warehouse-verify, naming its batch, and nothing repairs it. An
+/// index entry pointing at another text's record fails them too, until
+/// `warehouse-verify --repair` rebuilds the index from the verified keys.
+#[test]
+fn a_corrupt_warehouse_fails_assembly_and_only_its_index_is_repaired() {
+    let build = Build::new("vector-build-cli-corrupt");
+    let (work, warehouse) = (&build.work, build.warehouse.as_str());
+    let plan = build.step(1, &[("otzaria/a.txt", &[1, 2, 3])], None);
+    let assemble = |out: &str| -> Vec<String> {
+        [
+            "assemble",
+            "--kind",
+            "base",
+            "--plan",
+            &plan,
+            "--warehouse",
+            warehouse,
+            "--out",
+            out,
+            "--created-at",
+            AT,
+            "--verify",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    fn as_str(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+    let base = work.path("base");
+    let text = ok(&as_str(&assemble(&base)));
+    assert!(
+        text.contains("Verified:        3 record(s) in 1 batch(es)"),
+        "{text}"
+    );
+    let segment = std::fs::read(Path::new(&base).join("segment.oxv")).unwrap();
+    let verify_base = [
+        "assemble",
+        "--verify",
+        "--plan",
+        &plan,
+        "--warehouse",
+        warehouse,
+        "--out",
+        &base,
+    ];
+    let check = ["warehouse-verify", "--warehouse", warehouse];
+    let repair = ["warehouse-verify", "--warehouse", warehouse, "--repair"];
+
+    let vectors = Path::new(warehouse).join("vectors.f32");
+    let original = std::fs::read(&vectors).unwrap();
+    let mut flipped = original.clone();
+    flipped[DIM * 4 + 2] ^= 0x80;
+    std::fs::write(&vectors, &flipped).unwrap();
+    let again = assemble(&work.path("again-a"));
+    for args in [
+        as_str(&again),
+        verify_base.to_vec(),
+        check.to_vec(),
+        repair.to_vec(),
+    ] {
+        let (code, text) = run(&args);
+        assert_eq!(code, 1, "{args:?}:\n{text}");
+        assert!(
+            text.contains("batch 0 (records 0..3") && text.contains("vectors.f32 hashes to"),
+            "{args:?}:\n{text}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&vectors).unwrap(),
+        flipped,
+        "nothing repairs data"
+    );
+    std::fs::write(&vectors, &original).unwrap();
+
+    let index_path = Path::new(warehouse).join("index.bin");
+    let mut index = std::fs::read(&index_path).unwrap();
+    let entry = (16..index.len())
+        .step_by(40)
+        .find(|&entry| index[entry + 32] == 1)
+        .unwrap();
+    index[entry + 32] = 0;
+    std::fs::write(&index_path, &index).unwrap();
+    let again = assemble(&work.path("again-b"));
+    for args in [as_str(&again), verify_base.to_vec(), check.to_vec()] {
+        let (code, text) = run(&args);
+        assert_eq!(code, 1, "{args:?}:\n{text}");
+        assert!(
+            text.contains("index.bin is not the index of keys.bin"),
+            "{args:?}:\n{text}"
+        );
+    }
+    let text = ok(&repair);
+    assert!(text.contains("Index rebuilt:"), "{text}");
+    let text = ok(&check);
+    assert!(!text.contains("Index rebuilt:"), "{text}");
+    let rebuilt = work.path("rebuilt");
+    ok(&as_str(&assemble(&rebuilt)));
+    assert!(gates(&rebuilt).iter().all(|(_, passed)| *passed));
+    assert_eq!(
+        std::fs::read(Path::new(&rebuilt).join("segment.oxv")).unwrap(),
+        segment
+    );
+}
