@@ -469,7 +469,8 @@ otzaria-semantic-search/
     קטנות במקום תלות.
   - `retry` — ה-rename וההסרות של הסט. ב-Windows סירוב 5 או 32 (handle בלי
     `FILE_SHARE_DELETE`) נוסה שוב עד כ-1.9 שניות (§5.5 של החוזה); בכל מקום אחר — קריאת
-    `std::fs` אחת. איסוף האשפה אינו עובר דרכו.
+    `std::fs` אחת. איסוף האשפה אינו עובר דרכו. `write_atomically` כותב לשם זמני משלו
+    (`<name>.<pid>-<n>.tmp`), כי scrub כותב פסקי דין בלי ה-lock.
 
 * [`src/semantic/resolve.rs`](../src/semantic/resolve.rs) — **הפורט אל השורות החיות.**
   - `VectorHit` (ציון, מפתח, רשומות, segment ו-slot), `RecordRef` (ספר ו-hint), `BookSet`
