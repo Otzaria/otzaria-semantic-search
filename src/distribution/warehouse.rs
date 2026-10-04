@@ -122,7 +122,40 @@ pub struct Warehouse {
     manifest: WarehouseManifest,
     vectors: Option<Mmap>,
     index: Option<Mmap>,
-    _lock: Option<File>,
+    _lock: Option<AppendLock>,
+}
+
+/// The lock an append holds on its warehouse, for as long as the value lives.
+struct AppendLock(File);
+
+impl AppendLock {
+    fn take(dir: &Path) -> Result<Self, PackError> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK))
+            .map_err(io_error(format!("opening {}", dir.join(LOCK).display())))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Self(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(malformed(format!(
+                "{} is being added to by another process",
+                dir.display()
+            ))),
+            Err(std::fs::TryLockError::Error(source)) => Err(PackError::Io {
+                context: format!("locking {}", dir.display()),
+                source,
+            }),
+        }
+    }
+}
+
+impl Drop for AppendLock {
+    /// Unlocked, not only closed: a process spawned meanwhile shares the descriptor until it
+    /// execs, and closing ours would leave the lock held by its copy.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl Warehouse {
@@ -176,27 +209,7 @@ impl Warehouse {
 
     /// Open to add a batch: hold the lock, and repair what a crash left.
     pub fn open_for_append(dir: &Path) -> Result<Self, PackError> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(LOCK))
-            .map_err(io_error(format!("opening {}", dir.join(LOCK).display())))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(malformed(format!(
-                    "{} is being added to by another process",
-                    dir.display()
-                )))
-            }
-            Err(std::fs::TryLockError::Error(source)) => {
-                return Err(PackError::Io {
-                    context: format!("locking {}", dir.display()),
-                    source,
-                })
-            }
-        }
+        let lock = AppendLock::take(dir)?;
         let manifest: WarehouseManifest = read_json(&dir.join(MANIFEST_FILE))?;
         let width = manifest.identity.embedding_dim as u64 * 4;
         for (name, bytes) in [
@@ -615,4 +628,21 @@ fn rebuild_index(dir: &Path, records: u64) -> Result<(), PackError> {
     }
     entries.sort_unstable_by(|a, b| a[..32].cmp(&b[..32]));
     write_index(&dir.join(INDEX), entries.into_iter())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distribution::testing::TempDir;
+
+    #[test]
+    fn a_dropped_lock_is_free_whoever_shares_its_descriptor() {
+        let work = TempDir::new("warehouse_lock_shared");
+        let held = AppendLock::take(work.path()).unwrap();
+        // What a process spawned while the lock is held keeps until it execs.
+        let inherited = held.0.try_clone().unwrap();
+        drop(held);
+        assert!(AppendLock::take(work.path()).is_ok());
+        drop(inherited);
+    }
 }
