@@ -2616,13 +2616,13 @@ fn windows_a_download_held_past_the_retries_stays_and_the_old_generation_serves(
     assert!(!download.exists(), "taken into the set");
 }
 
-/// A reader still maps a segment an install would replace: the damaged base of a condemned
-/// set, mapped before the scrub. A mapping outlasts every retry, so the install fails with
-/// Windows' refusal, and changes nothing: the set and its verdict are as they were, and the
-/// download stays where the host left it. Unmapped, the repair installs.
+/// A reader still maps a segment an install replaces: the damaged base of a condemned set,
+/// mapped before the scrub. On NTFS `std::fs::rename` falls back to POSIX semantics when
+/// `MoveFileExW` refuses, so the file is replaced as on Unix: the reader keeps the bytes it
+/// mapped, and the set opens on the repair. No retry is involved.
 #[cfg(windows)]
 #[test]
-fn windows_a_segment_a_reader_maps_is_not_replaced_and_the_set_stays_as_it_was() {
+fn windows_a_segment_a_reader_maps_is_replaced_and_the_reader_keeps_its_bytes() {
     let work = TempDir::new("set_mapped_segment");
     let dir = work.join("vectors");
     install(&dir, &release(&work, &v29(), None)).unwrap();
@@ -2630,27 +2630,28 @@ fn windows_a_segment_a_reader_maps_is_not_replaced_and_the_set_stays_as_it_was()
     let file = dir.join(format!("segments/{id}.oxv"));
     let damaged = damage_last_byte(&file);
     assert!(is_corrupt(scrub(&dir, &CancellationToken::new())));
-    let verdict = std::fs::read(files::verdict_path(&dir, &id)).unwrap();
-    let as_it_was = on_disk(&dir);
     let mapped = unsafe { memmap2::Mmap::map(&std::fs::File::open(&file).unwrap()) }.unwrap();
-    let (download, json) = downloaded(&dir, &republished(&work, &v29(), None), "repair.oxv");
+    let again = republished(&work, &v29(), None);
+    let (download, json) = downloaded(&dir, &again, "repair.oxv");
 
     refusals();
-    let refused = os_error_of(install(&dir, &(download.clone(), json.clone())));
-    assert!(matches!(refused, Some(5 | 32)), "{refused:?}");
-    assert_eq!(refusals(), retry::DELAYS.len() + 1);
-    assert_eq!(&mapped[..], &damaged[..]);
-    assert_eq!(std::fs::read(&file).unwrap(), damaged);
-    assert_eq!(on_disk(&dir), as_it_was);
-    assert_eq!(
-        std::fs::read(files::verdict_path(&dir, &id)).unwrap(),
-        verdict
-    );
-    assert!(download.exists(), "the download is lost");
-    assert!(is_corrupt(SegmentSet::open(&dir)));
-    drop(mapped);
-
-    let report = install(&dir, &(download, json)).unwrap();
+    let report = install(&dir, &(download.clone(), json))
+        .unwrap_or_else(|error| panic!("the repair must install: {error}"));
+    assert_eq!(refusals(), 0);
     assert_eq!((report.generation, report.library_version), (2, 29));
-    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 2);
+    assert_eq!(
+        &mapped[..],
+        &damaged[..],
+        "the reader keeps the bytes it mapped"
+    );
+    assert_eq!(
+        files::sha256_hex(&std::fs::read(&file).unwrap()),
+        manifest_of(&again).segment.sha256
+    );
+    assert!(!download.exists(), "taken into the set");
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    assert!(!set.info().recovered_from_previous);
+    drop(set);
+    drop(mapped);
 }
