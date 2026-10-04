@@ -189,6 +189,7 @@ fn lexical_hit(line_id: u64, text: &str, bm25_score: f32) -> LexicalCandidate {
         is_pdf: false,
         file_path: GENESIS.to_string(),
         bm25_score,
+        facets: Vec::new(),
     }
 }
 

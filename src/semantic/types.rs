@@ -15,6 +15,19 @@ pub const FACET_DIMENSION_ROOTS: [&str; 3] = ["author", "era", "base"];
 /// root.
 const FACET_GROUP_COUNT: usize = FACET_DIMENSION_ROOTS.len() + 1;
 
+/// The facet of the library's foundational books, the `base` dimension's root.
+pub const FOUNDATIONAL_FACET: &str = "/base";
+
+/// Whether a book's facets place it among the foundational books: [`FOUNDATIONAL_FACET`]
+/// itself or any path under it.
+pub fn is_foundational(facets: &[String]) -> bool {
+    facets.iter().any(|facet| {
+        facet
+            .strip_prefix(FOUNDATIONAL_FACET)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
 /// What a book's fingerprint can prove, before its lines have been loaded.
 ///
 /// # Why this is not a bare `u64`
@@ -436,6 +449,10 @@ pub struct LexicalCandidate {
     pub is_pdf: bool,
     pub file_path: String,
     pub bm25_score: f32,
+    /// The book's facet paths, as the lexical engine indexes them. Read only for the
+    /// foundational bonus; empty when the host does not supply them.
+    #[serde(default)]
+    pub facets: Vec<String>,
 }
 
 /// Identifies the origin of a search result.
@@ -507,6 +524,11 @@ pub struct FusedCandidate {
     pub semantic_position: Option<u32>,
     pub lexical_weight: f32,
     pub semantic_weight: f32,
+    /// A foundational book's line, under a profile with a
+    /// [`foundational_bonus`](crate::config::profiles::RankingProfile::foundational_bonus):
+    /// the bonus is in [`Self::fused_score`], and among equal scores it comes first.
+    #[serde(default)]
+    pub foundational: bool,
 }
 
 /// Represents a merged sibling in the semantic engine.

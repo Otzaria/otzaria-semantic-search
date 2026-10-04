@@ -130,9 +130,9 @@ pub struct RankingProfile {
     pub profile: SearchProfile,
     /// How the two sides' scores are combined: weighted by alpha (`Weighted`, and
     /// `Adaptive`, which also min-max normalizes BM25 when its scores run high), or by rank
-    /// (`RRF { k }`: `1 / (k + rank)` from each side, with the semantic threshold deciding
-    /// only which semantic candidates take part, and no bonus or penalty applied). `k` must
-    /// be at least 1.
+    /// (`RRF { k }`: `1 / (k + rank)` from each side, in every mode, with the semantic
+    /// threshold deciding only which semantic candidates take part in a hybrid search, and
+    /// no bonus or penalty applied but [`Self::foundational_bonus`]). `k` must be at least 1.
     pub fusion_strategy: FusionStrategy,
     /// One alpha for every query, in place of [`Self::alpha_by_query_type`]. From 0 to 1.
     pub alpha_override: Option<f32>,
@@ -164,6 +164,15 @@ pub struct RankingProfile {
     pub query_cache_enabled: bool,
     pub embedding_cache_enabled: bool,
     pub telemetry_enabled: bool,
+    /// Added once to the fused score of a line of a foundational book
+    /// ([`is_foundational`](crate::semantic::types::is_foundational)), in every strategy and
+    /// mode. From 0 to 1; 0, every preset's value, leaves the ranking as it was.
+    #[serde(default)]
+    pub foundational_bonus: f32,
+    /// A second semantic query restricted to the foundational books fetches this share of
+    /// the main query's candidate count, appended after them. From 0 to 1; 0 is off.
+    #[serde(default)]
+    pub foundational_candidate_share: f32,
 }
 
 impl RankingProfile {
@@ -187,6 +196,8 @@ impl RankingProfile {
                 query_cache_enabled: true,
                 embedding_cache_enabled: true,
                 telemetry_enabled: true,
+                foundational_bonus: 0.0,
+                foundational_candidate_share: 0.0,
             },
             SearchProfile::Balanced => Self {
                 profile,
@@ -207,6 +218,8 @@ impl RankingProfile {
                 query_cache_enabled: true,
                 embedding_cache_enabled: true,
                 telemetry_enabled: true,
+                foundational_bonus: 0.0,
+                foundational_candidate_share: 0.0,
             },
             SearchProfile::Best => Self {
                 profile,
@@ -225,6 +238,8 @@ impl RankingProfile {
                 query_cache_enabled: true,
                 embedding_cache_enabled: true,
                 telemetry_enabled: true,
+                foundational_bonus: 0.0,
+                foundational_candidate_share: 0.0,
             },
         }
     }
@@ -286,6 +301,11 @@ impl RankingProfile {
             ("rare_term_bonus", self.rare_term_bonus),
             ("section_coverage_bonus", self.section_coverage_bonus),
             ("duplicate_penalty", self.duplicate_penalty),
+            ("foundational_bonus", self.foundational_bonus),
+            (
+                "foundational_candidate_share",
+                self.foundational_candidate_share,
+            ),
         ] {
             require_unit(parameter, value)?;
         }
@@ -389,6 +409,8 @@ mod tests {
             assert_eq!(profile.alpha_by_query_type, QueryTypeAlphas::default());
             assert_eq!(profile.bm25_saturation_k, DEFAULT_BM25_SATURATION_K);
             assert!(profile.alpha_override.is_none());
+            assert_eq!(profile.foundational_bonus, 0.0, "{preset}");
+            assert_eq!(profile.foundational_candidate_share, 0.0, "{preset}");
             assert!(profile.validate().is_ok(), "{preset}");
         }
     }
@@ -398,7 +420,7 @@ mod tests {
     #[test]
     fn a_parameter_the_ranking_is_not_defined_for_is_refused_by_name() {
         type Adjust = fn(&mut RankingProfile);
-        let cases: [(&str, Adjust); 26] = [
+        let cases: [(&str, Adjust); 30] = [
             ("fusion_strategy.k", |p| {
                 p.fusion_strategy = FusionStrategy::RRF { k: 0 }
             }),
@@ -444,6 +466,14 @@ mod tests {
             }),
             ("candidate_window_multiplier", |p| {
                 p.candidate_window_multiplier = f32::NAN
+            }),
+            ("foundational_bonus", |p| p.foundational_bonus = -0.001),
+            ("foundational_bonus", |p| p.foundational_bonus = f32::NAN),
+            ("foundational_candidate_share", |p| {
+                p.foundational_candidate_share = 1.5
+            }),
+            ("foundational_candidate_share", |p| {
+                p.foundational_candidate_share = f32::INFINITY
             }),
         ];
 
@@ -491,6 +521,8 @@ mod tests {
                 section_coverage_bonus: one,
                 duplicate_penalty: zero,
                 candidate_window_multiplier: 1.0 + 9.0 * one,
+                foundational_bonus: zero,
+                foundational_candidate_share: one,
                 ..RankingProfile::from_profile(SearchProfile::Best)
             };
             assert!(profile.validate().is_ok(), "{profile:?}");
@@ -510,6 +542,8 @@ mod tests {
             let object = json.as_object_mut().unwrap();
             assert!(object.remove("alpha_by_query_type").is_some());
             assert!(object.remove("bm25_saturation_k").is_some());
+            assert!(object.remove("foundational_bonus").is_some());
+            assert!(object.remove("foundational_candidate_share").is_some());
 
             let read: RankingProfile = serde_json::from_value(json).unwrap();
             assert_eq!(read, RankingProfile::from_profile(preset));

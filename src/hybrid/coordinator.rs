@@ -38,9 +38,9 @@ use crate::semantic::official_index::{OfficialSemanticIndex, ReloadOutcome};
 use crate::semantic::resolve::{CandidateResolver, NoResolver, ResolvedLine, VectorHit};
 use crate::semantic::segment_set::SetInfo;
 use crate::semantic::types::{
-    BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling, HybridResultItem,
-    HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate, ResultSource, SearchFilters,
-    SearchMode, SemanticCandidate, SemanticStatus, VectorMetadata,
+    is_foundational, BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling,
+    HybridResultItem, HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate,
+    ResultSource, SearchFilters, SearchMode, SemanticCandidate, SemanticStatus, VectorMetadata,
 };
 use crate::telemetry::SearchTelemetry;
 use sha2::{Digest, Sha256};
@@ -846,10 +846,12 @@ impl HybridCoordinator {
             SEMANTIC_RELEVANCE_THRESHOLD
         };
         let norm_sem = normalize_semantic_with_threshold(&sem_scores, threshold);
+        // In a single-source mode too, so the foundational bonus is in the same units.
         let rrf_k = match profile.fusion_strategy {
-            FusionStrategy::RRF { k } if mode == SearchMode::Hybrid => Some(k.max(1)),
+            FusionStrategy::RRF { k } => Some(k.max(1)),
             _ => None,
         };
+        let foundational_on = profile.foundational_bonus > 0.0;
 
         let mut fused_map: HashMap<(String, u64), FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
@@ -883,6 +885,7 @@ impl HybridCoordinator {
                     semantic_position: None,
                     lexical_weight: alpha,
                     semantic_weight: 1.0 - alpha,
+                    foundational: foundational_on && is_foundational(&candidate.facets),
                 },
             );
         }
@@ -893,9 +896,9 @@ impl HybridCoordinator {
             // Where the semantic path placed the line, the order ties fall in.
             let position = u32::try_from(position).unwrap_or(u32::MAX);
             // RRF ignores score magnitudes, so a threshold only has meaning if
-            // candidates below it are excluded. Weighted/adaptive fusion keeps
-            // them at zero to preserve semantic-only paging and grouping.
-            if normalized <= 0.0 && rrf_k.is_some() {
+            // candidates below it are excluded. Weighted/adaptive fusion, and a
+            // single-source mode, keep them to preserve semantic-only paging and grouping.
+            if normalized <= 0.0 && rrf_k.is_some() && mode == SearchMode::Hybrid {
                 continue;
             }
             let line_id = candidate.metadata.line_id;
@@ -926,6 +929,9 @@ impl HybridCoordinator {
                     if mode == SearchMode::Hybrid && rrf_k.is_none() {
                         existing.fused_score += profile.agreement_bonus.max(0.0);
                     }
+                    if foundational_on && !existing.foundational {
+                        existing.foundational = is_foundational(&candidate.metadata.facets);
+                    }
                 }
                 // Semantic-only: the vector store holds metadata but no line
                 // body, so the text has to be hydrated from Tantivy by id.
@@ -953,6 +959,7 @@ impl HybridCoordinator {
                             semantic_position: Some(position),
                             lexical_weight: alpha,
                             semantic_weight: 1.0 - alpha,
+                            foundational: foundational_on && is_foundational(&metadata.facets),
                         },
                     );
                 }
@@ -960,6 +967,14 @@ impl HybridCoordinator {
         }
 
         let mut results: Vec<FusedCandidate> = fused_map.into_values().collect();
+        if foundational_on {
+            for candidate in results
+                .iter_mut()
+                .filter(|candidate| candidate.foundational)
+            {
+                candidate.fused_score += profile.foundational_bonus;
+            }
+        }
         if rrf_k.is_none() {
             let mut section_counts: HashMap<(String, u64), usize> = HashMap::new();
             for candidate in &results {
@@ -1338,6 +1353,10 @@ fn hash_search_inputs(
         feed(&mut hasher, candidate.reference.as_bytes());
         feed(&mut hasher, candidate.text.as_bytes());
         feed(&mut hasher, candidate.file_path.as_bytes());
+        feed(&mut hasher, &(candidate.facets.len() as u64).to_le_bytes());
+        for facet in &candidate.facets {
+            feed(&mut hasher, facet.as_bytes());
+        }
     }
 
     hasher.finalize().into()
@@ -1490,6 +1509,7 @@ mod tests {
             is_pdf: false,
             file_path: "otzaria/tanach/genesis.txt".to_string(),
             bm25_score: bm25,
+            facets: Vec::new(),
         }
     }
 
@@ -2500,7 +2520,9 @@ mod tests {
     /// calibrated numbers, say — replaces it in the same commit. One has: ties fall in the
     /// semantic path's order before the line id's, so every line one vector resolved to — all
     /// scored alike — is shown as the resolver placed it. That order, and the position it
-    /// reads, are the only lines that differ from 1865ba0; every score is as it was.
+    /// reads, are the only lines that differ from 1865ba0; every score is as it was. And
+    /// another: under RRF a single-source mode scores by rank too, and only a hybrid search
+    /// drops the semantic candidates below the threshold.
     fn fuse_before_profile_parameters(
         metadata_ranker: &crate::hybrid::metadata_ranker::MetadataRanker,
         lexical: Vec<LexicalCandidate>,
@@ -2583,7 +2605,7 @@ mod tests {
         };
         let norm_sem = normalize_semantic_with_threshold(&sem_scores, threshold);
         let rrf_k = match profile.fusion_strategy {
-            FusionStrategy::RRF { k } if mode == SearchMode::Hybrid => Some(k.max(1)),
+            FusionStrategy::RRF { k } => Some(k.max(1)),
             _ => None,
         };
 
@@ -2619,6 +2641,7 @@ mod tests {
                     semantic_position: None,
                     lexical_weight: alpha,
                     semantic_weight: 1.0 - alpha,
+                    foundational: false,
                 },
             );
         }
@@ -2631,7 +2654,7 @@ mod tests {
             // RRF ignores score magnitudes, so a threshold only has meaning if
             // candidates below it are excluded. Weighted/adaptive fusion keeps
             // them at zero to preserve semantic-only paging and grouping.
-            if normalized <= 0.0 && rrf_k.is_some() {
+            if normalized <= 0.0 && rrf_k.is_some() && mode == SearchMode::Hybrid {
                 continue;
             }
             let line_id = candidate.metadata.line_id;
@@ -2689,6 +2712,7 @@ mod tests {
                             semantic_position: Some(position),
                             lexical_weight: alpha,
                             semantic_weight: 1.0 - alpha,
+                            foundational: false,
                         },
                     );
                 }
@@ -3477,5 +3501,161 @@ mod tests {
         assert!(!other.telemetry.as_ref().unwrap().cache_hit);
         assert_ne!(first.results[0].fused_score, other.results[0].fused_score);
         assert!(ranked_by(10.0).telemetry.unwrap().cache_hit);
+    }
+
+    const BASE_BOOK: &str = "otzaria/base/onkelos.txt";
+
+    /// The foundational bonus is added once to a foundational book's line — whether one side
+    /// found it or both — in every strategy and mode, and to no other line.
+    #[test]
+    fn the_foundational_bonus_is_added_once_whichever_side_found_the_line() {
+        const BONUS: f32 = 0.002;
+        let coordinator = HybridCoordinator::new(None);
+        let features = analyze_query("שאילתה כלשהי");
+        let base_facets = vec!["/base/תרגום".to_string()];
+        let lexical_in = |line_id: u64, book: &str, foundational: bool| LexicalCandidate {
+            file_path: book.to_string(),
+            facets: if foundational {
+                base_facets.clone()
+            } else {
+                Vec::new()
+            },
+            ..lexical(line_id, LINE_ONE, 20.0 - line_id as f32)
+        };
+        let semantic_in = |line_id: u64, book: &str, foundational: bool| {
+            let mut hit = semantic_hit(line_id, 0.9 - line_id as f32 / 100.0, book, 1, 0);
+            if foundational {
+                hit.metadata.facets = base_facets.clone();
+            }
+            hit
+        };
+        // Line 1 is found by both sides, 2 and 3 lexically only, 4 and 5 semantically only.
+        let lexical = vec![
+            lexical_in(1, BASE_BOOK, false),
+            lexical_in(2, BASE_BOOK, true),
+            lexical_in(3, "otzaria/b.txt", false),
+        ];
+        let semantic = vec![
+            semantic_in(1, BASE_BOOK, true),
+            semantic_in(4, BASE_BOOK, true),
+            semantic_in(5, "otzaria/b.txt", false),
+        ];
+        let mut checked = 0;
+        for strategy in [
+            FusionStrategy::Weighted,
+            FusionStrategy::RRF { k: 60 },
+            FusionStrategy::Adaptive,
+        ] {
+            for (mode, alpha) in [
+                (SearchMode::Hybrid, 0.5),
+                (SearchMode::SemanticOnly, 0.0),
+                (SearchMode::LexicalOnly, 1.0),
+            ] {
+                let fuse = |bonus: f32| {
+                    let profile = RankingProfile {
+                        fusion_strategy: strategy,
+                        foundational_bonus: bonus,
+                        ..RankingProfile::default()
+                    };
+                    coordinator.fuse_candidates(
+                        if mode == SearchMode::SemanticOnly {
+                            Vec::new()
+                        } else {
+                            lexical.clone()
+                        },
+                        if mode == SearchMode::LexicalOnly {
+                            Vec::new()
+                        } else {
+                            semantic.clone()
+                        },
+                        FusionContext {
+                            alpha,
+                            mode,
+                            profile: &profile,
+                            query_features: &features,
+                            query_facets: &[],
+                        },
+                    )
+                };
+                let without = fuse(0.0);
+                let with = fuse(BONUS);
+                assert_eq!(with.len(), without.len(), "{strategy:?} {mode}");
+                for candidate in &with {
+                    let before = without
+                        .iter()
+                        .find(|other| {
+                            other.file_path == candidate.file_path
+                                && other.line_id == candidate.line_id
+                        })
+                        .unwrap();
+                    let foundational = match candidate.line_id {
+                        1 => mode != SearchMode::LexicalOnly,
+                        2 | 4 => true,
+                        _ => false,
+                    };
+                    let expected = if foundational { BONUS } else { 0.0 };
+                    let added = candidate.fused_score - before.fused_score;
+                    assert!(
+                        (added - expected).abs() < 1e-6,
+                        "{strategy:?} {mode} line {}: added {added}",
+                        candidate.line_id
+                    );
+                    assert_eq!(candidate.foundational, foundational, "{strategy:?} {mode}");
+                    assert!(!before.foundational);
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 9);
+    }
+
+    /// Under RRF a single-source mode scores by rank as a hybrid search does, and keeps the
+    /// semantic candidates below the threshold, which only a hybrid search drops.
+    #[test]
+    fn under_rrf_a_single_source_mode_scores_by_rank() {
+        let coordinator = HybridCoordinator::new(None);
+        let profile = RankingProfile::from_profile(SearchProfile::Fast);
+        let features = analyze_query("שאילתה כלשהי");
+        let book = "otzaria/b.txt";
+        let fuse = |lexical: Vec<LexicalCandidate>, semantic, mode, alpha| {
+            coordinator.fuse_candidates(
+                lexical,
+                semantic,
+                FusionContext {
+                    alpha,
+                    mode,
+                    profile: &profile,
+                    query_features: &features,
+                    query_facets: &[],
+                },
+            )
+        };
+        let scores = |fused: &[FusedCandidate]| -> Vec<(u64, f32)> {
+            fused.iter().map(|c| (c.line_id, c.fused_score)).collect()
+        };
+
+        let semantic = vec![
+            semantic_hit(1, 0.9, book, 1, 0),
+            semantic_hit(2, 0.5, book, 1, 0),
+            semantic_hit(3, -0.2, book, 1, 0),
+        ];
+        let expected = vec![(1, 1.0 / 61.0), (2, 1.0 / 62.0), (3, 1.0 / 63.0)];
+        assert_eq!(
+            scores(&fuse(
+                Vec::new(),
+                semantic.clone(),
+                SearchMode::SemanticOnly,
+                0.0
+            )),
+            expected
+        );
+        let hybrid = fuse(Vec::new(), semantic, SearchMode::Hybrid, 0.3);
+        assert_eq!(scores(&hybrid), expected[..2]);
+
+        let lexical = vec![lexical(7, LINE_ONE, 3.0), lexical(8, LINE_TWO, 9.0)];
+        assert_eq!(
+            scores(&fuse(lexical, Vec::new(), SearchMode::LexicalOnly, 1.0)),
+            [(7, 1.0 / 61.0), (8, 1.0 / 62.0)]
+        );
     }
 }

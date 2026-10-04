@@ -357,6 +357,7 @@ fn lexical(line_id: u64, book: &str, text: &str, score: f32) -> LexicalCandidate
         is_pdf: false,
         file_path: book.to_string(),
         bm25_score: score,
+        facets: facets_of(book),
     }
 }
 
