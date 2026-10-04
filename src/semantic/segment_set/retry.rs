@@ -30,45 +30,35 @@ pub(super) const DELAYS: [Duration; 14] = [
 
 #[cfg(all(windows, test))]
 thread_local! {
-    /// Refusals retried on this thread, for the tests that hold a file open.
-    pub(crate) static REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The paths of every refused attempt on this thread, for the tests that hold a file open.
+    pub(crate) static REFUSED: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `fs::rename`.
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    retried(
-        || format!("moving {} to {}", from.display(), to.display()),
-        || fs::rename(from, to),
-    )
+    retried("moving", &[from, to], || fs::rename(from, to))
 }
 
 /// `fs::remove_file`.
 pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
-    retried(
-        || format!("removing {}", path.display()),
-        || fs::remove_file(path),
-    )
+    retried("removing", &[path], || fs::remove_file(path))
 }
 
 /// `fs::remove_dir`.
 pub(crate) fn remove_dir(path: &Path) -> io::Result<()> {
-    retried(
-        || format!("removing {}", path.display()),
-        || fs::remove_dir(path),
-    )
+    retried("removing", &[path], || fs::remove_dir(path))
 }
 
 /// `fs::remove_dir_all`.
 pub(crate) fn remove_dir_all(path: &Path) -> io::Result<()> {
-    retried(
-        || format!("removing {}", path.display()),
-        || fs::remove_dir_all(path),
-    )
+    retried("removing", &[path], || fs::remove_dir_all(path))
 }
 
 #[cfg(windows)]
 fn retried(
-    describe: impl Fn() -> String,
+    what: &str,
+    paths: &[&Path],
     mut operation: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut refused = 0usize;
@@ -85,7 +75,19 @@ fn retried(
         std::thread::sleep,
     );
     #[cfg(test)]
-    REFUSALS.with(|count| count.set(count.get() + refused));
+    REFUSED.with(|log| {
+        for _ in 0..refused {
+            log.borrow_mut()
+                .extend(paths.iter().map(|path| path.to_path_buf()));
+        }
+    });
+    let describe = || {
+        let paths: Vec<String> = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        format!("{what} {}", paths.join(" to "))
+    };
     match &result {
         Ok(()) if refused > 0 => log::info!(
             "Retried {}: it succeeded after {refused} refused attempt(s)",
@@ -103,14 +105,15 @@ fn retried(
 #[cfg(not(windows))]
 #[inline]
 fn retried(
-    _describe: impl Fn() -> String,
+    _what: &str,
+    _paths: &[&Path],
     mut operation: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     operation()
 }
 
-/// What Windows refuses while another handle holds the file an operation replaces or removes
-/// (ACCESS_DENIED, whatever the share mode) or the one it moves (SHARING_VIOLATION).
+/// Windows' refusals while another handle holds a file without delete sharing: ACCESS_DENIED
+/// (5) replacing it, SHARING_VIOLATION (32) moving or removing it.
 #[cfg(windows)]
 fn is_transient(error: &io::Error) -> bool {
     const ERROR_ACCESS_DENIED: i32 = 5;

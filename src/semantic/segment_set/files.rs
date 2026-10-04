@@ -19,7 +19,7 @@
 //! place, and its directory is flushed before a pointer names it — a segment taken from
 //! `incoming/`, which the set did not write, is flushed too; the two pointer files are the
 //! only ones ever replaced, and `std::fs::rename` replaces atomically on every platform the
-//! crate builds for (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows).
+//! crate builds for.
 
 use super::retry;
 use crate::cancellation::CancellationToken;
@@ -502,13 +502,27 @@ pub(crate) fn rename_into_place(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `bytes` to `path` under a temporary name, flush, rename into place, and flush the
-/// directory.
+/// `<name>.<pid>-<n>.tmp` beside `path`: no other writer's, since a scrub writes verdicts
+/// without the set's lock.
+fn temporary_path(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}-{next}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Whether `name` is a temporary file [`write_atomically`] writes for `file`, or wrote under
+/// the single name it once used.
+pub(crate) fn is_temporary_of(name: &str, file: &str) -> bool {
+    name.strip_prefix(file)
+        .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
+}
+
+/// Write `bytes` to `path` under a temporary name of its own, flush, rename into place, and
+/// flush the directory.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension(match path.extension() {
-        Some(extension) => format!("{}.tmp", extension.to_string_lossy()),
-        None => "tmp".to_string(),
-    });
+    let temporary = temporary_path(path);
     {
         let mut file = File::create(&temporary)?;
         file.write_all(bytes)?;
@@ -882,6 +896,26 @@ pub(crate) fn generation_path(dir: &Path, generation: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_write_has_a_temporary_name_of_its_own() {
+        let path = Path::new("segments").join("abc.corrupt");
+        let (first, second) = (temporary_path(&path), temporary_path(&path));
+        assert_ne!(first, second);
+        for temporary in [&first, &second] {
+            assert_eq!(temporary.parent(), path.parent());
+            let name = temporary.file_name().unwrap().to_str().unwrap();
+            assert!(is_temporary_of(name, "abc.corrupt"), "{name}");
+            assert!(
+                name.contains(&format!(".{}-", std::process::id())),
+                "{name}"
+            );
+        }
+        assert!(is_temporary_of("CURRENT.tmp", CURRENT));
+        assert!(!is_temporary_of("CURRENT", CURRENT));
+        assert!(!is_temporary_of("CURRENTLY.tmp", CURRENT));
+        assert!(!is_temporary_of("PREVIOUS.1-0.tmp", CURRENT));
+    }
 
     #[test]
     fn a_deleted_bitmap_round_trips_and_refuses_damage() {

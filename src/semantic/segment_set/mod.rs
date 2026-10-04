@@ -23,9 +23,9 @@
 //! the one an installation declares, and the vectors' bytes against their checksums.
 //!
 //! **Garbage** — generations neither pointer names, and segments only they used — is
-//! removed after every flip and at every open that can take the lock. On Windows a file that
-//! is mapped cannot be deleted, so a segment a running reader still holds stays until a
-//! later open or install finds it free; nothing depends on it being gone.
+//! removed after every flip and at every open that can take the lock. A file that cannot be
+//! removed — mapped by a reader on a filesystem without POSIX delete (FAT/exFAT) — stays until
+//! a later open or install finds it free; nothing depends on it being gone.
 
 mod compact;
 mod files;
@@ -149,7 +149,8 @@ impl SegmentSet {
     /// `CURRENT`'s does not open — which [`SetInfo::recovered_from_previous`] then says.
     ///
     /// Recovery runs first when nothing else holds the set's lock: what a crashed install
-    /// left in `staging/` is removed, and so is garbage. Opening reads every small section
+    /// left in `staging/` is removed, and so is garbage; a recovery that fails is logged,
+    /// and the open goes on. Opening reads every small section
     /// of every segment and every derived file, and checks each segment against the
     /// generation that names it; the vectors are mapped, not read.
     ///
@@ -160,7 +161,13 @@ impl SegmentSet {
     /// holds a v1 artifact; [`VectorStoreError::Corrupted`] when neither generation opens.
     pub fn open(dir: &Path) -> Result<Self, SemanticSearchError> {
         if let Some(_lock) = SetLock::try_take(dir)? {
-            recover(dir)?;
+            // Nothing recovery removes is read here, so its failure does not stop an open.
+            if let Err(error) = recover(dir) {
+                log::warn!(
+                    "Recovery of {} failed, and the set opens without it: {error}",
+                    dir.display()
+                );
+            }
         }
         Self::open_unlocked(dir)
     }
@@ -634,17 +641,35 @@ fn refuse_a_v1_artifact(dir: &Path) -> Result<(), ArtifactError> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fail the next recovery on this thread, as a file held past every retry would.
+    pub(crate) static RECOVERY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Clean up after a crash: `staging/`, half-written pointers, and garbage. Called with the
 /// lock held.
 pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
+    #[cfg(test)]
+    if RECOVERY_FAILS.with(|fails| fails.replace(false)) {
+        return Err(ArtifactError::Io {
+            context: format!("recovering {} (injected)", dir.display()),
+            source: std::io::Error::other("injected recovery failure"),
+        });
+    }
     let staging = dir.join(STAGING_DIR);
     if staging.exists() {
         retry::remove_dir_all(&staging)
             .map_err(io_error(format!("removing {}", staging.display())))?;
     }
-    for name in [format!("{CURRENT}.tmp"), format!("{PREVIOUS}.tmp")] {
-        let path = dir.join(name);
-        if path.exists() {
+    // Pointers are written under the lock only, so a temporary file of one is a crash's.
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if [CURRENT, PREVIOUS]
+            .into_iter()
+            .any(|pointer| files::is_temporary_of(&name, pointer))
+        {
+            let path = entry.path();
             retry::remove_file(&path).map_err(io_error(format!("removing {}", path.display())))?;
         }
     }
@@ -653,7 +678,7 @@ pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
 }
 
 /// Remove generations neither pointer names and segments only they used. Best effort: a
-/// file that cannot be removed — mapped by a reader, on Windows — is left for the next
+/// file that cannot be removed — mapped by a reader on FAT/exFAT, say — is left for the next
 /// call, and a pointer that cannot be read stops the collection altogether, since what it
 /// names cannot be known. So does `PREVIOUS` without `CURRENT`, which no flip leaves: what
 /// `CURRENT` named, if it named anything, cannot be known either.
@@ -698,7 +723,6 @@ pub(crate) fn collect_garbage(dir: &Path) {
         let id = name.split('.').next().unwrap_or_default();
         if !live_segments.contains(id) {
             if let Err(error) = fs::remove_file(entry.path()) {
-                // Expected on Windows while a reader maps the segment.
                 log::debug!("Garbage {} stays for now: {error}", entry.path().display());
             }
         }

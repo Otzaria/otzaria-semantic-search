@@ -328,8 +328,8 @@ pub fn install_package(
         }
     }
     // A base takes nothing from the set but the pointer it was built on, and lets go of its
-    // mappings now: the file it may replace could be one of them, and Windows replaces no
-    // file that is mapped.
+    // mappings now: the file it may replace could be one of them, and a filesystem without
+    // POSIX rename (FAT/exFAT) replaces no file that is mapped.
     let base = current.as_ref().map(|set| set.pointer().clone());
     let current = current.filter(|_| manifest.kind == PackageKind::Delta);
 
@@ -431,7 +431,8 @@ pub fn install_package(
         generation.push(entry, &segment, older, cancel)?
     };
     generation.library_release_tag = manifest.library_release_tag.clone();
-    // Every mapping goes before the segment is placed: Windows moves no file that is mapped.
+    // Every mapping goes before the segment is placed: a filesystem without POSIX rename
+    // (FAT/exFAT) replaces no file that is mapped.
     drop(current);
 
     // 5. Place it — beside every segment there is, and never over bytes a generation that
