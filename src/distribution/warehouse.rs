@@ -20,9 +20,8 @@
 //! new index and renames it into place, and only then records the new count. Opening for an
 //! append truncates whatever a crash left past the count; opening to read ignores it.
 //!
-//! **Checked before reuse.** [`Warehouse::verify`] re-hashes every batch and checks the index
-//! against `keys.bin`; assembly, the gates and an append run it themselves, and every lookup
-//! confirms its record's key.
+//! **Checked before reuse.** [`Warehouse::verify`] re-hashes the batches and checks the index;
+//! assembly, the gates and an append run it themselves, and every lookup confirms its key.
 
 use crate::distribution::files::{hex, io_error, malformed, partial_path, read_json, write_json};
 use crate::distribution::plan::HeldVectors;
@@ -340,9 +339,8 @@ impl Warehouse {
         Ok(())
     }
 
-    /// Check every byte the warehouse counts: each batch's vectors and keys against the
-    /// digests `warehouse.json` recorded, and the index against `keys.bin`. Run once per
-    /// open, on up to 8 threads, reading 1 MiB at a time.
+    /// Re-hash every batch against `warehouse.json` and check the index against `keys.bin`;
+    /// once per open, on up to 8 threads reading 1 MiB at a time.
     pub fn verify(&self) -> Result<Verified, PackError> {
         if let Some(verified) = self.verified.get() {
             return Ok(verified.clone());
@@ -495,9 +493,8 @@ impl Warehouse {
         Some(&entries[at])
     }
 
-    /// The record holding a vector of a text whose SHA-256 starts with `key` — a segment's
-    /// [`ChunkKey`](crate::semantic::chunk_key::ChunkKey): the index is in digest order,
-    /// so its prefixes are in order too. Confirmed as [`Self::find`] is.
+    /// The record of a text whose SHA-256 starts with `key`, a segment's `ChunkKey`
+    /// (prefixes of a digest-ordered index are in order too), confirmed as [`Self::find`] is.
     pub fn find_key(&self, key: &[u8; 16]) -> Option<u64> {
         let entries = self.entries()?;
         let at = entries.partition_point(|entry| entry[..16] < key[..]);
@@ -795,10 +792,8 @@ fn header_fault(index: &[u8], records: u64) -> Option<String> {
         .then(|| format!("it counts {count} entries in {} bytes", index.len()))
 }
 
-/// Why `index` is not exactly the index of the first `records` keys of `keys`, if it is
-/// not: the header's count, keys strictly ascending, and each entry's record counted and
-/// holding the entry's key. Distinct keys then point at distinct records, so every record
-/// is indexed once.
+/// Why `index` is not exactly the index of `keys`' first `records` keys, if it is not.
+/// Ascending keys that each match their record point at distinct records: a bijection.
 fn index_fault(index: &[u8], keys: &[u8], records: u64) -> Option<String> {
     if let Some(fault) = header_fault(index, records) {
         return Some(fault);

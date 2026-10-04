@@ -388,9 +388,8 @@ fn prefix(text: &str) -> [u8; 16] {
     sha256(text.as_bytes())[..16].try_into().unwrap()
 }
 
-/// The audit's first case: one bit of one vector flipped. Opening to read checks sizes
-/// only, but verifying refuses it, naming the batch, and an append refuses it before
-/// writing anything.
+/// The audit's first case, a flipped vector bit: open reads it, but verify and an append
+/// refuse it, naming the batch, and change nothing.
 #[test]
 fn a_flipped_vector_bit_is_refused_naming_its_batch() {
     let (_dir, at) = two_batches("warehouse_vector_bit");
@@ -415,9 +414,8 @@ fn a_flipped_vector_bit_is_refused_naming_its_batch() {
     assert_eq!(files(&at), before, "a refused warehouse is left as it was");
 }
 
-/// The audit's second case: an index entry pointing at another text's record, both data
-/// files intact. A lookup finds nothing rather than the other vector, verifying names
-/// the entry, and an append rebuilds the index from the verified keys.
+/// The audit's second case, a pointer to another text's record: lookups find nothing,
+/// verify names the entry, and an append rebuilds the index from the verified keys.
 #[test]
 fn an_index_pointing_at_another_record_finds_nothing_until_an_append_rebuilds_it() {
     let (_dir, at) = two_batches("warehouse_index_pointer");

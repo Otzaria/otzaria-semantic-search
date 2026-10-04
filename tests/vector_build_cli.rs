@@ -496,10 +496,8 @@ fn a_delta_that_ships_no_vector_verifies_through_the_cli() {
     );
 }
 
-/// The audit's two corruptions of a warehouse, through the CLI. A flipped vector bit fails
-/// assembly, the gates and warehouse-verify, naming its batch, and nothing repairs it. An
-/// index entry pointing at another text's record fails them too, until
-/// `warehouse-verify --repair` rebuilds the index from the verified keys.
+/// The audit's two cases through the CLI: a flipped vector bit fails every command and is
+/// never repaired; a moved index pointer fails them until `warehouse-verify --repair`.
 #[test]
 fn a_corrupt_warehouse_fails_assembly_and_only_its_index_is_repaired() {
     let build = Build::new("vector-build-cli-corrupt");

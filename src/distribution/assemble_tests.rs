@@ -897,9 +897,8 @@ fn the_exact_reference_finds_a_vector_itself() {
     assert_eq!(recall(&keys[..1], &keys), 1.0 / 3.0);
 }
 
-/// The audit's case: a vector bit flipped in the warehouse after a base was assembled from
-/// it. Assembling again, the gates and G6's exact reference all refuse the warehouse,
-/// naming the batch, rather than check the release against its corrupt vectors.
+/// A vector bit flipped after a base was assembled: assembly, the gates and G6's exact
+/// reference refuse the warehouse, naming the batch.
 #[test]
 fn a_corrupt_warehouse_fails_assembly_the_gates_and_the_exact_reference() {
     let machine = Machine::new("assemble_corrupt_warehouse");
