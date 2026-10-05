@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// A per-query record of search execution metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchTelemetry {
     pub query_type: String,
     pub search_mode: String,
@@ -29,6 +29,9 @@ pub struct SearchTelemetry {
     pub scan_ms: Option<u64>,
     /// Time the host's resolver took to tie the hits to live lines.
     pub resolve_ms: Option<u64>,
+    /// Candidates the foundational-books query added after the main query's.
+    #[serde(default)]
+    pub foundational_candidates: u32,
 }
 
 /// A snapshot of aggregated telemetry metrics.
@@ -197,6 +200,7 @@ mod tests {
             semantic_unresolved: 0,
             scan_ms: None,
             resolve_ms: None,
+            foundational_candidates: 0,
         }
     }
 

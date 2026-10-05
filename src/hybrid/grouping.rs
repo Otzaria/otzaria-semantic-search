@@ -158,6 +158,7 @@ mod tests {
             semantic_position: None,
             lexical_weight: 0.5,
             semantic_weight: 0.5,
+            foundational: false,
             needs_hydration: false,
             source: ResultSource::Semantic,
             section_id,

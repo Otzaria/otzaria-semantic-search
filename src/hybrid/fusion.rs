@@ -19,7 +19,8 @@ use crate::semantic::types::{FusedCandidate, ResultSource};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-/// The order of fused results, best first: the score; then the semantic path's own order
+/// The order of fused results, best first: the score; then a foundational line
+/// ([`FusedCandidate::foundational`]) first; then the semantic path's own order
 /// ([`FusedCandidate::semantic_position`]), a line only the lexical path found after every
 /// line it placed; then the line id, then the book — two books can hold lines with the same
 /// id, and a line is one per book and id — so the order is total. Fusion, grouping and the
@@ -34,6 +35,7 @@ use std::collections::HashMap;
 pub(crate) fn best_first(a: &FusedCandidate, b: &FusedCandidate) -> Ordering {
     b.fused_score
         .total_cmp(&a.fused_score)
+        .then_with(|| b.foundational.cmp(&a.foundational))
         .then_with(|| semantic_order(a.semantic_position, b.semantic_position))
         .then_with(|| a.line_id.cmp(&b.line_id))
         .then_with(|| a.file_path.cmp(&b.file_path))
@@ -437,13 +439,15 @@ mod tests {
             semantic_position: position,
             lexical_weight: 0.5,
             semantic_weight: 0.5,
+            foundational: false,
         }
     }
 
     /// What `best_first` orders by, a score by its bits.
-    fn keys(candidate: &FusedCandidate) -> (u32, Option<u32>, u64, String) {
+    fn keys(candidate: &FusedCandidate) -> (u32, bool, Option<u32>, u64, String) {
         (
             candidate.fused_score.to_bits(),
+            candidate.foundational,
             candidate.semantic_position,
             candidate.line_id,
             candidate.file_path.clone(),
@@ -480,6 +484,25 @@ mod tests {
         );
     }
 
+    /// Among equal scores a foundational line comes first, before the semantic order; a
+    /// higher score still wins.
+    #[test]
+    fn equal_scores_put_a_foundational_line_first() {
+        let foundational = |mut candidate: FusedCandidate| {
+            candidate.foundational = true;
+            candidate
+        };
+        let mut lines = [
+            ranked(0.5, Some(0), 1, "a.txt"),
+            foundational(ranked(0.5, None, 2, "base.txt")),
+            ranked(0.6, None, 3, "a.txt"),
+            foundational(ranked(0.5, Some(4), 4, "base.txt")),
+        ];
+        lines.sort_by(best_first);
+        let order: Vec<u64> = lines.iter().map(|line| line.line_id).collect();
+        assert_eq!(order, [3, 4, 2, 1]);
+    }
+
     /// `best_first` is a total order: antisymmetric, transitive, and two candidates compare
     /// equal only when every key it reads is equal — so two lines, one per book and id, never
     /// do, whatever their scores (NaN and both zeros included) and wherever the semantic path
@@ -491,8 +514,10 @@ mod tests {
         for score in [0.5, f32::NAN, 0.0, -0.0, 1.0, f32::NEG_INFINITY] {
             for position in [None, Some(0), Some(1), Some(u32::MAX)] {
                 for line_id in [1, 2] {
-                    for book in ["a.txt", "b.txt"] {
-                        lines.push(ranked(score, position, line_id, book));
+                    for (book, foundational) in [("a.txt", false), ("b.txt", true)] {
+                        let mut line = ranked(score, position, line_id, book);
+                        line.foundational = foundational;
+                        lines.push(line);
                     }
                 }
             }

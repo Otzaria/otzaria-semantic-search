@@ -23,7 +23,7 @@
 
 use otzaria_semantic_search::api::hybrid_search::OtzariaHybridEngine;
 use otzaria_semantic_search::cancellation::CancellationToken;
-use otzaria_semantic_search::config::profiles::SearchProfile;
+use otzaria_semantic_search::config::profiles::{FusionStrategy, RankingProfile, SearchProfile};
 use otzaria_semantic_search::distribution::builder::{
     build, BuildRequest, RELEASE_MANIFEST_FILENAME, SEGMENT_FILENAME,
 };
@@ -46,7 +46,7 @@ use otzaria_semantic_search::semantic::segment_set::{
     install_package, InstallExpectation, InstallSource, SegmentSet,
 };
 use otzaria_semantic_search::semantic::types::{
-    ContentFingerprint, LexicalCandidate, SearchFilters, SearchMode,
+    is_foundational, ContentFingerprint, LexicalCandidate, SearchFilters, SearchMode,
 };
 use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage};
 use std::collections::HashMap;
@@ -357,6 +357,7 @@ fn lexical(line_id: u64, book: &str, text: &str, score: f32) -> LexicalCandidate
         is_pdf: false,
         file_path: book.to_string(),
         bm25_score: score,
+        facets: facets_of(book),
     }
 }
 
@@ -1014,4 +1015,187 @@ fn a_restart_opens_the_same_set_without_writing_to_it() {
         );
     }
     assert_eq!(generations[0], generations[1]);
+}
+
+/// What [`Foundational`] does when a search asks it for the foundational books alone.
+#[derive(Clone, Copy)]
+enum OnBase {
+    Serve,
+    Fail,
+    Cancel,
+}
+
+/// The corpus's index with berachot among the foundational books.
+struct Foundational {
+    index: FakeResolver,
+    on_base: OnBase,
+}
+
+fn foundational_facets(book: &str) -> Vec<String> {
+    let mut facets = facets_of(book);
+    if book == BERACHOT {
+        facets.push("/base/משנה".to_string());
+    }
+    facets
+}
+
+impl CandidateResolver for Foundational {
+    fn generation(&self) -> u64 {
+        self.index.generation()
+    }
+
+    fn admissible_books(
+        &self,
+        filters: Option<&SearchFilters>,
+    ) -> Result<Option<BookSet>, ResolveError> {
+        let Some(compiled) = filters.and_then(SearchFilters::compile) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            [GENESIS, BERACHOT]
+                .into_iter()
+                .filter(|book| compiled.matches_book(book, &foundational_facets(book), false))
+                .collect(),
+        ))
+    }
+
+    fn resolve(
+        &self,
+        hits: &[VectorHit],
+        filters: Option<&SearchFilters>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ResolvedLine>, ResolveError> {
+        if filters
+            .and_then(|filters| filters.facets.as_deref())
+            .is_some_and(is_foundational)
+        {
+            match self.on_base {
+                OnBase::Serve => {}
+                OnBase::Fail => {
+                    return Err(ResolveError::Index {
+                        reason: "the foundational books are unreadable".to_string(),
+                    })
+                }
+                OnBase::Cancel => cancel.cancel(),
+            }
+        }
+        let compiled = filters.and_then(SearchFilters::compile);
+        let mut lines = self.index.resolve(hits, None, cancel)?;
+        lines.retain(|line| {
+            !compiled.as_ref().is_some_and(|compiled| {
+                !compiled.matches_book(
+                    &line.file_path,
+                    &foundational_facets(&line.file_path),
+                    false,
+                )
+            })
+        });
+        for line in &mut lines {
+            line.facets = foundational_facets(&line.file_path).into();
+        }
+        Ok(lines)
+    }
+}
+
+/// Over an installed set, the foundational query appends the foundational line the main
+/// query did not reach and the bonus lifts it; if that query fails the main query's
+/// candidates are served, and if it is cancelled the search is.
+#[test]
+fn the_foundational_query_appends_its_lines_and_only_a_cancellation_stops_the_search() {
+    let dir = TempDir::new("foundational");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let (genesis_line, _, text) = LINES[0];
+    let (berachot_line, _, _) = LINES[3];
+    let params = HybridSearchParams {
+        limit: 1,
+        force_mode: Some(SearchMode::SemanticOnly),
+        ranking: Some(RankingProfile {
+            fusion_strategy: FusionStrategy::RRF { k: 60 },
+            candidate_window_multiplier: 1.0,
+            foundational_bonus: 0.002,
+            foundational_candidate_share: 1.0,
+            ..RankingProfile::default()
+        }),
+        ..Default::default()
+    };
+    let resolver = |on_base| Foundational {
+        index: FakeResolver::of_the_corpus(),
+        on_base,
+    };
+    let cancel = CancellationToken::new();
+
+    let prepared = coordinator
+        .prepare_semantic(text, &params, &resolver(OnBase::Serve), &cancel)
+        .unwrap();
+    assert!(prepared.healthy());
+    assert_eq!(
+        (
+            prepared.top_k(),
+            prepared.semantic_hits(),
+            prepared.foundational_hits()
+        ),
+        (1, 1, 1)
+    );
+    let result = coordinator
+        .fuse_prepared(vec![], prepared, &params, &cancel)
+        .unwrap();
+    assert_eq!(result.total_count, 2);
+    let top = &result.results[0];
+    assert_eq!((top.id, top.file_path.as_str()), (berachot_line, BERACHOT));
+    assert_eq!(top.fused_score, 1.0 / 62.0 + 0.002);
+    assert!(top.provenance.as_ref().unwrap().foundational);
+    assert_eq!(result.telemetry.unwrap().foundational_candidates, 1);
+
+    let prepared = coordinator
+        .prepare_semantic(text, &params, &resolver(OnBase::Fail), &cancel)
+        .unwrap();
+    assert!(prepared.healthy());
+    assert_eq!(prepared.foundational_hits(), 0);
+    let result = coordinator
+        .fuse_prepared(vec![], prepared, &params, &cancel)
+        .unwrap();
+    assert_eq!(result.total_count, 1);
+    assert_eq!(result.results[0].id, genesis_line);
+    assert_eq!(result.fallback_reason, None);
+
+    let cancelled = CancellationToken::new();
+    assert!(matches!(
+        coordinator.prepare_semantic(text, &params, &resolver(OnBase::Cancel), &cancelled),
+        Err(SemanticSearchError::Cancelled)
+    ));
+    let cancelled = CancellationToken::new();
+    assert!(matches!(
+        coordinator.search_cancellable(
+            text,
+            vec![],
+            &params,
+            &resolver(OnBase::Cancel),
+            &cancelled
+        ),
+        Err(SemanticSearchError::Cancelled)
+    ));
+}
+
+/// A passage embedded by an installed set's runtime lands on the vector built for its text.
+#[test]
+fn an_embedded_passage_lands_on_the_vector_built_for_its_text() {
+    let dir = TempDir::new("embed_passages");
+    let (model_path, vectors) = install(&dir);
+    let index = open_official(&vectors, &model_path);
+    let cancel = CancellationToken::new();
+    let texts: Vec<&str> = LINES.iter().map(|(_, _, text)| *text).collect();
+    let embedded = index.embed_passages(&texts, &cancel).unwrap();
+    assert_eq!(embedded.len(), texts.len());
+    for (vector, text) in embedded.iter().zip(&texts) {
+        let hit = &index.search_hits(vector, 1, None, &cancel).unwrap()[0];
+        assert_eq!(hit.key, ChunkKey::of(text));
+        assert!(hit.score > 0.99, "{text}: {}", hit.score);
+    }
+
+    let coordinator = HybridCoordinator::with_official_index(index);
+    assert_eq!(
+        coordinator.embed_passages(&texts[..1], &cancel).unwrap(),
+        embedded[..1]
+    );
 }

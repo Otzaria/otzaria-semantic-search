@@ -50,7 +50,8 @@ pub struct QueryFeatures {
 
 /// Analyzes a query string to extract features useful for ranking
 pub fn analyze_query(query: &str) -> QueryFeatures {
-    let has_quoted_phrase = query.contains('"');
+    let quoted_phrases = quoted_phrases(query);
+    let has_quoted_phrase = !quoted_phrases.is_empty();
     let tokens: Vec<&str> = query.split_whitespace().collect();
     let token_count = tokens.len();
 
@@ -92,25 +93,6 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
         "other".to_string()
     };
 
-    let mut quoted_phrases = Vec::new();
-    let mut in_quotes = false;
-    let mut current_phrase = String::new();
-    for c in query.chars() {
-        if c == '"' {
-            if in_quotes {
-                if !current_phrase.trim().is_empty() {
-                    quoted_phrases.push(current_phrase.trim().to_string());
-                }
-                current_phrase.clear();
-                in_quotes = false;
-            } else {
-                in_quotes = true;
-            }
-        } else if in_quotes {
-            current_phrase.push(c);
-        }
-    }
-
     let estimated_type = if token_count == 0 {
         QueryType::Unknown
     } else if has_quoted_phrase {
@@ -137,6 +119,43 @@ pub fn analyze_query(query: &str) -> QueryFeatures {
         rare_tokens,
         quoted_phrases,
     }
+}
+
+/// The phrases `query` quotes, each trimmed, in order.
+///
+/// ״ “ ” „ count as `"`. A `"` between two Hebrew letters is an acronym's gershayim
+/// (רמב"ם, שו"ע) and part of the text; any other is a delimiter, and a phrase is the
+/// non-blank text between two of them. So `"רמב"ם"` quotes רמב"ם, and a lone delimiter
+/// quotes nothing. Each phrase keeps the characters the query has.
+pub fn quoted_phrases(query: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    if !query.contains(['"', '״', '“', '”', '„']) {
+        return phrases;
+    }
+    let is_quote = |c: char| matches!(c, '"' | '״' | '“' | '”' | '„');
+    let is_letter = |c: Option<char>| c.is_some_and(|c| ('\u{05D0}'..='\u{05EA}').contains(&c));
+    let mut open: Option<usize> = None;
+    let mut previous = None;
+    let mut chars = query.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, c)| c);
+        if is_quote(c) && !(is_letter(previous) && is_letter(next)) {
+            match open.take() {
+                Some(start) => {
+                    let phrase = query[start..at].trim();
+                    if !phrase.is_empty() {
+                        phrases.push(phrase.to_string());
+                    }
+                }
+                None => open = Some(at + c.len_utf8()),
+            }
+        }
+        // Nikud and teamim sit between the letter and the gershayim: רַמְבַּ"ם.
+        if !matches!(c, '\u{0591}'..='\u{05BD}' | '\u{05BF}'..='\u{05C7}') {
+            previous = Some(c);
+        }
+    }
+    phrases
 }
 
 /// Computes the alpha weight for lexical search (1 - alpha for semantic)
@@ -258,6 +277,39 @@ mod tests {
         let alpha = compute_alpha(&features);
         // Quoted phrases return 1.0 to let the coordinator skip semantic entirely.
         assert_eq!(alpha, 1.0);
+    }
+
+    /// A gershayim between two letters is an acronym's, any other quote a delimiter, and only
+    /// a pair of delimiters quotes a phrase.
+    #[test]
+    fn only_a_pair_of_delimiters_quotes_a_phrase_and_an_acronym_is_text() {
+        let cases: [(&str, &[&str]); 14] = [
+            ("רמב\"ם", &[]),
+            ("רמב״ם", &[]),
+            ("רַמְבַּ\"ם", &[]),
+            ("\"רַמְבַּ\"ם\"", &["רַמְבַּ\"ם"]),
+            ("\"רמב\"ם\"", &["רמב\"ם"]),
+            ("“רמב״ם”", &["רמב״ם"]),
+            ("\"ויאמר משה\"", &["ויאמר משה"]),
+            ("„ויאמר משה“ בתורה", &["ויאמר משה"]),
+            ("ויאמר \"משה", &[]),
+            ("\"", &[]),
+            ("\" \"", &[]),
+            ("שו\"ע וחז\"ל", &[]),
+            ("\"שו\"ע\" וחז\"ל", &["שו\"ע"]),
+            ("\"אחת\" \"שתים\"", &["אחת", "שתים"]),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(quoted_phrases(query), expected, "{query:?}");
+            let features = analyze_query(query);
+            assert_eq!(features.quoted_phrases, expected, "{query:?}");
+            assert_eq!(
+                features.has_quoted_phrase,
+                !expected.is_empty(),
+                "{query:?}"
+            );
+        }
+        assert_eq!(analyze_query("רמב\"ם").estimated_type, QueryType::Short);
     }
 
     #[test]
