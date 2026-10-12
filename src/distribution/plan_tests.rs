@@ -76,6 +76,7 @@ fn records_round_trip_and_refuse_disorder_and_damage() {
     let records = [(0, 0, L1), (0, 3, L2), (2, 1, L3)].map(|(book, ordinal, text)| PlanRecord {
         book,
         ordinal,
+        window: 0,
         sha256: sha256(text.as_bytes()),
     });
     let mut writer = RecordsWriter::create(&path).unwrap();
@@ -101,6 +102,78 @@ fn records_round_trip_and_refuse_disorder_and_damage() {
     assert!(
         PlanRecords::open(&path).is_err(),
         "a truncated file is refused"
+    );
+}
+
+/// `OXVREC1` is written byte for byte as it was before windows existed, and refuses one.
+#[test]
+fn a_plan_without_windows_is_written_as_it_always_was() {
+    let dir = TempDir::new("plan_records_v1_bytes");
+    let path = dir.join("records.bin");
+    let record = PlanRecord {
+        book: 7,
+        ordinal: 0x0102_0304,
+        window: 0,
+        sha256: sha256(L1.as_bytes()),
+    };
+    let mut writer = RecordsWriter::create(&path).unwrap();
+    writer.push(record).unwrap();
+    assert!(matches!(
+        writer.push(PlanRecord {
+            window: 1,
+            ..record
+        }),
+        Err(PackError::MalformedInput { .. })
+    ));
+    writer.finish().unwrap();
+    let mut expected = b"OXVREC1\n".to_vec();
+    expected.extend_from_slice(&1u64.to_le_bytes());
+    expected.extend_from_slice(&7u32.to_le_bytes());
+    expected.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+    expected.extend_from_slice(&sha256(L1.as_bytes()));
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+    assert!(!PlanRecords::open(&path).unwrap().is_windowed());
+}
+
+/// `OXVREC2`: a line may hold several records, one per window, ascending by window.
+#[test]
+fn windowed_records_round_trip_and_ascend_by_window() {
+    let dir = TempDir::new("plan_records_v2");
+    let path = dir.join("records.bin");
+    let records = [(0, 0, 0, L1), (0, 0, 1, L2), (0, 0, 3, L3), (1, 2, 0, L2)].map(
+        |(book, ordinal, window, text)| PlanRecord {
+            book,
+            ordinal,
+            window,
+            sha256: sha256(text.as_bytes()),
+        },
+    );
+    let mut writer = RecordsWriter::create_windowed(&path).unwrap();
+    for record in records {
+        writer.push(record).unwrap();
+    }
+    assert!(matches!(
+        writer.push(records[2]),
+        Err(PackError::MalformedInput { .. })
+    ));
+    assert_eq!(writer.finish().unwrap(), 4);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), 16 + 4 * 44);
+    assert_eq!(&bytes[..8], b"OXVREC2\n");
+    assert_eq!(&bytes[16 + 44 + 8..16 + 44 + 12], &[1, 0, 0, 0]);
+
+    let read = PlanRecords::open(&path).unwrap();
+    assert!(read.is_windowed());
+    assert_eq!(read.iter().collect::<Vec<_>>(), records);
+    assert_eq!(read.get(2), records[2]);
+    drop(read);
+
+    let mut disordered = bytes.clone();
+    disordered[16 + 44 + 8] = 4;
+    std::fs::write(&path, &disordered).unwrap();
+    assert!(
+        PlanRecords::open(&path).is_err(),
+        "window 4 before window 3"
     );
 }
 

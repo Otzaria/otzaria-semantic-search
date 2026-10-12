@@ -30,7 +30,7 @@ use crate::distribution::ledger::{
     classify, write_ledger, BaseRecord, Disposition, Ledger, LedgerManifest,
 };
 use crate::distribution::package::{IndexPackage, PackageKind};
-use crate::distribution::plan::{EmbedManifest, Plan, EMBED_MANIFEST_FILE};
+use crate::distribution::plan::{EmbedManifest, Plan, PlanRecords, EMBED_MANIFEST_FILE};
 use crate::distribution::warehouse::Warehouse;
 use crate::errors::PackError;
 use crate::semantic::chunk_key::ChunkKey;
@@ -39,7 +39,7 @@ use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::writer::{SegmentBuilder, SegmentSpec, VectorSink, WrittenSegment};
 use crate::semantic::segment_set::{ReleaseFile, ReleaseManifest};
 use crate::semantic::versioning::{EmbeddingWorker, IndexVersion, VectorProvenance};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// The segment's name in an assembled package.
@@ -194,6 +194,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         },
         placeholder,
     );
+    let windows = slot_windows(&plan.records);
     let mut book = BookRecords::new(u32::MAX);
     let mut slot_records: Vec<u64> = Vec::new();
     let (mut missing, mut first_missing) = (0u64, None);
@@ -210,6 +211,8 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
                 Disposition::Slot { slot } => {
                     debug_assert_eq!(slot as usize, slot_records.len());
                     book.primary.push((record.key(), record.ordinal));
+                    book.windows
+                        .push(windows.get(&record.key_bytes()).copied().unwrap_or(0));
                     slot_records.push(warehouse.find(&record.sha256).unwrap_or_else(|| {
                         missing += 1;
                         first_missing.get_or_insert(hex(&record.sha256));
@@ -322,6 +325,8 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
 struct BookRecords {
     book: u32,
     primary: Vec<(ChunkKey, u32)>,
+    /// One per primary record: its slot's window.
+    windows: Vec<u8>,
     extras: Vec<(u32, u32)>,
     foreign: Vec<(ChunkKey, u32)>,
 }
@@ -331,6 +336,7 @@ impl BookRecords {
         Self {
             book,
             primary: Vec::new(),
+            windows: Vec::new(),
             extras: Vec::new(),
             foreign: Vec::new(),
         }
@@ -341,14 +347,38 @@ impl BookRecords {
         if self.book != u32::MAX {
             let name = plan.books.name(self.book);
             builder
-                .add_book(name, &self.primary, &self.extras, &self.foreign)
+                .add_book_windowed(
+                    name,
+                    &self.primary,
+                    &self.windows,
+                    &self.extras,
+                    &self.foreign,
+                )
                 .map_err(io_error(format!("adding {name}")))?;
         }
         self.primary.clear();
+        self.windows.clear();
         self.extras.clear();
         self.foreign.clear();
         Ok(())
     }
+}
+
+/// The window of every key whose records are all past a line's first window: the least of
+/// them. A key absent is window 0. Empty for a plan without windows.
+fn slot_windows(records: &PlanRecords) -> HashMap<[u8; 16], u8> {
+    let mut windows: HashMap<[u8; 16], u8> = HashMap::new();
+    if !records.is_windowed() {
+        return windows;
+    }
+    for record in records.iter().filter(|record| record.window > 0) {
+        let window = windows.entry(record.key_bytes()).or_insert(record.window);
+        *window = (*window).min(record.window);
+    }
+    for record in records.iter().filter(|record| record.window == 0) {
+        windows.remove(&record.key_bytes());
+    }
+    windows
 }
 
 /// Every slot's vector, in slot order, read a window at a time in warehouse order.

@@ -183,6 +183,7 @@ impl SemanticSide {
         top_k: usize,
         filters: Option<&SearchFilters>,
         share: f32,
+        window_penalty: f32,
         resolver: &dyn CandidateResolver,
         cancel: &CancellationToken,
         telemetry: &mut SearchTelemetry,
@@ -206,6 +207,7 @@ impl SemanticSide {
             query_vector,
             base_top_k,
             Some(&base_filters),
+            window_penalty,
             resolver,
             cancel,
             &mut base_telemetry,
@@ -274,11 +276,13 @@ impl SemanticSide {
     /// Under a filter the scan reads the books the resolver admits, and weighs besides the
     /// vectors it names as [unreached](CandidateResolver::unreached): those of texts that
     /// moved into an admitted book, at their own scores, beside the scan's hits.
+    #[allow(clippy::too_many_arguments)]
     fn candidates(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        window_penalty: f32,
         resolver: &dyn CandidateResolver,
         cancel: &CancellationToken,
         telemetry: &mut SearchTelemetry,
@@ -295,8 +299,14 @@ impl SemanticSide {
             None => Vec::new(),
         };
         let scan_started = std::time::Instant::now();
-        let hits =
-            index.search_hits_with(query_vector, top_k, books.as_ref(), &unreached, cancel)?;
+        let hits = index.search_hits_with(
+            query_vector,
+            top_k,
+            books.as_ref(),
+            &unreached,
+            window_penalty,
+            cancel,
+        )?;
         telemetry.scan_ms = Some(scan_started.elapsed().as_millis() as u64);
         telemetry.semantic_hits = hits.len().min(u32::MAX as usize) as u32;
         cancel.checkpoint()?;
@@ -832,6 +842,7 @@ impl HybridCoordinator {
                             &vector,
                             top_k,
                             params.filters.as_ref(),
+                            setup.ranking_profile.window_penalty,
                             resolver,
                             cancel,
                             &mut setup.telemetry,
@@ -848,6 +859,7 @@ impl HybridCoordinator {
                                 top_k,
                                 params.filters.as_ref(),
                                 setup.ranking_profile.foundational_candidate_share,
+                                setup.ranking_profile.window_penalty,
                                 resolver,
                                 cancel,
                                 &mut setup.telemetry,
@@ -3189,6 +3201,7 @@ mod tests {
             score,
             key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {n}")),
             records: Vec::new(),
+            window: 0,
             seg: 0,
             slot: n,
         };
@@ -3241,6 +3254,7 @@ mod tests {
             score,
             key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {slot}")),
             records: Vec::new(),
+            window: 0,
             seg: 0,
             slot,
         };

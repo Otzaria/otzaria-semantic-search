@@ -314,7 +314,7 @@ release that was already assembled.
 |------|--------|
 | G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped |
 | G5 | Every slot holds its key's warehouse vector, encoded. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998. Not applicable to a delta with no slot; any other empty sample fails |
-| G7 | A base is ≤ 2.0 × 10⁹ bytes; a delta is ≤ 0.15 × its base, otherwise publish a base |
+| G7 | A base is ≤ 3.5 × 10⁹ bytes (room for a set with long-line windows, about 2.73 × 10⁹); a delta is ≤ 0.15 × its base, otherwise publish a base |
 | G8 | Assembling again into `<out>.g8` gives the same segment, package, release manifest and ledger, byte for byte |
 | G9 | `verify_for_install` passes, reading every payload byte, under the manifest's `packageDigest`; the segment is the manifest's |
 | G10 | Reported, not enforced: the base plus its deltas as a multiple of the base, with a note past 1.3 |

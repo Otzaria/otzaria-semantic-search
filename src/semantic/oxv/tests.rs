@@ -428,6 +428,118 @@ fn an_unknown_ancillary_section_is_skipped_and_an_unknown_critical_one_refused()
     }
 }
 
+/// A segment whose every slot is a first window is written without SLOT_WINDOWS, byte for
+/// byte as before windows existed: the digests are of files the previous writer wrote.
+#[test]
+fn a_segment_without_windows_is_written_as_it_always_was() {
+    let dir = TempDir::new("no_windows_bytes");
+    let mut random = Random(7);
+    let delta = dir.join("delta.oxv");
+    write_segment(
+        &delta,
+        spec(PackageKind::Delta, 29, 30),
+        Codec::i8_sym_dim(vec![0.5; DIM], 1.0).unwrap(),
+        &delta_books(&mut random),
+        &[key(201), key(200)],
+    );
+    let base = dir.join("base.oxv");
+    let mut books = random_books(&mut random, 3, 5, DIM, 0);
+    books[1].windows = vec![0; 5];
+    write_segment(
+        &base,
+        spec(PackageKind::Base, 0, 30),
+        Codec::i8_sym_vec(DIM).unwrap(),
+        &books,
+        &[],
+    );
+    for (path, expected) in [
+        (&delta, PRE_WINDOWS_DELTA_SHA256),
+        (&base, PRE_WINDOWS_BASE_SHA256),
+    ] {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(hex(&Sha256::digest(&bytes)), expected, "{}", path.display());
+        let header = Header::decode(&bytes).unwrap();
+        assert!(header
+            .sections
+            .iter()
+            .all(|entry| entry.kind != SectionKind::SlotWindows.code()));
+        let segment = open(path);
+        assert_eq!(segment.slot_window_bytes(), None);
+        assert!((0..segment.slot_count()).all(|slot| segment.slot_window(slot) == 0));
+    }
+}
+
+const PRE_WINDOWS_DELTA_SHA256: &str =
+    "5ec412fa20672ec62cd8d9cdb53dc61d2743c9e4dd9a5844bee06f551a0c584f";
+const PRE_WINDOWS_BASE_SHA256: &str =
+    "7ff4ea97a6e878603326ceed7cc56a64c9f72558bba521534662484106537901";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SLOT_WINDOWS round-trips, is critical and block-summed, and a flipped byte in it is
+/// found by the block checksums; a segment with it keeps the id its keys give it.
+#[test]
+fn slot_windows_round_trip_and_are_checked_by_block() {
+    let dir = TempDir::new("slot_windows");
+    let mut random = Random(21);
+    let mut books = random_books(&mut random, 3, 4, DIM, 0);
+    books[0].windows = vec![0, 2, 0, 5];
+    books[2].windows = vec![1, 1, 0, 0];
+    let path = dir.join("base.oxv");
+    let written = write_segment(
+        &path,
+        spec(PackageKind::Base, 0, 30),
+        Codec::i8_sym_vec(DIM).unwrap(),
+        &books,
+        &[],
+    );
+    let segment = open(&path);
+    let expected = [0, 2, 0, 5, 0, 0, 0, 0, 1, 1, 0, 0];
+    assert_eq!(segment.slot_window_bytes(), Some(&expected[..]));
+    for (slot, window) in expected.iter().enumerate() {
+        assert_eq!(segment.slot_window(slot as u32), *window);
+    }
+    segment
+        .verify_blocks(&CancellationToken::new(), |_| {})
+        .unwrap();
+
+    let without = dir.join("without.oxv");
+    for book in &mut books {
+        book.windows.clear();
+    }
+    let plain = write_segment(
+        &without,
+        spec(PackageKind::Base, 0, 30),
+        Codec::i8_sym_vec(DIM).unwrap(),
+        &books,
+        &[],
+    );
+    assert_eq!(
+        written.segment_id, plain.segment_id,
+        "the id names the keys"
+    );
+    assert!(written.size > plain.size);
+
+    let header = Header::decode(&std::fs::read(&path).unwrap()).unwrap();
+    let entry = header
+        .sections
+        .iter()
+        .find(|entry| entry.kind == SectionKind::SlotWindows.code())
+        .expect("SLOT_WINDOWS is written");
+    assert_eq!(entry.flags, SECTION_CRITICAL | SECTION_BLOCKSUMMED);
+    assert_eq!((entry.elem_size, entry.elem_count), (1, 12));
+    drop(segment);
+    flip(&path, entry.offset + 1);
+    match open(&path).verify_blocks(&CancellationToken::new(), |_| {}) {
+        Err(VectorStoreError::Corrupted { reason }) => {
+            assert!(reason.contains("SLOT_WINDOWS"), "{reason}")
+        }
+        other => panic!("a flipped window must be found, got {other:?}"),
+    }
+}
+
 #[test]
 fn the_writer_refuses_tables_no_reader_could_use() {
     let dir = TempDir::new("writer_refusals");

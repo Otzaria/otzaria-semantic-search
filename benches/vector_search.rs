@@ -260,6 +260,7 @@ fn oxv(options: Options) {
             top_k,
             books,
             threads,
+            window_penalty: 0.0,
         };
         for _ in 0..3 {
             scan_segments(&[&segment], &unit(usize::MAX / 3), &request, &cancel).expect("scan");

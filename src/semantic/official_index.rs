@@ -26,6 +26,7 @@
 //! | [`EmbeddingError`](crate::errors::EmbeddingError) | the model is missing or does not fit this configuration |
 
 use crate::cancellation::CancellationToken;
+use crate::config::profiles::DEFAULT_WINDOW_PENALTY;
 use crate::errors::{ArtifactError, SemanticSearchError};
 use crate::semantic::backend::Pooling;
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
@@ -282,18 +283,27 @@ impl OfficialSemanticIndex {
         books: Option<&BookSet>,
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, SemanticSearchError> {
-        self.search_hits_with(query_vector, top_k, books, &[], cancel)
+        self.search_hits_with(
+            query_vector,
+            top_k,
+            books,
+            &[],
+            DEFAULT_WINDOW_PENALTY,
+            cancel,
+        )
     }
 
     /// [`Self::search_hits`], weighing the vectors of `also` besides the ones `books`
     /// reaches: see [`SegmentSet::scan_with`]. Slots of this index's
-    /// [generation](Self::generation).
+    /// [generation](Self::generation). `window_penalty` is
+    /// [`ScanRequest::window_penalty`].
     pub fn search_hits_with(
         &self,
         query_vector: &[f32],
         top_k: usize,
         books: Option<&BookSet>,
         also: &[SlotRef],
+        window_penalty: f32,
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, SemanticSearchError> {
         Ok(self.set.scan_with(
@@ -302,6 +312,7 @@ impl OfficialSemanticIndex {
                 top_k,
                 books,
                 threads: self.scan_threads,
+                window_penalty,
             },
             also,
             cancel,

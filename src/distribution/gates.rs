@@ -44,7 +44,7 @@ pub const G5_MIN_MEAN_COSINE: f64 = 0.9995;
 /// G5: the least 0.1st-percentile cosine.
 pub const G5_MIN_P001_COSINE: f64 = 0.998;
 /// G7: the largest base, in bytes.
-pub const G7_MAX_BASE_BYTES: u64 = 2_000_000_000;
+pub const G7_MAX_BASE_BYTES: u64 = 3_500_000_000;
 /// G7: the largest delta, as a fraction of its base; a larger one is published as a base.
 pub const G7_MAX_DELTA_RATIO: f64 = 0.15;
 /// G10: the most a base and its deltas should be, as a multiple of the base; past it the

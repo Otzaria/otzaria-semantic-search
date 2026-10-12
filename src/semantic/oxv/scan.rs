@@ -96,6 +96,9 @@ pub struct ScanRequest<'a> {
     pub books: Option<&'a BookSet>,
     /// Threads to scan with, the calling one included; at least one is used.
     pub threads: usize,
+    /// Taken off the cosine of every slot past a line's first window, before the best `k`
+    /// are chosen. 0 ranks every slot by its cosine alone.
+    pub window_penalty: f32,
 }
 
 /// The thread count the application gets by default: half the cores, at most eight. A
@@ -224,8 +227,8 @@ fn scan_all(
                 inv_scale: *inv_scale,
                 kernel,
             };
-            let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, found, also, request.top_k, cancel)?;
+            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, found, also, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
         PreparedQuery::Int8PerVector { q16, inv_scale } => {
@@ -235,14 +238,14 @@ fn scan_all(
                 inv_scale: *inv_scale,
                 kernel,
             };
-            let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, found, also, request.top_k, cancel)?;
+            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, found, also, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
         PreparedQuery::Float { q } => {
             let scorer = Float { q };
-            let found = run_shares(set, &scorer, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, found, also, request.top_k, cancel)?;
+            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, found, also, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
     }
@@ -253,6 +256,8 @@ fn scan_all(
 trait Scorer: Sync {
     fn rank(&self, vector: &[u8], scale: f32) -> i32;
     fn score(&self, rank: i32) -> f32;
+    /// `rank` with `penalty` taken off the score it stands for, still an exact total order.
+    fn penalize(&self, rank: i32, penalty: f32) -> i32;
 }
 
 struct Int8<'a> {
@@ -269,6 +274,10 @@ impl Scorer for Int8<'_> {
 
     fn score(&self, rank: i32) -> f32 {
         rank as f32 * self.inv_scale
+    }
+
+    fn penalize(&self, rank: i32, penalty: f32) -> i32 {
+        rank.saturating_sub((penalty / self.inv_scale).round() as i32)
     }
 }
 
@@ -289,6 +298,10 @@ impl Scorer for Int8PerVector<'_> {
     fn score(&self, rank: i32) -> f32 {
         unordered(rank) * self.inv_scale
     }
+
+    fn penalize(&self, rank: i32, penalty: f32) -> i32 {
+        ordered(unordered(rank) - penalty / self.inv_scale)
+    }
 }
 
 struct Float<'a> {
@@ -303,6 +316,10 @@ impl Scorer for Float<'_> {
 
     fn score(&self, rank: i32) -> f32 {
         unordered(rank)
+    }
+
+    fn penalize(&self, rank: i32, penalty: f32) -> i32 {
+        ordered(unordered(rank) - penalty)
     }
 }
 
@@ -433,12 +450,14 @@ impl Work {
 fn run_shares(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
+    request: &ScanRequest<'_>,
     k: usize,
     shares: &[Vec<Piece>],
     cancel: &CancellationToken,
     progress: Option<&[AtomicUsize]>,
 ) -> Result<Vec<Candidate>, VectorStoreError> {
     let report = |share: usize| progress.and_then(|counters| counters.get(share));
+    let penalty = request.window_penalty;
     let results: Vec<Result<TopK, VectorStoreError>> = std::thread::scope(|scope| {
         let handles: Vec<_> = shares
             .iter()
@@ -446,10 +465,18 @@ fn run_shares(
             .skip(1)
             .map(|(index, share)| {
                 let counter = report(index);
-                scope.spawn(move || scan_share(set, scorer, k, share, cancel, counter))
+                scope.spawn(move || scan_share(set, scorer, penalty, k, share, cancel, counter))
             })
             .collect();
-        let mut results = vec![scan_share(set, scorer, k, &shares[0], cancel, report(0))];
+        let mut results = vec![scan_share(
+            set,
+            scorer,
+            penalty,
+            k,
+            &shares[0],
+            cancel,
+            report(0),
+        )];
         results.extend(
             handles
                 .into_iter()
@@ -476,11 +503,12 @@ fn run_shares(
 fn merge_also(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
+    request: &ScanRequest<'_>,
     mut found: Vec<Candidate>,
     also: &[SlotRef],
-    k: usize,
     cancel: &CancellationToken,
 ) -> Result<Vec<Candidate>, VectorStoreError> {
+    let k = request.top_k;
     if also.is_empty() {
         return Ok(found);
     }
@@ -501,8 +529,12 @@ fn merge_also(
             continue;
         }
         let scale = segment.segment.vector_scale(wanted.slot).unwrap_or(1.0);
+        let mut rank = scorer.rank(segment.segment.vector(wanted.slot), scale);
+        if request.window_penalty != 0.0 && segment.segment.slot_window(wanted.slot) > 0 {
+            rank = scorer.penalize(rank, request.window_penalty);
+        }
         weighed.push(Candidate {
-            rank: scorer.rank(segment.segment.vector(wanted.slot), scale),
+            rank,
             key: wanted.key,
             seg: wanted.seg,
             slot: wanted.slot,
@@ -523,6 +555,7 @@ fn merge_also(
 fn scan_share(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
+    penalty: f32,
     k: usize,
     share: &[Piece],
     cancel: &CancellationToken,
@@ -535,10 +568,18 @@ fn scan_share(
         let width = segment.segment.codec().bytes_per_vector();
         let vectors = &segment.segment.vector_bytes()
             [piece.start as usize * width..piece.end as usize * width];
+        // Read only when there is a penalty to apply, so a scan without one is untouched.
+        let windows = segment
+            .segment
+            .slot_window_bytes()
+            .filter(|_| penalty != 0.0)
+            .map(|windows| &windows[piece.start as usize..piece.end as usize]);
         let scan = Pass {
             segment,
             scorer,
             piece,
+            windows,
+            penalty,
             cancel,
             progress,
         };
@@ -572,6 +613,9 @@ struct Pass<'p, 's, S> {
     segment: &'p ScanSegment<'s>,
     scorer: &'p S,
     piece: &'p Piece,
+    /// The piece's slots' windows, when a penalty applies to them.
+    windows: Option<&'p [u8]>,
+    penalty: f32,
     cancel: &'p CancellationToken,
     progress: Option<&'p AtomicUsize>,
 }
@@ -597,12 +641,13 @@ impl<S: Scorer> Pass<'_, '_, S> {
             if self.segment.is_deleted(slot) {
                 continue;
             }
-            top.offer(
-                self.scorer.rank(vector, scale),
-                self.piece.seg,
-                slot,
-                || self.segment.segment.key(slot),
-            );
+            let mut rank = self.scorer.rank(vector, scale);
+            if self.windows.is_some_and(|windows| windows[offset] > 0) {
+                rank = self.scorer.penalize(rank, self.penalty);
+            }
+            top.offer(rank, self.piece.seg, slot, || {
+                self.segment.segment.key(slot)
+            });
         }
         Ok(())
     }
@@ -699,6 +744,9 @@ fn hits(
             score: scorer.score(candidate.rank),
             key: candidate.key,
             records: records(set, candidate.seg, candidate.slot, request.books),
+            window: set.segments[candidate.seg as usize]
+                .segment
+                .slot_window(candidate.slot),
             seg: candidate.seg,
             slot: candidate.slot,
         })

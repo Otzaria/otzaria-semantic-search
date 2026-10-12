@@ -53,6 +53,8 @@ pub struct Segment {
     vectors: Range<usize>,
     /// VECTOR_SCALES, for a codec with a scale per vector.
     scales: Option<Range<usize>>,
+    /// SLOT_WINDOWS, when the segment has it.
+    windows: Option<Range<usize>>,
     extras: Range<usize>,
     extras_by_slot: Range<usize>,
     foreign: Range<usize>,
@@ -315,6 +317,16 @@ impl Segment {
             }
             (false, _) => None,
         };
+        let windows_entry = match sections.get(&SectionKind::SlotWindows) {
+            Some(entry) if entry.elem_count != header.slot_count || !entry.is_blocksummed() => {
+                return Err(format!(
+                    "SLOT_WINDOWS holds {} window(s) for {} slot(s), or is not covered by block \
+                     CRCs",
+                    entry.elem_count, header.slot_count
+                ))
+            }
+            entry => entry.copied(),
+        };
 
         let blocksummed: Vec<(SectionKind, Range<usize>)> = header
             .sections
@@ -414,6 +426,7 @@ impl Segment {
             keys: range(&keys_entry),
             vectors: range(&vectors_entry),
             scales: scales_entry.as_ref().map(range),
+            windows: windows_entry.as_ref().map(range),
             extras: range(&extras_entry),
             extras_by_slot: range(&by_slot_entry),
             foreign: range(&foreign_entry),
@@ -644,6 +657,21 @@ impl Segment {
     /// Every slot's scale, little-endian `f32`s in slot order, for a codec with them.
     pub fn vector_scale_bytes(&self) -> Option<&[u8]> {
         self.scales.as_ref().map(|scales| &self.map[scales.clone()])
+    }
+
+    /// The least window ordinal of the slot's key: 0 for a line's first window, and for
+    /// every slot of a segment without SLOT_WINDOWS.
+    pub fn slot_window(&self, slot: u32) -> u8 {
+        self.windows
+            .as_ref()
+            .map_or(0, |windows| self.map[windows.start + slot as usize])
+    }
+
+    /// Every slot's window, in slot order, when the segment has SLOT_WINDOWS.
+    pub fn slot_window_bytes(&self) -> Option<&[u8]> {
+        self.windows
+            .as_ref()
+            .map(|windows| &self.map[windows.clone()])
     }
 
     /// Every encoded vector, in slot order.

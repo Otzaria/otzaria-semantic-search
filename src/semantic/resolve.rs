@@ -44,6 +44,9 @@ pub struct VectorHit {
     /// Where that text was: the books admitted by the search's filter first, then the
     /// rest, at most [`MAX_RECORDS_PER_HIT`] in all.
     pub records: Vec<RecordRef>,
+    /// The least window ordinal any record of the key has: 0 for a line's first window, the
+    /// key a line's `chunkKey` holds; past it, a window of a long line's text.
+    pub window: u8,
     /// Which segment of the set holds the vector, and at which slot. Stable for one
     /// generation of the set; for diagnostics, not for identity.
     pub seg: u16,

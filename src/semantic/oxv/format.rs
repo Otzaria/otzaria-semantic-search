@@ -72,6 +72,9 @@ pub(crate) enum SectionKind {
     Vectors,
     /// One `f32` per slot, for a codec that scales each vector. Reserved.
     VectorScales,
+    /// One `u8` per slot: the least window ordinal any record of the slot's key has, 0 being
+    /// a line's own first window. Absent, every slot's is 0.
+    SlotWindows,
     /// `{slot u32, hint u32}`: a further record of a slot's key, in some book.
     Extras,
     /// `u32` indexes into [`Self::Extras`], ordered by slot.
@@ -98,6 +101,7 @@ impl SectionKind {
             Self::SlotHints => 0x0011,
             Self::Vectors => 0x0012,
             Self::VectorScales => 0x0013,
+            Self::SlotWindows => 0x0014,
             Self::Extras => 0x0020,
             Self::ExtrasBySlot => 0x0021,
             Self::Foreign => 0x0022,
@@ -117,6 +121,7 @@ impl SectionKind {
             0x0011 => Self::SlotHints,
             0x0012 => Self::Vectors,
             0x0013 => Self::VectorScales,
+            0x0014 => Self::SlotWindows,
             0x0020 => Self::Extras,
             0x0021 => Self::ExtrasBySlot,
             0x0022 => Self::Foreign,
@@ -134,6 +139,7 @@ impl SectionKind {
             Self::Books => Some(BOOK_ENTRY_LEN as u32),
             Self::SlotKeys | Self::Tombstones => Some(16),
             Self::SlotHints | Self::ExtrasBySlot | Self::BlockCrcs | Self::VectorScales => Some(4),
+            Self::SlotWindows => Some(1),
             Self::Extras => Some(EXTRA_LEN as u32),
             Self::Foreign => Some(FOREIGN_LEN as u32),
             Self::BookNames
@@ -153,6 +159,7 @@ impl SectionKind {
             Self::SlotHints => "SLOT_HINTS",
             Self::Vectors => "VECTORS",
             Self::VectorScales => "VECTOR_SCALES",
+            Self::SlotWindows => "SLOT_WINDOWS",
             Self::Extras => "EXTRAS",
             Self::ExtrasBySlot => "EXTRAS_BY_SLOT",
             Self::Foreign => "FOREIGN",
@@ -526,6 +533,7 @@ mod tests {
             SectionKind::SlotHints,
             SectionKind::Vectors,
             SectionKind::VectorScales,
+            SectionKind::SlotWindows,
             SectionKind::Extras,
             SectionKind::ExtrasBySlot,
             SectionKind::Foreign,

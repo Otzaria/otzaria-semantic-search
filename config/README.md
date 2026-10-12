@@ -8,6 +8,7 @@ handed one pair, never a mix of two.
 | Directory | Model | Status |
 |---|---|---|
 | `config/models/meivin-round2-onnx/` | Meivin Round 2 through ONNX Runtime, 256 dimensions: its int8 and fp32 packages | **the production identity**: the application ships the int8 package and embeds queries with it; the library's passages are embedded with fp32 |
+| `config/models/meivin-round2-windows-onnx/` | the same model and packages; `chunking_version` 2, which also embeds windows of 512 characters, overlapping by 128, of a line longer than 512 (at most 6 per line) | published beside the production identity; every line's first window is the production identity's text and key |
 
 The pair that sat in `config/` itself — `EMD123/Otzaria-Embedding-V1-Flash-0.6B`, GGUF
 `Q4_K_M` through llama.cpp, 1024 dimensions — went with the GGUF backend; the last commit

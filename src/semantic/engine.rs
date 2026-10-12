@@ -2125,13 +2125,13 @@ mod tests {
 
     /// A chunking algorithm this build does not implement is not an incompatibility to
     /// report — it is a configuration that cannot be acted on at all. Opening under it and
-    /// then chunking with version 1's code would record version 2 in the manifest for
+    /// then chunking with version 1's code would record version 3 in the manifest for
     /// vectors version 1 produced.
     #[test]
     fn a_chunking_version_this_build_does_not_implement_is_refused_at_open() {
         let dir = TempDir::new("unimplemented_chunking");
         let mut config = config_at(&dir);
-        config.chunking.chunking_version = 2;
+        config.chunking.chunking_version = 3;
 
         match SemanticEngine::open(config) {
             Err(SemanticSearchError::Artifact(ArtifactError::UnsupportedRecipeVersion {
@@ -2140,7 +2140,7 @@ mod tests {
                 ..
             })) => {
                 assert_eq!(field, "chunking_version");
-                assert_eq!(found, 2);
+                assert_eq!(found, 3);
             }
             Err(other) => panic!(
                 "an unimplemented chunking algorithm must be refused as \

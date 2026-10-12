@@ -179,6 +179,10 @@ impl BuildPlan {
         for book_key in corpus.book_keys()? {
             books += 1;
             for chunk in chunks_for_book(corpus, &chunker, &book_key)? {
+                // A line's further windows follow its first, which is the one counted.
+                if chunk.window > 0 {
+                    continue;
+                }
                 // Two books claiming one line, or one book listing it twice. Built, it
                 // would be recorded twice, under two positions; refusing here names the
                 // corpus, which is where the fault is.
@@ -310,8 +314,10 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
         codec,
     );
     for book in &assembled.books {
+        let first = segment.slot_count() as usize;
+        let windows = &assembled.windows[first..first + book.primary.len()];
         segment
-            .add_book(&book.name, &book.primary, &book.extras, &[])
+            .add_book_windowed(&book.name, &book.primary, windows, &book.extras, &[])
             .map_err(io_error(format!("assembling book {:?}", book.name)))?;
     }
     let codec_params_sha256 = segment.codec().params_sha256();
@@ -573,6 +579,8 @@ struct Assembled {
     books: Vec<AssembledBook>,
     /// `slots × embedding_dim` floats.
     vectors: Vec<f32>,
+    /// Each slot's window: the least of its key's records'.
+    windows: Vec<u8>,
 }
 
 /// Apply the recipe to every book and embed what it derives, assigning slots the way a
@@ -606,6 +614,7 @@ fn embed_corpus(
 
     let mut slots: HashMap<ChunkKey, u32> = HashMap::new();
     let mut vectors = Vec::new();
+    let mut windows: Vec<u8> = Vec::new();
     let mut books = Vec::with_capacity(book_keys.len());
     let mut chunked = BTreeSet::new();
     for name in book_keys {
@@ -636,6 +645,11 @@ fn embed_corpus(
             let hint = ordinals[&chunk.line_id];
             // The string the backend is handed below, and nothing derived from it.
             let key = ChunkKey::of(&chunk.embedding_text);
+            // A slot's window is the least any record of its key has.
+            if let Some(&slot) = slots.get(&key) {
+                let window = &mut windows[slot as usize];
+                *window = (*window).min(chunk.window);
+            }
             if !recorded.insert(key) {
                 continue;
             }
@@ -643,6 +657,7 @@ fn embed_corpus(
                 Some(&slot) => book.extras.push((hint, slot)),
                 None => {
                     slots.insert(key, slots.len() as u32);
+                    windows.push(chunk.window);
                     book.primary.push((key, hint));
                     texts.push(chunk.embedding_text);
                 }
@@ -684,7 +699,11 @@ fn embed_corpus(
             first_unexpected: unexpected.first().copied(),
         });
     }
-    Ok(Assembled { books, vectors })
+    Ok(Assembled {
+        books,
+        vectors,
+        windows,
+    })
 }
 
 /// Refuse an output path that is not an empty place to write a whole package.
@@ -1259,19 +1278,19 @@ mod tests {
                 // of the configuration — so the declared identity moves with it.
                 "chunking_version",
                 ChunkerConfig {
-                    chunking_version: 2,
+                    chunking_version: 3,
                     ..ChunkerConfig::default()
                 },
                 ModelIdentity {
                     chunking_identity: ChunkerConfig {
-                        chunking_version: 2,
+                        chunking_version: 3,
                         ..ChunkerConfig::default()
                     }
                     .identity(),
                     ..truthful.clone()
                 },
-                2,
-                "1",
+                3,
+                "1, 2",
             ),
         ];
 
@@ -1444,6 +1463,43 @@ mod tests {
         );
     }
 
+    /// Under windows a long line takes a slot per window, at its own hint, and each slot
+    /// records its window; the plan still counts lines, not windows.
+    #[test]
+    fn a_build_with_windows_gives_each_window_a_slot() {
+        let dir = TempDir::new("windows_build");
+        let corpus = standard_corpus(&dir);
+        let chunking = ChunkerConfig {
+            max_chunk_chars: 20,
+            chunking_version: 2,
+            window_chars: 16,
+            window_overlap_chars: 4,
+            max_windows_per_line: 3,
+            ..ChunkerConfig::default()
+        };
+        let (_, checksum) = write_model(&dir);
+        let model = model_for(&checksum, &chunking);
+        let report = build(build_request(&dir, model, chunking.clone()), &corpus).unwrap();
+        assert_eq!(report.planned_lines, 3);
+
+        let segment = Segment::open(&report.output_path.join(SEGMENT_FILENAME)).unwrap();
+        let chunker = Chunker::new(chunking).unwrap();
+        let mut expected = Vec::new();
+        for book in [BERACHOT, GENESIS] {
+            for chunk in chunks_for_book(&corpus, &chunker, book).unwrap() {
+                let key = ChunkKey::of(&chunk.embedding_text);
+                if !expected.iter().any(|(seen, _)| *seen == key) {
+                    expected.push((key, chunk.window));
+                }
+            }
+        }
+        let stored: Vec<(ChunkKey, u8)> = (0..segment.slot_count())
+            .map(|slot| (segment.key(slot), segment.slot_window(slot)))
+            .collect();
+        assert_eq!(stored, expected);
+        assert!(stored.iter().any(|(_, window)| *window == 2));
+    }
+
     /// The stage's own claim, end to end and without a hand-built fixture anywhere: a
     /// corpus and a model in, a package out that installs, opens and finds what it holds.
     #[test]
@@ -1510,6 +1566,7 @@ mod tests {
                         top_k: 3,
                         books: None,
                         threads: 1,
+                        window_penalty: 0.0,
                     },
                     &CancellationToken::new(),
                 )

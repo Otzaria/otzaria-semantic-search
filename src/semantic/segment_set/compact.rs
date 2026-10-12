@@ -11,8 +11,9 @@
 //! holds the same library version as
 //! the set — re-anchored on the lines that hold each key today, through [`LiveKeySource`]:
 //! a hint moves to the live line closest to it, and a record whose key the book no longer
-//! holds is dropped. Slots are then assigned as a build assigns them: the first time a key
-//! appears it takes the next slot, every later appearance is an extra.
+//! holds is dropped. A record of a slot past a line's first window is kept as it is: the
+//! live index's keys are first windows only. Slots are then assigned as a build assigns them:
+//! the first time a key appears it takes the next slot, every later appearance is an extra.
 
 use super::files::{self, io_error, Durable, SetLock, SetSegment, STAGING_DIR};
 use super::install::{full_or_io, NewGeneration};
@@ -242,20 +243,26 @@ pub fn compact(
                 .iter()
                 .take_while(|book| book.0 == name)
                 .count();
-        let mut records: Vec<(ChunkKey, u32, u16)> = Vec::new();
+        // (key, hint, segment, the window of the slot it names)
+        let mut records: Vec<(ChunkKey, u32, u16, u8)> = Vec::new();
         for &(_, seg, index) in &books[start..end] {
             let segment = &segments[seg as usize];
             let book = &segment.books()[index];
             let dead = &deleted[seg as usize];
             for slot in book.slots.clone() {
                 if !dead.is_set(slot) {
-                    records.push((segment.key(slot), segment.hint(slot), seg));
+                    records.push((
+                        segment.key(slot),
+                        segment.hint(slot),
+                        seg,
+                        segment.slot_window(slot),
+                    ));
                 }
             }
             for extra in book.extras.clone() {
                 let (slot, hint) = segment.extra(extra);
                 if !dead.is_set(slot) {
-                    records.push((segment.key(slot), hint, seg));
+                    records.push((segment.key(slot), hint, seg, segment.slot_window(slot)));
                 }
             }
             for foreign in book.foreign.clone() {
@@ -265,7 +272,8 @@ pub fn compact(
                     .and_then(|link| link.target());
                 if let Some((target_seg, target_slot)) = target {
                     if !deleted[target_seg as usize].is_set(target_slot) {
-                        records.push((key, hint, seg));
+                        let window = segments[target_seg as usize].slot_window(target_slot);
+                        records.push((key, hint, seg, window));
                     }
                 }
             }
@@ -287,21 +295,25 @@ pub fn compact(
                         by_key.entry(value).or_default().push(ordinal);
                     }
                 }
-                records.retain_mut(|(key, hint, _)| match by_key.get_mut(&key.column_value()) {
-                    Some(ordinals) => {
-                        let closest = *ordinals
-                            .iter()
-                            .min_by_key(|ordinal| (ordinal.abs_diff(*hint), **ordinal))
-                            .expect("a key in the map has a line");
-                        if closest != *hint {
-                            refreshed += 1;
-                            *hint = closest;
+                records.retain_mut(|(key, hint, _, window)| {
+                    match by_key.get_mut(&key.column_value()) {
+                        // The live index holds no key past a line's first window.
+                        _ if *window > 0 => true,
+                        Some(ordinals) => {
+                            let closest = *ordinals
+                                .iter()
+                                .min_by_key(|ordinal| (ordinal.abs_diff(*hint), **ordinal))
+                                .expect("a key in the map has a line");
+                            if closest != *hint {
+                                refreshed += 1;
+                                *hint = closest;
+                            }
+                            true
                         }
-                        true
-                    }
-                    None => {
-                        pruned += 1;
-                        false
+                        None => {
+                            pruned += 1;
+                            false
+                        }
                     }
                 });
             }
@@ -309,8 +321,9 @@ pub fn compact(
 
         records.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
         let mut primary = Vec::new();
+        let mut windows = Vec::new();
         let mut extras = Vec::new();
-        for (key, hint, _) in records {
+        for (key, hint, _, _) in records {
             let Ok(position) = live_slots.binary_search_by(|probe| probe.0.cmp(&key)) else {
                 continue;
             };
@@ -319,12 +332,13 @@ pub fn compact(
                 let (_, seg, slot) = live_slots[position];
                 order.push((seg, slot));
                 primary.push((key, hint));
+                windows.push(segments[seg as usize].slot_window(slot));
             } else {
                 extras.push((hint, new_slot[position]));
             }
         }
         builder
-            .add_book(name, &primary, &extras, &[])
+            .add_book_windowed(name, &primary, &windows, &extras, &[])
             .map_err(io_error(format!("assembling book {name:?}")))?;
     }
     drop(new_slot);
@@ -388,6 +402,7 @@ pub fn compact(
             if output.vector(slot as u32) != original.vector(source)
                 || output.vector_scale(slot as u32) != original.vector_scale(source)
                 || output.key(slot as u32) != original.key(source)
+                || output.slot_window(slot as u32) != original.slot_window(source)
             {
                 return Err(VectorStoreError::Corrupted {
                     reason: format!(

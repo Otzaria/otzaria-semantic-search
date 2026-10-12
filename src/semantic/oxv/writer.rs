@@ -51,6 +51,8 @@ pub struct SegmentBuilder {
     names: Vec<u8>,
     keys: Vec<[u8; 16]>,
     hints: Vec<u32>,
+    /// One per slot; SLOT_WINDOWS is written only when one of them is not 0.
+    windows: Vec<u8>,
     extras: Vec<(u32, u32)>,
     foreign: Vec<([u8; 16], u32, u32)>,
     tombstones: Vec<[u8; 16]>,
@@ -81,6 +83,7 @@ impl SegmentBuilder {
             names: Vec::new(),
             keys: Vec::new(),
             hints: Vec::new(),
+            windows: Vec::new(),
             extras: Vec::new(),
             foreign: Vec::new(),
             tombstones: Vec::new(),
@@ -107,6 +110,26 @@ impl SegmentBuilder {
         extras: &[(u32, u32)],
         foreign: &[(ChunkKey, u32)],
     ) -> io::Result<u32> {
+        self.add_book_windowed(name, primary, &[], extras, foreign)
+    }
+
+    /// [`Self::add_book`], with each primary record's window — one per record, or none for
+    /// all 0 — in SLOT_WINDOWS.
+    pub fn add_book_windowed(
+        &mut self,
+        name: &str,
+        primary: &[(ChunkKey, u32)],
+        windows: &[u8],
+        extras: &[(u32, u32)],
+        foreign: &[(ChunkKey, u32)],
+    ) -> io::Result<u32> {
+        if !windows.is_empty() && windows.len() != primary.len() {
+            return Err(invalid(format!(
+                "book {name:?} has {} primary record(s) and {} window(s)",
+                primary.len(),
+                windows.len()
+            )));
+        }
         let first_slot = self.keys.len() as u32;
         if primary.is_empty() && extras.is_empty() && foreign.is_empty() {
             return Ok(first_slot);
@@ -158,6 +181,11 @@ impl SegmentBuilder {
         for (key, hint) in primary {
             self.keys.push(key.0);
             self.hints.push(*hint);
+        }
+        if windows.is_empty() {
+            self.windows.resize(self.keys.len(), 0);
+        } else {
+            self.windows.extend_from_slice(windows);
         }
         let mut sorted: Vec<(u32, u32)> = extras.to_vec();
         sorted.sort_unstable();
@@ -264,11 +292,20 @@ impl SegmentBuilder {
         } else {
             0
         };
+        // Left out when every slot is a line's first window, so such a segment is
+        // byte for byte what it was before windows existed.
+        let window_bytes = self
+            .windows
+            .iter()
+            .any(|window| *window != 0)
+            .then_some(self.windows);
+        let windows_len = window_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
         let blocks = |len: u64| len.div_ceil(BLOCK_SIZE as u64);
         let crc_count = blocks(hint_bytes.len() as u64)
             + blocks(key_bytes.len() as u64)
             + blocks(vectors_len)
-            + blocks(scales_len);
+            + blocks(scales_len)
+            + blocks(windows_len);
 
         // The layout: small metadata first, vectors last.
         let fixed = |kind: SectionKind| kind.fixed_elem_size().expect("a fixed-size section");
@@ -352,6 +389,15 @@ impl SegmentBuilder {
                 SectionKind::VectorScales,
                 4,
                 scales_len,
+                u64::from(slot_count),
+                true,
+            ));
+        }
+        if window_bytes.is_some() {
+            plan.push((
+                SectionKind::SlotWindows,
+                1,
+                windows_len,
                 u64::from(slot_count),
                 true,
             ));
@@ -492,6 +538,7 @@ impl SegmentBuilder {
             section_sha256,
             scratch: Vec::new(),
             scales: has_scales.then(|| Vec::with_capacity(scales_len as usize)),
+            windows: window_bytes,
             clipped: 0,
         })
     }
@@ -518,6 +565,8 @@ pub struct VectorSink {
     scratch: Vec<u8>,
     /// VECTOR_SCALES, for a codec with a scale per vector: written after the last vector.
     scales: Option<Vec<u8>>,
+    /// SLOT_WINDOWS, when the segment has it: written after the scales.
+    windows: Option<Vec<u8>>,
     clipped: u64,
 }
 
@@ -634,6 +683,21 @@ impl VectorSink {
                 .extend(scales.chunks(BLOCK_SIZE).map(crc32fast::hash));
             if let Some(digests) = &mut self.section_sha256 {
                 digests[entry] = Sha256::digest(&scales).into();
+            }
+        }
+        if let Some(windows) = self.windows.take() {
+            let entry = self
+                .header
+                .sections
+                .iter()
+                .position(|entry| entry.kind == SectionKind::SlotWindows.code())
+                .expect("windows lay out their section");
+            self.out.pad_to(self.header.sections[entry].offset)?;
+            self.out.write_all(&windows)?;
+            self.block_crcs
+                .extend(windows.chunks(BLOCK_SIZE).map(crc32fast::hash));
+            if let Some(digests) = &mut self.section_sha256 {
+                digests[entry] = Sha256::digest(&windows).into();
             }
         }
         let crc_bytes: Vec<u8> = self

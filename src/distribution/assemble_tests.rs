@@ -37,6 +37,7 @@ fn text(i: usize) -> String {
 /// A build machine's state: the family, its warehouse, and the plans and releases made.
 struct Machine {
     dir: TempDir,
+    chunking: ChunkerConfig,
     model: ModelIdentity,
     package: ModelPackage,
     warehouse: PathBuf,
@@ -44,13 +45,20 @@ struct Machine {
 
 impl Machine {
     fn new(name: &str) -> Self {
+        Self::chunked(name, ChunkerConfig::default())
+    }
+
+    /// A machine whose family is built under `chunking`.
+    fn chunked(name: &str, chunking: ChunkerConfig) -> Self {
         let dir = TempDir::new(name);
         let model_path = stub_model(dir.path());
-        let (model, package) = (family(&model_path), passage_package(&model_path));
+        let (mut model, package) = (family(&model_path), passage_package(&model_path));
+        model.chunking_identity = chunking.identity();
         let warehouse = dir.join("warehouse");
         Warehouse::create(&warehouse, WarehouseIdentity::of(&model, &package)).unwrap();
         Self {
             dir,
+            chunking,
             model,
             package,
             warehouse,
@@ -84,7 +92,7 @@ impl Machine {
                 PlanRequest {
                     out_dir: out.clone(),
                     model: self.model.clone(),
-                    chunking: ChunkerConfig::default(),
+                    chunking: self.chunking.clone(),
                     passage_package: self.package.clone(),
                     previous,
                     warehouse: Some(&warehouse),
@@ -188,7 +196,8 @@ struct Live(u32, BTreeMap<String, Vec<(u32, u64)>>);
 impl Live {
     fn of(plan: &Plan) -> Self {
         let mut books: BTreeMap<String, Vec<(u32, u64)>> = BTreeMap::new();
-        for record in plan.records.iter() {
+        // An index's column holds each line's first window only.
+        for record in plan.records.iter().filter(|record| record.window == 0) {
             books
                 .entry(plan.books.name(record.book).to_string())
                 .or_default()
@@ -208,6 +217,102 @@ impl LiveKeySource for Live {
             out.extend_from_slice(lines);
             true
         }))
+    }
+}
+
+/// A recipe with windows: small enough that every line of [`text`] has some.
+fn windows_chunking() -> ChunkerConfig {
+    ChunkerConfig {
+        max_chunk_chars: 20,
+        chunking_version: 2,
+        window_chars: 16,
+        window_overlap_chars: 4,
+        max_windows_per_line: 3,
+        ..ChunkerConfig::default()
+    }
+}
+
+/// A plan under windows is `OXVREC2`, its first windows are the plan of the same recipe
+/// without them, and the base assembled from it gives every slot the least window of its
+/// key's records. The gates pass, G8 included; a delta then compacted on the live index
+/// is the base of the newer library, windows and all.
+#[test]
+fn a_release_with_windows_records_each_slots_window() {
+    let machine = Machine::chunked("release_windows", windows_chunking());
+    let anchor = Machine::chunked("release_windows_anchor", windows_chunking().anchor());
+    let p1 = machine.plan("p1", 1, &v1(), None);
+    let a1 = anchor.plan("p1", 1, &v1(), None);
+    assert!(p1.records.is_windowed() && !a1.records.is_windowed());
+    let firsts: Vec<_> = p1.records.iter().filter(|r| r.window == 0).collect();
+    assert_eq!(firsts, a1.records.iter().collect::<Vec<_>>());
+    assert!(p1.records.iter().any(|record| record.window > 0));
+
+    let base1 = machine.assemble(&p1, PackageKind::Base, None, NEW, "base1");
+    let segment = Segment::open(&base1.out_dir.join(SEGMENT_FILE)).unwrap();
+    let mut least: BTreeMap<ChunkKey, u8> = BTreeMap::new();
+    for record in p1.records.iter() {
+        let window = least.entry(record.key()).or_insert(record.window);
+        *window = (*window).min(record.window);
+    }
+    assert_eq!(segment.slot_count() as usize, least.len());
+    for slot in 0..segment.slot_count() {
+        assert_eq!(segment.slot_window(slot), least[&segment.key(slot)]);
+    }
+    assert!(least.values().any(|window| *window > 0));
+    let ledger1 = Ledger::open(&base1.out_dir, Some(1)).unwrap();
+
+    let p2 = machine.plan("p2", 2, &v2(), Some(&ledger1));
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger1), NEW, "delta2");
+    let base2 = machine.assemble(&p2, PackageKind::Base, None, NEW, "base2");
+    let work = &machine.dir;
+    let chain = simulate_device(&work.join("device"), &[&base1.out_dir, &delta.out_dir]).unwrap();
+    assert!(coverage(&chain, &p2).complete());
+    drop(chain);
+    compact(
+        &work.join("device"),
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&p2)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&work.join("device")).unwrap();
+    let direct = simulate_device(&work.join("direct"), &[&base2.out_dir]).unwrap();
+    let windows = |segment: &Segment| -> Vec<u8> {
+        (0..segment.slot_count())
+            .map(|slot| segment.slot_window(slot))
+            .collect()
+    };
+    let (slots, extras, books) = contents(&compacted.segments()[0]);
+    let (direct_slots, direct_extras, direct_books) = contents(&direct.segments()[0]);
+    assert_eq!(slots, direct_slots);
+    assert_eq!(
+        windows(&compacted.segments()[0]),
+        windows(&direct.segments()[0])
+    );
+    // [`text`]'s later words are every line's, so C's windows share live keys: the index
+    // cannot vouch for a window, and a book it does not hold keeps its records.
+    assert_eq!(books, [A, B, C, D]);
+    assert_eq!(direct_books, [A, B, D]);
+    assert_eq!(extras.len(), direct_extras.len() + 2);
+
+    for (release, plan, previous) in [
+        ("base1", &p1, None),
+        ("base2", &p2, None),
+        ("delta2", &p2, Some(&ledger1)),
+    ] {
+        let report = machine.verify(plan, release, previous);
+        for gate in &report.gates {
+            let sized = release == "delta2" && gate.gate == "G7";
+            assert!(
+                gate.passed() || sized,
+                "{release} {}: {}",
+                gate.gate,
+                gate.detail
+            );
+        }
     }
 }
 
@@ -479,6 +584,7 @@ fn a_delta_that_ships_no_vector_installs() {
                     top_k: 1000,
                     books: None,
                     threads: 1,
+                    window_penalty: 0.0,
                 },
                 &CancellationToken::new(),
             )

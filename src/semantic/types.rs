@@ -382,6 +382,13 @@ pub struct SemanticChunk {
     pub title: String,
     /// All facet paths describing the book — see [`BookForIndexing::all_facets`].
     pub facets: Vec<String>,
+    /// Which window of the line this chunk is; 0 is the text the line has always embedded as.
+    #[serde(default, skip_serializing_if = "is_first_window")]
+    pub window: u8,
+}
+
+fn is_first_window(window: &u8) -> bool {
+    *window == 0
 }
 
 /// Metadata stored alongside each vector in the vector database.
