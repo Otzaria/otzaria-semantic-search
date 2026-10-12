@@ -292,8 +292,8 @@ impl SegmentBuilder {
         } else {
             0
         };
-        // Left out when every slot is a line's first window, so such a segment is
-        // byte for byte what it was before windows existed.
+        // Left out when every slot is a line's first window: such a segment's bytes do not
+        // depend on windows at all.
         let window_bytes = self
             .windows
             .iter()

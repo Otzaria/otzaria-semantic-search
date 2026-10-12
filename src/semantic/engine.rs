@@ -133,7 +133,17 @@ impl SemanticConfig {
         // The same argument, for the three recipe versions. `Chunker::new` resolves them
         // too, but that happens after this and only on the path that builds one — and a
         // manifest signed with a version nothing implements is exactly what this refuses.
-        ChunkingAlgorithm::from_version(self.chunking.chunking_version)?;
+        // Windows need the scan's penalty, which this store does not apply: version 1 only.
+        if ChunkingAlgorithm::from_version(self.chunking.chunking_version)?
+            != ChunkingAlgorithm::AnchoredLine
+        {
+            return Err(crate::errors::ArtifactError::UnsupportedRecipeVersion {
+                field: "chunking_version",
+                found: self.chunking.chunking_version,
+                supported: ChunkingAlgorithm::AnchoredLine.version().to_string(),
+            }
+            .into());
+        }
         EmbeddingTextRecipe::from_version(self.chunking.embedding_text_version)?;
         TextNormalizationRecipe::from_version(self.chunking.normalization_version)?;
         // 2, not 1: the cap counts the special tokens the backend adds around the text,
@@ -2125,13 +2135,13 @@ mod tests {
 
     /// A chunking algorithm this build does not implement is not an incompatibility to
     /// report — it is a configuration that cannot be acted on at all. Opening under it and
-    /// then chunking with version 1's code would record version 3 in the manifest for
+    /// then chunking with version 1's code would record version 2 in the manifest for
     /// vectors version 1 produced.
     #[test]
     fn a_chunking_version_this_build_does_not_implement_is_refused_at_open() {
         let dir = TempDir::new("unimplemented_chunking");
         let mut config = config_at(&dir);
-        config.chunking.chunking_version = 3;
+        config.chunking.chunking_version = 2;
 
         match SemanticEngine::open(config) {
             Err(SemanticSearchError::Artifact(ArtifactError::UnsupportedRecipeVersion {
@@ -2140,7 +2150,7 @@ mod tests {
                 ..
             })) => {
                 assert_eq!(field, "chunking_version");
-                assert_eq!(found, 3);
+                assert_eq!(found, 2);
             }
             Err(other) => panic!(
                 "an unimplemented chunking algorithm must be refused as \

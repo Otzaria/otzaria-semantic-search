@@ -232,10 +232,8 @@ fn windows_chunking() -> ChunkerConfig {
     }
 }
 
-/// A plan under windows is `OXVREC2`, its first windows are the plan of the same recipe
-/// without them, and the base assembled from it gives every slot the least window of its
-/// key's records. The gates pass, G8 included; a delta then compacted on the live index
-/// is the base of the newer library, windows and all.
+/// A windows plan's first windows are the plan without them; every slot gets its key's least
+/// window, the gates pass, and delta + compaction gives the newer base's slots and windows.
 #[test]
 fn a_release_with_windows_records_each_slots_window() {
     let machine = Machine::chunked("release_windows", windows_chunking());

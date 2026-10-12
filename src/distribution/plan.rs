@@ -6,10 +6,8 @@
 //!
 //! ```text
 //! records.bin          b"OXVREC1\n", u64 count, then {book u32, ordinal u32, sha256 [32]}
-//!                      per embedded line, strictly ascending by (book, ordinal); or
-//!                      b"OXVREC2\n", u64 count, then {book u32, ordinal u32, window u8,
-//!                      pad [3], sha256 [32]} per embedded window, strictly ascending by
-//!                      (book, ordinal, window): a recipe with further windows
+//!                      per embedded line, strictly ascending by (book, ordinal); b"OXVREC2\n"
+//!                      adds {window u8, pad [3]} after ordinal and ascends by window too
 //! books.json           the books' stable keys, a JSON array in strictly ascending byte
 //!                      order; a record's book is an index into it
 //! embed.jsonl          the texts no warehouse vector exists for, one per key, in order of

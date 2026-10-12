@@ -28,7 +28,7 @@ One directory, written by `export_semantic_plan` over the release index (in
 
 | File | Layout |
 |---|---|
-| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal) |
+| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, pad [3], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first |
 | `books.json` | JSON array of the books' stable keys, strictly ascending by bytes; a record's `book` is an index into it |
 | `embed.jsonl` | the texts to embed — §2 |
 | `embed-manifest.json` | what `embed.jsonl` is — §2 |

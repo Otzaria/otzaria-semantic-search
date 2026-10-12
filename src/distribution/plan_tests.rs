@@ -105,7 +105,7 @@ fn records_round_trip_and_refuse_disorder_and_damage() {
     );
 }
 
-/// `OXVREC1` is written byte for byte as it was before windows existed, and refuses one.
+/// `OXVREC1`'s bytes are its documented layout, and it refuses a window past 0.
 #[test]
 fn a_plan_without_windows_is_written_as_it_always_was() {
     let dir = TempDir::new("plan_records_v1_bytes");

@@ -83,8 +83,8 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-/// One window of a line's embedded text: its ordinal (0 is the text a line has always
-/// embedded as), its characters within the trimmed text, and the string the model is given.
+/// One window of a line's embedded text: its ordinal (0 is [`Chunker::embedded_text`]), its
+/// characters within the trimmed line, and the string the model is given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedWindow {
     pub ordinal: u8,
@@ -114,7 +114,7 @@ impl ChunkerConfig {
         ] {
             hasher.update(field.to_le_bytes());
         }
-        // Only from version 2, so every version 1 identity stays what was published.
+        // Only from version 2: a version 1 identity does not depend on the window fields.
         if self.chunking_version >= ChunkingAlgorithm::AnchoredLineWindows.version() {
             for field in [
                 self.window_chars as u64,
@@ -274,11 +274,7 @@ impl Chunker {
     }
 
     /// Every window `lines[index]` is embedded as, [`Self::embedded_text`] first; empty when
-    /// the line is not embedded. Takes the same `lines` as [`Self::embedded_text`].
-    ///
-    /// # Panics
-    ///
-    /// When `index` is not inside `lines`, as slice indexing does.
+    /// the line is not embedded. Takes, and panics on, the same `lines` as that.
     pub fn embedded_windows(&self, lines: &[LineRef<'_>], index: usize) -> Vec<EmbeddedWindow> {
         self.windows_of(lines, index)
     }
@@ -345,8 +341,7 @@ impl Chunker {
             return Vec::new();
         };
         let text = lines.text(index).trim();
-        let chars: Vec<char> = text.chars().collect();
-        let n = chars.len();
+        let n = text.chars().count();
         let mut out = vec![EmbeddedWindow {
             ordinal: 0,
             chars: 0..n.min(self.config.max_chunk_chars) as u32,
@@ -358,6 +353,7 @@ impl Chunker {
         {
             return out;
         }
+        let chars: Vec<char> = text.chars().collect();
         let mut keys = vec![ChunkKey::of(&out[0].text)];
         let spans = window_spans(
             &chars,
@@ -537,8 +533,8 @@ pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_identit
     hex
 }
 
-/// [`compute_semantic_id`] for one window of a line: the window's ordinal is folded in only
-/// past the first, so a line's first window keeps the id it has always had.
+/// [`compute_semantic_id`] for one window of a line; window 0's id is the line's
+/// [`compute_semantic_id`] itself.
 pub fn compute_window_semantic_id(
     source_book_key: &str,
     line_id: u64,
@@ -1239,8 +1235,8 @@ mod tests {
         family("meivin-round2-windows-onnx").0
     }
 
-    /// The published identity is untouched, the windows family declares its own recipe's,
-    /// and differs from the published family in nothing else.
+    /// The production family keeps its identity; the windows family declares its own recipe's
+    /// and differs from the production family in nothing else.
     #[test]
     fn the_windows_family_is_the_published_one_with_windows() {
         let (published, published_model) = family("meivin-round2-onnx");
@@ -1397,7 +1393,7 @@ mod tests {
 
     #[test]
     fn windows_snap_to_words_and_stop_at_six() {
-        // 512 or fewer: the line's one window, as today.
+        // 512 or fewer: the line's one window.
         assert_eq!(spans(&one_line_windows(&"א".repeat(512))), vec![(0, 512)]);
 
         // 513 characters of 4-character words: the second window starts on a word after

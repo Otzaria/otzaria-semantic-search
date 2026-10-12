@@ -960,9 +960,8 @@ fn scan_one(
     .unwrap()
 }
 
-/// With no penalty a windowed segment ranks exactly as the same segment without windows;
-/// with one, every window's score is its cosine less the penalty, the order is the penalized
-/// one at every `k` and thread count, and each hit says which window it is.
+/// Penalty 0 ranks as a segment without windows; otherwise a window scores its cosine less
+/// the penalty, in that order at every `k` and thread count.
 #[test]
 fn the_window_penalty_ranks_by_the_penalized_score_before_the_top_k() {
     let dir = TempDir::new("window_penalty");

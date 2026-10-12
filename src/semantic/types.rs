@@ -382,7 +382,7 @@ pub struct SemanticChunk {
     pub title: String,
     /// All facet paths describing the book — see [`BookForIndexing::all_facets`].
     pub facets: Vec<String>,
-    /// Which window of the line this chunk is; 0 is the text the line has always embedded as.
+    /// Which window of the line this chunk is; 0 is [`Chunker::embedded_text`](crate::semantic::chunker::Chunker::embedded_text).
     #[serde(default, skip_serializing_if = "is_first_window")]
     pub window: u8,
 }

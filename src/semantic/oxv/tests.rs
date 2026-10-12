@@ -428,8 +428,8 @@ fn an_unknown_ancillary_section_is_skipped_and_an_unknown_critical_one_refused()
     }
 }
 
-/// A segment whose every slot is a first window is written without SLOT_WINDOWS, byte for
-/// byte as before windows existed: the digests are of files the previous writer wrote.
+/// A segment whose every slot is a first window has no SLOT_WINDOWS; the digests pin its
+/// bytes, computed by a writer with no window support (a9138e0).
 #[test]
 fn a_segment_without_windows_is_written_as_it_always_was() {
     let dir = TempDir::new("no_windows_bytes");
