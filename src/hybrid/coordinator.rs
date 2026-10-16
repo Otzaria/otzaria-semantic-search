@@ -370,7 +370,7 @@ fn candidates_of(
     // Stable, so each hit keeps its lines' order.
     lines.sort_by_key(|line| line.hit);
     let mut resolved = vec![false; hits.len()];
-    let candidates: Vec<SemanticCandidate> = lines
+    let mut candidates: Vec<SemanticCandidate> = lines
         .into_iter()
         .filter_map(|line| {
             let Some(hit) = hits.get(line.hit as usize) else {
@@ -399,10 +399,23 @@ fn candidates_of(
                     title: line.title,
                     facets: line.facets.to_vec(),
                 },
-                similarity_score: hit.score,
+                similarity_score: hit.score
+                    + if hit.window > 0 {
+                        hit.window_penalty
+                    } else {
+                        0.0
+                    }
+                    - if line.window > 0 {
+                        hit.window_penalty
+                    } else {
+                        0.0
+                    },
             })
         })
         .collect();
+    // Roles can differ even for the same shared vector. Rank each actual occurrence
+    // after applying its own penalty; stable ties retain the resolver's placement.
+    candidates.sort_by(|a, b| b.similarity_score.total_cmp(&a.similarity_score));
     let unresolved = resolved.iter().filter(|resolved| !**resolved).count() as u32;
     (candidates, unresolved)
 }
@@ -3198,6 +3211,7 @@ mod tests {
     #[test]
     fn semantic_candidates_follow_the_scan_whatever_order_the_resolver_returns() {
         let hit = |n: u32, score: f32| VectorHit {
+            window_penalty: 0.0,
             score,
             key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {n}")),
             records: Vec::new(),
@@ -3207,6 +3221,7 @@ mod tests {
         };
         let hits = [hit(0, 0.9), hit(1, 0.8), hit(2, 0.7), hit(3, 0.6)];
         let line = |hit: u32, book: &str, line_id: u64| ResolvedLine {
+            window: 0,
             hit,
             line_id,
             file_path: book.to_string(),
@@ -3242,6 +3257,48 @@ mod tests {
         assert_eq!(unresolved, 1);
     }
 
+    #[test]
+    fn shared_vectors_score_each_resolved_occurrence_by_its_actual_role() {
+        let hit = |slot, score, window| VectorHit {
+            window_penalty: 0.04,
+            score,
+            window,
+            key: crate::semantic::chunk_key::ChunkKey::of(&format!("shared {slot}")),
+            records: Vec::new(),
+            seg: 0,
+            slot,
+        };
+        // First vector has an anchor somewhere and an inner-window occurrence here.
+        // Second vector was scanned only as an inner window; resolution finds its anchor.
+        let hits = [hit(0, 0.99, 0), hit(1, 0.97, 0), hit(2, 0.94, 1)];
+        let line = |hit, line_id, window| ResolvedLine {
+            hit,
+            line_id,
+            window,
+            file_path: "book".to_string(),
+            section_id: 0,
+            line_hash: 0,
+            segment: line_id,
+            is_pdf: false,
+            facets: Vec::<String>::new().into(),
+            title: String::new(),
+            reference: String::new(),
+        };
+        let (candidates, unresolved) =
+            candidates_of(&hits, vec![line(0, 10, 1), line(1, 20, 0), line(2, 30, 0)]);
+        assert_eq!(unresolved, 0);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.metadata.line_id)
+                .collect::<Vec<_>>(),
+            [30, 20, 10]
+        );
+        for (candidate, expected) in candidates.iter().zip([0.98, 0.97, 0.95]) {
+            assert!((candidate.similarity_score - expected).abs() < 1e-6);
+        }
+    }
+
     /// A text repeated in many places is one vector, and every line it resolves to scores
     /// alike. They are shown as the resolver placed them — a line of each book, then one
     /// book's repeats — in every preset and strategy, in both modes that consult the
@@ -3251,6 +3308,7 @@ mod tests {
     #[test]
     fn the_lines_one_vector_resolved_to_come_in_the_resolvers_order() {
         let hit = |slot: u32, score: f32| VectorHit {
+            window_penalty: 0.0,
             score,
             key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {slot}")),
             records: Vec::new(),
@@ -3261,6 +3319,7 @@ mod tests {
         let hits = [hit(0, 0.9), hit(1, 0.6)];
         // Each line in a section of its own, with the same facets: every bonus alike.
         let line = |hit: u32, book: &str, line_id: u64| ResolvedLine {
+            window: 0,
             hit,
             line_id,
             file_path: book.to_string(),

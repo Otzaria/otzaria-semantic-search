@@ -26,7 +26,6 @@ use crate::errors::{ArtifactError, PackError, SemanticSearchError};
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::CodecSpec;
 use crate::semantic::oxv::reader::Segment;
-use crate::semantic::oxv::scan::LINK_UNRESOLVED;
 use crate::semantic::segment_set::{
     install_package, InstallExpectation, InstallSource, ReleaseManifest, SegmentSet,
 };
@@ -570,35 +569,10 @@ pub fn simulate_device(dir: &Path, chain: &[&Path]) -> Result<SegmentSet, Semant
 /// the primary and extra records of live slots, and the foreign records that resolve to
 /// one.
 pub fn book_records(set: &SegmentSet, book: &str, out: &mut Vec<(ChunkKey, u32)>) {
+    let mut records = Vec::new();
+    set.book_occurrences(book, &mut records);
     out.clear();
-    let segments = set.segments();
-    let live = |seg: usize, slot: u32| !set.deleted()[seg].is_set(slot);
-    for (seg, segment) in segments.iter().enumerate() {
-        let books = segment.books();
-        let Ok(at) = books.binary_search_by(|entry| entry.name.as_bytes().cmp(book.as_bytes()))
-        else {
-            continue;
-        };
-        let entry = &books[at];
-        for slot in entry.slots.clone() {
-            if live(seg, slot) {
-                out.push((segment.key(slot), segment.hint(slot)));
-            }
-        }
-        for index in entry.extras.clone() {
-            let (slot, hint) = segment.extra(index);
-            if live(seg, slot) {
-                out.push((segment.key(slot), hint));
-            }
-        }
-        for index in entry.foreign.clone() {
-            let link = set.links()[seg][index as usize];
-            if link.flags & LINK_UNRESOLVED == 0 && live(link.seg as usize, link.slot) {
-                let (key, _, hint) = segment.foreign_record(index);
-                out.push((key, hint));
-            }
-        }
-    }
+    out.extend(records.into_iter().map(|(key, record)| (key, record.hint)));
     out.sort_unstable();
     out.dedup();
 }
@@ -620,28 +594,39 @@ impl Coverage {
     }
 }
 
-/// G3's count: the plan's records whose (book, key) a scan of `set` reaches. Holds one
-/// book's records at a time.
+/// G3's count: windowed plans require the exact book/key/hint/parent/window metadata;
+/// legacy plans retain their key membership check. Holds one book at a time.
 pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
     let mut coverage = Coverage {
         records: 0,
         reachable: 0,
         first_unreachable: None,
     };
-    let (mut current, mut records) = (u32::MAX, Vec::new());
-    for record in plan.records.iter() {
+    let mut current = u32::MAX;
+    let mut effective = Vec::new();
+    let mut records = std::collections::HashSet::new();
+    for record in plan.records.occurrences() {
         if record.book != current {
             current = record.book;
-            book_records(set, plan.books.name(current), &mut records);
+            set.book_occurrences(plan.books.name(current), &mut effective);
+            records.clear();
+            records.extend(
+                effective
+                    .iter()
+                    .map(|(key, row)| (*key, row.hint, row.anchor, row.window)),
+            );
         }
         coverage.records += 1;
-        let key = record.key();
-        let at = records.partition_point(|(other, _)| *other < key);
-        if records.get(at).is_some_and(|(other, _)| *other == key) {
+        let reached = if plan.records.is_windowed() {
+            records.contains(&(record.key, record.hint, Some(record.anchor), record.window))
+        } else {
+            records.iter().any(|(key, _, _, _)| *key == record.key)
+        };
+        if reached {
             coverage.reachable += 1;
         } else if coverage.first_unreachable.is_none() {
             coverage.first_unreachable =
-                Some((plan.books.name(record.book).to_string(), record.ordinal));
+                Some((plan.books.name(record.book).to_string(), record.hint));
         }
     }
     coverage

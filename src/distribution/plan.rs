@@ -258,6 +258,13 @@ impl PlanRecords {
         };
         let mut last = None;
         for record in records.iter() {
+            if record.window > 0
+                && !last.is_some_and(|(book, ordinal, _)| {
+                    book == record.book && ordinal == record.ordinal
+                })
+            {
+                return Err(malformed("a windowed plan line must begin with window 0"));
+            }
             let at = record.position();
             if last.is_some_and(|last| at <= last) {
                 return Err(malformed(format!(
@@ -273,6 +280,33 @@ impl PlanRecords {
     /// Whether the file is `OXVREC2`, whose records name their window.
     pub fn is_windowed(&self) -> bool {
         self.record_len == WINDOWED_RECORD_LEN
+    }
+
+    pub(crate) fn copy_to(&self, path: &Path) -> Result<(), PackError> {
+        crate::distribution::files::write_atomically(path, &self.map)
+    }
+
+    /// Every location with its line's first-window anchor. The plan is streamed in line
+    /// order, so no independent parent column or corpus-size map is needed.
+    pub(crate) fn occurrences(
+        &self,
+    ) -> impl Iterator<Item = crate::semantic::oxv::occurrence::Occurrence> + '_ {
+        let mut parent = None;
+        self.iter().map(move |record| {
+            if record.window == 0 {
+                parent = Some((record.book, record.ordinal, record.key()));
+            }
+            let anchor = parent
+                .filter(|(book, hint, _)| *book == record.book && *hint == record.ordinal)
+                .map_or(record.key(), |(_, _, anchor)| anchor);
+            crate::semantic::oxv::occurrence::Occurrence {
+                key: record.key(),
+                book: record.book,
+                hint: record.ordinal,
+                anchor,
+                window: record.window,
+            }
+        })
     }
 
     pub fn len(&self) -> u64 {

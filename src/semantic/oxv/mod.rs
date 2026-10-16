@@ -28,6 +28,7 @@
 pub mod codec;
 pub mod format;
 pub(crate) mod kernel;
+pub mod occurrence;
 pub mod reader;
 pub mod scan;
 pub mod writer;
@@ -38,3 +39,6 @@ mod scan_tests;
 pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod occurrence_tests;

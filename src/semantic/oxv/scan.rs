@@ -198,6 +198,11 @@ fn scan_all(
     progress: Option<&[AtomicUsize]>,
 ) -> Result<Vec<VectorHit>, VectorStoreError> {
     cancel.scan_checkpoint(0)?;
+    if !request.window_penalty.is_finite() || request.window_penalty < 0.0 {
+        return Err(VectorStoreError::SearchFailed {
+            reason: "window penalty must be finite and nonnegative".to_string(),
+        });
+    }
     if request.top_k == 0 {
         return Ok(Vec::new());
     }
@@ -465,12 +470,24 @@ fn run_shares(
             .skip(1)
             .map(|(index, share)| {
                 let counter = report(index);
-                scope.spawn(move || scan_share(set, scorer, penalty, k, share, cancel, counter))
+                scope.spawn(move || {
+                    scan_share(
+                        set,
+                        scorer,
+                        request.books,
+                        penalty,
+                        k,
+                        share,
+                        cancel,
+                        counter,
+                    )
+                })
             })
             .collect();
         let mut results = vec![scan_share(
             set,
             scorer,
+            request.books,
             penalty,
             k,
             &shares[0],
@@ -530,7 +547,12 @@ fn merge_also(
         }
         let scale = segment.segment.vector_scale(wanted.slot).unwrap_or(1.0);
         let mut rank = scorer.rank(segment.segment.vector(wanted.slot), scale);
-        if request.window_penalty != 0.0 && segment.segment.slot_window(wanted.slot) > 0 {
+        let Some(window) = effective_window(set, wanted.seg, wanted.slot, request.books)
+            .or_else(|| effective_window(set, wanted.seg, wanted.slot, None))
+        else {
+            continue;
+        };
+        if request.window_penalty != 0.0 && window > 0 {
             rank = scorer.penalize(rank, request.window_penalty);
         }
         weighed.push(Candidate {
@@ -555,6 +577,7 @@ fn merge_also(
 fn scan_share(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
+    books: Option<&BookSet>,
     penalty: f32,
     k: usize,
     share: &[Piece],
@@ -568,17 +591,12 @@ fn scan_share(
         let width = segment.segment.codec().bytes_per_vector();
         let vectors = &segment.segment.vector_bytes()
             [piece.start as usize * width..piece.end as usize * width];
-        // Read only when there is a penalty to apply, so a scan without one is untouched.
-        let windows = segment
-            .segment
-            .slot_window_bytes()
-            .filter(|_| penalty != 0.0)
-            .map(|windows| &windows[piece.start as usize..piece.end as usize]);
         let scan = Pass {
+            set,
+            books,
             segment,
             scorer,
             piece,
-            windows,
             penalty,
             cancel,
             progress,
@@ -610,11 +628,11 @@ fn scan_share(
 
 /// One piece of a share, scanned.
 struct Pass<'p, 's, S> {
+    set: &'p ScanSet<'s>,
+    books: Option<&'p BookSet>,
     segment: &'p ScanSegment<'s>,
     scorer: &'p S,
     piece: &'p Piece,
-    /// The piece's slots' windows, when a penalty applies to them.
-    windows: Option<&'p [u8]>,
     penalty: f32,
     cancel: &'p CancellationToken,
     progress: Option<&'p AtomicUsize>,
@@ -642,7 +660,15 @@ impl<S: Scorer> Pass<'_, '_, S> {
                 continue;
             }
             let mut rank = self.scorer.rank(vector, scale);
-            if self.windows.is_some_and(|windows| windows[offset] > 0) {
+            // A nonnegative penalty cannot promote a raw score below the heap's
+            // worst. Resolve metadata only for contenders, not every scanned vector.
+            if top.heap.len() == top.k && top.heap.peek().is_some_and(|worst| rank < worst.rank) {
+                continue;
+            }
+            let Some(window) = effective_window(self.set, self.piece.seg, slot, self.books) else {
+                continue;
+            };
+            if window > 0 && self.penalty != 0.0 {
                 rank = self.scorer.penalize(rank, self.penalty);
             }
             top.offer(rank, self.piece.seg, slot, || {
@@ -741,16 +767,37 @@ fn hits(
     found
         .into_iter()
         .map(|candidate| VectorHit {
+            window_penalty: request.window_penalty,
             score: scorer.score(candidate.rank),
             key: candidate.key,
             records: records(set, candidate.seg, candidate.slot, request.books),
-            window: set.segments[candidate.seg as usize]
-                .segment
-                .slot_window(candidate.slot),
+            window: effective_window(set, candidate.seg, candidate.slot, request.books)
+                .or_else(|| effective_window(set, candidate.seg, candidate.slot, None))
+                .unwrap_or(0),
             seg: candidate.seg,
             slot: candidate.slot,
         })
         .collect()
+}
+
+/// Cheapest role among occurrences admitted by this query. A snapshot supersedes
+/// the old vector holder's book and role; it can also remove that book entirely.
+fn effective_window(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> Option<u8> {
+    let source = set.segments[seg as usize].segment;
+    let key = source.key(slot);
+    for view in set.segments.iter().rev() {
+        if let Some(snapshot) = view.segment.key_occurrences(key) {
+            return snapshot
+                .filter(|record| {
+                    books.is_none_or(|books| {
+                        books.contains(&view.segment.books()[record.book as usize].name)
+                    })
+                })
+                .map(|record| record.window)
+                .min();
+        }
+    }
+    Some(source.slot_window(slot))
 }
 
 /// Every record of a slot's key: its primary record, its extras, and the foreign records
@@ -759,10 +806,18 @@ fn hits(
 fn records(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> Vec<RecordRef> {
     let segment = set.segments[seg as usize].segment;
     let mut records = Vec::new();
+    // A snapshot is complete for its key, including removals. Consult newest first.
+    for view in set.segments.iter().rev() {
+        if let Some(snapshot) = view.segment.key_occurrences(segment.key(slot)) {
+            return snapshot_records(view.segment, snapshot, books);
+        }
+    }
     let book = &segment.books()[segment.book_of_slot(slot)];
     records.push(RecordRef {
         book: book.name.clone(),
         hint: segment.hint(slot),
+        window: segment.slot_window(slot),
+        anchor: None,
     });
     if segment.has_extras(slot) {
         for extra in segment.extras_of_slot(slot) {
@@ -770,6 +825,8 @@ fn records(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> V
             records.push(RecordRef {
                 book: segment.books()[segment.book_of_extra(extra)].name.clone(),
                 hint,
+                window: segment.slot_window(slot),
+                anchor: None,
             });
         }
     }
@@ -791,13 +848,107 @@ fn records(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> V
             records.push(RecordRef {
                 book: book.name.clone(),
                 hint,
+                window: segment.slot_window(slot),
+                anchor: None,
             });
         }
     }
-    if let Some(books) = books {
-        // Stable, so each half keeps the order above.
-        records.sort_by_key(|record| !books.contains(&record.book));
-    }
-    records.truncate(MAX_RECORDS_PER_HIT);
+    finish_records(&mut records, books);
     records
+}
+
+/// Select fair representatives while streaming a key's possibly enormous snapshot.
+/// At most 32 parents of the current book and 32 records per filter class are held.
+fn snapshot_records(
+    segment: &Segment,
+    snapshot: impl Iterator<Item = super::occurrence::Occurrence>,
+    books: Option<&BookSet>,
+) -> Vec<RecordRef> {
+    use super::occurrence::Occurrence;
+    type Ranked = ((usize, u8, u32), RecordRef);
+    fn flush(
+        segment: &Segment,
+        group: &mut Vec<Occurrence>,
+        books: Option<&BookSet>,
+        admitted: &mut Vec<Ranked>,
+        other: &mut Vec<Ranked>,
+    ) {
+        let Some(first) = group.first() else {
+            return;
+        };
+        let book = &segment.books()[first.book as usize];
+        let selected = if books.is_none_or(|books| books.contains(&book.name)) {
+            admitted
+        } else {
+            other
+        };
+        for (round, row) in group.drain(..).enumerate() {
+            let rank = (round, row.window, row.book);
+            let at = selected.partition_point(|(other, _)| *other < rank);
+            if at < MAX_RECORDS_PER_HIT {
+                selected.insert(
+                    at,
+                    (
+                        rank,
+                        RecordRef {
+                            book: book.name.clone(),
+                            hint: row.hint,
+                            window: row.window,
+                            anchor: Some(row.anchor),
+                        },
+                    ),
+                );
+                selected.truncate(MAX_RECORDS_PER_HIT);
+            }
+        }
+    }
+    let mut admitted = Vec::new();
+    let mut other = Vec::new();
+    let mut group = Vec::new();
+    let mut current = None;
+    for row in snapshot {
+        if current != Some(row.book) {
+            flush(segment, &mut group, books, &mut admitted, &mut other);
+            current = Some(row.book);
+        }
+        // The least-penalized parent represents a book first; stable hints break ties.
+        let at = group.partition_point(|other: &Occurrence| other.window <= row.window);
+        if at < MAX_RECORDS_PER_HIT {
+            group.insert(at, row);
+            group.truncate(MAX_RECORDS_PER_HIT);
+        }
+    }
+    flush(segment, &mut group, books, &mut admitted, &mut other);
+    admitted
+        .into_iter()
+        .chain(other)
+        .take(MAX_RECORDS_PER_HIT)
+        .map(|(_, record)| record)
+        .collect()
+}
+
+/// A frequent parent must not crowd every other book out of a shared vector's cap.
+fn finish_records(records: &mut Vec<RecordRef>, books: Option<&BookSet>) {
+    // Prefer the least-penalized representative of each book.
+    records.sort_by_key(|record| record.window);
+    let mut rounds = std::collections::HashMap::new();
+    let mut ranked: Vec<_> = records
+        .drain(..)
+        .map(|record| {
+            let round = rounds.entry(record.book.clone()).or_insert(0usize);
+            let rank = (
+                books.is_some_and(|books| !books.contains(&record.book)),
+                *round,
+            );
+            *round += 1;
+            (rank, record)
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    records.extend(
+        ranked
+            .into_iter()
+            .take(MAX_RECORDS_PER_HIT)
+            .map(|(_, record)| record),
+    );
 }

@@ -290,11 +290,10 @@ fn a_release_with_windows_records_each_slots_window() {
         windows(&compacted.segments()[0]),
         windows(&direct.segments()[0])
     );
-    // [`text`]'s later words are every line's, so C's windows share live keys: the index
-    // cannot vouch for a window, and a book it does not hold keeps its records.
-    assert_eq!(books, [A, B, C, D]);
-    assert_eq!(direct_books, [A, B, D]);
-    assert_eq!(extras.len(), direct_extras.len() + 2);
+    // The delta snapshot removes C even when its shared vectors remain live elsewhere.
+    assert_eq!(books, direct_books);
+    assert_eq!(books, [A, B, D]);
+    assert_eq!(extras, direct_extras);
 
     for (release, plan, previous) in [
         ("base1", &p1, None),
@@ -1199,4 +1198,265 @@ fn assembly_memory_is_bounded() {
         per_slot < 200.0 && per_slot < vector,
         "{per_slot:.0} bytes a slot, peaks {peaks:?}"
     );
+}
+
+impl Machine {
+    fn custom_plan(
+        &self,
+        name: &str,
+        version: u32,
+        lines: &[(u64, &str, &str)],
+        previous: Option<&Ledger>,
+    ) -> Plan {
+        let out = self.dir.join(name);
+        {
+            let warehouse = Warehouse::open(&self.warehouse).unwrap();
+            plan_from_corpus(
+                &corpus(self.dir.path(), name, version, lines),
+                PlanRequest {
+                    out_dir: out.clone(),
+                    model: self.model.clone(),
+                    chunking: self.chunking.clone(),
+                    passage_package: self.package.clone(),
+                    previous,
+                    warehouse: Some(&warehouse),
+                    created_at: CREATED.to_string(),
+                },
+            )
+            .unwrap();
+        }
+        let shard = raw_shard(&out, &self.dir.join(&format!("{name}-shard")));
+        Warehouse::open_for_append(&self.warehouse)
+            .unwrap()
+            .add_shards(
+                Some(&out),
+                &[shard],
+                &ShardPolicy {
+                    allow_non_semantic: true,
+                },
+                CREATED.to_string(),
+            )
+            .unwrap();
+        Plan::open(&out).unwrap()
+    }
+}
+
+#[test]
+fn mixed_anchor_and_inner_window_survive_compaction_with_their_own_roles() {
+    let cfg: ChunkerConfig = serde_json::from_str(include_str!(
+        "../../config/models/meivin-round2-windows-onnx/chunking.json"
+    ))
+    .unwrap();
+    let mut machine = Machine::chunked("mixed_occurrences", cfg);
+    machine.model.embedding_text_version = 2;
+    std::fs::remove_dir_all(&machine.warehouse).unwrap();
+    Warehouse::create(
+        &machine.warehouse,
+        WarehouseIdentity::of(&machine.model, &machine.package),
+    )
+    .unwrap();
+    let long = (0..800)
+        .map(|n| format!("מילה{n:04}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let windows = crate::semantic::chunker::Chunker::new(machine.chunking.clone())
+        .unwrap()
+        .embedded_windows(
+            &[crate::semantic::chunk_key::LineRef {
+                text: &long,
+                section: 1,
+            }],
+            0,
+        );
+    let tail = windows[1].text.strip_prefix("[PASSAGE] ").unwrap();
+    let key = ChunkKey::of(&windows[1].text);
+    let plan = machine.custom_plan("p1", 1, &[(1, A, &long), (2, B, tail)], None);
+    let base = machine.assemble(&plan, PackageKind::Base, None, NEW, "base");
+    let device = machine.dir.join("device");
+    let set = simulate_device(&device, &[&base.out_dir]).unwrap();
+    let mut records = Vec::new();
+    set.book_occurrences(A, &mut records);
+    let inner = records
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(inner.window, 1);
+    assert_ne!(inner.anchor, Some(key));
+    set.book_occurrences(B, &mut records);
+    assert!(records.iter().any(|(candidate, record)| *candidate == key
+        && record.window == 0
+        && record.anchor == Some(key)));
+    assert!(coverage(&set, &plan).complete());
+    drop(set);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&plan)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&device).unwrap();
+    assert!(coverage(&set, &plan).complete());
+    set.book_occurrences(A, &mut records);
+    assert!(records
+        .iter()
+        .any(|(candidate, record)| *candidate == key && *record == inner));
+}
+
+#[test]
+fn delta_snapshots_replace_roles_hints_and_removed_books_without_reembedding() {
+    let machine = Machine::chunked(
+        "occurrence_transition",
+        ChunkerConfig {
+            min_meaningful_chars: 1,
+            ..windows_chunking()
+        },
+    );
+    let long = "abcdefghijklmnopqrst uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    let windows = crate::semantic::chunker::Chunker::new(machine.chunking.clone())
+        .unwrap()
+        .embedded_windows(
+            &[crate::semantic::chunk_key::LineRef {
+                text: long,
+                section: 1,
+            }],
+            0,
+        );
+    let tail = windows[1].text.as_str();
+    let key = ChunkKey::of(tail);
+    let p1 = machine.custom_plan("p1", 1, &[(1, B, tail)], None);
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base");
+    let ledger = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    assert!(ledger.manifest.occurrences.is_some());
+    let p2 = machine.custom_plan(
+        "p2",
+        2,
+        &[(1, A, "new preface"), (2, A, long)],
+        Some(&ledger),
+    );
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger), NEW, "delta");
+    let direct = machine.assemble(&p2, PackageKind::Base, None, NEW, "direct");
+    let chain = simulate_device(
+        &machine.dir.join("device"),
+        &[&base.out_dir, &delta.out_dir],
+    )
+    .unwrap();
+    let fresh = simulate_device(&machine.dir.join("fresh"), &[&direct.out_dir]).unwrap();
+    let mut chained = Vec::new();
+    let mut rebuilt = Vec::new();
+    for book in [A, B] {
+        chain.book_occurrences(book, &mut chained);
+        fresh.book_occurrences(book, &mut rebuilt);
+        assert_eq!(chained, rebuilt, "book {book}");
+    }
+    chain.book_occurrences(A, &mut chained);
+    assert!(chained
+        .iter()
+        .any(|(candidate, record)| *candidate == key && record.window == 1 && record.hint == 1));
+    chain.book_occurrences(B, &mut chained);
+    assert!(chained.is_empty());
+    assert!(coverage(&chain, &p2).complete());
+    let b: crate::semantic::resolve::BookSet = [B].into_iter().collect();
+    let hits = chain
+        .scan_with(
+            &vec![1.0; chain.codec().dim()],
+            &crate::semantic::oxv::scan::ScanRequest {
+                top_k: 100,
+                books: Some(&b),
+                threads: 1,
+                window_penalty: 0.04,
+            },
+            &[],
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(
+        hits.iter().all(|hit| hit.key != key),
+        "removed book must not admit an old anchor occurrence"
+    );
+    let ledger2 = Ledger::open(&delta.out_dir, Some(2)).unwrap();
+    let p3 = machine.custom_plan(
+        "p3",
+        3,
+        &[(1, A, "new preface"), (2, A, long)],
+        Some(&ledger2),
+    );
+    let unchanged = machine.assemble(&p3, PackageKind::Delta, Some(&ledger2), NEW, "unchanged");
+    assert_eq!(
+        Segment::open(&unchanged.out_dir.join(SEGMENT_FILE))
+            .unwrap()
+            .occurrences()
+            .count(),
+        0,
+        "unchanged metadata must not inflate deltas"
+    );
+}
+
+#[test]
+fn distinct_parents_in_one_book_are_retained_and_reanchored_by_compaction() {
+    let machine = Machine::chunked(
+        "distinct_parents",
+        ChunkerConfig {
+            min_meaningful_chars: 1,
+            ..windows_chunking()
+        },
+    );
+    let long_a = "abcdefghijklmnopqrst uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    let long_b = "ABCDEFGHIJKLMNOPQRST uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    let plan = machine.custom_plan("p1", 1, &[(1, A, long_a), (2, A, long_b)], None);
+    let base = machine.assemble(&plan, PackageKind::Base, None, NEW, "base");
+    let device = machine.dir.join("device");
+    let set = simulate_device(&device, &[&base.out_dir]).unwrap();
+    let mut before = Vec::new();
+    set.book_occurrences(A, &mut before);
+    let shared = before
+        .iter()
+        .find(|(key, record)| {
+            record.window > 0
+                && before
+                    .iter()
+                    .any(|(other, r)| other == key && r.anchor != record.anchor)
+        })
+        .expect("fixture needs a shared window under different anchors")
+        .0;
+    assert_eq!(before.iter().filter(|(key, _)| *key == shared).count(), 2);
+    struct Moved(Live);
+    impl LiveKeySource for Moved {
+        fn library_version(&self) -> u32 {
+            self.0.library_version()
+        }
+        fn book_keys(&self, book: &str, out: &mut Vec<(u32, u64)>) -> Result<bool, ResolveError> {
+            let found = self.0.book_keys(book, out)?;
+            for (ordinal, _) in out {
+                *ordinal += 40;
+            }
+            Ok(found)
+        }
+    }
+    drop(set);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Moved(Live::of(&plan))),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&device).unwrap();
+    let mut after = Vec::new();
+    set.book_occurrences(A, &mut after);
+    assert_eq!(after.len(), before.len());
+    for ((before_key, old), (after_key, new)) in before.iter().zip(&after) {
+        assert_eq!(before_key, after_key);
+        assert_eq!(new.hint, old.hint + 40);
+        assert_eq!(new.window, old.window);
+        assert_eq!(new.anchor, old.anchor);
+    }
 }

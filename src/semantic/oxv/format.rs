@@ -75,6 +75,8 @@ pub(crate) enum SectionKind {
     /// One `u8` per slot: the least window ordinal any record of the slot's key has, 0 being
     /// a line's own first window. Absent, every slot's is 0.
     SlotWindows,
+    /// Complete per-key occurrence snapshots; newest snapshot replaces older records.
+    Occurrences,
     /// `{slot u32, hint u32}`: a further record of a slot's key, in some book.
     Extras,
     /// `u32` indexes into [`Self::Extras`], ordered by slot.
@@ -102,6 +104,7 @@ impl SectionKind {
             Self::Vectors => 0x0012,
             Self::VectorScales => 0x0013,
             Self::SlotWindows => 0x0014,
+            Self::Occurrences => 0x0024,
             Self::Extras => 0x0020,
             Self::ExtrasBySlot => 0x0021,
             Self::Foreign => 0x0022,
@@ -122,6 +125,7 @@ impl SectionKind {
             0x0012 => Self::Vectors,
             0x0013 => Self::VectorScales,
             0x0014 => Self::SlotWindows,
+            0x0024 => Self::Occurrences,
             0x0020 => Self::Extras,
             0x0021 => Self::ExtrasBySlot,
             0x0022 => Self::Foreign,
@@ -140,6 +144,7 @@ impl SectionKind {
             Self::SlotKeys | Self::Tombstones => Some(16),
             Self::SlotHints | Self::ExtrasBySlot | Self::BlockCrcs | Self::VectorScales => Some(4),
             Self::SlotWindows => Some(1),
+            Self::Occurrences => Some(44),
             Self::Extras => Some(EXTRA_LEN as u32),
             Self::Foreign => Some(FOREIGN_LEN as u32),
             Self::BookNames
@@ -160,6 +165,7 @@ impl SectionKind {
             Self::Vectors => "VECTORS",
             Self::VectorScales => "VECTOR_SCALES",
             Self::SlotWindows => "SLOT_WINDOWS",
+            Self::Occurrences => "OCCURRENCES",
             Self::Extras => "EXTRAS",
             Self::ExtrasBySlot => "EXTRAS_BY_SLOT",
             Self::Foreign => "FOREIGN",

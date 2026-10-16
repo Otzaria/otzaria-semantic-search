@@ -53,6 +53,7 @@ pub struct SegmentBuilder {
     hints: Vec<u32>,
     /// One per slot; SLOT_WINDOWS is written only when one of them is not 0.
     windows: Vec<u8>,
+    occurrences: Vec<[u8; 44]>,
     extras: Vec<(u32, u32)>,
     foreign: Vec<([u8; 16], u32, u32)>,
     tombstones: Vec<[u8; 16]>,
@@ -84,6 +85,7 @@ impl SegmentBuilder {
             keys: Vec::new(),
             hints: Vec::new(),
             windows: Vec::new(),
+            occurrences: Vec::new(),
             extras: Vec::new(),
             foreign: Vec::new(),
             tombstones: Vec::new(),
@@ -200,6 +202,55 @@ impl SegmentBuilder {
         Ok(first_slot)
     }
 
+    /// Add this book's complete snapshots for the keys whose locations changed.
+    /// Call after adding the book's vector records. Keys are sorted at write time.
+    pub fn add_occurrences(
+        &mut self,
+        name: &str,
+        occurrences: &[super::occurrence::Occurrence],
+    ) -> io::Result<()> {
+        if occurrences.is_empty() {
+            return Ok(());
+        }
+        let book = self
+            .books
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid("occurrences need a book"))?;
+        let entry = &self.books[book];
+        if &self.names[entry.name_off as usize..][..entry.name_len as usize] != name.as_bytes() {
+            return Err(invalid("occurrences must follow their book"));
+        }
+        let mut referenced = std::collections::HashSet::new();
+        referenced.extend(
+            self.keys[entry.slot_start as usize..][..entry.slot_count as usize]
+                .iter()
+                .copied(),
+        );
+        referenced.extend(
+            self.extras[entry.extra_start as usize..][..entry.extra_count as usize]
+                .iter()
+                .map(|(slot, _)| self.keys[*slot as usize]),
+        );
+        referenced.extend(
+            self.foreign[entry.foreign_start as usize..][..entry.foreign_count as usize]
+                .iter()
+                .map(|(key, _, _)| *key),
+        );
+        if occurrences
+            .iter()
+            .any(|record| !referenced.contains(&record.key.0))
+        {
+            return Err(invalid("an occurrence needs a vector record in its book"));
+        }
+        self.occurrences.extend(occurrences.iter().map(|record| {
+            let mut record = *record;
+            record.book = book as u32;
+            record.to_bytes()
+        }));
+        Ok(())
+    }
+
     /// The keys a delta tells the set to forget. Sorted and deduplicated here.
     pub fn set_tombstones(&mut self, mut keys: Vec<ChunkKey>) {
         keys.sort_unstable();
@@ -234,7 +285,7 @@ impl SegmentBuilder {
 
     /// Lay the file out at `path`, which must not exist, write every table, and return the
     /// sink the vectors go through.
-    pub fn write(self, path: &Path) -> io::Result<VectorSink> {
+    pub fn write(mut self, path: &Path) -> io::Result<VectorSink> {
         validate_release_tag(&self.spec.library_release_tag)
             .map_err(|error| invalid(error.to_string()))?;
         let slot_count = self.keys.len() as u32;
@@ -300,12 +351,17 @@ impl SegmentBuilder {
             .any(|window| *window != 0)
             .then_some(self.windows);
         let windows_len = window_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
+        self.occurrences
+            .sort_unstable_by_key(|row| super::occurrence::Occurrence::decode(row));
+        self.occurrences.dedup();
+        let occurrences_len = self.occurrences.len() as u64 * 44;
         let blocks = |len: u64| len.div_ceil(BLOCK_SIZE as u64);
         let crc_count = blocks(hint_bytes.len() as u64)
             + blocks(key_bytes.len() as u64)
             + blocks(vectors_len)
             + blocks(scales_len)
-            + blocks(windows_len);
+            + blocks(windows_len)
+            + blocks(occurrences_len);
 
         // The layout: small metadata first, vectors last.
         let fixed = |kind: SectionKind| kind.fixed_elem_size().expect("a fixed-size section");
@@ -399,6 +455,15 @@ impl SegmentBuilder {
                 1,
                 windows_len,
                 u64::from(slot_count),
+                true,
+            ));
+        }
+        if !self.occurrences.is_empty() {
+            plan.push((
+                SectionKind::Occurrences,
+                44,
+                occurrences_len,
+                self.occurrences.len() as u64,
                 true,
             ));
         }
@@ -539,6 +604,7 @@ impl SegmentBuilder {
             scratch: Vec::new(),
             scales: has_scales.then(|| Vec::with_capacity(scales_len as usize)),
             windows: window_bytes,
+            occurrences: self.occurrences,
             clipped: 0,
         })
     }
@@ -567,6 +633,7 @@ pub struct VectorSink {
     scales: Option<Vec<u8>>,
     /// SLOT_WINDOWS, when the segment has it: written after the scales.
     windows: Option<Vec<u8>>,
+    occurrences: Vec<[u8; 44]>,
     clipped: u64,
 }
 
@@ -698,6 +765,25 @@ impl VectorSink {
                 .extend(windows.chunks(BLOCK_SIZE).map(crc32fast::hash));
             if let Some(digests) = &mut self.section_sha256 {
                 digests[entry] = Sha256::digest(&windows).into();
+            }
+        }
+        if !self.occurrences.is_empty() {
+            let entry = self
+                .header
+                .sections
+                .iter()
+                .position(|entry| entry.kind == SectionKind::Occurrences.code())
+                .expect("occurrences section");
+            self.out.pad_to(self.header.sections[entry].offset)?;
+            self.out.write_all(self.occurrences.as_flattened())?;
+            self.block_crcs.extend(
+                self.occurrences
+                    .as_flattened()
+                    .chunks(BLOCK_SIZE)
+                    .map(crc32fast::hash),
+            );
+            if let Some(digests) = &mut self.section_sha256 {
+                digests[entry] = Sha256::digest(self.occurrences.as_flattened()).into();
             }
         }
         let crc_bytes: Vec<u8> = self

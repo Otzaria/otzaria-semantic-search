@@ -1082,3 +1082,35 @@ fn a_weighed_slot_is_penalized_as_the_scan_penalizes() {
     }
     assert!(after.iter().any(|hit| hit.slot >= 30 && hit.window > 0));
 }
+
+#[test]
+fn public_scan_rejects_a_negative_or_nonfinite_window_penalty() {
+    let dir = TempDir::new("invalid_window_penalty");
+    let [segment, _] = windowed_pair(&dir, 101, per_vector);
+    let views = [ScanSegment {
+        segment: &segment,
+        deleted: &[],
+        links: &[],
+    }];
+    let set = ScanSet {
+        segments: &views,
+        reverse_links: &[],
+    };
+    let query = PreparedQuery::new(&Random(102).unit(DIM), segment.codec()).unwrap();
+    for penalty in [-0.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let result = scan(
+            &set,
+            &query,
+            &ScanRequest {
+                top_k: 1,
+                books: None,
+                threads: 1,
+                window_penalty: penalty,
+            },
+            &CancellationToken::new(),
+        );
+        assert!(
+            matches!(result,Err(VectorStoreError::SearchFailed {reason}) if reason.contains("finite and nonnegative"))
+        );
+    }
+}

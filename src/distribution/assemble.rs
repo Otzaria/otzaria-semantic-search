@@ -195,6 +195,10 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         placeholder,
     );
     let windows = slot_windows(&plan.records);
+    let all_occurrences =
+        plan.records.is_windowed() && delta.is_none_or(|old| old.occurrences.is_none());
+    let changed = changed_occurrences(plan, delta)?;
+    let mut occurrences = plan.records.occurrences();
     let mut book = BookRecords::new(u32::MAX);
     let mut slot_records: Vec<u64> = Vec::new();
     let (mut missing, mut first_missing) = (0u64, None);
@@ -206,6 +210,14 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
             if record.book != book.book {
                 book.add_to(&mut builder, plan)?;
                 book.book = record.book;
+            }
+            let occurrence = occurrences.next().expect("one occurrence per plan record");
+            if all_occurrences
+                || changed
+                    .as_ref()
+                    .is_some_and(|changed| changed.contains(&record.key_bytes()))
+            {
+                book.occurrences.push(occurrence);
             }
             match disposition {
                 Disposition::Slot { slot } => {
@@ -221,6 +233,18 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
                 }
                 Disposition::Extra { slot } => book.extras.push((record.ordinal, slot)),
                 Disposition::Foreign => book.foreign.push((record.key(), record.ordinal)),
+                // Changed snapshots need a book record even if their vector is held:
+                // this keeps book filters linked to every current location.
+                Disposition::Held | Disposition::Repeat
+                    if delta.is_some_and(|previous| {
+                        previous.find_key(&record.key_bytes()).is_some()
+                    }) && (all_occurrences
+                        || changed
+                            .as_ref()
+                            .is_some_and(|changed| changed.contains(&record.key_bytes()))) =>
+                {
+                    book.foreign.push((record.key(), record.ordinal))
+                }
                 Disposition::Held | Disposition::Repeat => {}
             }
             Ok(())
@@ -329,6 +353,7 @@ struct BookRecords {
     windows: Vec<u8>,
     extras: Vec<(u32, u32)>,
     foreign: Vec<(ChunkKey, u32)>,
+    occurrences: Vec<crate::semantic::oxv::occurrence::Occurrence>,
 }
 
 impl BookRecords {
@@ -339,12 +364,16 @@ impl BookRecords {
             windows: Vec::new(),
             extras: Vec::new(),
             foreign: Vec::new(),
+            occurrences: Vec::new(),
         }
     }
 
     /// Add the book to `builder`, if it is one, and empty it.
     fn add_to(&mut self, builder: &mut SegmentBuilder, plan: &Plan) -> Result<(), PackError> {
         if self.book != u32::MAX {
+            // One physical link per book/key is enough; the snapshot holds every parent.
+            self.foreign.sort_unstable();
+            self.foreign.dedup_by(|later, earlier| later.0 == earlier.0);
             let name = plan.books.name(self.book);
             builder
                 .add_book_windowed(
@@ -355,13 +384,71 @@ impl BookRecords {
                     &self.foreign,
                 )
                 .map_err(io_error(format!("adding {name}")))?;
+            builder
+                .add_occurrences(name, &self.occurrences)
+                .map_err(io_error(format!("adding occurrences of {name}")))?;
         }
         self.primary.clear();
         self.windows.clear();
         self.extras.clear();
         self.foreign.clear();
+        self.occurrences.clear();
         Ok(())
     }
+}
+
+/// Compare full location metadata book by book. A changed key receives a complete
+/// snapshot across all books, so removed locations cannot survive in an older segment.
+fn changed_occurrences(
+    plan: &Plan,
+    previous: Option<&Ledger>,
+) -> Result<Option<crate::distribution::files::KeySet<[u8; 16]>>, PackError> {
+    use crate::distribution::files::KeySet;
+    use crate::semantic::oxv::occurrence::Occurrence;
+    if !plan.records.is_windowed() {
+        return Ok(None);
+    }
+    let mut changed = KeySet::default();
+    let Some(previous) = previous else {
+        return Ok(Some(changed));
+    };
+    let Some(old) = previous.occurrences.as_ref() else {
+        // An older producer has no occurrence snapshot; rewrite locations once.
+        return Ok(Some(changed));
+    };
+    let mut current = plan.records.occurrences().peekable();
+    let mut earlier = old.occurrences().peekable();
+    let mut names: BTreeSet<&str> = plan.books.names().iter().map(String::as_str).collect();
+    names.extend(previous.books().names().iter().map(String::as_str));
+    for name in names {
+        let collect = |iter: &mut std::iter::Peekable<_>,
+                       books: &crate::distribution::plan::BookList| {
+            let mut rows: HashMap<[u8; 16], Vec<(u32, ChunkKey, u8)>> = HashMap::new();
+            while iter
+                .peek()
+                .is_some_and(|row: &Occurrence| books.name(row.book) == name)
+            {
+                let row: Occurrence = iter.next().expect("peeked");
+                rows.entry(row.key.0)
+                    .or_default()
+                    .push((row.hint, row.anchor, row.window));
+            }
+            rows
+        };
+        let now = collect(&mut current, &plan.books);
+        let before = collect(&mut earlier, previous.books());
+        for (key, values) in &now {
+            if before.get(key) != Some(values) {
+                changed.insert(*key);
+            }
+        }
+        for key in before.keys() {
+            if !now.contains_key(key) {
+                changed.insert(*key);
+            }
+        }
+    }
+    Ok(Some(changed))
 }
 
 /// The window of every key whose records are all past a line's first window: the least of

@@ -8,6 +8,7 @@
 //! pairs-vN.bin             b"OXVPAIR1", u64 count, then {book u32, key [16]} for every
 //!                          (book, key) record of vN, strictly ascending; `book` indexes
 //!                          the manifest's `books`
+//! occurrences-vN.bin      optional OXVREC2 plan records for windowed location deltas
 //! ledger-vN.manifest.json  the identity digest, the codec epoch and its parameters, the
 //!                          two files' digests, the books, and the base this chain grows on
 //! ```
@@ -73,6 +74,9 @@ pub struct LedgerManifest {
     /// a delta's vectors come from a warehouse of the same one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passage_package: Option<ModelPackage>,
+    /// Windowed plan records preserve the full occurrence snapshot for the next delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<LedgerFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +155,7 @@ impl LedgerManifest {
     }
 }
 
-/// A ledger, opened: its manifest, and its two files mapped and checked.
+/// A ledger, opened: its manifest and state files mapped and checked.
 pub struct Ledger {
     pub dir: PathBuf,
     pub manifest: LedgerManifest,
@@ -159,6 +163,7 @@ pub struct Ledger {
     books: BookList,
     keys: Mmap,
     pairs: Mmap,
+    pub(crate) occurrences: Option<PlanRecords>,
 }
 
 impl Ledger {
@@ -212,6 +217,22 @@ impl Ledger {
             PAIR_LEN,
             &manifest.pairs,
         )?;
+        let occurrences = manifest
+            .occurrences
+            .as_ref()
+            .map(|entry| {
+                let path = dir.join(&entry.file);
+                let digest = crate::distribution::files::FileDigest::of(&path)?;
+                if digest.sha256 != entry.sha256 {
+                    return Err(malformed("ledger occurrence digest mismatch"));
+                }
+                let records = PlanRecords::open(&path)?;
+                if records.len() != entry.count || !records.is_windowed() {
+                    return Err(malformed("ledger occurrence count or format mismatch"));
+                }
+                Ok(records)
+            })
+            .transpose()?;
         let books = BookList::new(manifest.books.clone())?;
         manifest.codec.codec()?;
         Ok(Self {
@@ -221,6 +242,7 @@ impl Ledger {
             books,
             keys,
             pairs,
+            occurrences,
         })
     }
 
@@ -684,6 +706,18 @@ pub(crate) fn write_ledger(
         base,
         deltas_since_base,
         passage_package: passage_package.cloned(),
+        occurrences: if records.is_windowed() {
+            let name = format!("occurrences-v{library_version}.bin");
+            let path = dir.join(&name);
+            records.copy_to(&path)?;
+            Some(LedgerFile {
+                file: name,
+                count: records.len(),
+                sha256: crate::distribution::files::FileDigest::of(&path)?.sha256,
+            })
+        } else {
+            None
+        },
     };
     write_json(&dir.join(manifest_file_name(library_version)), &manifest)?;
     Ok(manifest)

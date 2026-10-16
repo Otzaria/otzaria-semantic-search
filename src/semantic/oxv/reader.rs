@@ -55,6 +55,7 @@ pub struct Segment {
     scales: Option<Range<usize>>,
     /// SLOT_WINDOWS, when the segment has it.
     windows: Option<Range<usize>>,
+    occurrences: Option<Range<usize>>,
     extras: Range<usize>,
     extras_by_slot: Range<usize>,
     foreign: Range<usize>,
@@ -328,6 +329,20 @@ impl Segment {
             entry => entry.copied(),
         };
 
+        if sections
+            .get(&SectionKind::Occurrences)
+            .is_some_and(|entry| !entry.is_critical() || !entry.is_blocksummed())
+        {
+            return Err("OCCURRENCES must be critical and block-summed".to_string());
+        }
+        if let Some(entry) = sections.get(&SectionKind::Occurrences) {
+            if map[range(entry)]
+                .chunks_exact(44)
+                .any(|row| row[41..44] != [0, 0, 0])
+            {
+                return Err("an occurrence has nonzero reserved bytes".to_string());
+            }
+        }
         let blocksummed: Vec<(SectionKind, Range<usize>)> = header
             .sections
             .iter()
@@ -427,6 +442,7 @@ impl Segment {
             vectors: range(&vectors_entry),
             scales: scales_entry.as_ref().map(range),
             windows: windows_entry.as_ref().map(range),
+            occurrences: sections.get(&SectionKind::Occurrences).map(range),
             extras: range(&extras_entry),
             extras_by_slot: range(&by_slot_entry),
             foreign: range(&foreign_entry),
@@ -437,6 +453,19 @@ impl Segment {
             map,
         };
         segment.check_records()?;
+        let mut last = None;
+        for occurrence in segment.occurrences() {
+            if occurrence.book as usize >= segment.books.len() || occurrence.hint > HINT_MASK {
+                return Err("an occurrence names an invalid book or hint".to_string());
+            }
+            if occurrence.window == 0 && occurrence.anchor != occurrence.key {
+                return Err("a first-window occurrence must name its own anchor".to_string());
+            }
+            if last.is_some_and(|last| last >= occurrence) {
+                return Err("occurrences must ascend strictly".to_string());
+            }
+            last = Some(occurrence);
+        }
         Ok(segment)
     }
 
@@ -661,6 +690,33 @@ impl Segment {
 
     /// The least window ordinal of the slot's key: 0 for a line's first window, and for
     /// every slot of a segment without SLOT_WINDOWS.
+    pub fn occurrences(&self) -> impl Iterator<Item = super::occurrence::Occurrence> + '_ {
+        self.occurrences
+            .as_ref()
+            .map_or(&[][..], |range| &self.map[range.clone()])
+            .chunks_exact(44)
+            .map(super::occurrence::Occurrence::decode)
+    }
+
+    /// A complete snapshot for this key, or None when this segment does not update it.
+    pub fn key_occurrences(
+        &self,
+        key: ChunkKey,
+    ) -> Option<impl Iterator<Item = super::occurrence::Occurrence> + '_> {
+        let bytes = self
+            .occurrences
+            .as_ref()
+            .map(|range| &self.map[range.clone()])?;
+        let rows = bytes.as_chunks::<44>().0;
+        let start = rows.partition_point(|row| row[..16] < key.0[..]);
+        let end = start + rows[start..].partition_point(|row| row[..16] == key.0);
+        (end > start).then(|| {
+            rows[start..end]
+                .iter()
+                .map(|row| super::occurrence::Occurrence::decode(row))
+        })
+    }
+
     pub fn slot_window(&self, slot: u32) -> u8 {
         self.windows
             .as_ref()

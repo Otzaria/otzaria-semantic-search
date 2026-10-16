@@ -319,6 +319,12 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
         segment
             .add_book_windowed(&book.name, &book.primary, windows, &book.extras, &[])
             .map_err(io_error(format!("assembling book {:?}", book.name)))?;
+        segment
+            .add_occurrences(&book.name, &book.occurrences)
+            .map_err(io_error(format!(
+                "assembling occurrences of {:?}",
+                book.name
+            )))?;
     }
     let codec_params_sha256 = segment.codec().params_sha256();
     let segment_path = root.join(SEGMENT_FILENAME);
@@ -572,6 +578,7 @@ struct AssembledBook {
     primary: Vec<(ChunkKey, u32)>,
     /// `(hint, slot)` of each record whose key already had a slot.
     extras: Vec<(u32, u32)>,
+    occurrences: Vec<crate::semantic::oxv::occurrence::Occurrence>,
 }
 
 /// Every book's records, and every distinct vector in slot order.
@@ -637,14 +644,35 @@ fn embed_corpus(
             name,
             primary: Vec::new(),
             extras: Vec::new(),
+            occurrences: Vec::new(),
         };
         let mut recorded = HashSet::new();
         let mut texts = Vec::new();
+        let mut parent = None;
         for chunk in chunks {
             chunked.insert(chunk.line_id);
             let hint = ordinals[&chunk.line_id];
             // The string the backend is handed below, and nothing derived from it.
             let key = ChunkKey::of(&chunk.embedding_text);
+            if request.chunking.chunking_version >= 2 {
+                if chunk.window == 0 {
+                    parent = Some((hint, key));
+                }
+                let anchor = parent
+                    .filter(|(ordinal, _)| *ordinal == hint)
+                    .map(|(_, key)| key)
+                    .ok_or_else(|| PackError::MalformedInput {
+                        reason: "a window must follow its line's anchor".to_string(),
+                    })?;
+                book.occurrences
+                    .push(crate::semantic::oxv::occurrence::Occurrence {
+                        key,
+                        book: 0,
+                        hint,
+                        anchor,
+                        window: chunk.window,
+                    });
+            }
             // A slot's window is the least any record of its key has.
             if let Some(&slot) = slots.get(&key) {
                 let window = &mut windows[slot as usize];
