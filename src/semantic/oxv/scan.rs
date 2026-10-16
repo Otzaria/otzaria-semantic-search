@@ -462,7 +462,6 @@ fn run_shares(
     progress: Option<&[AtomicUsize]>,
 ) -> Result<Vec<Candidate>, VectorStoreError> {
     let report = |share: usize| progress.and_then(|counters| counters.get(share));
-    let penalty = request.window_penalty;
     let results: Vec<Result<TopK, VectorStoreError>> = std::thread::scope(|scope| {
         let handles: Vec<_> = shares
             .iter()
@@ -470,25 +469,13 @@ fn run_shares(
             .skip(1)
             .map(|(index, share)| {
                 let counter = report(index);
-                scope.spawn(move || {
-                    scan_share(
-                        set,
-                        scorer,
-                        request.books,
-                        penalty,
-                        k,
-                        share,
-                        cancel,
-                        counter,
-                    )
-                })
+                scope.spawn(move || scan_share(set, scorer, request, k, share, cancel, counter))
             })
             .collect();
         let mut results = vec![scan_share(
             set,
             scorer,
-            request.books,
-            penalty,
+            request,
             k,
             &shares[0],
             cancel,
@@ -577,8 +564,7 @@ fn merge_also(
 fn scan_share(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
-    books: Option<&BookSet>,
-    penalty: f32,
+    request: &ScanRequest<'_>,
     k: usize,
     share: &[Piece],
     cancel: &CancellationToken,
@@ -593,11 +579,11 @@ fn scan_share(
             [piece.start as usize * width..piece.end as usize * width];
         let scan = Pass {
             set,
-            books,
+            books: request.books,
             segment,
             scorer,
             piece,
-            penalty,
+            penalty: request.window_penalty,
             cancel,
             progress,
         };
