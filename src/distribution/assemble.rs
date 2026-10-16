@@ -125,6 +125,7 @@ pub(crate) fn check_warehouse(plan: &Plan, warehouse: &Warehouse) -> Result<(), 
 /// Assemble the release `request` describes. See the module documentation.
 pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackError> {
     let plan = request.plan;
+    let source_hashes = plan.book_source_hashes()?;
     let warehouse = request.warehouse;
     check_warehouse(plan, warehouse)?;
     warehouse.verify()?;
@@ -194,6 +195,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         },
         placeholder,
     );
+    let mut next_book = 0u32;
     let windows = slot_windows(&plan.records);
     let all_occurrences =
         plan.records.is_windowed() && delta.is_none_or(|old| old.occurrences.is_none());
@@ -208,7 +210,16 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         delta,
         |_, record, disposition| {
             if record.book != book.book {
-                book.add_to(&mut builder, plan)?;
+                book.add_to(&mut builder, plan, source_hashes.as_ref())?;
+                if let Some(hashes) = &source_hashes {
+                    for index in next_book..record.book {
+                        let name = plan.books.name(index);
+                        builder
+                            .add_book_windowed_hashed(name, &[], &[], &[], &[], Some(hashes[name]))
+                            .map_err(io_error(format!("adding source hash of {name}")))?;
+                    }
+                }
+                next_book = record.book + 1;
                 book.book = record.book;
             }
             let occurrence = occurrences.next().expect("one occurrence per plan record");
@@ -250,7 +261,15 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
             Ok(())
         },
     )?;
-    book.add_to(&mut builder, plan)?;
+    book.add_to(&mut builder, plan, source_hashes.as_ref())?;
+    if let Some(hashes) = &source_hashes {
+        for index in next_book..plan.books.len() as u32 {
+            let name = plan.books.name(index);
+            builder
+                .add_book_windowed_hashed(name, &[], &[], &[], &[], Some(hashes[name]))
+                .map_err(io_error(format!("adding source hash of {name}")))?;
+        }
+    }
     if missing > 0 {
         return Err(malformed(format!(
             "the warehouse holds no vector for {missing} key(s) the release ships, the first \
@@ -369,19 +388,25 @@ impl BookRecords {
     }
 
     /// Add the book to `builder`, if it is one, and empty it.
-    fn add_to(&mut self, builder: &mut SegmentBuilder, plan: &Plan) -> Result<(), PackError> {
+    fn add_to(
+        &mut self,
+        builder: &mut SegmentBuilder,
+        plan: &Plan,
+        hashes: Option<&std::collections::BTreeMap<String, u64>>,
+    ) -> Result<(), PackError> {
         if self.book != u32::MAX {
             // One physical link per book/key is enough; the snapshot holds every parent.
             self.foreign.sort_unstable();
             self.foreign.dedup_by(|later, earlier| later.0 == earlier.0);
             let name = plan.books.name(self.book);
             builder
-                .add_book_windowed(
+                .add_book_windowed_hashed(
                     name,
                     &self.primary,
                     &self.windows,
                     &self.extras,
                     &self.foreign,
+                    hashes.and_then(|hashes| hashes.get(name)).copied(),
                 )
                 .map_err(io_error(format!("adding {name}")))?;
             builder

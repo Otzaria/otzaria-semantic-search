@@ -62,6 +62,8 @@ pub(crate) enum SectionKind {
     Books,
     /// The UTF-8 names the book entries point into.
     BookNames,
+    /// Full source-text hash per book; 0 means unknown.
+    BookHashes,
     /// The codec's parameters, whose SHA-256 the header carries.
     CodecParams,
     /// One 16-byte key per slot.
@@ -98,6 +100,7 @@ impl SectionKind {
         match self {
             Self::Books => 0x0001,
             Self::BookNames => 0x0002,
+            Self::BookHashes => 0x0004,
             Self::CodecParams => 0x0003,
             Self::SlotKeys => 0x0010,
             Self::SlotHints => 0x0011,
@@ -119,6 +122,7 @@ impl SectionKind {
         Some(match code {
             0x0001 => Self::Books,
             0x0002 => Self::BookNames,
+            0x0004 => Self::BookHashes,
             0x0003 => Self::CodecParams,
             0x0010 => Self::SlotKeys,
             0x0011 => Self::SlotHints,
@@ -144,6 +148,7 @@ impl SectionKind {
             Self::SlotKeys | Self::Tombstones => Some(16),
             Self::SlotHints | Self::ExtrasBySlot | Self::BlockCrcs | Self::VectorScales => Some(4),
             Self::SlotWindows => Some(1),
+            Self::BookHashes => Some(8),
             Self::Occurrences => Some(44),
             Self::Extras => Some(EXTRA_LEN as u32),
             Self::Foreign => Some(FOREIGN_LEN as u32),
@@ -159,6 +164,7 @@ impl SectionKind {
         match self {
             Self::Books => "BOOKS",
             Self::BookNames => "BOOK_NAMES",
+            Self::BookHashes => "BOOK_HASHES",
             Self::CodecParams => "CODEC_PARAMS",
             Self::SlotKeys => "SLOT_KEYS",
             Self::SlotHints => "SLOT_HINTS",

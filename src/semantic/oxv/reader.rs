@@ -56,6 +56,7 @@ pub struct Segment {
     /// SLOT_WINDOWS, when the segment has it.
     windows: Option<Range<usize>>,
     occurrences: Option<Range<usize>>,
+    book_hashes: Option<Range<usize>>,
     extras: Range<usize>,
     extras_by_slot: Range<usize>,
     foreign: Range<usize>,
@@ -343,6 +344,15 @@ impl Segment {
                 return Err("an occurrence has nonzero reserved bytes".to_string());
             }
         }
+        if sections.get(&SectionKind::BookHashes).is_some_and(|entry| {
+            entry.elem_count != u64::from(header.book_count)
+                || !entry.is_critical()
+                || !entry.is_blocksummed()
+        }) {
+            return Err(
+                "BOOK_HASHES must contain one critical block-summed hash per book".to_string(),
+            );
+        }
         let blocksummed: Vec<(SectionKind, Range<usize>)> = header
             .sections
             .iter()
@@ -443,6 +453,7 @@ impl Segment {
             scales: scales_entry.as_ref().map(range),
             windows: windows_entry.as_ref().map(range),
             occurrences: sections.get(&SectionKind::Occurrences).map(range),
+            book_hashes: sections.get(&SectionKind::BookHashes).map(range),
             extras: range(&extras_entry),
             extras_by_slot: range(&by_slot_entry),
             foreign: range(&foreign_entry),
@@ -690,6 +701,18 @@ impl Segment {
 
     /// The least window ordinal of the slot's key: 0 for a line's first window, and for
     /// every slot of a segment without SLOT_WINDOWS.
+    /// Source text hash of this book, or None for older/unknown metadata.
+    pub fn book_source_hash(&self, name: &str) -> Option<u64> {
+        let index = self
+            .books
+            .binary_search_by(|book| book.name.as_ref().cmp(name))
+            .ok()?;
+        let range = self.book_hashes.as_ref()?;
+        let at = range.start + index * 8;
+        let hash = u64::from_le_bytes(self.map[at..at + 8].try_into().expect("book hash"));
+        (hash != 0).then_some(hash)
+    }
+
     pub fn occurrences(&self) -> impl Iterator<Item = super::occurrence::Occurrence> + '_ {
         self.occurrences
             .as_ref()

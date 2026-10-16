@@ -263,7 +263,13 @@ pub fn compact(
                     if verified.is_empty() {
                         pruned += 1;
                     }
-                    for fresh in verified {
+                    for mut fresh in verified {
+                        // A legacy key may also occur in a book the live index cannot
+                        // inspect. Keep the entire key legacy instead of publishing a
+                        // partial snapshot that would hide those unknown occurrences.
+                        if record.anchor.is_none() {
+                            fresh.anchor = None;
+                        }
                         if fresh.hint != record.hint {
                             refreshed += 1;
                         }
@@ -306,6 +312,13 @@ pub fn compact(
         let mut windows = Vec::new();
         let mut extras = Vec::new();
         let mut occurrences = Vec::new();
+        let mut least = HashMap::<ChunkKey, u8>::new();
+        for (key, record) in &records {
+            least
+                .entry(*key)
+                .and_modify(|window| *window = (*window).min(record.window))
+                .or_insert(record.window);
+        }
         let mut recorded = std::collections::HashSet::new();
         for (key, record) in records {
             if let Some(anchor) = record.anchor {
@@ -328,13 +341,21 @@ pub fn compact(
                 let (_, seg, slot) = live_slots[position];
                 order.push((seg, slot));
                 primary.push((key, record.hint));
-                windows.push(segments[seg as usize].slot_window(slot));
+                windows.push(least[&key]);
             } else {
+                builder.minimize_slot_window(new_slot[position], least[&key]);
                 extras.push((record.hint, new_slot[position]));
             }
         }
         builder
-            .add_book_windowed(name, &primary, &windows, &extras, &[])
+            .add_book_windowed_hashed(
+                name,
+                &primary,
+                &windows,
+                &extras,
+                &[],
+                set.book_source_hash(name),
+            )
             .map_err(io_error(format!("assembling book {name:?}")))?;
         builder
             .add_occurrences(name, &occurrences)
@@ -401,7 +422,6 @@ pub fn compact(
             if output.vector(slot as u32) != original.vector(source)
                 || output.vector_scale(slot as u32) != original.vector_scale(source)
                 || output.key(slot as u32) != original.key(source)
-                || output.slot_window(slot as u32) != original.slot_window(source)
             {
                 return Err(VectorStoreError::Corrupted {
                     reason: format!(

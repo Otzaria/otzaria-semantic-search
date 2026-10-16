@@ -594,7 +594,7 @@ impl Coverage {
     }
 }
 
-/// G3's count: windowed plans require the exact book/key/hint/parent/window metadata;
+/// G3's count: windowed plans require the exact book/key/parent/window metadata;
 /// legacy plans retain their key membership check. Holds one book at a time.
 pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
     let mut coverage = Coverage {
@@ -605,22 +605,25 @@ pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
     let mut current = u32::MAX;
     let mut effective = Vec::new();
     let mut records = std::collections::HashSet::new();
+    let mut keys = std::collections::HashSet::new();
     for record in plan.records.occurrences() {
         if record.book != current {
             current = record.book;
             set.book_occurrences(plan.books.name(current), &mut effective);
             records.clear();
+            keys.clear();
+            keys.extend(effective.iter().map(|(key, _)| *key));
             records.extend(
                 effective
                     .iter()
-                    .map(|(key, row)| (*key, row.hint, row.anchor, row.window)),
+                    .map(|(key, row)| (*key, row.anchor, row.window)),
             );
         }
         coverage.records += 1;
         let reached = if plan.records.is_windowed() {
-            records.contains(&(record.key, record.hint, Some(record.anchor), record.window))
+            records.contains(&(record.key, Some(record.anchor), record.window))
         } else {
-            records.iter().any(|(key, _, _, _)| *key == record.key)
+            keys.contains(&record.key)
         };
         if reached {
             coverage.reachable += 1;

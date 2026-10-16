@@ -42,3 +42,6 @@ mod tests;
 
 #[cfg(test)]
 mod occurrence_tests;
+
+#[cfg(test)]
+mod book_hash_tests;

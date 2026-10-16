@@ -1379,6 +1379,41 @@ fn delta_snapshots_replace_roles_hints_and_removed_books_without_reembedding() {
         hits.iter().all(|hit| hit.key != key),
         "removed book must not admit an old anchor occurrence"
     );
+    let score_of = |set: &SegmentSet| {
+        let hits = set
+            .scan_with(
+                &vec![1.0; set.codec().dim()],
+                &crate::semantic::oxv::scan::ScanRequest {
+                    top_k: 100,
+                    books: None,
+                    threads: 1,
+                    window_penalty: 0.04,
+                },
+                &[],
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let hit = hits.iter().find(|hit| hit.key == key).unwrap();
+        (hit.window, hit.score.to_bits())
+    };
+    let before_compaction = score_of(&chain);
+    assert_eq!(before_compaction.0, 1);
+    compact(
+        &machine.dir.join("device"),
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&machine.dir.join("device")).unwrap();
+    assert_eq!(
+        score_of(&compacted),
+        before_compaction,
+        "compaction must refresh a reused vector's own role for the unfiltered fast path"
+    );
     let ledger2 = Ledger::open(&delta.out_dir, Some(2)).unwrap();
     let p3 = machine.custom_plan(
         "p3",
@@ -1459,4 +1494,88 @@ fn distinct_parents_in_one_book_are_retained_and_reanchored_by_compaction() {
         assert_eq!(new.window, old.window);
         assert_eq!(new.anchor, old.anchor);
     }
+}
+
+fn with_source_hashes(plan: Plan, hashes: &[(&str, u64)]) -> Plan {
+    use super::plan::{PlanManifest, BOOK_HASHES_FILE};
+    super::files::write_json(
+        &plan.dir.join(BOOK_HASHES_FILE),
+        &hashes
+            .iter()
+            .map(|(book, hash)| (book.to_string(), *hash))
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .unwrap();
+    let original = &plan.manifest;
+    PlanManifest::write(
+        &plan.dir,
+        original.identity.clone(),
+        original.library_version,
+        original.library_release_tag.clone(),
+        original.previous.clone(),
+        original.counts,
+        original.parity,
+        original.created_at.clone(),
+    )
+    .unwrap();
+    Plan::open(&plan.dir).unwrap()
+}
+
+#[test]
+fn source_hash_deltas_refresh_unchanged_and_metadata_only_books_and_survive_compaction() {
+    let machine = Machine::chunked("book_hash_delta", windows_chunking());
+    let long = "abcdefghijklmnopqrst uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    // A has no embedded record and lies before B in the book table.
+    let p1 = with_source_hashes(
+        machine.custom_plan("p1", 1, &[(1, A, "!"), (2, B, long)], None),
+        &[(A, 11), (B, 22)],
+    );
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base");
+    let ledger = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    let p2 = with_source_hashes(
+        machine.custom_plan("p2", 2, &[(1, A, "!"), (2, B, long)], Some(&ledger)),
+        &[(A, 33), (B, 44)],
+    );
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger), NEW, "delta");
+    let segment = Segment::open(&delta.out_dir.join(SEGMENT_FILE)).unwrap();
+    assert_eq!(segment.slot_count(), 0);
+    assert_eq!(segment.foreign_count(), 0);
+    assert_eq!(segment.book_source_hash(A), Some(33));
+    assert_eq!(segment.book_source_hash(B), Some(44));
+    let device = machine.dir.join("device");
+    let set = simulate_device(&device, &[&base.out_dir, &delta.out_dir]).unwrap();
+    assert_eq!(set.book_source_hash(A), Some(33));
+    assert_eq!(set.book_source_hash(B), Some(44));
+    drop(set);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&device).unwrap();
+    assert_eq!(set.book_source_hash(A), Some(33));
+    assert_eq!(set.book_source_hash(B), Some(44));
+    assert!(coverage(&set, &p2).complete());
+    // Hash snapshots are part of the plan's digest-bound inputs.
+    std::fs::write(p2.dir.join(super::plan::BOOK_HASHES_FILE), b"{}").unwrap();
+    assert!(p2.book_source_hashes().is_err());
+}
+
+#[test]
+fn a_legacy_plan_ignores_a_stale_windowed_book_hash_file() {
+    let machine = Machine::new("legacy_hash_ignored");
+    let plan = with_source_hashes(
+        machine.plan("p1", 1, &v1(), None),
+        &[(A, 11), (B, 22), (C, 33)],
+    );
+    assert!(!plan
+        .manifest
+        .files
+        .contains_key(super::plan::BOOK_HASHES_FILE));
+    assert_eq!(plan.book_source_hashes().unwrap(), None);
 }

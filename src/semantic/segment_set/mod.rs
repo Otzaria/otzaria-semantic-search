@@ -377,6 +377,20 @@ impl SegmentSet {
         scan_with(&set, &prepared, request, also, cancel)
     }
 
+    /// The newest entry for a book is authoritative, including an unknown hash.
+    pub fn book_source_hash(&self, name: &str) -> Option<u64> {
+        self.segments
+            .iter()
+            .rev()
+            .find(|segment| {
+                segment
+                    .books()
+                    .binary_search_by(|book| book.name.as_ref().cmp(name))
+                    .is_ok()
+            })
+            .and_then(|segment| segment.book_source_hash(name))
+    }
+
     /// Effective complete occurrences in a book, without the search result count cap.
     /// Newest per-key snapshots replace every older location, including removed ones.
     pub fn book_occurrences(

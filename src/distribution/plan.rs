@@ -38,11 +38,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const RECORDS_FILE: &str = "records.bin";
 pub const BOOKS_FILE: &str = "books.json";
+pub const BOOK_HASHES_FILE: &str = "book-hashes.json";
 pub const EMBED_PLAN_FILE: &str = "embed.jsonl";
 pub const EMBED_MANIFEST_FILE: &str = "embed-manifest.json";
 pub const TOMBSTONES_FILE: &str = "tombstones.bin";
@@ -690,11 +691,22 @@ impl PlanManifest {
         for name in [
             RECORDS_FILE,
             BOOKS_FILE,
+            BOOK_HASHES_FILE,
             EMBED_PLAN_FILE,
             EMBED_MANIFEST_FILE,
             TOMBSTONES_FILE,
         ] {
             let path = dir.join(name);
+            if name == BOOK_HASHES_FILE && path.exists() {
+                let records_path = dir.join(RECORDS_FILE);
+                let mut magic = [0u8; 8];
+                File::open(&records_path)
+                    .and_then(|mut file| file.read_exact(&mut magic))
+                    .map_err(io_error(format!("reading {}", records_path.display())))?;
+                if &magic != WINDOWED_RECORDS_MAGIC {
+                    continue;
+                }
+            }
             if path.exists() {
                 files.insert(name.to_string(), FileDigest::of(&path)?);
             }
@@ -730,6 +742,31 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Exact live-index text hashes, when supplied by a windowed index planner.
+    pub fn book_source_hashes(&self) -> Result<Option<BTreeMap<String, u64>>, PackError> {
+        let Some(digest) = self.manifest.files.get(BOOK_HASHES_FILE) else {
+            return Ok(None);
+        };
+        if !self.records.is_windowed() {
+            return Err(malformed("book hashes require a windowed plan"));
+        }
+        let path = self.dir.join(BOOK_HASHES_FILE);
+        digest.verify(&path)?;
+        let hashes: BTreeMap<String, u64> = read_json(&path)?;
+        if hashes.len() != self.books.len()
+            || self
+                .books
+                .names()
+                .iter()
+                .any(|name| !hashes.contains_key(name))
+        {
+            return Err(malformed(
+                "book hashes must name every plan book exactly once",
+            ));
+        }
+        Ok(Some(hashes))
+    }
+
     pub fn open(dir: &Path) -> Result<Self, PackError> {
         let manifest = PlanManifest::read(dir)?;
         for name in [RECORDS_FILE, BOOKS_FILE] {

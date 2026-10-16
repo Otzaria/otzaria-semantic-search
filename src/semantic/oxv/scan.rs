@@ -784,8 +784,18 @@ fn hits(
 /// the old vector holder's book and role; it can also remove that book entirely.
 fn effective_window(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> Option<u8> {
     let source = set.segments[seg as usize].segment;
+    // An unfiltered slot's own minimum is already stored alongside the vector.
+    // Only newer snapshots can override it; a fresh base stays a byte lookup.
+    if books.is_none() && seg as usize + 1 == set.segments.len() {
+        return Some(source.slot_window(slot));
+    }
     let key = source.key(slot);
-    for view in set.segments.iter().rev() {
+    let snapshots = if books.is_none() {
+        &set.segments[seg as usize + 1..]
+    } else {
+        set.segments
+    };
+    for view in snapshots.iter().rev() {
         if let Some(snapshot) = view.segment.key_occurrences(key) {
             return snapshot
                 .filter(|record| {

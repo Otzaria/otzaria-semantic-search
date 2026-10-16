@@ -48,12 +48,15 @@ pub struct SegmentBuilder {
     spec: SegmentSpec,
     codec: Codec,
     books: Vec<BookEntry>,
+    book_hashes: Vec<u64>,
+    has_book_hashes: bool,
     names: Vec<u8>,
     keys: Vec<[u8; 16]>,
     hints: Vec<u32>,
     /// One per slot; SLOT_WINDOWS is written only when one of them is not 0.
     windows: Vec<u8>,
     occurrences: Vec<[u8; 44]>,
+    occurrence_slots: Vec<u64>,
     extras: Vec<(u32, u32)>,
     foreign: Vec<([u8; 16], u32, u32)>,
     tombstones: Vec<[u8; 16]>,
@@ -81,11 +84,14 @@ impl SegmentBuilder {
             spec,
             codec,
             books: Vec::new(),
+            book_hashes: Vec::new(),
+            has_book_hashes: false,
             names: Vec::new(),
             keys: Vec::new(),
             hints: Vec::new(),
             windows: Vec::new(),
             occurrences: Vec::new(),
+            occurrence_slots: Vec::new(),
             extras: Vec::new(),
             foreign: Vec::new(),
             tombstones: Vec::new(),
@@ -125,6 +131,21 @@ impl SegmentBuilder {
         extras: &[(u32, u32)],
         foreign: &[(ChunkKey, u32)],
     ) -> io::Result<u32> {
+        self.add_book_windowed_hashed(name, primary, windows, extras, foreign, None)
+    }
+
+    /// The same book records with an optional full source-text hash. Some(0) records an
+    /// unknown hash explicitly; metadata-only books are retained when a hash is supplied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_book_windowed_hashed(
+        &mut self,
+        name: &str,
+        primary: &[(ChunkKey, u32)],
+        windows: &[u8],
+        extras: &[(u32, u32)],
+        foreign: &[(ChunkKey, u32)],
+        source_hash: Option<u64>,
+    ) -> io::Result<u32> {
         if !windows.is_empty() && windows.len() != primary.len() {
             return Err(invalid(format!(
                 "book {name:?} has {} primary record(s) and {} window(s)",
@@ -133,7 +154,7 @@ impl SegmentBuilder {
             )));
         }
         let first_slot = self.keys.len() as u32;
-        if primary.is_empty() && extras.is_empty() && foreign.is_empty() {
+        if primary.is_empty() && extras.is_empty() && foreign.is_empty() && source_hash.is_none() {
             return Ok(first_slot);
         }
         if name.is_empty() || name.len() > u16::MAX as usize {
@@ -199,6 +220,8 @@ impl SegmentBuilder {
         self.foreign
             .extend(sorted.into_iter().map(|(hint, key)| (key, book, hint)));
         self.books.push(entry);
+        self.book_hashes.push(source_hash.unwrap_or(0));
+        self.has_book_hashes |= source_hash.is_some();
         Ok(first_slot)
     }
 
@@ -221,27 +244,34 @@ impl SegmentBuilder {
         if &self.names[entry.name_off as usize..][..entry.name_len as usize] != name.as_bytes() {
             return Err(invalid("occurrences must follow their book"));
         }
-        let mut referenced = std::collections::HashSet::new();
-        referenced.extend(
-            self.keys[entry.slot_start as usize..][..entry.slot_count as usize]
-                .iter()
-                .copied(),
-        );
-        referenced.extend(
-            self.extras[entry.extra_start as usize..][..entry.extra_count as usize]
-                .iter()
-                .map(|(slot, _)| self.keys[*slot as usize]),
-        );
-        referenced.extend(
-            self.foreign[entry.foreign_start as usize..][..entry.foreign_count as usize]
-                .iter()
-                .map(|(key, _, _)| *key),
-        );
-        if occurrences
-            .iter()
-            .any(|record| !referenced.contains(&record.key.0))
+        let mut referenced = std::collections::HashMap::new();
+        for slot in entry.slot_start..entry.slot_start + entry.slot_count {
+            referenced.insert(self.keys[slot as usize], Some(slot));
+        }
+        for (slot, _) in &self.extras[entry.extra_start as usize..][..entry.extra_count as usize] {
+            referenced.insert(self.keys[*slot as usize], Some(*slot));
+        }
+        for (key, _, _) in
+            &self.foreign[entry.foreign_start as usize..][..entry.foreign_count as usize]
         {
-            return Err(invalid("an occurrence needs a vector record in its book"));
+            referenced.entry(*key).or_insert(None);
+        }
+        self.occurrence_slots
+            .resize(self.keys.len().div_ceil(64), 0);
+        for record in occurrences {
+            let Some(slot) = referenced.get(&record.key.0) else {
+                return Err(invalid("an occurrence needs a vector record in its book"));
+            };
+            if let Some(slot) = slot {
+                let slot = *slot as usize;
+                let (word, bit) = (slot / 64, slot % 64);
+                self.windows[slot] = if self.occurrence_slots[word] & (1u64 << bit) != 0 {
+                    self.windows[slot].min(record.window)
+                } else {
+                    record.window
+                };
+                self.occurrence_slots[word] |= 1u64 << bit;
+            }
         }
         self.occurrences.extend(occurrences.iter().map(|record| {
             let mut record = *record;
@@ -256,6 +286,11 @@ impl SegmentBuilder {
         keys.sort_unstable();
         keys.dedup();
         self.tombstones = keys.into_iter().map(|key| key.0).collect();
+    }
+
+    /// A later book may provide a less penalized occurrence of an existing slot.
+    pub fn minimize_slot_window(&mut self, slot: u32, window: u8) {
+        self.windows[slot as usize] = self.windows[slot as usize].min(window);
     }
 
     /// Slots assigned so far.
@@ -353,15 +388,37 @@ impl SegmentBuilder {
         let windows_len = window_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
         self.occurrences
             .sort_unstable_by_key(|row| super::occurrence::Occurrence::decode(row));
-        self.occurrences.dedup();
+        // Identical parent lines are recovered through the anchor index. Keep only
+        // their first hint; distinct parents and window roles remain separate.
+        let mut current = None;
+        let mut parents = std::collections::HashSet::new();
+        self.occurrences.retain(|bytes| {
+            let record = super::occurrence::Occurrence::decode(bytes);
+            let group = (record.key, record.book);
+            if current != Some(group) {
+                current = Some(group);
+                parents.clear();
+            }
+            parents.insert((record.anchor, record.window))
+        });
         let occurrences_len = self.occurrences.len() as u64 * 44;
+        let book_hash_bytes: Vec<u8> = if self.has_book_hashes {
+            self.book_hashes
+                .iter()
+                .flat_map(|hash| hash.to_le_bytes())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let book_hashes_len = book_hash_bytes.len() as u64;
         let blocks = |len: u64| len.div_ceil(BLOCK_SIZE as u64);
         let crc_count = blocks(hint_bytes.len() as u64)
             + blocks(key_bytes.len() as u64)
             + blocks(vectors_len)
             + blocks(scales_len)
             + blocks(windows_len)
-            + blocks(occurrences_len);
+            + blocks(occurrences_len)
+            + blocks(book_hashes_len);
 
         // The layout: small metadata first, vectors last.
         let fixed = |kind: SectionKind| kind.fixed_elem_size().expect("a fixed-size section");
@@ -464,6 +521,15 @@ impl SegmentBuilder {
                 44,
                 occurrences_len,
                 self.occurrences.len() as u64,
+                true,
+            ));
+        }
+        if self.has_book_hashes {
+            plan.push((
+                SectionKind::BookHashes,
+                8,
+                book_hashes_len,
+                self.books.len() as u64,
                 true,
             ));
         }
@@ -605,6 +671,7 @@ impl SegmentBuilder {
             scales: has_scales.then(|| Vec::with_capacity(scales_len as usize)),
             windows: window_bytes,
             occurrences: self.occurrences,
+            book_hashes: book_hash_bytes,
             clipped: 0,
         })
     }
@@ -634,6 +701,7 @@ pub struct VectorSink {
     /// SLOT_WINDOWS, when the segment has it: written after the scales.
     windows: Option<Vec<u8>>,
     occurrences: Vec<[u8; 44]>,
+    book_hashes: Vec<u8>,
     clipped: u64,
 }
 
@@ -784,6 +852,20 @@ impl VectorSink {
             );
             if let Some(digests) = &mut self.section_sha256 {
                 digests[entry] = Sha256::digest(self.occurrences.as_flattened()).into();
+            }
+        }
+        if let Some(entry) = self
+            .header
+            .sections
+            .iter()
+            .position(|entry| entry.kind == SectionKind::BookHashes.code())
+        {
+            self.out.pad_to(self.header.sections[entry].offset)?;
+            self.out.write_all(&self.book_hashes)?;
+            self.block_crcs
+                .extend(self.book_hashes.chunks(BLOCK_SIZE).map(crc32fast::hash));
+            if let Some(digests) = &mut self.section_sha256 {
+                digests[entry] = Sha256::digest(&self.book_hashes).into();
             }
         }
         let crc_bytes: Vec<u8> = self

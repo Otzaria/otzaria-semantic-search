@@ -2911,3 +2911,59 @@ fn compaction_keeps_the_records_of_windows() {
         ])
     );
 }
+
+#[test]
+fn compaction_never_upgrades_a_legacy_key_to_a_partial_occurrence_snapshot() {
+    use crate::semantic::resolve::RecordRef;
+    let work = TempDir::new("partial_legacy_snapshot");
+    let dir = work.join("vectors");
+    let library = Library::with(29, &[("a", &[(0, 1)]), ("b", &[(0, 1)])]);
+    install(&dir, &release(&work, &library, None)).unwrap();
+    struct Partial;
+    impl LiveKeySource for Partial {
+        fn library_version(&self) -> u32 {
+            29
+        }
+        fn book_keys(&self, book: &str, out: &mut Vec<(u32, u64)>) -> Result<bool, ResolveError> {
+            if book == "b" {
+                out.push((9, key(1).column_value()));
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        fn resolve_record(
+            &self,
+            key: ChunkKey,
+            record: &RecordRef,
+            _cancel: &CancellationToken,
+        ) -> Result<Option<Vec<RecordRef>>, ResolveError> {
+            if record.book.as_ref() == "a" {
+                return Ok(None);
+            }
+            let mut fresh = record.clone();
+            fresh.hint = 9;
+            fresh.anchor = Some(key);
+            Ok(Some(vec![fresh]))
+        }
+    }
+    compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Partial),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+    assert!(set.segments()[0].key_occurrences(key(1)).is_none());
+    let mut records = Vec::new();
+    set.book_occurrences("a", &mut records);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1.hint, 0);
+    set.book_occurrences("b", &mut records);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1.hint, 9);
+}
