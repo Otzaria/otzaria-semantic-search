@@ -338,7 +338,9 @@ impl Segment {
         }
         if let Some(entry) = sections.get(&SectionKind::Occurrences) {
             if map[range(entry)]
-                .chunks_exact(44)
+                .as_chunks::<44>()
+                .0
+                .iter()
                 .any(|row| row[41..44] != [0, 0, 0])
             {
                 return Err("an occurrence has nonzero reserved bytes".to_string());
@@ -717,8 +719,10 @@ impl Segment {
         self.occurrences
             .as_ref()
             .map_or(&[][..], |range| &self.map[range.clone()])
-            .chunks_exact(44)
-            .map(super::occurrence::Occurrence::decode)
+            .as_chunks::<44>()
+            .0
+            .iter()
+            .map(|row| super::occurrence::Occurrence::decode(row))
     }
 
     /// A complete snapshot for this key, or None when this segment does not update it.
