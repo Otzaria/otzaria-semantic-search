@@ -33,6 +33,8 @@ fn source_hashes_round_trip_including_metadata_only_and_unknown_books() {
     segment
         .verify_blocks(&CancellationToken::new(), |_| {})
         .unwrap();
+    // Windows cannot rewrite a file while its read-only mapping is open.
+    drop(segment);
     let bytes = std::fs::read(&path).unwrap();
     let mut header = Header::decode(&bytes).unwrap();
     let entry = header
