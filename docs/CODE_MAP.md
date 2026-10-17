@@ -434,19 +434,23 @@ otzaria-semantic-search/
 * [`src/semantic/oxv/`](../src/semantic/oxv/mod.rs) — **פורמט ה-segment.** הפריסה, שדה
   אחר שדה: [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.
   - `format` — ה-header של 4,096 בתים, ספריית ה-sections, הרשומות בגודל קבוע. הכותב
-    והקורא עוברים דרכו, ולכן אינם יכולים לחלוק על offset.
+    והקורא עוברים דרכו, ולכן אינם יכולים לחלוק על offset. גרסה 2 וגרסה 3 (מפתחות של 8
+    בתים, `key_len`); `default_format_version` — 3 ל-`rot192-i8i4`, 2 לכל השאר.
   - `codec` — `i8-sym-vec`, ברירת המחדל (סקלה לכל וקטור, `s = max|x|/127`, הקודים
     ב-`VECTORS` והסקלות ב-`VECTOR_SCALES`), `i8-sym-dim` (סקלה לכל ממד, `round_half_away`,
-    clamp ל-±127; `calibrate_i8_sym_dim` לוקח קוונטיל מדויק בכלל lower) ו-`f32`; `CodecSpec`
-    הוא מה שבנייה מבקשת.
+    clamp ל-±127; `calibrate_i8_sym_dim` לוקח קוונטיל מדויק בכלל lower), `rot192-i8i4`
+    (סיבוב, 128 רכיבים ב-int8 ו-64 ב-4 ביטים; `fit_rot_i8i4`) ו-`f32`; `CodecSpec` הוא מה
+    שבנייה מבקשת.
+  - `rotation` — הסיבוב של `rot192-i8i4`: הפעלה ב-f64 בסדר קבוע, ופירוק עצמי Jacobi
+    דטרמיניסטי להתאמה.
   - `writer` — `SegmentBuilder`: הטבלאות קודם, ואז `VectorSink` שמקבל וקטורים בסדר
     ה-slots, ב-buffer, עם CRC לכל block — כך שבנייה בקנה מידה של הספרייה זורמת בזיכרון
     חסום. `segment_id` של שחרור דטרמיניסטי ונשאר כפי שפורסם; ל-segment שנדחס על המכשיר
     המזהה הוא digest של כל מה שהוא מחזיק (§3.6 של החוזה), ולכן שתי דחיסות שונות — שני שמות.
   - `reader` — `Segment::open` ממפה (memmap2), בודק את ה-header, את ה-CRC של כל section
     קטן ואת העקביות המבנית; `verify_blocks` קורא כל block.
-  - `kernel` — מכפלה סקלרית בשלמים: scalar, AVX2 ו-NEON, זהות ביט אחר ביט; שאילתה מוכנה
-    כך שאף סכום ביניים אינו גולש. ה-`unsafe` היחיד הוא ה-intrinsics, וכל ליבה נבדקת מול
+  - `kernel` — מכפלה סקלרית בשלמים, מול קודים של 8 ושל 4 ביטים: scalar, AVX2 ו-NEON, זהות
+    ביט אחר ביט; שאילתה מוכנה — ומסובבת, ל-`rot192-i8i4` — כך שאף סכום ביניים אינו גולש. ה-`unsafe` היחיד הוא ה-intrinsics, וכל ליבה נבדקת מול
     ה-scalar.
   - `scan` — `scan_segments`: כל slot חי מדורג, על כמה חוטים, תחת מסנן ספרים, `k`
     הטובים נשמרים בסדר מלא; כפילות מפתח נספרת פעם אחת. `default_scan_threads` — חצי
@@ -570,7 +574,8 @@ otzaria-semantic-search/
     שלה הם עובדות שרק ה-runtime יודע.
   - הזהות הצפויה מורכבת משלושה מקורות: **text** מהאינדקס שהמארח פתח, **model**
     מהמשפחה המוצהרת (`LocalModel::of_family`) עם החבילה שנטענה, ו-**store** ממה ש-build
-    הזה יודע לקרוא (`readable_store_identity()`: `otzaria-oxv`, 2, `i8-sym-vec`).
+    הזה יודע לקרוא (`readable_store_for(store)` מתוך `readable_store_identities()`:
+    `otzaria-oxv` 2 `i8-sym-vec`, ו-`otzaria-oxv` 3 `rot192-i8i4`).
   - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
     `search_hits_with(vector, …, also, …)` — ולצדם הווקטורים של `also` (`scan_with`);
     `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
