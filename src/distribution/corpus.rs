@@ -162,6 +162,12 @@ pub trait CorpusIndex {
 /// the second read is what proves the corpus still says what the first read assumed, and
 /// this runs on a build machine.
 pub trait CorpusBooks: CorpusIndex {
+    /// Exact full-book text hash from the host index, when available. Used only by
+    /// windowed artifacts to avoid recomputing windows in unchanged books.
+    fn book_source_hash(&self, _book: &str) -> Result<Option<u64>, PackError> {
+        Ok(None)
+    }
+
     /// Every book in the corpus, in an order that does not change between runs.
     ///
     /// Determinism is not cosmetic here: it is what makes a rejection name the same book

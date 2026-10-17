@@ -53,6 +53,10 @@ pub struct Segment {
     vectors: Range<usize>,
     /// VECTOR_SCALES, for a codec with a scale per vector.
     scales: Option<Range<usize>>,
+    /// SLOT_WINDOWS, when the segment has it.
+    windows: Option<Range<usize>>,
+    occurrences: Option<Range<usize>>,
+    book_hashes: Option<Range<usize>>,
     extras: Range<usize>,
     extras_by_slot: Range<usize>,
     foreign: Range<usize>,
@@ -315,7 +319,42 @@ impl Segment {
             }
             (false, _) => None,
         };
+        let windows_entry = match sections.get(&SectionKind::SlotWindows) {
+            Some(entry) if entry.elem_count != header.slot_count || !entry.is_blocksummed() => {
+                return Err(format!(
+                    "SLOT_WINDOWS holds {} window(s) for {} slot(s), or is not covered by block \
+                     CRCs",
+                    entry.elem_count, header.slot_count
+                ))
+            }
+            entry => entry.copied(),
+        };
 
+        if sections
+            .get(&SectionKind::Occurrences)
+            .is_some_and(|entry| !entry.is_critical() || !entry.is_blocksummed())
+        {
+            return Err("OCCURRENCES must be critical and block-summed".to_string());
+        }
+        if let Some(entry) = sections.get(&SectionKind::Occurrences) {
+            if map[range(entry)]
+                .as_chunks::<44>()
+                .0
+                .iter()
+                .any(|row| row[41..44] != [0, 0, 0])
+            {
+                return Err("an occurrence has nonzero reserved bytes".to_string());
+            }
+        }
+        if sections.get(&SectionKind::BookHashes).is_some_and(|entry| {
+            entry.elem_count != u64::from(header.book_count)
+                || !entry.is_critical()
+                || !entry.is_blocksummed()
+        }) {
+            return Err(
+                "BOOK_HASHES must contain one critical block-summed hash per book".to_string(),
+            );
+        }
         let blocksummed: Vec<(SectionKind, Range<usize>)> = header
             .sections
             .iter()
@@ -414,6 +453,9 @@ impl Segment {
             keys: range(&keys_entry),
             vectors: range(&vectors_entry),
             scales: scales_entry.as_ref().map(range),
+            windows: windows_entry.as_ref().map(range),
+            occurrences: sections.get(&SectionKind::Occurrences).map(range),
+            book_hashes: sections.get(&SectionKind::BookHashes).map(range),
             extras: range(&extras_entry),
             extras_by_slot: range(&by_slot_entry),
             foreign: range(&foreign_entry),
@@ -424,6 +466,19 @@ impl Segment {
             map,
         };
         segment.check_records()?;
+        let mut last = None;
+        for occurrence in segment.occurrences() {
+            if occurrence.book as usize >= segment.books.len() || occurrence.hint > HINT_MASK {
+                return Err("an occurrence names an invalid book or hint".to_string());
+            }
+            if occurrence.window == 0 && occurrence.anchor != occurrence.key {
+                return Err("a first-window occurrence must name its own anchor".to_string());
+            }
+            if last.is_some_and(|last| last >= occurrence) {
+                return Err("occurrences must ascend strictly".to_string());
+            }
+            last = Some(occurrence);
+        }
         Ok(segment)
     }
 
@@ -644,6 +699,62 @@ impl Segment {
     /// Every slot's scale, little-endian `f32`s in slot order, for a codec with them.
     pub fn vector_scale_bytes(&self) -> Option<&[u8]> {
         self.scales.as_ref().map(|scales| &self.map[scales.clone()])
+    }
+
+    /// The least window ordinal of the slot's key: 0 for a line's first window, and for
+    /// every slot of a segment without SLOT_WINDOWS.
+    /// Source text hash of this book, or None for older/unknown metadata.
+    pub fn book_source_hash(&self, name: &str) -> Option<u64> {
+        let index = self
+            .books
+            .binary_search_by(|book| book.name.as_ref().cmp(name))
+            .ok()?;
+        let range = self.book_hashes.as_ref()?;
+        let at = range.start + index * 8;
+        let hash = u64::from_le_bytes(self.map[at..at + 8].try_into().expect("book hash"));
+        (hash != 0).then_some(hash)
+    }
+
+    pub fn occurrences(&self) -> impl Iterator<Item = super::occurrence::Occurrence> + '_ {
+        self.occurrences
+            .as_ref()
+            .map_or(&[][..], |range| &self.map[range.clone()])
+            .as_chunks::<44>()
+            .0
+            .iter()
+            .map(|row| super::occurrence::Occurrence::decode(row))
+    }
+
+    /// A complete snapshot for this key, or None when this segment does not update it.
+    pub fn key_occurrences(
+        &self,
+        key: ChunkKey,
+    ) -> Option<impl Iterator<Item = super::occurrence::Occurrence> + '_> {
+        let bytes = self
+            .occurrences
+            .as_ref()
+            .map(|range| &self.map[range.clone()])?;
+        let rows = bytes.as_chunks::<44>().0;
+        let start = rows.partition_point(|row| row[..16] < key.0[..]);
+        let end = start + rows[start..].partition_point(|row| row[..16] == key.0);
+        (end > start).then(|| {
+            rows[start..end]
+                .iter()
+                .map(|row| super::occurrence::Occurrence::decode(row))
+        })
+    }
+
+    pub fn slot_window(&self, slot: u32) -> u8 {
+        self.windows
+            .as_ref()
+            .map_or(0, |windows| self.map[windows.start + slot as usize])
+    }
+
+    /// Every slot's window, in slot order, when the segment has SLOT_WINDOWS.
+    pub fn slot_window_bytes(&self) -> Option<&[u8]> {
+        self.windows
+            .as_ref()
+            .map(|windows| &self.map[windows.clone()])
     }
 
     /// Every encoded vector, in slot order.

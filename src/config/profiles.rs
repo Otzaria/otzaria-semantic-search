@@ -15,6 +15,14 @@ fn default_bm25_saturation_k() -> f32 {
     DEFAULT_BM25_SATURATION_K
 }
 
+/// Taken off the cosine of a vector past a line's first window, in every preset: the middle
+/// of the range (0.03 to 0.05) measured on long lines.
+pub const DEFAULT_WINDOW_PENALTY: f32 = 0.04;
+
+fn default_window_penalty() -> f32 {
+    DEFAULT_WINDOW_PENALTY
+}
+
 /// The lexical weight `alpha` for each kind of query
 /// [`analyze_query`](crate::hybrid::ranking::analyze_query) tells apart; `1 - alpha` goes
 /// to the semantic side. Read by
@@ -173,6 +181,10 @@ pub struct RankingProfile {
     /// the main query's candidate count, appended after them. From 0 to 1; 0 is off.
     #[serde(default)]
     pub foundational_candidate_share: f32,
+    /// Taken off the cosine of a vector past a line's first window before the scan keeps its
+    /// best ([`DEFAULT_WINDOW_PENALTY`]). From 0 to 0.2.
+    #[serde(default = "default_window_penalty")]
+    pub window_penalty: f32,
 }
 
 impl RankingProfile {
@@ -198,6 +210,7 @@ impl RankingProfile {
                 telemetry_enabled: true,
                 foundational_bonus: 0.0,
                 foundational_candidate_share: 0.0,
+                window_penalty: DEFAULT_WINDOW_PENALTY,
             },
             SearchProfile::Balanced => Self {
                 profile,
@@ -220,6 +233,7 @@ impl RankingProfile {
                 telemetry_enabled: true,
                 foundational_bonus: 0.0,
                 foundational_candidate_share: 0.0,
+                window_penalty: DEFAULT_WINDOW_PENALTY,
             },
             SearchProfile::Best => Self {
                 profile,
@@ -240,6 +254,7 @@ impl RankingProfile {
                 telemetry_enabled: true,
                 foundational_bonus: 0.0,
                 foundational_candidate_share: 0.0,
+                window_penalty: DEFAULT_WINDOW_PENALTY,
             },
         }
     }
@@ -314,6 +329,12 @@ impl RankingProfile {
             self.candidate_window_multiplier,
             (1.0..=10.0).contains(&self.candidate_window_multiplier),
             "a number from 1 to 10",
+        )?;
+        require(
+            "window_penalty",
+            self.window_penalty,
+            (0.0..=0.2).contains(&self.window_penalty),
+            "a number from 0 to 0.2",
         )?;
         Ok(())
     }
@@ -544,6 +565,7 @@ mod tests {
             assert!(object.remove("bm25_saturation_k").is_some());
             assert!(object.remove("foundational_bonus").is_some());
             assert!(object.remove("foundational_candidate_share").is_some());
+            assert!(object.remove("window_penalty").is_some());
 
             let read: RankingProfile = serde_json::from_value(json).unwrap();
             assert_eq!(read, RankingProfile::from_profile(preset));
@@ -557,5 +579,41 @@ mod tests {
                 ..QueryTypeAlphas::default()
             }
         );
+    }
+
+    /// Every preset takes the measured window penalty, and a profile is held to 0 to 0.2.
+    #[test]
+    fn the_window_penalty_defaults_to_the_measured_one_and_is_bounded() {
+        assert_eq!(DEFAULT_WINDOW_PENALTY, 0.04);
+        for preset in [
+            SearchProfile::Fast,
+            SearchProfile::Balanced,
+            SearchProfile::Best,
+        ] {
+            assert_eq!(
+                RankingProfile::from_profile(preset).window_penalty,
+                DEFAULT_WINDOW_PENALTY
+            );
+        }
+        for (penalty, valid) in [
+            (0.0, true),
+            (0.2, true),
+            (-0.01, false),
+            (0.21, false),
+            (f32::NAN, false),
+        ] {
+            let profile = RankingProfile {
+                window_penalty: penalty,
+                ..RankingProfile::default()
+            };
+            match profile.validate() {
+                Ok(()) => assert!(valid, "{penalty}"),
+                Err(SemanticSearchError::InvalidRankingParameter { parameter, .. }) => {
+                    assert!(!valid, "{penalty}");
+                    assert_eq!(parameter, "window_penalty");
+                }
+                Err(other) => panic!("{other}"),
+            }
+        }
     }
 }

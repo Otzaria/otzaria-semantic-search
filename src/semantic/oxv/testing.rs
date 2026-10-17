@@ -96,6 +96,8 @@ pub(crate) struct TestBook {
     pub primary: Vec<(ChunkKey, u32, Vec<f32>)>,
     pub extras: Vec<(u32, u32)>,
     pub foreign: Vec<(ChunkKey, u32)>,
+    /// One per primary record, or none for all 0.
+    pub windows: Vec<u8>,
 }
 
 impl TestBook {
@@ -120,7 +122,13 @@ pub(crate) fn write_segment(
     for book in books {
         let primary: Vec<(ChunkKey, u32)> = book.primary.iter().map(|(k, h, _)| (*k, *h)).collect();
         builder
-            .add_book(&book.name, &primary, &book.extras, &book.foreign)
+            .add_book_windowed(
+                &book.name,
+                &primary,
+                &book.windows,
+                &book.extras,
+                &book.foreign,
+            )
             .unwrap();
         vectors.extend(book.primary.iter().map(|(_, _, v)| v.clone()));
     }

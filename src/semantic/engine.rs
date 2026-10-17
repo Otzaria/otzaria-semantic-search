@@ -133,7 +133,17 @@ impl SemanticConfig {
         // The same argument, for the three recipe versions. `Chunker::new` resolves them
         // too, but that happens after this and only on the path that builds one — and a
         // manifest signed with a version nothing implements is exactly what this refuses.
-        ChunkingAlgorithm::from_version(self.chunking.chunking_version)?;
+        // Windows need the scan's penalty, which this store does not apply: version 1 only.
+        if ChunkingAlgorithm::from_version(self.chunking.chunking_version)?
+            != ChunkingAlgorithm::AnchoredLine
+        {
+            return Err(crate::errors::ArtifactError::UnsupportedRecipeVersion {
+                field: "chunking_version",
+                found: self.chunking.chunking_version,
+                supported: ChunkingAlgorithm::AnchoredLine.version().to_string(),
+            }
+            .into());
+        }
         EmbeddingTextRecipe::from_version(self.chunking.embedding_text_version)?;
         TextNormalizationRecipe::from_version(self.chunking.normalization_version)?;
         // 2, not 1: the cap counts the special tokens the backend adds around the text,

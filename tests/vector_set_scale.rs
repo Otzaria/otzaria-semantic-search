@@ -293,6 +293,7 @@ fn a_library_scale_set_installs_scans_applies_and_compacts() {
                     top_k: 100,
                     books,
                     threads,
+                    window_penalty: 0.0,
                 },
                 &cancel,
             )
@@ -309,6 +310,7 @@ fn a_library_scale_set_installs_scans_applies_and_compacts() {
                             top_k: 100,
                             books,
                             threads,
+                            window_penalty: 0.0,
                         },
                         &cancel,
                     )

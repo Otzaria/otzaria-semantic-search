@@ -63,6 +63,9 @@ pub enum ChunkingAlgorithm {
     /// neighbours inside the same section, and the result truncated on a character
     /// boundary.
     AnchoredLine,
+    /// [`Self::AnchoredLine`], and a line that stands alone and is longer than the cap also
+    /// embeds further overlapping windows of its text, each a chunk of its own.
+    AnchoredLineWindows,
 }
 
 /// What text a chunk carries to the model, and what text a query does.
@@ -241,6 +244,7 @@ macro_rules! recipe_versions {
 
 recipe_versions!(ChunkingAlgorithm, "chunking_version", {
     AnchoredLine => 1,
+    AnchoredLineWindows => 2,
 });
 recipe_versions!(EmbeddingTextRecipe, "embedding_text_version", {
     LineOrNeighbourContext => 1,
@@ -334,9 +338,9 @@ mod tests {
         for (field, error, unimplemented, supported) in [
             (
                 "chunking_version",
-                ChunkingAlgorithm::from_version(2).unwrap_err(),
-                2,
-                "1",
+                ChunkingAlgorithm::from_version(3).unwrap_err(),
+                3,
+                "1, 2",
             ),
             (
                 "embedding_text_version",

@@ -207,6 +207,7 @@ impl CandidateResolver for FakeResolver {
                     continue;
                 }
                 resolved.push(ResolvedLine {
+                    window: 0,
                     hit: index as u32,
                     line_id: *line_id,
                     file_path: record.book.to_string(),
@@ -513,6 +514,7 @@ impl CandidateResolver for MovedIntoBerachot {
         for (index, hit) in hits.iter().enumerate() {
             if hit.key == self.moved.key && admitted {
                 lines.push(ResolvedLine {
+                    window: 0,
                     hit: index as u32,
                     line_id: MOVED_LINE,
                     file_path: BERACHOT.to_string(),
@@ -675,6 +677,7 @@ impl CandidateResolver for RepeatedText {
         if let Some(hit) = hits.iter().position(|hit| hit.key == ChunkKey::of(text)) {
             for (book, line_id) in Self::placed().into_iter().skip(1) {
                 lines.push(ResolvedLine {
+                    window: 0,
                     hit: hit as u32,
                     line_id,
                     // Each in a section of its own, so no bonus sets one above another.

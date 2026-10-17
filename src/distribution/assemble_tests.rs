@@ -37,6 +37,7 @@ fn text(i: usize) -> String {
 /// A build machine's state: the family, its warehouse, and the plans and releases made.
 struct Machine {
     dir: TempDir,
+    chunking: ChunkerConfig,
     model: ModelIdentity,
     package: ModelPackage,
     warehouse: PathBuf,
@@ -44,13 +45,20 @@ struct Machine {
 
 impl Machine {
     fn new(name: &str) -> Self {
+        Self::chunked(name, ChunkerConfig::default())
+    }
+
+    /// A machine whose family is built under `chunking`.
+    fn chunked(name: &str, chunking: ChunkerConfig) -> Self {
         let dir = TempDir::new(name);
         let model_path = stub_model(dir.path());
-        let (model, package) = (family(&model_path), passage_package(&model_path));
+        let (mut model, package) = (family(&model_path), passage_package(&model_path));
+        model.chunking_identity = chunking.identity();
         let warehouse = dir.join("warehouse");
         Warehouse::create(&warehouse, WarehouseIdentity::of(&model, &package)).unwrap();
         Self {
             dir,
+            chunking,
             model,
             package,
             warehouse,
@@ -84,7 +92,7 @@ impl Machine {
                 PlanRequest {
                     out_dir: out.clone(),
                     model: self.model.clone(),
-                    chunking: ChunkerConfig::default(),
+                    chunking: self.chunking.clone(),
                     passage_package: self.package.clone(),
                     previous,
                     warehouse: Some(&warehouse),
@@ -188,7 +196,8 @@ struct Live(u32, BTreeMap<String, Vec<(u32, u64)>>);
 impl Live {
     fn of(plan: &Plan) -> Self {
         let mut books: BTreeMap<String, Vec<(u32, u64)>> = BTreeMap::new();
-        for record in plan.records.iter() {
+        // An index's column holds each line's first window only.
+        for record in plan.records.iter().filter(|record| record.window == 0) {
             books
                 .entry(plan.books.name(record.book).to_string())
                 .or_default()
@@ -208,6 +217,99 @@ impl LiveKeySource for Live {
             out.extend_from_slice(lines);
             true
         }))
+    }
+}
+
+/// A recipe with windows: small enough that every line of [`text`] has some.
+fn windows_chunking() -> ChunkerConfig {
+    ChunkerConfig {
+        max_chunk_chars: 20,
+        chunking_version: 2,
+        window_chars: 16,
+        window_overlap_chars: 4,
+        max_windows_per_line: 3,
+        ..ChunkerConfig::default()
+    }
+}
+
+/// A windows plan's first windows are the plan without them; every slot gets its key's least
+/// window, the gates pass, and delta + compaction gives the newer base's slots and windows.
+#[test]
+fn a_release_with_windows_records_each_slots_window() {
+    let machine = Machine::chunked("release_windows", windows_chunking());
+    let anchor = Machine::chunked("release_windows_anchor", windows_chunking().anchor());
+    let p1 = machine.plan("p1", 1, &v1(), None);
+    let a1 = anchor.plan("p1", 1, &v1(), None);
+    assert!(p1.records.is_windowed() && !a1.records.is_windowed());
+    let firsts: Vec<_> = p1.records.iter().filter(|r| r.window == 0).collect();
+    assert_eq!(firsts, a1.records.iter().collect::<Vec<_>>());
+    assert!(p1.records.iter().any(|record| record.window > 0));
+
+    let base1 = machine.assemble(&p1, PackageKind::Base, None, NEW, "base1");
+    let segment = Segment::open(&base1.out_dir.join(SEGMENT_FILE)).unwrap();
+    let mut least: BTreeMap<ChunkKey, u8> = BTreeMap::new();
+    for record in p1.records.iter() {
+        let window = least.entry(record.key()).or_insert(record.window);
+        *window = (*window).min(record.window);
+    }
+    assert_eq!(segment.slot_count() as usize, least.len());
+    for slot in 0..segment.slot_count() {
+        assert_eq!(segment.slot_window(slot), least[&segment.key(slot)]);
+    }
+    assert!(least.values().any(|window| *window > 0));
+    let ledger1 = Ledger::open(&base1.out_dir, Some(1)).unwrap();
+
+    let p2 = machine.plan("p2", 2, &v2(), Some(&ledger1));
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger1), NEW, "delta2");
+    let base2 = machine.assemble(&p2, PackageKind::Base, None, NEW, "base2");
+    let work = &machine.dir;
+    let chain = simulate_device(&work.join("device"), &[&base1.out_dir, &delta.out_dir]).unwrap();
+    assert!(coverage(&chain, &p2).complete());
+    drop(chain);
+    compact(
+        &work.join("device"),
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&p2)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&work.join("device")).unwrap();
+    let direct = simulate_device(&work.join("direct"), &[&base2.out_dir]).unwrap();
+    let windows = |segment: &Segment| -> Vec<u8> {
+        (0..segment.slot_count())
+            .map(|slot| segment.slot_window(slot))
+            .collect()
+    };
+    let (slots, extras, books) = contents(&compacted.segments()[0]);
+    let (direct_slots, direct_extras, direct_books) = contents(&direct.segments()[0]);
+    assert_eq!(slots, direct_slots);
+    assert_eq!(
+        windows(&compacted.segments()[0]),
+        windows(&direct.segments()[0])
+    );
+    // The delta snapshot removes C even when its shared vectors remain live elsewhere.
+    assert_eq!(books, direct_books);
+    assert_eq!(books, [A, B, D]);
+    assert_eq!(extras, direct_extras);
+
+    for (release, plan, previous) in [
+        ("base1", &p1, None),
+        ("base2", &p2, None),
+        ("delta2", &p2, Some(&ledger1)),
+    ] {
+        let report = machine.verify(plan, release, previous);
+        for gate in &report.gates {
+            let sized = release == "delta2" && gate.gate == "G7";
+            assert!(
+                gate.passed() || sized,
+                "{release} {}: {}",
+                gate.gate,
+                gate.detail
+            );
+        }
     }
 }
 
@@ -479,6 +581,7 @@ fn a_delta_that_ships_no_vector_installs() {
                     top_k: 1000,
                     books: None,
                     threads: 1,
+                    window_penalty: 0.0,
                 },
                 &CancellationToken::new(),
             )
@@ -1095,4 +1198,384 @@ fn assembly_memory_is_bounded() {
         per_slot < 200.0 && per_slot < vector,
         "{per_slot:.0} bytes a slot, peaks {peaks:?}"
     );
+}
+
+impl Machine {
+    fn custom_plan(
+        &self,
+        name: &str,
+        version: u32,
+        lines: &[(u64, &str, &str)],
+        previous: Option<&Ledger>,
+    ) -> Plan {
+        let out = self.dir.join(name);
+        {
+            let warehouse = Warehouse::open(&self.warehouse).unwrap();
+            plan_from_corpus(
+                &corpus(self.dir.path(), name, version, lines),
+                PlanRequest {
+                    out_dir: out.clone(),
+                    model: self.model.clone(),
+                    chunking: self.chunking.clone(),
+                    passage_package: self.package.clone(),
+                    previous,
+                    warehouse: Some(&warehouse),
+                    created_at: CREATED.to_string(),
+                },
+            )
+            .unwrap();
+        }
+        let shard = raw_shard(&out, &self.dir.join(&format!("{name}-shard")));
+        Warehouse::open_for_append(&self.warehouse)
+            .unwrap()
+            .add_shards(
+                Some(&out),
+                &[shard],
+                &ShardPolicy {
+                    allow_non_semantic: true,
+                },
+                CREATED.to_string(),
+            )
+            .unwrap();
+        Plan::open(&out).unwrap()
+    }
+}
+
+#[test]
+fn mixed_anchor_and_inner_window_survive_compaction_with_their_own_roles() {
+    let cfg: ChunkerConfig = serde_json::from_str(include_str!(
+        "../../config/models/meivin-round2-windows-onnx/chunking.json"
+    ))
+    .unwrap();
+    let mut machine = Machine::chunked("mixed_occurrences", cfg);
+    machine.model.embedding_text_version = 2;
+    std::fs::remove_dir_all(&machine.warehouse).unwrap();
+    Warehouse::create(
+        &machine.warehouse,
+        WarehouseIdentity::of(&machine.model, &machine.package),
+    )
+    .unwrap();
+    let long = (0..800)
+        .map(|n| format!("מילה{n:04}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let windows = crate::semantic::chunker::Chunker::new(machine.chunking.clone())
+        .unwrap()
+        .embedded_windows(
+            &[crate::semantic::chunk_key::LineRef {
+                text: &long,
+                section: 1,
+            }],
+            0,
+        );
+    let tail = windows[1].text.strip_prefix("[PASSAGE] ").unwrap();
+    let key = ChunkKey::of(&windows[1].text);
+    let plan = machine.custom_plan("p1", 1, &[(1, A, &long), (2, B, tail)], None);
+    let base = machine.assemble(&plan, PackageKind::Base, None, NEW, "base");
+    let device = machine.dir.join("device");
+    let set = simulate_device(&device, &[&base.out_dir]).unwrap();
+    let mut records = Vec::new();
+    set.book_occurrences(A, &mut records);
+    let inner = records
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(inner.window, 1);
+    assert_ne!(inner.anchor, Some(key));
+    set.book_occurrences(B, &mut records);
+    assert!(records.iter().any(|(candidate, record)| *candidate == key
+        && record.window == 0
+        && record.anchor == Some(key)));
+    assert!(coverage(&set, &plan).complete());
+    drop(set);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&plan)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&device).unwrap();
+    assert!(coverage(&set, &plan).complete());
+    set.book_occurrences(A, &mut records);
+    assert!(records
+        .iter()
+        .any(|(candidate, record)| *candidate == key && *record == inner));
+}
+
+#[test]
+fn delta_snapshots_replace_roles_hints_and_removed_books_without_reembedding() {
+    let machine = Machine::chunked(
+        "occurrence_transition",
+        ChunkerConfig {
+            min_meaningful_chars: 1,
+            ..windows_chunking()
+        },
+    );
+    let long = "abcdefghijklmnopqrst uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    let windows = crate::semantic::chunker::Chunker::new(machine.chunking.clone())
+        .unwrap()
+        .embedded_windows(
+            &[crate::semantic::chunk_key::LineRef {
+                text: long,
+                section: 1,
+            }],
+            0,
+        );
+    let tail = windows[1].text.as_str();
+    let key = ChunkKey::of(tail);
+    let p1 = machine.custom_plan("p1", 1, &[(1, B, tail)], None);
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base");
+    let ledger = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    assert!(ledger.manifest.occurrences.is_some());
+    let p2 = machine.custom_plan(
+        "p2",
+        2,
+        &[(1, A, "new preface"), (2, A, long)],
+        Some(&ledger),
+    );
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger), NEW, "delta");
+    let direct = machine.assemble(&p2, PackageKind::Base, None, NEW, "direct");
+    let chain = simulate_device(
+        &machine.dir.join("device"),
+        &[&base.out_dir, &delta.out_dir],
+    )
+    .unwrap();
+    let fresh = simulate_device(&machine.dir.join("fresh"), &[&direct.out_dir]).unwrap();
+    let mut chained = Vec::new();
+    let mut rebuilt = Vec::new();
+    for book in [A, B] {
+        chain.book_occurrences(book, &mut chained);
+        fresh.book_occurrences(book, &mut rebuilt);
+        assert_eq!(chained, rebuilt, "book {book}");
+    }
+    chain.book_occurrences(A, &mut chained);
+    assert!(chained
+        .iter()
+        .any(|(candidate, record)| *candidate == key && record.window == 1 && record.hint == 1));
+    chain.book_occurrences(B, &mut chained);
+    assert!(chained.is_empty());
+    assert!(coverage(&chain, &p2).complete());
+    let b: crate::semantic::resolve::BookSet = [B].into_iter().collect();
+    let hits = chain
+        .scan_with(
+            &vec![1.0; chain.codec().dim()],
+            &crate::semantic::oxv::scan::ScanRequest {
+                top_k: 100,
+                books: Some(&b),
+                threads: 1,
+                window_penalty: 0.04,
+            },
+            &[],
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(
+        hits.iter().all(|hit| hit.key != key),
+        "removed book must not admit an old anchor occurrence"
+    );
+    let score_of = |set: &SegmentSet| {
+        let hits = set
+            .scan_with(
+                &vec![1.0; set.codec().dim()],
+                &crate::semantic::oxv::scan::ScanRequest {
+                    top_k: 100,
+                    books: None,
+                    threads: 1,
+                    window_penalty: 0.04,
+                },
+                &[],
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let hit = hits.iter().find(|hit| hit.key == key).unwrap();
+        (hit.window, hit.score.to_bits())
+    };
+    let before_compaction = score_of(&chain);
+    assert_eq!(before_compaction.0, 1);
+    compact(
+        &machine.dir.join("device"),
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&machine.dir.join("device")).unwrap();
+    assert_eq!(
+        score_of(&compacted),
+        before_compaction,
+        "compaction must refresh a reused vector's own role for the unfiltered fast path"
+    );
+    let ledger2 = Ledger::open(&delta.out_dir, Some(2)).unwrap();
+    let p3 = machine.custom_plan(
+        "p3",
+        3,
+        &[(1, A, "new preface"), (2, A, long)],
+        Some(&ledger2),
+    );
+    let unchanged = machine.assemble(&p3, PackageKind::Delta, Some(&ledger2), NEW, "unchanged");
+    assert_eq!(
+        Segment::open(&unchanged.out_dir.join(SEGMENT_FILE))
+            .unwrap()
+            .occurrences()
+            .count(),
+        0,
+        "unchanged metadata must not inflate deltas"
+    );
+}
+
+#[test]
+fn distinct_parents_in_one_book_are_retained_and_reanchored_by_compaction() {
+    let machine = Machine::chunked(
+        "distinct_parents",
+        ChunkerConfig {
+            min_meaningful_chars: 1,
+            ..windows_chunking()
+        },
+    );
+    let long_a = "abcdefghijklmnopqrst uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    let long_b = "ABCDEFGHIJKLMNOPQRST uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    let plan = machine.custom_plan("p1", 1, &[(1, A, long_a), (2, A, long_b)], None);
+    let base = machine.assemble(&plan, PackageKind::Base, None, NEW, "base");
+    let device = machine.dir.join("device");
+    let set = simulate_device(&device, &[&base.out_dir]).unwrap();
+    let mut before = Vec::new();
+    set.book_occurrences(A, &mut before);
+    let shared = before
+        .iter()
+        .find(|(key, record)| {
+            record.window > 0
+                && before
+                    .iter()
+                    .any(|(other, r)| other == key && r.anchor != record.anchor)
+        })
+        .expect("fixture needs a shared window under different anchors")
+        .0;
+    assert_eq!(before.iter().filter(|(key, _)| *key == shared).count(), 2);
+    struct Moved(Live);
+    impl LiveKeySource for Moved {
+        fn library_version(&self) -> u32 {
+            self.0.library_version()
+        }
+        fn book_keys(&self, book: &str, out: &mut Vec<(u32, u64)>) -> Result<bool, ResolveError> {
+            let found = self.0.book_keys(book, out)?;
+            for (ordinal, _) in out {
+                *ordinal += 40;
+            }
+            Ok(found)
+        }
+    }
+    drop(set);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Moved(Live::of(&plan))),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&device).unwrap();
+    let mut after = Vec::new();
+    set.book_occurrences(A, &mut after);
+    assert_eq!(after.len(), before.len());
+    for ((before_key, old), (after_key, new)) in before.iter().zip(&after) {
+        assert_eq!(before_key, after_key);
+        assert_eq!(new.hint, old.hint + 40);
+        assert_eq!(new.window, old.window);
+        assert_eq!(new.anchor, old.anchor);
+    }
+}
+
+fn with_source_hashes(plan: Plan, hashes: &[(&str, u64)]) -> Plan {
+    use super::plan::{PlanManifest, BOOK_HASHES_FILE};
+    super::files::write_json(
+        &plan.dir.join(BOOK_HASHES_FILE),
+        &hashes
+            .iter()
+            .map(|(book, hash)| (book.to_string(), *hash))
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .unwrap();
+    let original = &plan.manifest;
+    PlanManifest::write(
+        &plan.dir,
+        original.identity.clone(),
+        original.library_version,
+        original.library_release_tag.clone(),
+        original.previous.clone(),
+        original.counts,
+        original.parity,
+        original.created_at.clone(),
+    )
+    .unwrap();
+    Plan::open(&plan.dir).unwrap()
+}
+
+#[test]
+fn source_hash_deltas_refresh_unchanged_and_metadata_only_books_and_survive_compaction() {
+    let machine = Machine::chunked("book_hash_delta", windows_chunking());
+    let long = "abcdefghijklmnopqrst uvwxyz ABCDEFGHIJKLMNOP QRSTUVWXYZ";
+    // A has no embedded record and lies before B in the book table.
+    let p1 = with_source_hashes(
+        machine.custom_plan("p1", 1, &[(1, A, "!"), (2, B, long)], None),
+        &[(A, 11), (B, 22)],
+    );
+    let base = machine.assemble(&p1, PackageKind::Base, None, NEW, "base");
+    let ledger = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    let p2 = with_source_hashes(
+        machine.custom_plan("p2", 2, &[(1, A, "!"), (2, B, long)], Some(&ledger)),
+        &[(A, 33), (B, 44)],
+    );
+    let delta = machine.assemble(&p2, PackageKind::Delta, Some(&ledger), NEW, "delta");
+    let segment = Segment::open(&delta.out_dir.join(SEGMENT_FILE)).unwrap();
+    assert_eq!(segment.slot_count(), 0);
+    assert_eq!(segment.foreign_count(), 0);
+    assert_eq!(segment.book_source_hash(A), Some(33));
+    assert_eq!(segment.book_source_hash(B), Some(44));
+    let device = machine.dir.join("device");
+    let set = simulate_device(&device, &[&base.out_dir, &delta.out_dir]).unwrap();
+    assert_eq!(set.book_source_hash(A), Some(33));
+    assert_eq!(set.book_source_hash(B), Some(44));
+    drop(set);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&device).unwrap();
+    assert_eq!(set.book_source_hash(A), Some(33));
+    assert_eq!(set.book_source_hash(B), Some(44));
+    assert!(coverage(&set, &p2).complete());
+    // Hash snapshots are part of the plan's digest-bound inputs.
+    std::fs::write(p2.dir.join(super::plan::BOOK_HASHES_FILE), b"{}").unwrap();
+    assert!(p2.book_source_hashes().is_err());
+}
+
+#[test]
+fn a_legacy_plan_ignores_a_stale_windowed_book_hash_file() {
+    let machine = Machine::new("legacy_hash_ignored");
+    let plan = with_source_hashes(
+        machine.plan("p1", 1, &v1(), None),
+        &[(A, 11), (B, 22), (C, 33)],
+    );
+    assert!(!plan
+        .manifest
+        .files
+        .contains_key(super::plan::BOOK_HASHES_FILE));
+    assert_eq!(plan.book_source_hashes().unwrap(), None);
 }

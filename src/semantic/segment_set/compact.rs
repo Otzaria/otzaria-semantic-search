@@ -6,13 +6,11 @@
 //! of a set shares one codec epoch — and every block is verified before it is copied, since
 //! the copy is checksummed afresh.
 //!
-//! The records are gathered book by book in name order, deduplicated to one per book and
-//! key (the newest segment's, at the first line that holds it), and — when the live index
-//! holds the same library version as
-//! the set — re-anchored on the lines that hold each key today, through [`LiveKeySource`]:
-//! a hint moves to the live line closest to it, and a record whose key the book no longer
-//! holds is dropped. Slots are then assigned as a build assigns them: the first time a key
-//! appears it takes the next slot, every later appearance is an extra.
+//! Records are gathered book by book from the newest complete snapshot of each key;
+//! distinct parent anchors within a book survive. On a live index of the same version,
+//! the host can verify and refresh each occurrence, including inner windows. Legacy
+//! sources expose only the anchor column and conservatively keep unverified windows.
+//! Vectors remain deduplicated: the first appearance takes a slot, later books an extra.
 
 use super::files::{self, io_error, Durable, SetLock, SetSegment, STAGING_DIR};
 use super::install::{full_or_io, NewGeneration};
@@ -242,75 +240,99 @@ pub fn compact(
                 .iter()
                 .take_while(|book| book.0 == name)
                 .count();
-        let mut records: Vec<(ChunkKey, u32, u16)> = Vec::new();
-        for &(_, seg, index) in &books[start..end] {
-            let segment = &segments[seg as usize];
-            let book = &segment.books()[index];
-            let dead = &deleted[seg as usize];
-            for slot in book.slots.clone() {
-                if !dead.is_set(slot) {
-                    records.push((segment.key(slot), segment.hint(slot), seg));
-                }
-            }
-            for extra in book.extras.clone() {
-                let (slot, hint) = segment.extra(extra);
-                if !dead.is_set(slot) {
-                    records.push((segment.key(slot), hint, seg));
-                }
-            }
-            for foreign in book.foreign.clone() {
-                let (key, _, hint) = segment.foreign_record(foreign);
-                let target = set.links()[seg as usize]
-                    .get(foreign as usize)
-                    .and_then(|link| link.target());
-                if let Some((target_seg, target_slot)) = target {
-                    if !deleted[target_seg as usize].is_set(target_slot) {
-                        records.push((key, hint, seg));
-                    }
-                }
-            }
-        }
+        // Resolve effective snapshots before merging: a newer key's locations replace
+        // all older ones, and distinct parents in the same book remain distinct.
+        let mut records = Vec::new();
+        set.book_occurrences(name, &mut records);
         start = end;
-        // One record per book and key: the newest segment's, at the first line that holds
-        // the key — a segment may hold a key twice in one book, and the order is total, so
-        // which record stays is the rule's and not the sort's.
-        records.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)).then(a.1.cmp(&b.1)));
-        records.dedup_by(|later, earlier| later.0 == earlier.0);
-
         if refresh {
-            live_lines.clear();
             let source = live.expect("refresh implies a source");
-            if source.book_keys(name, &mut live_lines)? {
-                let mut by_key: HashMap<u64, Vec<u32>> = HashMap::new();
+            let mut resolved = Vec::new();
+            live_lines.clear();
+            let has_keys = source.book_keys(name, &mut live_lines)?;
+            let mut by_key: HashMap<u64, Vec<u32>> = HashMap::new();
+            if has_keys {
                 for &(ordinal, value) in &live_lines {
                     if value != 0 {
                         by_key.entry(value).or_default().push(ordinal);
                     }
                 }
-                records.retain_mut(|(key, hint, _)| match by_key.get_mut(&key.column_value()) {
+            }
+            for (key, mut record) in records {
+                if let Some(verified) = source.resolve_record(key, &record, cancel)? {
+                    if verified.is_empty() {
+                        pruned += 1;
+                    }
+                    for mut fresh in verified {
+                        // A legacy key may also occur in a book the live index cannot
+                        // inspect. Keep the entire key legacy instead of publishing a
+                        // partial snapshot that would hide those unknown occurrences.
+                        if record.anchor.is_none() {
+                            fresh.anchor = None;
+                        }
+                        if fresh.hint != record.hint {
+                            refreshed += 1;
+                        }
+                        resolved.push((key, fresh));
+                    }
+                    continue;
+                }
+                // Legacy hosts only expose the parent's column. It can refresh a
+                // recorded parent, but cannot prove an inner window was removed.
+                let lookup = record.anchor.unwrap_or(key).column_value();
+                match by_key.get(&lookup) {
                     Some(ordinals) => {
                         let closest = *ordinals
                             .iter()
-                            .min_by_key(|ordinal| (ordinal.abs_diff(*hint), **ordinal))
-                            .expect("a key in the map has a line");
-                        if closest != *hint {
+                            .min_by_key(|ordinal| (ordinal.abs_diff(record.hint), **ordinal))
+                            .expect("nonempty");
+                        if closest != record.hint {
                             refreshed += 1;
-                            *hint = closest;
+                            record.hint = closest;
                         }
-                        true
+                        resolved.push((key, record));
                     }
-                    None => {
+                    None if has_keys && record.window == 0 => {
                         pruned += 1;
-                        false
                     }
+                    None => resolved.push((key, record)),
+                }
+            }
+            records = resolved;
+        }
+        records.sort_unstable_by(|(ka, a), (kb, b)| {
+            a.hint
+                .cmp(&b.hint)
+                .then(ka.cmp(kb))
+                .then(a.window.cmp(&b.window))
+                .then(a.anchor.cmp(&b.anchor))
+        });
+        records.dedup();
+        let mut primary = Vec::new();
+        let mut windows = Vec::new();
+        let mut extras = Vec::new();
+        let mut occurrences = Vec::new();
+        let mut least = HashMap::<ChunkKey, u8>::new();
+        for (key, record) in &records {
+            least
+                .entry(*key)
+                .and_modify(|window| *window = (*window).min(record.window))
+                .or_insert(record.window);
+        }
+        let mut recorded = std::collections::HashSet::new();
+        for (key, record) in records {
+            if let Some(anchor) = record.anchor {
+                occurrences.push(crate::semantic::oxv::occurrence::Occurrence {
+                    key,
+                    book: 0,
+                    hint: record.hint,
+                    anchor,
+                    window: record.window,
                 });
             }
-        }
-
-        records.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        let mut primary = Vec::new();
-        let mut extras = Vec::new();
-        for (key, hint, _) in records {
+            if !recorded.insert(key) {
+                continue;
+            }
             let Ok(position) = live_slots.binary_search_by(|probe| probe.0.cmp(&key)) else {
                 continue;
             };
@@ -318,14 +340,26 @@ pub fn compact(
                 new_slot[position] = order.len() as u32;
                 let (_, seg, slot) = live_slots[position];
                 order.push((seg, slot));
-                primary.push((key, hint));
+                primary.push((key, record.hint));
+                windows.push(least[&key]);
             } else {
-                extras.push((hint, new_slot[position]));
+                builder.minimize_slot_window(new_slot[position], least[&key]);
+                extras.push((record.hint, new_slot[position]));
             }
         }
         builder
-            .add_book(name, &primary, &extras, &[])
+            .add_book_windowed_hashed(
+                name,
+                &primary,
+                &windows,
+                &extras,
+                &[],
+                set.book_source_hash(name),
+            )
             .map_err(io_error(format!("assembling book {name:?}")))?;
+        builder
+            .add_occurrences(name, &occurrences)
+            .map_err(io_error(format!("assembling occurrences of {name:?}")))?;
     }
     drop(new_slot);
     drop(live_slots);

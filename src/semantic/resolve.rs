@@ -32,18 +32,27 @@ pub struct RecordRef {
     /// The line's ordinal in that book when the vectors were built: where to look first,
     /// not where the line must be.
     pub hint: u32,
+    /// Exact role of this occurrence; legacy records inherit their slot's role.
+    pub window: u8,
+    /// The first-window key of the parent line, when recorded by the producer.
+    pub anchor: Option<ChunkKey>,
 }
 
 /// One vector a scan returned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorHit {
-    /// Cosine similarity to the query, as the store's codec computes it.
+    /// Query penalty, retained so each resolved occurrence receives its own score.
+    pub window_penalty: f32,
+    /// Codec similarity after the least penalty among admitted occurrences.
     pub score: f32,
     /// The key of the text the vector was embedded from.
     pub key: ChunkKey,
     /// Where that text was: the books admitted by the search's filter first, then the
     /// rest, at most [`MAX_RECORDS_PER_HIT`] in all.
     pub records: Vec<RecordRef>,
+    /// Least window ordinal among the query's admitted occurrences; each record retains
+    /// its own role so resolution can apply the correct per-line penalty.
+    pub window: u8,
     /// Which segment of the set holds the vector, and at which slot. Stable for one
     /// generation of the set; for diagnostics, not for identity.
     pub seg: u16,
@@ -119,6 +128,18 @@ pub trait LiveKeySource {
     /// record.
     fn library_version(&self) -> u32;
 
+    /// Resolve and verify one occurrence within its book against the live index.
+    /// Returned records must name the same book. None means the source
+    /// does not support full verification; Some(empty) means no live occurrence remains.
+    fn resolve_record(
+        &self,
+        _key: ChunkKey,
+        _record: &RecordRef,
+        _cancel: &CancellationToken,
+    ) -> Result<Option<Vec<RecordRef>>, ResolveError> {
+        Ok(None)
+    }
+
     /// Fill `out` with `(ordinal, chunk key column value)` for every live line of `book`
     /// — [`ChunkKey::column_value`], `0` for a line that is not embedded — and return
     /// `false` when the index holds no such book, whose records are then kept as they are.
@@ -128,6 +149,8 @@ pub trait LiveKeySource {
 /// One live line a hit resolved to, described by the live index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedLine {
+    /// Actual matched occurrence role, used to score mixed anchor/window hits.
+    pub window: u8,
     /// Which of the hits handed to [`CandidateResolver::resolve`] it came from.
     pub hit: u32,
     /// The document id the index gives the line now.

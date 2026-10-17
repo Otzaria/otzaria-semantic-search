@@ -377,6 +377,126 @@ impl SegmentSet {
         scan_with(&set, &prepared, request, also, cancel)
     }
 
+    /// The newest entry for a book is authoritative, including an unknown hash.
+    pub fn book_source_hash(&self, name: &str) -> Option<u64> {
+        self.segments
+            .iter()
+            .rev()
+            .find(|segment| {
+                segment
+                    .books()
+                    .binary_search_by(|book| book.name.as_ref().cmp(name))
+                    .is_ok()
+            })
+            .and_then(|segment| segment.book_source_hash(name))
+    }
+
+    /// Effective complete occurrences in a book, without the search result count cap.
+    /// Newest per-key snapshots replace every older location, including removed ones.
+    pub fn book_occurrences(
+        &self,
+        name: &str,
+        out: &mut Vec<(
+            crate::semantic::chunk_key::ChunkKey,
+            crate::semantic::resolve::RecordRef,
+        )>,
+    ) {
+        use crate::semantic::resolve::RecordRef;
+        use std::collections::HashMap;
+        out.clear();
+        let mut records = HashMap::new();
+        for (seg, segment) in self.segments.iter().enumerate() {
+            let Ok(index) = segment
+                .books()
+                .binary_search_by(|book| book.name.as_ref().cmp(name))
+            else {
+                continue;
+            };
+            let book = &segment.books()[index];
+            let mut fresh = HashMap::new();
+            let mut add = |key, hint, window| {
+                let record = fresh.entry(key).or_insert(RecordRef {
+                    book: book.name.clone(),
+                    hint,
+                    window,
+                    anchor: None,
+                });
+                if hint < record.hint {
+                    record.hint = hint;
+                    record.window = window;
+                }
+            };
+            for slot in book.slots.clone() {
+                if self.is_live(seg as u16, slot) {
+                    add(
+                        segment.key(slot),
+                        segment.hint(slot),
+                        segment.slot_window(slot),
+                    );
+                }
+            }
+            for extra in book.extras.clone() {
+                let (slot, hint) = segment.extra(extra);
+                if self.is_live(seg as u16, slot) {
+                    add(segment.key(slot), hint, segment.slot_window(slot));
+                }
+            }
+            for foreign in book.foreign.clone() {
+                let (key, _, hint) = segment.foreign_record(foreign);
+                if let Some((target_seg, target_slot)) = self.links[seg]
+                    .get(foreign as usize)
+                    .and_then(|link| link.target())
+                {
+                    if self.is_live(target_seg, target_slot) {
+                        add(
+                            key,
+                            hint,
+                            self.segments[target_seg as usize].slot_window(target_slot),
+                        );
+                    }
+                }
+            }
+            records.extend(fresh);
+        }
+        for (key, legacy) in records {
+            let mut found = false;
+            for segment in self.segments.iter().rev() {
+                if let Some(snapshot) = segment.key_occurrences(key) {
+                    out.extend(
+                        snapshot
+                            .filter(|record| {
+                                segment.books()[record.book as usize].name.as_ref() == name
+                            })
+                            .map(|record| {
+                                (
+                                    key,
+                                    RecordRef {
+                                        book: segment.books()[record.book as usize].name.clone(),
+                                        hint: record.hint,
+                                        window: record.window,
+                                        anchor: Some(record.anchor),
+                                    },
+                                )
+                            }),
+                    );
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                out.push((key, legacy));
+            }
+        }
+        out.sort_unstable_by(|(ka, a), (kb, b)| {
+            a.hint
+                .cmp(&b.hint)
+                .then(ka.cmp(kb))
+                .then(a.window.cmp(&b.window))
+                .then(a.anchor.cmp(&b.anchor))
+        });
+        out.dedup();
+    }
+
     pub fn info(&self) -> &SetInfo {
         &self.info
     }

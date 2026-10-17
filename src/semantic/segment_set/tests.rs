@@ -211,6 +211,7 @@ fn everything(
             top_k: 100_000,
             books: None,
             threads: 2,
+            window_penalty: 0.0,
         },
         &CancellationToken::new(),
     )
@@ -1061,6 +1062,7 @@ fn a_filtered_scan_of_a_set_reaches_foreign_records() {
                 top_k: 100,
                 books: Some(&books),
                 threads: 1,
+                window_penalty: 0.0,
             },
             &CancellationToken::new(),
         )
@@ -1109,6 +1111,7 @@ fn a_set_weighs_the_live_slots_it_is_handed_besides_the_books_it_admits() {
                 top_k: 100,
                 books,
                 threads: 1,
+                window_penalty: 0.0,
             },
             also,
             &CancellationToken::new(),
@@ -1139,7 +1142,8 @@ fn a_set_weighs_the_live_slots_it_is_handed_besides_the_books_it_admits() {
             &ScanRequest {
                 top_k: 100,
                 books: Some(&books),
-                threads: 1
+                threads: 1,
+                window_penalty: 0.0
             },
             &CancellationToken::new()
         )
@@ -2820,4 +2824,146 @@ fn windows_a_verdict_held_open_briefly_is_withdrawn_once_released() {
     assert!(!verdict.exists());
     assert_eq!(report.generation, 2);
     assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 2);
+}
+
+/// The live index holds first windows only, so a record of a slot past one is kept as it
+/// is when compaction re-anchors, and the compacted segment keeps every slot's window.
+#[test]
+fn compaction_keeps_the_records_of_windows() {
+    let work = TempDir::new("set_windows");
+    let dir = work.join("vectors");
+    let book = |name: &str, lines: &[(u64, u32, u8)]| TestBook {
+        primary: lines
+            .iter()
+            .map(|(k, hint, _)| (key(*k), *hint, vector_of(*k)))
+            .collect(),
+        windows: lines.iter().map(|(_, _, window)| *window).collect(),
+        ..TestBook::named(name)
+    };
+    let books = [
+        book("id:1", &[(1, 0, 0), (2, 0, 1), (3, 2, 0), (9, 2, 3)]),
+        book("id:2", &[(4, 0, 0), (5, 0, 2)]),
+    ];
+    let mut spec = spec(PackageKind::Base, 0, 29);
+    spec.identity_digest = identity().identity_digest();
+    let path = work.join("base-windows.oxv");
+    let written = write_segment(&path, spec, codec(), &books, &[]);
+    let manifest = ReleaseManifest::for_segment(
+        &written,
+        &identity(),
+        codec().params_sha256(),
+        test_provenance(),
+        "2026-10-02T00:00:00Z".to_string(),
+    );
+    install(&dir, &(path, manifest.to_json())).unwrap();
+
+    // Line 2 of id:1 moved to line 4, and key 9 — its window — stays with its hint.
+    let live = Fixed {
+        version: 29,
+        books: BTreeMap::from([
+            (
+                "id:1".to_string(),
+                vec![(0, key(1).column_value()), (4, key(3).column_value())],
+            ),
+            ("id:2".to_string(), vec![(0, key(4).column_value())]),
+        ]),
+    };
+    let report = compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&live),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!((report.records_pruned, report.hints_refreshed), (0, 1));
+    let set = SegmentSet::open(&dir).unwrap();
+    let hits = everything(&set, 7);
+    for (k, records) in [
+        (1, ("id:1", 0)),
+        (2, ("id:1", 0)),
+        (3, ("id:1", 4)),
+        (9, ("id:1", 2)),
+        (4, ("id:2", 0)),
+        (5, ("id:2", 0)),
+    ] {
+        assert_eq!(
+            hits[&key(k)].1,
+            BTreeSet::from([(records.0.to_string(), records.1)]),
+            "key {k}"
+        );
+    }
+    let segment = &set.segments()[0];
+    let windows: BTreeMap<ChunkKey, u8> = (0..segment.slot_count())
+        .map(|slot| (segment.key(slot), segment.slot_window(slot)))
+        .collect();
+    assert_eq!(
+        windows,
+        BTreeMap::from([
+            (key(1), 0),
+            (key(2), 1),
+            (key(3), 0),
+            (key(9), 3),
+            (key(4), 0),
+            (key(5), 2),
+        ])
+    );
+}
+
+#[test]
+fn compaction_never_upgrades_a_legacy_key_to_a_partial_occurrence_snapshot() {
+    use crate::semantic::resolve::RecordRef;
+    let work = TempDir::new("partial_legacy_snapshot");
+    let dir = work.join("vectors");
+    let library = Library::with(29, &[("a", &[(0, 1)]), ("b", &[(0, 1)])]);
+    install(&dir, &release(&work, &library, None)).unwrap();
+    struct Partial;
+    impl LiveKeySource for Partial {
+        fn library_version(&self) -> u32 {
+            29
+        }
+        fn book_keys(&self, book: &str, out: &mut Vec<(u32, u64)>) -> Result<bool, ResolveError> {
+            if book == "b" {
+                out.push((9, key(1).column_value()));
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        fn resolve_record(
+            &self,
+            key: ChunkKey,
+            record: &RecordRef,
+            _cancel: &CancellationToken,
+        ) -> Result<Option<Vec<RecordRef>>, ResolveError> {
+            if record.book.as_ref() == "a" {
+                return Ok(None);
+            }
+            let mut fresh = record.clone();
+            fresh.hint = 9;
+            fresh.anchor = Some(key);
+            Ok(Some(vec![fresh]))
+        }
+    }
+    compact(
+        &dir,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Partial),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+    assert!(set.segments()[0].key_occurrences(key(1)).is_none());
+    let mut records = Vec::new();
+    set.book_occurrences("a", &mut records);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1.hint, 0);
+    set.book_occurrences("b", &mut records);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1.hint, 9);
 }

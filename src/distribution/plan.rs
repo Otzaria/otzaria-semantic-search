@@ -6,7 +6,8 @@
 //!
 //! ```text
 //! records.bin          b"OXVREC1\n", u64 count, then {book u32, ordinal u32, sha256 [32]}
-//!                      per embedded line, strictly ascending by (book, ordinal)
+//!                      per embedded line, strictly ascending by (book, ordinal); b"OXVREC2\n"
+//!                      adds {window u8, pad [3]} after ordinal and ascends by window too
 //! books.json           the books' stable keys, a JSON array in strictly ascending byte
 //!                      order; a record's book is an index into it
 //! embed.jsonl          the texts no warehouse vector exists for, one per key, in order of
@@ -30,18 +31,19 @@ use crate::errors::PackError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::official_index::readable_store_identity;
-use crate::semantic::recipe::EmbeddingRecipe;
+use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingRecipe};
 use crate::semantic::versioning::{IndexVersion, ModelIdentity, ModelPackage};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const RECORDS_FILE: &str = "records.bin";
 pub const BOOKS_FILE: &str = "books.json";
+pub const BOOK_HASHES_FILE: &str = "book-hashes.json";
 pub const EMBED_PLAN_FILE: &str = "embed.jsonl";
 pub const EMBED_MANIFEST_FILE: &str = "embed-manifest.json";
 pub const TOMBSTONES_FILE: &str = "tombstones.bin";
@@ -55,8 +57,10 @@ pub const EMBED_PLAN_FORMAT: &str = "otzaria-embed-plan";
 pub const EMBED_PLAN_VERSION: u32 = 2;
 
 const RECORDS_MAGIC: &[u8; 8] = b"OXVREC1\n";
+const WINDOWED_RECORDS_MAGIC: &[u8; 8] = b"OXVREC2\n";
 const RECORDS_HEADER: usize = 16;
 const RECORD_LEN: usize = 40;
+const WINDOWED_RECORD_LEN: usize = 44;
 
 /// What a planner asks of the vectors already embedded — the warehouse's: whether one is
 /// held for the text whose SHA-256 is `sha256`.
@@ -71,6 +75,8 @@ pub struct PlanRecord {
     pub book: u32,
     /// The line's position in its book: the hint a segment records.
     pub ordinal: u32,
+    /// Which window of the line; 0, the line's first, in a plan without windows.
+    pub window: u8,
     /// SHA-256 of the text the model is given.
     pub sha256: [u8; 32],
 }
@@ -84,19 +90,30 @@ impl PlanRecord {
         self.sha256[..16].try_into().expect("16 of 32")
     }
 
-    fn encode(&self) -> [u8; RECORD_LEN] {
-        let mut out = [0u8; RECORD_LEN];
-        out[..4].copy_from_slice(&self.book.to_le_bytes());
-        out[4..8].copy_from_slice(&self.ordinal.to_le_bytes());
-        out[8..].copy_from_slice(&self.sha256);
+    /// Where it is in its plan's order: (book, ordinal, window).
+    pub fn position(&self) -> (u32, u32, u8) {
+        (self.book, self.ordinal, self.window)
+    }
+
+    fn encode(&self, windowed: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(WINDOWED_RECORD_LEN);
+        out.extend_from_slice(&self.book.to_le_bytes());
+        out.extend_from_slice(&self.ordinal.to_le_bytes());
+        if windowed {
+            out.extend_from_slice(&[self.window, 0, 0, 0]);
+        }
+        out.extend_from_slice(&self.sha256);
         out
     }
 
-    fn decode(bytes: &[u8; RECORD_LEN]) -> Self {
+    fn decode(bytes: &[u8]) -> Self {
+        let windowed = bytes.len() == WINDOWED_RECORD_LEN;
+        let digest = if windowed { 12 } else { 8 };
         Self {
             book: u32::from_le_bytes(bytes[..4].try_into().expect("4")),
             ordinal: u32::from_le_bytes(bytes[4..8].try_into().expect("4")),
-            sha256: bytes[8..].try_into().expect("32"),
+            window: if windowed { bytes[8] } else { 0 },
+            sha256: bytes[digest..digest + 32].try_into().expect("32"),
         }
     }
 }
@@ -108,17 +125,33 @@ pub struct RecordsWriter {
     path: PathBuf,
     partial: PathBuf,
     count: u64,
-    last: Option<(u32, u32)>,
+    last: Option<(u32, u32, u8)>,
+    windowed: bool,
 }
 
 impl RecordsWriter {
+    /// `OXVREC1`: a plan whose every record is a line's first window.
     pub fn create(path: &Path) -> Result<Self, PackError> {
+        Self::create_as(path, false)
+    }
+
+    /// `OXVREC2`: a plan of a recipe with further windows.
+    pub fn create_windowed(path: &Path) -> Result<Self, PackError> {
+        Self::create_as(path, true)
+    }
+
+    fn create_as(path: &Path, windowed: bool) -> Result<Self, PackError> {
         let partial = partial_path(path);
         let mut out = BufWriter::with_capacity(
             4 << 20,
             File::create(&partial).map_err(io_error(format!("creating {}", partial.display())))?,
         );
-        out.write_all(RECORDS_MAGIC)
+        let magic = if windowed {
+            WINDOWED_RECORDS_MAGIC
+        } else {
+            RECORDS_MAGIC
+        };
+        out.write_all(magic)
             .and_then(|()| out.write_all(&0u64.to_le_bytes()))
             .map_err(io_error(format!("writing {}", partial.display())))?;
         Ok(Self {
@@ -127,21 +160,31 @@ impl RecordsWriter {
             partial,
             count: 0,
             last: None,
+            windowed,
         })
     }
 
-    /// The next record, strictly after the previous one by (book, ordinal).
+    /// The next record, strictly after the previous one by (book, ordinal, window).
     pub fn push(&mut self, record: PlanRecord) -> Result<(), PackError> {
-        let at = (record.book, record.ordinal);
+        if record.window != 0 && !self.windowed {
+            return Err(malformed(format!(
+                "record {:?} is window {} of its line, and an OXVREC1 plan holds first \
+                 windows only",
+                (record.book, record.ordinal),
+                record.window
+            )));
+        }
+        let at = record.position();
         if self.last.is_some_and(|last| at <= last) {
             return Err(malformed(format!(
-                "records must ascend strictly by (book, ordinal), and {at:?} follows {:?}",
+                "records must ascend strictly by (book, ordinal, window), and {at:?} follows \
+                 {:?}",
                 self.last.expect("checked")
             )));
         }
         self.last = Some(at);
         self.out
-            .write_all(&record.encode())
+            .write_all(&record.encode(self.windowed))
             .map_err(io_error(format!("writing {}", self.partial.display())))?;
         self.count += 1;
         Ok(())
@@ -174,6 +217,7 @@ impl RecordsWriter {
 pub struct PlanRecords {
     map: Mmap,
     count: u64,
+    record_len: usize,
 }
 
 impl PlanRecords {
@@ -185,7 +229,13 @@ impl PlanRecords {
         // process; a plan is written once, renamed into place, and only read after.
         let map =
             unsafe { Mmap::map(&file) }.map_err(io_error(format!("mapping {}", path.display())))?;
-        if map.len() < RECORDS_HEADER || &map[..8] != RECORDS_MAGIC {
+        let record_len = match map.get(..8) {
+            _ if map.len() < RECORDS_HEADER => 0,
+            Some(magic) if magic == RECORDS_MAGIC => RECORD_LEN,
+            Some(magic) if magic == WINDOWED_RECORDS_MAGIC => WINDOWED_RECORD_LEN,
+            _ => 0,
+        };
+        if record_len == 0 {
             return Err(malformed(format!(
                 "{} is not a records file",
                 path.display()
@@ -193,7 +243,7 @@ impl PlanRecords {
         }
         let count = u64::from_le_bytes(map[8..16].try_into().expect("8"));
         let expected = count
-            .checked_mul(RECORD_LEN as u64)
+            .checked_mul(record_len as u64)
             .and_then(|bytes| bytes.checked_add(RECORDS_HEADER as u64));
         if expected != Some(map.len() as u64) {
             return Err(malformed(format!(
@@ -202,19 +252,62 @@ impl PlanRecords {
                 map.len()
             )));
         }
-        let records = Self { map, count };
+        let records = Self {
+            map,
+            count,
+            record_len,
+        };
         let mut last = None;
         for record in records.iter() {
-            let at = (record.book, record.ordinal);
+            if record.window > 0
+                && !last.is_some_and(|(book, ordinal, _)| {
+                    book == record.book && ordinal == record.ordinal
+                })
+            {
+                return Err(malformed("a windowed plan line must begin with window 0"));
+            }
+            let at = record.position();
             if last.is_some_and(|last| at <= last) {
                 return Err(malformed(format!(
-                    "{}: records do not ascend strictly by (book, ordinal) at {at:?}",
+                    "{}: records do not ascend strictly by (book, ordinal, window) at {at:?}",
                     path.display()
                 )));
             }
             last = Some(at);
         }
         Ok(records)
+    }
+
+    /// Whether the file is `OXVREC2`, whose records name their window.
+    pub fn is_windowed(&self) -> bool {
+        self.record_len == WINDOWED_RECORD_LEN
+    }
+
+    pub(crate) fn copy_to(&self, path: &Path) -> Result<(), PackError> {
+        crate::distribution::files::write_atomically(path, &self.map)
+    }
+
+    /// Every location with its line's first-window anchor. The plan is streamed in line
+    /// order, so no independent parent column or corpus-size map is needed.
+    pub(crate) fn occurrences(
+        &self,
+    ) -> impl Iterator<Item = crate::semantic::oxv::occurrence::Occurrence> + '_ {
+        let mut parent = None;
+        self.iter().map(move |record| {
+            if record.window == 0 {
+                parent = Some((record.book, record.ordinal, record.key()));
+            }
+            let anchor = parent
+                .filter(|(book, hint, _)| *book == record.book && *hint == record.ordinal)
+                .map_or(record.key(), |(_, _, anchor)| anchor);
+            crate::semantic::oxv::occurrence::Occurrence {
+                key: record.key(),
+                book: record.book,
+                hint: record.ordinal,
+                anchor,
+                window: record.window,
+            }
+        })
     }
 
     pub fn len(&self) -> u64 {
@@ -226,15 +319,13 @@ impl PlanRecords {
     }
 
     pub fn get(&self, index: u64) -> PlanRecord {
-        let at = RECORDS_HEADER + index as usize * RECORD_LEN;
-        PlanRecord::decode(self.map[at..at + RECORD_LEN].try_into().expect("in range"))
+        let at = RECORDS_HEADER + index as usize * self.record_len;
+        PlanRecord::decode(&self.map[at..at + self.record_len])
     }
 
     pub fn iter(&self) -> impl Iterator<Item = PlanRecord> + '_ {
         self.map[RECORDS_HEADER..]
-            .as_chunks::<RECORD_LEN>()
-            .0
-            .iter()
+            .chunks_exact(self.record_len)
             .map(PlanRecord::decode)
     }
 }
@@ -600,11 +691,22 @@ impl PlanManifest {
         for name in [
             RECORDS_FILE,
             BOOKS_FILE,
+            BOOK_HASHES_FILE,
             EMBED_PLAN_FILE,
             EMBED_MANIFEST_FILE,
             TOMBSTONES_FILE,
         ] {
             let path = dir.join(name);
+            if name == BOOK_HASHES_FILE && path.exists() {
+                let records_path = dir.join(RECORDS_FILE);
+                let mut magic = [0u8; 8];
+                File::open(&records_path)
+                    .and_then(|mut file| file.read_exact(&mut magic))
+                    .map_err(io_error(format!("reading {}", records_path.display())))?;
+                if &magic != WINDOWED_RECORDS_MAGIC {
+                    continue;
+                }
+            }
             if path.exists() {
                 files.insert(name.to_string(), FileDigest::of(&path)?);
             }
@@ -640,6 +742,31 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Exact live-index text hashes, when supplied by a windowed index planner.
+    pub fn book_source_hashes(&self) -> Result<Option<BTreeMap<String, u64>>, PackError> {
+        let Some(digest) = self.manifest.files.get(BOOK_HASHES_FILE) else {
+            return Ok(None);
+        };
+        if !self.records.is_windowed() {
+            return Err(malformed("book hashes require a windowed plan"));
+        }
+        let path = self.dir.join(BOOK_HASHES_FILE);
+        digest.verify(&path)?;
+        let hashes: BTreeMap<String, u64> = read_json(&path)?;
+        if hashes.len() != self.books.len()
+            || self
+                .books
+                .names()
+                .iter()
+                .any(|name| !hashes.contains_key(name))
+        {
+            return Err(malformed(
+                "book hashes must name every plan book exactly once",
+            ));
+        }
+        Ok(Some(hashes))
+    }
+
     pub fn open(dir: &Path) -> Result<Self, PackError> {
         let manifest = PlanManifest::read(dir)?;
         for name in [RECORDS_FILE, BOOKS_FILE] {
@@ -718,7 +845,12 @@ pub fn plan_from_corpus(
     books.write(&dir.join(BOOKS_FILE))?;
 
     let chunker = Chunker::new(request.chunking.clone())?;
-    let mut records = RecordsWriter::create(&dir.join(RECORDS_FILE))?;
+    let mut records = match chunker.recipe().0 {
+        ChunkingAlgorithm::AnchoredLine => RecordsWriter::create(&dir.join(RECORDS_FILE))?,
+        ChunkingAlgorithm::AnchoredLineWindows => {
+            RecordsWriter::create_windowed(&dir.join(RECORDS_FILE))?
+        }
+    };
     let mut embed = EmbedPlanWriter::create(dir, request.warehouse)?;
     for (index, name) in books.names().iter().enumerate() {
         let (line_ids, chunks) = chunk_book_lines(corpus, &chunker, name)?;
@@ -732,6 +864,7 @@ pub fn plan_from_corpus(
             records.push(PlanRecord {
                 book: index as u32,
                 ordinal: ordinals[&chunk.line_id],
+                window: chunk.window,
                 sha256,
             })?;
             embed.offer(&sha256, &chunk.embedding_text)?;

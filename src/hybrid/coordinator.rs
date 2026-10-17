@@ -183,6 +183,7 @@ impl SemanticSide {
         top_k: usize,
         filters: Option<&SearchFilters>,
         share: f32,
+        window_penalty: f32,
         resolver: &dyn CandidateResolver,
         cancel: &CancellationToken,
         telemetry: &mut SearchTelemetry,
@@ -206,6 +207,7 @@ impl SemanticSide {
             query_vector,
             base_top_k,
             Some(&base_filters),
+            window_penalty,
             resolver,
             cancel,
             &mut base_telemetry,
@@ -274,11 +276,13 @@ impl SemanticSide {
     /// Under a filter the scan reads the books the resolver admits, and weighs besides the
     /// vectors it names as [unreached](CandidateResolver::unreached): those of texts that
     /// moved into an admitted book, at their own scores, beside the scan's hits.
+    #[allow(clippy::too_many_arguments)]
     fn candidates(
         &self,
         query_vector: &[f32],
         top_k: usize,
         filters: Option<&SearchFilters>,
+        window_penalty: f32,
         resolver: &dyn CandidateResolver,
         cancel: &CancellationToken,
         telemetry: &mut SearchTelemetry,
@@ -295,8 +299,14 @@ impl SemanticSide {
             None => Vec::new(),
         };
         let scan_started = std::time::Instant::now();
-        let hits =
-            index.search_hits_with(query_vector, top_k, books.as_ref(), &unreached, cancel)?;
+        let hits = index.search_hits_with(
+            query_vector,
+            top_k,
+            books.as_ref(),
+            &unreached,
+            window_penalty,
+            cancel,
+        )?;
         telemetry.scan_ms = Some(scan_started.elapsed().as_millis() as u64);
         telemetry.semantic_hits = hits.len().min(u32::MAX as usize) as u32;
         cancel.checkpoint()?;
@@ -360,7 +370,7 @@ fn candidates_of(
     // Stable, so each hit keeps its lines' order.
     lines.sort_by_key(|line| line.hit);
     let mut resolved = vec![false; hits.len()];
-    let candidates: Vec<SemanticCandidate> = lines
+    let mut candidates: Vec<SemanticCandidate> = lines
         .into_iter()
         .filter_map(|line| {
             let Some(hit) = hits.get(line.hit as usize) else {
@@ -389,10 +399,23 @@ fn candidates_of(
                     title: line.title,
                     facets: line.facets.to_vec(),
                 },
-                similarity_score: hit.score,
+                similarity_score: hit.score
+                    + if hit.window > 0 {
+                        hit.window_penalty
+                    } else {
+                        0.0
+                    }
+                    - if line.window > 0 {
+                        hit.window_penalty
+                    } else {
+                        0.0
+                    },
             })
         })
         .collect();
+    // Roles can differ even for the same shared vector. Rank each actual occurrence
+    // after applying its own penalty; stable ties retain the resolver's placement.
+    candidates.sort_by(|a, b| b.similarity_score.total_cmp(&a.similarity_score));
     let unresolved = resolved.iter().filter(|resolved| !**resolved).count() as u32;
     (candidates, unresolved)
 }
@@ -832,6 +855,7 @@ impl HybridCoordinator {
                             &vector,
                             top_k,
                             params.filters.as_ref(),
+                            setup.ranking_profile.window_penalty,
                             resolver,
                             cancel,
                             &mut setup.telemetry,
@@ -848,6 +872,7 @@ impl HybridCoordinator {
                                 top_k,
                                 params.filters.as_ref(),
                                 setup.ranking_profile.foundational_candidate_share,
+                                setup.ranking_profile.window_penalty,
                                 resolver,
                                 cancel,
                                 &mut setup.telemetry,
@@ -3186,14 +3211,17 @@ mod tests {
     #[test]
     fn semantic_candidates_follow_the_scan_whatever_order_the_resolver_returns() {
         let hit = |n: u32, score: f32| VectorHit {
+            window_penalty: 0.0,
             score,
             key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {n}")),
             records: Vec::new(),
+            window: 0,
             seg: 0,
             slot: n,
         };
         let hits = [hit(0, 0.9), hit(1, 0.8), hit(2, 0.7), hit(3, 0.6)];
         let line = |hit: u32, book: &str, line_id: u64| ResolvedLine {
+            window: 0,
             hit,
             line_id,
             file_path: book.to_string(),
@@ -3229,6 +3257,48 @@ mod tests {
         assert_eq!(unresolved, 1);
     }
 
+    #[test]
+    fn shared_vectors_score_each_resolved_occurrence_by_its_actual_role() {
+        let hit = |slot, score, window| VectorHit {
+            window_penalty: 0.04,
+            score,
+            window,
+            key: crate::semantic::chunk_key::ChunkKey::of(&format!("shared {slot}")),
+            records: Vec::new(),
+            seg: 0,
+            slot,
+        };
+        // First vector has an anchor somewhere and an inner-window occurrence here.
+        // Second vector was scanned only as an inner window; resolution finds its anchor.
+        let hits = [hit(0, 0.99, 0), hit(1, 0.97, 0), hit(2, 0.94, 1)];
+        let line = |hit, line_id, window| ResolvedLine {
+            hit,
+            line_id,
+            window,
+            file_path: "book".to_string(),
+            section_id: 0,
+            line_hash: 0,
+            segment: line_id,
+            is_pdf: false,
+            facets: Vec::<String>::new().into(),
+            title: String::new(),
+            reference: String::new(),
+        };
+        let (candidates, unresolved) =
+            candidates_of(&hits, vec![line(0, 10, 1), line(1, 20, 0), line(2, 30, 0)]);
+        assert_eq!(unresolved, 0);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.metadata.line_id)
+                .collect::<Vec<_>>(),
+            [30, 20, 10]
+        );
+        for (candidate, expected) in candidates.iter().zip([0.98, 0.97, 0.95]) {
+            assert!((candidate.similarity_score - expected).abs() < 1e-6);
+        }
+    }
+
     /// A text repeated in many places is one vector, and every line it resolves to scores
     /// alike. They are shown as the resolver placed them — a line of each book, then one
     /// book's repeats — in every preset and strategy, in both modes that consult the
@@ -3238,15 +3308,18 @@ mod tests {
     #[test]
     fn the_lines_one_vector_resolved_to_come_in_the_resolvers_order() {
         let hit = |slot: u32, score: f32| VectorHit {
+            window_penalty: 0.0,
             score,
             key: crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {slot}")),
             records: Vec::new(),
+            window: 0,
             seg: 0,
             slot,
         };
         let hits = [hit(0, 0.9), hit(1, 0.6)];
         // Each line in a section of its own, with the same facets: every bonus alike.
         let line = |hit: u32, book: &str, line_id: u64| ResolvedLine {
+            window: 0,
             hit,
             line_id,
             file_path: book.to_string(),

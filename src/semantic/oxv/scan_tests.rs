@@ -197,6 +197,7 @@ fn run(
         top_k,
         books,
         threads,
+        window_penalty: 0.0,
     };
     let hits = scan(&set, query, &request, &CancellationToken::new()).unwrap();
     ranked(fixture, query, hits)
@@ -300,6 +301,7 @@ fn equal_scores_are_ordered_by_key() {
                 top_k: 25,
                 books: None,
                 threads,
+                window_penalty: 0.0,
             },
             &CancellationToken::new(),
         )
@@ -336,6 +338,7 @@ fn threads_agree(fixture: Fixture) {
                 top_k: 100,
                 books: None,
                 threads: 1,
+                window_penalty: 0.0,
             },
             &CancellationToken::new(),
         )
@@ -348,6 +351,7 @@ fn threads_agree(fixture: Fixture) {
                     top_k: 100,
                     books: None,
                     threads,
+                    window_penalty: 0.0,
                 },
                 &CancellationToken::new(),
             )
@@ -442,6 +446,7 @@ fn a_hit_carries_every_record_of_its_key_admitted_books_first() {
             top_k: 1,
             books: None,
             threads: 1,
+            window_penalty: 0.0,
         },
         &CancellationToken::new(),
     )
@@ -461,6 +466,7 @@ fn a_hit_carries_every_record_of_its_key_admitted_books_first() {
             top_k: 1,
             books: Some(&books),
             threads: 1,
+            window_penalty: 0.0,
         },
         &CancellationToken::new(),
     )
@@ -511,6 +517,7 @@ fn a_hit_carries_at_most_32_records() {
             top_k: 1,
             books: Some(&wanted),
             threads: 1,
+            window_penalty: 0.0,
         },
         &CancellationToken::new(),
     )
@@ -537,6 +544,7 @@ fn a_cancelled_scan_stops_at_its_next_checkpoint() {
         top_k: 10,
         books: None,
         threads: 1,
+        window_penalty: 0.0,
     };
 
     let token = CancellationToken::new();
@@ -580,6 +588,7 @@ fn a_scan_on_four_threads_stops_within_two_intervals_of_a_cancel() {
         top_k: 10,
         books: None,
         threads: 4,
+        window_penalty: 0.0,
     };
     let share = (200 * 1000 + 1000) / 4;
 
@@ -638,6 +647,7 @@ fn run_with(
         top_k,
         books,
         threads,
+        window_penalty: 0.0,
     };
     scan_with(&set, query, &request, also, &CancellationToken::new()).unwrap()
 }
@@ -698,6 +708,7 @@ fn a_scan_with_nothing_besides_is_the_scan_bit_for_bit() {
                         top_k,
                         books,
                         threads,
+                        window_penalty: 0.0,
                     };
                     let plain = scan(&set, &query, &request, &CancellationToken::new()).unwrap();
                     let with =
@@ -886,5 +897,220 @@ fn the_merged_hits_are_the_same_at_every_thread_count() {
                 );
             }
         }
+    }
+}
+
+// ── the window penalty ──
+
+/// One base of 40 books × 30 slots in `codec`, every third slot past a first window, and
+/// the same base without SLOT_WINDOWS.
+fn windowed_pair(dir: &TempDir, seed: u64, codec: fn(&[&[f32]]) -> Codec) -> [Segment; 2] {
+    let mut random = Random(seed);
+    let mut books = random_books(&mut random, 40, 30, DIM, 0);
+    let vectors: Vec<&[f32]> = books
+        .iter()
+        .flat_map(|book| book.primary.iter().map(|(_, _, v)| v.as_slice()))
+        .collect();
+    let codec = codec(&vectors);
+    let plain = dir.join(&format!("plain-{seed}.oxv"));
+    write_segment(
+        &plain,
+        spec(PackageKind::Base, 0, 30),
+        codec.clone(),
+        &books,
+        &[],
+    );
+    for (index, book) in books.iter_mut().enumerate() {
+        book.windows = (0..30)
+            .map(|i| ((index * 30 + i) % 3 == 1) as u8 * 2)
+            .collect();
+    }
+    let windowed = dir.join(&format!("windowed-{seed}.oxv"));
+    write_segment(
+        &windowed,
+        spec(PackageKind::Base, 0, 30),
+        codec,
+        &books,
+        &[],
+    );
+    [
+        Segment::open(&windowed).unwrap(),
+        Segment::open(&plain).unwrap(),
+    ]
+}
+
+fn scan_one(
+    segment: &Segment,
+    query: &[f32],
+    top_k: usize,
+    penalty: f32,
+    threads: usize,
+) -> Vec<VectorHit> {
+    super::scan::scan_segments(
+        &[segment],
+        query,
+        &ScanRequest {
+            top_k,
+            books: None,
+            threads,
+            window_penalty: penalty,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap()
+}
+
+/// Penalty 0 ranks as a segment without windows; otherwise a window scores its cosine less
+/// the penalty, in that order at every `k` and thread count.
+#[test]
+fn the_window_penalty_ranks_by_the_penalized_score_before_the_top_k() {
+    let dir = TempDir::new("window_penalty");
+    for (seed, codec) in [
+        (71u64, int8 as fn(&[&[f32]]) -> Codec),
+        (72, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+        (73, per_vector),
+    ] {
+        let [windowed, plain] = windowed_pair(&dir, seed, codec);
+        let mut random = Random(seed * 3);
+        for _ in 0..5 {
+            let query = random.unit(DIM);
+            let unpenalized = scan_one(&windowed, &query, 1200, 0.0, 1);
+            let without = scan_one(&plain, &query, 1200, 0.0, 1);
+            let strip = |hits: &[VectorHit]| {
+                hits.iter()
+                    .map(|hit| (hit.score.to_bits(), hit.key, hit.slot))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                strip(&unpenalized),
+                strip(&without),
+                "penalty 0 changes nothing"
+            );
+            assert!(without.iter().all(|hit| hit.window == 0));
+
+            let all = scan_one(&windowed, &query, 1200, 0.04, 1);
+            assert_eq!(all.len(), 1200);
+            let cosine: HashMap<ChunkKey, f32> =
+                unpenalized.iter().map(|hit| (hit.key, hit.score)).collect();
+            for hit in &all {
+                assert_eq!(hit.window, windowed.slot_window(hit.slot));
+                let expected = cosine[&hit.key] - if hit.window > 0 { 0.04 } else { 0.0 };
+                assert!(
+                    (hit.score - expected).abs() < 2e-3,
+                    "{} against {expected}",
+                    hit.score
+                );
+            }
+            assert!(all.windows(2).all(|pair| pair[0].score >= pair[1].score));
+            assert!(all.iter().any(|hit| hit.window > 0) && all.iter().any(|hit| hit.window == 0));
+            for (top_k, threads) in [(10, 1), (10, 8), (100, 3)] {
+                assert_eq!(
+                    strip(&scan_one(&windowed, &query, top_k, 0.04, threads)),
+                    strip(&all[..top_k]),
+                    "k {top_k}, {threads} threads"
+                );
+            }
+        }
+    }
+}
+
+/// A window that is the best match unpenalized loses its place to a first window once the
+/// penalty is larger than the gap between them.
+#[test]
+fn the_penalty_moves_a_window_below_a_first_window() {
+    let dir = TempDir::new("window_penalty_moves");
+    let [windowed, _] = windowed_pair(&dir, 81, per_vector);
+    let mut random = Random(82);
+    let mut moved = 0;
+    for _ in 0..20 {
+        let query = random.unit(DIM);
+        let before = scan_one(&windowed, &query, 1, 0.0, 1);
+        if before[0].window == 0 {
+            continue;
+        }
+        let after = scan_one(&windowed, &query, 1, 0.2, 1);
+        assert_ne!(after[0].key, before[0].key);
+        moved += 1;
+    }
+    assert!(moved > 0, "some query's best match was a window");
+}
+
+/// The slots a scan weighs besides its filter are penalized as the scan's own are.
+#[test]
+fn a_weighed_slot_is_penalized_as_the_scan_penalizes() {
+    let dir = TempDir::new("window_penalty_also");
+    let [windowed, _] = windowed_pair(&dir, 91, per_vector);
+    let views = [ScanSegment {
+        segment: &windowed,
+        deleted: &[],
+        links: &[],
+    }];
+    let set = ScanSet {
+        segments: &views,
+        reverse_links: &[],
+    };
+    let books: BookSet = ["id:00000"].into_iter().collect();
+    let also: Vec<SlotRef> = (30..60)
+        .map(|slot| SlotRef {
+            seg: 0,
+            slot,
+            key: windowed.key(slot),
+        })
+        .collect();
+    let query = PreparedQuery::new(&Random(92).unit(DIM), windowed.codec()).unwrap();
+    let scan = |penalty: f32| {
+        scan_with(
+            &set,
+            &query,
+            &ScanRequest {
+                top_k: 40,
+                books: Some(&books),
+                threads: 1,
+                window_penalty: penalty,
+            },
+            &also,
+            &CancellationToken::new(),
+        )
+        .unwrap()
+    };
+    let (before, after) = (scan(0.0), scan(0.04));
+    assert_eq!(after.len(), 60);
+    let cosine: HashMap<ChunkKey, f32> = before.iter().map(|hit| (hit.key, hit.score)).collect();
+    for hit in after.iter().filter(|hit| hit.slot >= 30) {
+        let expected = cosine[&hit.key] - if hit.window > 0 { 0.04 } else { 0.0 };
+        assert!((hit.score - expected).abs() < 2e-3);
+    }
+    assert!(after.iter().any(|hit| hit.slot >= 30 && hit.window > 0));
+}
+
+#[test]
+fn public_scan_rejects_a_negative_or_nonfinite_window_penalty() {
+    let dir = TempDir::new("invalid_window_penalty");
+    let [segment, _] = windowed_pair(&dir, 101, per_vector);
+    let views = [ScanSegment {
+        segment: &segment,
+        deleted: &[],
+        links: &[],
+    }];
+    let set = ScanSet {
+        segments: &views,
+        reverse_links: &[],
+    };
+    let query = PreparedQuery::new(&Random(102).unit(DIM), segment.codec()).unwrap();
+    for penalty in [-0.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let result = scan(
+            &set,
+            &query,
+            &ScanRequest {
+                top_k: 1,
+                books: None,
+                threads: 1,
+                window_penalty: penalty,
+            },
+            &CancellationToken::new(),
+        );
+        assert!(
+            matches!(result,Err(VectorStoreError::SearchFailed {reason}) if reason.contains("finite and nonnegative"))
+        );
     }
 }

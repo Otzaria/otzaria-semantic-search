@@ -66,6 +66,30 @@ pub struct ChunkerConfig {
     /// actually embedded, and that string is normalized before it is hashed. Also in
     /// `ModelIdentity`, for the same reason as `embedding_text_version`.
     pub normalization_version: u32,
+    /// Characters of every window after the first; 0 under version 1. Defaulted only because
+    /// absent is version 1's value, and [`Chunker::new`] refuses 0 under version 2.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub window_chars: usize,
+    /// How many characters a window shares with the one before it, before the snap to a
+    /// word start. Less than half of `window_chars`; zero under version 1.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub window_overlap_chars: usize,
+    /// The most windows one line embeds, the first included; zero under version 1.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_windows_per_line: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// One window of a line's embedded text: its ordinal (0 is [`Chunker::embedded_text`]), its
+/// characters within the trimmed line, and the string the model is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedWindow {
+    pub ordinal: u8,
+    pub chars: std::ops::Range<u32>,
+    pub text: String,
 }
 
 impl ChunkerConfig {
@@ -90,8 +114,73 @@ impl ChunkerConfig {
         ] {
             hasher.update(field.to_le_bytes());
         }
+        // Only from version 2: a version 1 identity does not depend on the window fields.
+        if self.chunking_version >= ChunkingAlgorithm::AnchoredLineWindows.version() {
+            for field in [
+                self.window_chars as u64,
+                self.window_overlap_chars as u64,
+                self.max_windows_per_line as u64,
+            ] {
+                hasher.update(field.to_le_bytes());
+            }
+        }
         let digest = hasher.finalize();
         u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 yields 32 bytes"))
+    }
+
+    /// The same recipe without its windows: what every line's first window — the key an
+    /// index's `chunkKey` column holds — is computed under.
+    pub fn anchor(&self) -> Self {
+        Self {
+            chunking_version: ChunkingAlgorithm::AnchoredLine.version(),
+            window_chars: 0,
+            window_overlap_chars: 0,
+            max_windows_per_line: 0,
+            ..self.clone()
+        }
+    }
+
+    /// Refuse window fields that do not belong to `algorithm`.
+    fn check_windows(&self, algorithm: ChunkingAlgorithm) -> Result<(), ArtifactError> {
+        let fields = [
+            ("window_chars", self.window_chars),
+            ("window_overlap_chars", self.window_overlap_chars),
+            ("max_windows_per_line", self.max_windows_per_line),
+        ];
+        let refuse = |field: &'static str, found: usize, supported: &str| {
+            Err(ArtifactError::UnsupportedRecipeVersion {
+                field,
+                found: u32::try_from(found).unwrap_or(u32::MAX),
+                supported: supported.to_string(),
+            })
+        };
+        match algorithm {
+            ChunkingAlgorithm::AnchoredLine => {
+                if let Some((field, found)) = fields.into_iter().find(|(_, value)| *value != 0) {
+                    return refuse(field, found, "0 under chunking_version 1");
+                }
+            }
+            ChunkingAlgorithm::AnchoredLineWindows => {
+                if let Some((field, found)) = fields.into_iter().find(|(_, value)| *value == 0) {
+                    return refuse(field, found, "a positive value under chunking_version 2");
+                }
+                if self.window_overlap_chars * 2 >= self.window_chars {
+                    return refuse(
+                        "window_overlap_chars",
+                        self.window_overlap_chars,
+                        "less than half of window_chars",
+                    );
+                }
+                if self.max_windows_per_line > usize::from(u8::MAX) + 1 {
+                    return refuse(
+                        "max_windows_per_line",
+                        self.max_windows_per_line,
+                        "at most 256",
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +194,9 @@ impl Default for ChunkerConfig {
             chunking_version: ChunkingAlgorithm::AnchoredLine.version(),
             embedding_text_version: EmbeddingTextRecipe::LineOrNeighbourContext.version(),
             normalization_version: TextNormalizationRecipe::AsSuppliedByCorpus.version(),
+            window_chars: 0,
+            window_overlap_chars: 0,
+            max_windows_per_line: 0,
         }
     }
 }
@@ -127,8 +219,10 @@ impl Chunker {
     /// version 99 and run version 1's code. The identity would be self-consistent and the
     /// artifact would describe a recipe that exists nowhere.
     pub fn new(config: ChunkerConfig) -> Result<Self, ArtifactError> {
+        let algorithm = ChunkingAlgorithm::from_version(config.chunking_version)?;
+        config.check_windows(algorithm)?;
         Ok(Self {
-            algorithm: ChunkingAlgorithm::from_version(config.chunking_version)?,
+            algorithm,
             text_recipe: EmbeddingTextRecipe::from_version(config.embedding_text_version)?,
             normalization: TextNormalizationRecipe::from_version(config.normalization_version)?,
             config,
@@ -151,7 +245,9 @@ impl Chunker {
         // Exhaustive on purpose: a second algorithm has to be written here before its
         // version number can be accepted anywhere.
         match self.algorithm {
-            ChunkingAlgorithm::AnchoredLine => self.chunk_book_anchored(book),
+            ChunkingAlgorithm::AnchoredLine | ChunkingAlgorithm::AnchoredLineWindows => {
+                self.chunk_book_anchored(book)
+            }
         }
     }
 
@@ -167,10 +263,20 @@ impl Chunker {
     /// # Panics
     ///
     /// When `index` is not inside `lines`, as slice indexing does.
+    ///
+    /// Under version 2 as well: the first window, the key an index's column holds.
     pub fn embedded_text(&self, lines: &[LineRef<'_>], index: usize) -> Option<String> {
         match self.algorithm {
-            ChunkingAlgorithm::AnchoredLine => self.anchored_text(lines, index),
+            ChunkingAlgorithm::AnchoredLine | ChunkingAlgorithm::AnchoredLineWindows => {
+                self.anchored_text(lines, index)
+            }
         }
+    }
+
+    /// Every window `lines[index]` is embedded as, [`Self::embedded_text`] first; empty when
+    /// the line is not embedded. Takes, and panics on, the same `lines` as that.
+    pub fn embedded_windows(&self, lines: &[LineRef<'_>], index: usize) -> Vec<EmbeddedWindow> {
+        self.windows_of(lines, index)
     }
 
     /// Every line's key, in order: `Some` for a line the recipe embeds, `None` for one it
@@ -194,33 +300,87 @@ impl Chunker {
         let chunking_identity = self.config.identity();
 
         for (i, line) in book.lines.iter().enumerate() {
-            let Some(embedded_text) = self.anchored_text(book.lines.as_slice(), i) else {
-                continue;
-            };
-            let chunk_hash = compute_chunk_hash(&embedded_text);
-            let semantic_id =
-                compute_semantic_id(&book.source_book_key, line.line_id, chunking_identity);
+            for window in self.windows_of(book.lines.as_slice(), i) {
+                let embedded_text = window.text;
+                let chunk_hash = compute_chunk_hash(&embedded_text);
+                let semantic_id = compute_window_semantic_id(
+                    &book.source_book_key,
+                    line.line_id,
+                    chunking_identity,
+                    window.ordinal,
+                );
 
-            chunks.push(SemanticChunk {
-                semantic_id: semantic_id.clone(),
-                source_book_key: book.source_book_key.clone(),
-                source_doc_key: format!("{}:{}", book.source_book_key, line.line_id),
-                line_id: line.line_id,
-                section_id: line.section_id,
-                line_hash: line.line_hash,
-                anchor_text: line.text.clone(),
-                embedding_text: embedded_text,
-                chunk_hash,
-                content_hash: book.content_fingerprint,
-                reference: line.reference.clone(),
-                segment: line.segment,
-                is_pdf: book.is_pdf,
-                title: book.title.clone(),
-                facets: facets.clone(),
-            });
+                chunks.push(SemanticChunk {
+                    semantic_id,
+                    source_book_key: book.source_book_key.clone(),
+                    source_doc_key: format!("{}:{}", book.source_book_key, line.line_id),
+                    line_id: line.line_id,
+                    section_id: line.section_id,
+                    line_hash: line.line_hash,
+                    anchor_text: line.text.clone(),
+                    embedding_text: embedded_text,
+                    chunk_hash,
+                    content_hash: book.content_fingerprint,
+                    reference: line.reference.clone(),
+                    segment: line.segment,
+                    is_pdf: book.is_pdf,
+                    title: book.title.clone(),
+                    facets: facets.clone(),
+                    window: window.ordinal,
+                });
+            }
         }
 
         chunks
+    }
+
+    /// Every window one line embeds as: the first is [`Self::anchored_text`]; the rest, under
+    /// version 2, only for a line that stands alone and is longer than the cap.
+    fn windows_of<L: Lines + ?Sized>(&self, lines: &L, index: usize) -> Vec<EmbeddedWindow> {
+        let Some(first) = self.anchored_text(lines, index) else {
+            return Vec::new();
+        };
+        let text = lines.text(index).trim();
+        let n = text.chars().count();
+        let mut out = vec![EmbeddedWindow {
+            ordinal: 0,
+            chars: 0..n.min(self.config.max_chunk_chars) as u32,
+            text: first,
+        }];
+        if self.algorithm != ChunkingAlgorithm::AnchoredLineWindows
+            || n < self.config.min_meaningful_chars
+            || n <= self.config.max_chunk_chars
+        {
+            return out;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut keys = vec![ChunkKey::of(&out[0].text)];
+        let spans = window_spans(
+            &chars,
+            self.config.max_chunk_chars,
+            self.config.window_chars,
+            self.config.window_overlap_chars,
+            self.config.max_windows_per_line,
+        );
+        for (ordinal, (start, end)) in spans.into_iter().enumerate().skip(1) {
+            let piece: String = chars[start..end].iter().collect();
+            let normalized = self.normalization.apply(&piece);
+            if normalized.trim().is_empty() {
+                continue;
+            }
+            let text = self.text_recipe.passage_text(&normalized).into_owned();
+            let key = ChunkKey::of(&text);
+            if keys.contains(&key) {
+                continue;
+            }
+            keys.push(key);
+            out.push(EmbeddedWindow {
+                ordinal: ordinal as u8,
+                chars: start as u32..end as u32,
+                text,
+            });
+        }
+        out
     }
 
     /// What version 1 of the algorithm embeds for one line, over either shape of lines.
@@ -371,6 +531,63 @@ pub fn compute_semantic_id(source_book_key: &str, line_id: u64, chunking_identit
         let _ = write!(hex, "{b:02x}");
     }
     hex
+}
+
+/// [`compute_semantic_id`] for one window of a line; window 0's id is the line's
+/// [`compute_semantic_id`] itself.
+pub fn compute_window_semantic_id(
+    source_book_key: &str,
+    line_id: u64,
+    chunking_identity: u64,
+    window: u8,
+) -> String {
+    if window == 0 {
+        return compute_semantic_id(source_book_key, line_id, chunking_identity);
+    }
+    use std::fmt::Write;
+    let mut hasher = Sha256::new();
+    hasher.update(source_book_key.as_bytes());
+    hasher.update(format!(":{line_id}:{chunking_identity}#{window}").as_bytes());
+    let mut hex = String::with_capacity(32);
+    for b in &hasher.finalize()[..16] {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// A long line's window spans in characters: `[0, first)`, then `length` each overlapping by
+/// `overlap`, snapped to word boundaries — exactly as the quality measurement computed them.
+pub(crate) fn window_spans(
+    chars: &[char],
+    first: usize,
+    length: usize,
+    overlap: usize,
+    max_windows: usize,
+) -> Vec<(usize, usize)> {
+    let n = chars.len();
+    let mut out = vec![(0, n.min(first))];
+    while let Some(&(previous_start, previous_end)) = out.last() {
+        if previous_end >= n || out.len() >= max_windows {
+            break;
+        }
+        let mut start = previous_end.saturating_sub(overlap).max(previous_start + 1);
+        if chars[start - 1] != ' ' {
+            if let Some(space) = (start..previous_end).find(|&at| chars[at] == ' ') {
+                start = space + 1;
+            }
+        }
+        let mut end = n.min(start + length);
+        if end < n {
+            let from = start + length / 2;
+            if from <= end {
+                if let Some(space) = (from..=end).rev().find(|&at| chars[at] == ' ') {
+                    end = space;
+                }
+            }
+        }
+        out.push((start, end));
+    }
+    out
 }
 
 /// 32 lowercase hex digits: [`ChunkKey::of`] the embedded text, as the records have always
@@ -998,6 +1215,335 @@ mod tests {
                     "[PASSAGE] abcdefghijklmnopqrstuvwxyz0123"
                 )),
             ]
+        );
+    }
+
+    // ── long-line windows ──
+
+    const PUBLISHED_CHUNKING_IDENTITY: u64 = 2_685_558_872_390_372_738;
+
+    fn family(dir: &str) -> (ChunkerConfig, serde_json::Value) {
+        let path = format!("{}/config/models/{dir}", env!("CARGO_MANIFEST_DIR"));
+        let read = |name: &str| std::fs::read_to_string(format!("{path}/{name}")).unwrap();
+        (
+            serde_json::from_str(&read("chunking.json")).unwrap(),
+            serde_json::from_str(&read("model.json")).unwrap(),
+        )
+    }
+
+    fn windows_config() -> ChunkerConfig {
+        family("meivin-round2-windows-onnx").0
+    }
+
+    /// The production family keeps its identity; the windows family declares its own recipe's
+    /// and differs from the production family in nothing else.
+    #[test]
+    fn the_windows_family_is_the_published_one_with_windows() {
+        let (published, published_model) = family("meivin-round2-onnx");
+        assert_eq!(published.identity(), PUBLISHED_CHUNKING_IDENTITY);
+        assert_eq!(published.anchor(), published);
+
+        let (windows, mut model) = family("meivin-round2-windows-onnx");
+        Chunker::new(windows.clone()).unwrap();
+        assert_eq!(model["chunking_identity"], windows.identity());
+        assert_ne!(windows.identity(), PUBLISHED_CHUNKING_IDENTITY);
+        assert_eq!(windows.anchor(), published);
+        assert_eq!(windows.anchor().identity(), PUBLISHED_CHUNKING_IDENTITY);
+        model["chunking_identity"] = published_model["chunking_identity"].clone();
+        assert_eq!(model, published_model);
+    }
+
+    /// A version 1 configuration is read and written without the window fields, so its
+    /// file and its identity are what they were.
+    #[test]
+    fn version_one_serializes_without_window_fields() {
+        let json = serde_json::to_string(&ChunkerConfig::default()).unwrap();
+        for field in [
+            "window_chars",
+            "window_overlap_chars",
+            "max_windows_per_line",
+        ] {
+            assert!(!json.contains(field), "{json}");
+        }
+        assert_eq!(
+            serde_json::from_str::<ChunkerConfig>(&json).unwrap(),
+            ChunkerConfig::default()
+        );
+    }
+
+    #[test]
+    fn an_inconsistent_windows_configuration_is_refused() {
+        let windows = windows_config();
+        for (field, config) in [
+            (
+                "window_chars",
+                ChunkerConfig {
+                    window_chars: 0,
+                    ..windows.clone()
+                },
+            ),
+            (
+                "max_windows_per_line",
+                ChunkerConfig {
+                    max_windows_per_line: 0,
+                    ..windows.clone()
+                },
+            ),
+            (
+                "window_overlap_chars",
+                ChunkerConfig {
+                    window_overlap_chars: 256,
+                    ..windows.clone()
+                },
+            ),
+            (
+                "max_windows_per_line",
+                ChunkerConfig {
+                    max_windows_per_line: 257,
+                    ..windows.clone()
+                },
+            ),
+            (
+                "window_chars",
+                ChunkerConfig {
+                    chunking_version: 1,
+                    ..windows.clone()
+                },
+            ),
+        ] {
+            match Chunker::new(config) {
+                Err(ArtifactError::UnsupportedRecipeVersion { field: named, .. }) => {
+                    assert_eq!(named, field)
+                }
+                other => panic!("{field}: expected a refusal, got {:?}", other.err()),
+            }
+        }
+    }
+
+    /// Window 0 is exactly what version 1 embeds, on the fixed book and on random ones —
+    /// text, key and semantic id — and nothing but long lines gains windows.
+    #[test]
+    fn the_first_window_is_what_version_one_embeds() {
+        let mut random = Random(0x00C0_FFEE);
+        let books = std::iter::once(every_branch_book())
+            .chain((0..1500).map(|_| random_book(&mut random)))
+            .collect::<Vec<_>>();
+        for windows in [
+            windows_config(),
+            ChunkerConfig {
+                max_chunk_chars: 30,
+                window_chars: 20,
+                window_overlap_chars: 5,
+                max_windows_per_line: 4,
+                ..windows_config()
+            },
+        ] {
+            let v1 = chunker(windows.anchor());
+            let v2 = chunker(windows.clone());
+            for (case, book) in books.iter().enumerate() {
+                let before = v1.chunk_book(book);
+                let after = v2.chunk_book(book);
+                let firsts: Vec<&SemanticChunk> =
+                    after.iter().filter(|chunk| chunk.window == 0).collect();
+                assert_eq!(firsts.len(), before.len(), "case {case}");
+                for (old, new) in before.iter().zip(firsts) {
+                    assert_eq!(new.line_id, old.line_id);
+                    assert_eq!(new.embedding_text, old.embedding_text, "case {case}");
+                    assert_eq!(new.chunk_hash, old.chunk_hash);
+                    assert_eq!(
+                        new.semantic_id,
+                        compute_semantic_id(&book.source_book_key, new.line_id, windows.identity())
+                    );
+                }
+                let refs = line_refs(book);
+                for chunk in after.iter().filter(|chunk| chunk.window > 0) {
+                    let index = book
+                        .lines
+                        .iter()
+                        .position(|line| line.line_id == chunk.line_id)
+                        .unwrap();
+                    let n = book.lines[index].text.trim().chars().count();
+                    assert!(n > windows.max_chunk_chars && n >= windows.min_meaningful_chars);
+                    assert!(usize::from(chunk.window) < windows.max_windows_per_line);
+                    assert_eq!(
+                        v2.embedded_text(&refs, index).as_deref(),
+                        v1.embedded_text(&refs, index).as_deref()
+                    );
+                }
+                let ids: std::collections::HashSet<&str> = after
+                    .iter()
+                    .map(|chunk| chunk.semantic_id.as_str())
+                    .collect();
+                assert_eq!(ids.len(), after.len(), "case {case}: ids are unique");
+            }
+        }
+    }
+
+    fn one_line_windows(text: &str) -> Vec<EmbeddedWindow> {
+        let book = dummy_book(vec![(1, text)]);
+        chunker(windows_config()).embedded_windows(&line_refs(&book), 0)
+    }
+
+    fn spans(windows: &[EmbeddedWindow]) -> Vec<(u32, u32)> {
+        windows
+            .iter()
+            .map(|window| (window.chars.start, window.chars.end))
+            .collect()
+    }
+
+    #[test]
+    fn windows_snap_to_words_and_stop_at_six() {
+        // 512 or fewer: the line's one window.
+        assert_eq!(spans(&one_line_windows(&"א".repeat(512))), vec![(0, 512)]);
+
+        // 513 characters of 4-character words: the second window starts on a word after
+        // the 128-character overlap, and runs to the end.
+        let words: String = "אבג ".repeat(129);
+        let text = format!("{}ד", &words[..words.char_indices().nth(512).unwrap().0]);
+        assert_eq!(text.chars().count(), 513);
+        assert_eq!(spans(&one_line_windows(&text)), vec![(0, 512), (384, 513)]);
+
+        // One word with no space: nothing to snap to.
+        let word: String = (0..2000u32)
+            .map(|at| char::from_u32(0x05D0 + at * 7 % 27).unwrap())
+            .collect();
+        assert_eq!(
+            spans(&one_line_windows(&word)),
+            vec![
+                (0, 512),
+                (384, 896),
+                (768, 1280),
+                (1152, 1664),
+                (1536, 2000)
+            ]
+        );
+
+        // Words everywhere: each end falls on a space, each start right after one.
+        let text = (0..1500)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let windows = one_line_windows(&text);
+        assert_eq!(windows.len(), 6, "capped at six");
+        let chars: Vec<char> = text.chars().collect();
+        for window in &windows[1..] {
+            let (start, end) = (window.chars.start as usize, window.chars.end as usize);
+            assert_eq!(chars[start - 1], ' ', "a window starts a word");
+            assert_eq!(chars[end], ' ', "a window ends a word");
+            assert!(end - start <= 512);
+            let content: String = chars[start..end].iter().collect();
+            assert_eq!(window.text, format!("[PASSAGE] {}", content.trim()));
+        }
+        assert!(windows
+            .windows(2)
+            .all(|pair| pair[0].ordinal < pair[1].ordinal));
+    }
+
+    /// A short line borrows a long context, and still embeds one window: the rest of that
+    /// text is its neighbours', each with windows of its own.
+    #[test]
+    fn a_short_line_with_a_long_context_has_one_window() {
+        let long = "מילה ".repeat(300);
+        let book = dummy_book(vec![
+            (1, long.as_str()),
+            (1, "שורה קצרה"),
+            (1, long.as_str()),
+        ]);
+        let chunks = chunker(windows_config()).chunk_book(&book);
+        assert_eq!(
+            chunks.iter().filter(|chunk| chunk.line_id == 2).count(),
+            1,
+            "the short line"
+        );
+        let short = chunks.iter().find(|chunk| chunk.line_id == 2).unwrap();
+        assert_eq!(short.window, 0);
+        assert!(chunks.iter().filter(|chunk| chunk.line_id == 1).count() > 1);
+    }
+
+    /// A window whose key an earlier window of the line has is not embedded twice.
+    #[test]
+    fn a_repeated_window_is_recorded_once() {
+        let text = "עולם ".repeat(1000);
+        let windows = one_line_windows(text.trim());
+        let keys: std::collections::HashSet<ChunkKey> = windows
+            .iter()
+            .map(|window| ChunkKey::of(&window.text))
+            .collect();
+        assert_eq!(keys.len(), windows.len());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Golden {
+        window_chars: usize,
+        window_overlap_chars: usize,
+        max_windows_per_line: usize,
+        cases: Vec<GoldenCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct GoldenCase {
+        source: String,
+        text: String,
+        spans: Vec<(u32, u32)>,
+        keys: Vec<String>,
+    }
+
+    /// The windows the retrieval quality was measured on, by the measurement's own script
+    /// (`windows.py`): real long lines of the library, and edge cases of spaces and words.
+    #[test]
+    fn windows_are_the_measured_ones() {
+        let path = format!(
+            "{}/tests/data/long_line_windows_golden.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let golden: Golden = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let config = windows_config();
+        assert_eq!(
+            (
+                golden.window_chars,
+                golden.window_overlap_chars,
+                golden.max_windows_per_line
+            ),
+            (
+                config.window_chars,
+                config.window_overlap_chars,
+                config.max_windows_per_line
+            )
+        );
+        assert!(golden.cases.len() >= 40);
+        let mut deduplicated = 0;
+        for case in &golden.cases {
+            let windows = one_line_windows(&case.text);
+            // The measurement keeps a repeated window; the recipe records it once.
+            let mut seen = std::collections::HashSet::new();
+            let expected: Vec<((u32, u32), &str, u8)> = case
+                .spans
+                .iter()
+                .zip(&case.keys)
+                .enumerate()
+                .filter(|(_, (_, key))| seen.insert(key.as_str()))
+                .map(|(ordinal, (span, key))| (*span, key.as_str(), ordinal as u8))
+                .collect();
+            deduplicated += case.spans.len() - expected.len();
+            let actual: Vec<((u32, u32), String, u8)> = windows
+                .iter()
+                .map(|window| {
+                    (
+                        (window.chars.start, window.chars.end),
+                        ChunkKey::of(&window.text).to_hex(),
+                        window.ordinal,
+                    )
+                })
+                .collect();
+            let expected: Vec<((u32, u32), String, u8)> = expected
+                .into_iter()
+                .map(|(span, key, ordinal)| (span, key.to_string(), ordinal))
+                .collect();
+            assert_eq!(actual, expected, "{}", case.source);
+        }
+        assert!(
+            deduplicated > 0,
+            "the golden set exercises a repeated window"
         );
     }
 }

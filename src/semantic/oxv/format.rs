@@ -62,6 +62,8 @@ pub(crate) enum SectionKind {
     Books,
     /// The UTF-8 names the book entries point into.
     BookNames,
+    /// Full source-text hash per book; 0 means unknown.
+    BookHashes,
     /// The codec's parameters, whose SHA-256 the header carries.
     CodecParams,
     /// One 16-byte key per slot.
@@ -72,6 +74,11 @@ pub(crate) enum SectionKind {
     Vectors,
     /// One `f32` per slot, for a codec that scales each vector. Reserved.
     VectorScales,
+    /// One `u8` per slot: the least window ordinal any record of the slot's key has, 0 being
+    /// a line's own first window. Absent, every slot's is 0.
+    SlotWindows,
+    /// Complete per-key occurrence snapshots; newest snapshot replaces older records.
+    Occurrences,
     /// `{slot u32, hint u32}`: a further record of a slot's key, in some book.
     Extras,
     /// `u32` indexes into [`Self::Extras`], ordered by slot.
@@ -93,11 +100,14 @@ impl SectionKind {
         match self {
             Self::Books => 0x0001,
             Self::BookNames => 0x0002,
+            Self::BookHashes => 0x0004,
             Self::CodecParams => 0x0003,
             Self::SlotKeys => 0x0010,
             Self::SlotHints => 0x0011,
             Self::Vectors => 0x0012,
             Self::VectorScales => 0x0013,
+            Self::SlotWindows => 0x0014,
+            Self::Occurrences => 0x0024,
             Self::Extras => 0x0020,
             Self::ExtrasBySlot => 0x0021,
             Self::Foreign => 0x0022,
@@ -112,11 +122,14 @@ impl SectionKind {
         Some(match code {
             0x0001 => Self::Books,
             0x0002 => Self::BookNames,
+            0x0004 => Self::BookHashes,
             0x0003 => Self::CodecParams,
             0x0010 => Self::SlotKeys,
             0x0011 => Self::SlotHints,
             0x0012 => Self::Vectors,
             0x0013 => Self::VectorScales,
+            0x0014 => Self::SlotWindows,
+            0x0024 => Self::Occurrences,
             0x0020 => Self::Extras,
             0x0021 => Self::ExtrasBySlot,
             0x0022 => Self::Foreign,
@@ -134,6 +147,9 @@ impl SectionKind {
             Self::Books => Some(BOOK_ENTRY_LEN as u32),
             Self::SlotKeys | Self::Tombstones => Some(16),
             Self::SlotHints | Self::ExtrasBySlot | Self::BlockCrcs | Self::VectorScales => Some(4),
+            Self::SlotWindows => Some(1),
+            Self::BookHashes => Some(8),
+            Self::Occurrences => Some(44),
             Self::Extras => Some(EXTRA_LEN as u32),
             Self::Foreign => Some(FOREIGN_LEN as u32),
             Self::BookNames
@@ -148,11 +164,14 @@ impl SectionKind {
         match self {
             Self::Books => "BOOKS",
             Self::BookNames => "BOOK_NAMES",
+            Self::BookHashes => "BOOK_HASHES",
             Self::CodecParams => "CODEC_PARAMS",
             Self::SlotKeys => "SLOT_KEYS",
             Self::SlotHints => "SLOT_HINTS",
             Self::Vectors => "VECTORS",
             Self::VectorScales => "VECTOR_SCALES",
+            Self::SlotWindows => "SLOT_WINDOWS",
+            Self::Occurrences => "OCCURRENCES",
             Self::Extras => "EXTRAS",
             Self::ExtrasBySlot => "EXTRAS_BY_SLOT",
             Self::Foreign => "FOREIGN",
@@ -526,6 +545,7 @@ mod tests {
             SectionKind::SlotHints,
             SectionKind::Vectors,
             SectionKind::VectorScales,
+            SectionKind::SlotWindows,
             SectionKind::Extras,
             SectionKind::ExtrasBySlot,
             SectionKind::Foreign,
