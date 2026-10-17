@@ -279,6 +279,14 @@ impl Chunker {
         self.windows_of(lines, index)
     }
 
+    /// Whether a line of this text is embedded with its neighbours' context: one the recipe
+    /// embeds that is shorter than `min_meaningful_chars`. What a plan records as
+    /// `PlanRecord::short`.
+    pub fn borrows_context(&self, line_text: &str) -> bool {
+        let n = line_text.trim().chars().count();
+        n >= self.config.min_embeddable_chars && n < self.config.min_meaningful_chars
+    }
+
     /// Every line's key, in order: `Some` for a line the recipe embeds, `None` for one it
     /// skips. The keys are exactly the `chunk_hash`es [`Self::chunk_book`] would give the
     /// same lines — one recipe, one implementation, used by the build machine and by the

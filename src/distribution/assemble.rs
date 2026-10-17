@@ -80,6 +80,9 @@ pub struct AssembleRequest<'a> {
     pub created_at: String,
     /// Which build made it, for people: the manifest's `builtBy`.
     pub built_by: Option<serde_json::Value>,
+    /// The cosine a short line needs to share a neighbour's vector ([`alias`](super::alias)),
+    /// format 3 only; `None` or 0 for none. A delta takes its ledger's, and refuses another.
+    pub alias_threshold: Option<f32>,
 }
 
 /// What an assembly wrote.
@@ -91,8 +94,13 @@ pub struct AssembleReport {
     pub manifest_sha256: String,
     /// The ledger of this release, in `out_dir`.
     pub ledger: LedgerManifest,
-    /// Components the codec clipped: always 0 but for `i8-sym-dim`.
+    /// Components the codec clipped: always 0 but for `i8-sym-dim` and `rot192-i8i4`.
     pub clipped_components: u64,
+    /// Plan records that share a neighbour's vector, the distinct keys they spare, and the
+    /// least cosine of one with its neighbour.
+    pub alias_records: u64,
+    pub alias_keys: u64,
+    pub alias_min_cosine: Option<f64>,
 }
 
 /// The identity a release built from a plan declares: the plan's, with the codec's name as
@@ -206,6 +214,35 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         _ => SEGMENT_FORMAT_VERSION,
     };
     check_key_prefixes(plan, delta, key_len(format_version))?;
+    let alias_threshold = match delta {
+        Some(previous) => {
+            let chain = previous.manifest.alias_threshold;
+            if request
+                .alias_threshold
+                .is_some_and(|asked| Some(asked) != chain && !(asked == 0.0 && chain.is_none()))
+            {
+                return Err(malformed(format!(
+                    "the chain shares short lines' vectors at {chain:?} and this build asks for \
+                     {:?}: a new threshold starts with a base",
+                    request.alias_threshold
+                )));
+            }
+            chain
+        }
+        None => request.alias_threshold.filter(|threshold| *threshold > 0.0),
+    };
+    if alias_threshold.is_some() && key_len(format_version) == 16 {
+        return Err(malformed(
+            "a short line shares a neighbour's vector only in segment format 3 (rot192-i8i4)",
+        ));
+    }
+    let aliases = crate::distribution::alias::decide(&plan.records, warehouse, alias_threshold)?;
+    let earlier_aliases = match delta.and_then(|old| old.occurrences.as_ref().map(|o| (old, o))) {
+        Some((old, records)) => {
+            crate::distribution::alias::decide(records, warehouse, old.manifest.alias_threshold)?
+        }
+        None => crate::distribution::alias::Aliases::none(),
+    };
     if let Some(previous) = delta {
         let codec = kept_epoch.as_ref().expect("a delta keeps the epoch");
         let identity = release_identity(&plan.manifest.identity, codec);
@@ -253,8 +290,8 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
     let windows = slot_windows(&plan.records);
     let all_occurrences =
         plan.records.is_windowed() && delta.is_none_or(|old| old.occurrences.is_none());
-    let changed = changed_occurrences(plan, delta)?;
-    let mut occurrences = plan.records.occurrences();
+    let changed = changed_occurrences(plan, delta, &aliases, &earlier_aliases)?;
+    let mut occurrences = aliases.occurrences(&plan.records);
     let mut book = BookRecords::new(u32::MAX);
     let mut slot_records: Vec<u64> = Vec::new();
     let (mut missing, mut first_missing) = (0u64, None);
@@ -262,6 +299,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         &plan.records,
         &plan.books,
         delta,
+        &aliases,
         |_, record, disposition| {
             if record.book != book.book {
                 book.add_to(&mut builder, plan, source_hashes.as_ref())?;
@@ -280,7 +318,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
             if all_occurrences
                 || changed
                     .as_ref()
-                    .is_some_and(|changed| changed.contains(&record.key_bytes()))
+                    .is_some_and(|changed| changed.contains(&occurrence.key.0))
             {
                 book.occurrences.push(occurrence);
             }
@@ -310,7 +348,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
                 {
                     book.foreign.push((record.key(), record.ordinal))
                 }
-                Disposition::Held | Disposition::Repeat => {}
+                Disposition::Held | Disposition::Repeat | Disposition::Alias => {}
             }
             Ok(())
         },
@@ -417,6 +455,8 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         delta,
         &classified,
         Some(package),
+        &aliases,
+        alias_threshold,
     )?;
     Ok(AssembleReport {
         out_dir: out.clone(),
@@ -424,6 +464,9 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         manifest,
         ledger,
         clipped_components: written.clipped_components,
+        alias_records: aliases.len(),
+        alias_keys: aliases.keys,
+        alias_min_cosine: aliases.min_cosine(),
     })
 }
 
@@ -490,6 +533,8 @@ impl BookRecords {
 fn changed_occurrences(
     plan: &Plan,
     previous: Option<&Ledger>,
+    aliases: &crate::distribution::alias::Aliases,
+    earlier_aliases: &crate::distribution::alias::Aliases,
 ) -> Result<Option<crate::distribution::files::KeySet<[u8; 16]>>, PackError> {
     use crate::distribution::files::KeySet;
     use crate::semantic::oxv::occurrence::Occurrence;
@@ -504,8 +549,8 @@ fn changed_occurrences(
         // An older producer has no occurrence snapshot; rewrite locations once.
         return Ok(Some(changed));
     };
-    let mut current = plan.records.occurrences().peekable();
-    let mut earlier = old.occurrences().peekable();
+    let mut current = aliases.occurrences(&plan.records).peekable();
+    let mut earlier = earlier_aliases.occurrences(old).peekable();
     let mut names: BTreeSet<&str> = plan.books.names().iter().map(String::as_str).collect();
     names.extend(previous.books().names().iter().map(String::as_str));
     for name in names {

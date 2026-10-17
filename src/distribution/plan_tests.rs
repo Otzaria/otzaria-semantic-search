@@ -77,6 +77,7 @@ fn records_round_trip_and_refuse_disorder_and_damage() {
         book,
         ordinal,
         window: 0,
+        short: false,
         sha256: sha256(text.as_bytes()),
     });
     let mut writer = RecordsWriter::create(&path).unwrap();
@@ -114,6 +115,7 @@ fn a_plan_without_windows_is_written_as_it_always_was() {
         book: 7,
         ordinal: 0x0102_0304,
         window: 0,
+        short: false,
         sha256: sha256(L1.as_bytes()),
     };
     let mut writer = RecordsWriter::create(&path).unwrap();
@@ -145,6 +147,7 @@ fn windowed_records_round_trip_and_ascend_by_window() {
             book,
             ordinal,
             window,
+            short: false,
             sha256: sha256(text.as_bytes()),
         },
     );
@@ -319,6 +322,7 @@ fn the_split_against_the_previous_release() {
         &v2.records,
         &v2.books,
         Some(&ledger_v1),
+        &crate::distribution::alias::Aliases::none(),
         |_, record, disposition| {
             dispositions.push((record.book, record.ordinal, disposition));
             Ok(())
@@ -390,4 +394,39 @@ fn a_ledger_refuses_another_chain_and_damage() {
         Ledger::open(&at, Some(1)).is_err(),
         "a damaged keys file is refused"
     );
+}
+
+/// `OXVREC2` carries a first window's `short` flag in its flags byte; a later window cannot
+/// be short, and `OXVREC1` has no flag to carry.
+#[test]
+fn a_short_first_window_round_trips_in_oxvrec2() {
+    let dir = TempDir::new("short_flag");
+    let path = dir.join(RECORDS_FILE);
+    let mut writer = RecordsWriter::create_windowed(&path).unwrap();
+    let record = PlanRecord {
+        book: 0,
+        ordinal: 0,
+        window: 0,
+        short: true,
+        sha256: [7; 32],
+    };
+    writer.push(record).unwrap();
+    assert!(writer
+        .push(PlanRecord {
+            ordinal: 1,
+            window: 1,
+            ..record
+        })
+        .is_err());
+    writer.finish().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes[16 + 9], 1);
+    let records = PlanRecords::open(&path).unwrap();
+    assert_eq!(records.get(0), record);
+
+    let plain = dir.join("plain.bin");
+    let mut writer = RecordsWriter::create(&plain).unwrap();
+    writer.push(record).unwrap();
+    writer.finish().unwrap();
+    assert!(!PlanRecords::open(&plain).unwrap().get(0).short);
 }

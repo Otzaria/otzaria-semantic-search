@@ -25,6 +25,7 @@ use crate::distribution::warehouse::Warehouse;
 use crate::errors::{ArtifactError, PackError, SemanticSearchError};
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::{Codec, CodecSpec};
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::segment_set::{
     install_package, InstallExpectation, InstallSource, ReleaseManifest, SegmentSet,
@@ -137,7 +138,16 @@ pub fn verify_release(request: &VerifyRequest<'_>) -> Result<GateReport, PackErr
         ));
     }
     let segment = Segment::open(&dir.join(SEGMENT_FILE))?;
-    let content = content_pass(&segment, request.warehouse, request.samples);
+    // The threshold the release's own ledger records its aliases at.
+    let alias_threshold = Ledger::open(dir, Some(manifest.to_library_version))
+        .ok()
+        .and_then(|ledger| ledger.manifest.alias_threshold);
+    let content = content_pass(
+        &segment,
+        request.warehouse,
+        request.samples,
+        alias_threshold,
+    );
     let gates = vec![
         g1(&manifest, &segment, &content),
         g5(&content, manifest.kind, segment.codec()),
@@ -163,9 +173,19 @@ struct Content {
     bad_scales: u64,
     clipped: u64,
     cosines: Vec<f64>,
+    /// Alias occurrences, those whose vectors are missing or under the threshold, and the
+    /// least cosine of a short line's vector with the one it shares.
+    aliases: u64,
+    alias_faults: u64,
+    alias_min: Option<f64>,
 }
 
-fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Content {
+fn content_pass(
+    segment: &Segment,
+    warehouse: &Warehouse,
+    samples: usize,
+    alias_threshold: Option<f32>,
+) -> Content {
     let codec = segment.codec();
     let dim = codec.dim();
     let slots = segment.slot_count();
@@ -182,6 +202,9 @@ fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Con
         bad_scales: 0,
         clipped: 0,
         cosines: Vec::new(),
+        aliases: 0,
+        alias_faults: 0,
+        alias_min: None,
     };
     for slot in 0..slots {
         let scale = segment.vector_scale(slot);
@@ -204,6 +227,24 @@ fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Con
         if (slot as usize).is_multiple_of(step) {
             codec.decode(segment.vector(slot), scale, &mut decoded);
             content.cosines.push(cosine(&original, &decoded));
+        }
+    }
+    let width = segment.key_len();
+    for row in segment.occurrences().filter(|row| row.is_alias()) {
+        content.aliases += 1;
+        let pair = warehouse
+            .find_key_prefix(&row.anchor.0[..width])
+            .zip(warehouse.find_key_prefix(&row.key.0[..width]));
+        let Some((own, shared)) = pair else {
+            content.alias_faults += 1;
+            continue;
+        };
+        warehouse.vector(own, &mut original);
+        warehouse.vector(shared, &mut decoded);
+        let value = cosine(&original, &decoded);
+        content.alias_min = Some(content.alias_min.map_or(value, |least| least.min(value)));
+        if alias_threshold.is_none_or(|threshold| value < f64::from(threshold)) {
+            content.alias_faults += 1;
         }
     }
     content
@@ -343,6 +384,13 @@ fn g5(content: &Content, kind: PackageKind, codec: &Codec) -> Gate {
             content.mismatched
         ));
     }
+    if content.alias_faults > 0 {
+        faults.push(format!(
+            "{} of {} alias(es) share a vector under the release's threshold, or one the \
+             warehouse lacks",
+            content.alias_faults, content.aliases
+        ));
+    }
     let non_finite = cosines.iter().filter(|cosine| !cosine.is_finite()).count();
     let measured = if cosines.is_empty() {
         faults.push(format!(
@@ -372,9 +420,14 @@ fn g5(content: &Content, kind: PackageKind, codec: &Codec) -> Gate {
             true,
             format!(
                 "{} slot(s) encode their vectors; on {} sampled, cosine mean {mean:.6}, \
-                 p0.1 {p001:.6}",
+                 p0.1 {p001:.6}{}",
                 content.slots,
-                cosines.len()
+                cosines.len(),
+                match content.alias_min {
+                    Some(least) =>
+                        format!("; {} alias(es), least cosine {least:.6}", content.aliases),
+                    None => String::new(),
+                }
             ),
         ),
         _ => gate("G5", false, faults.join("; ")),
@@ -458,6 +511,15 @@ fn g8(request: &VerifyRequest<'_>, manifest: &ReleaseManifest) -> Result<Gate, P
         out_dir: scratch.clone(),
         created_at: manifest.created_at.clone(),
         built_by: manifest.built_by.clone(),
+        // A base decided at its own ledger's threshold; a delta takes its chain's.
+        alias_threshold: match manifest.kind {
+            PackageKind::Delta => None,
+            _ => {
+                Ledger::open(request.release_dir, Some(manifest.to_library_version))?
+                    .manifest
+                    .alias_threshold
+            }
+        },
     });
     let same =
         |name: &str| -> Result<bool, PackError> {
@@ -633,6 +695,8 @@ pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
         .first()
         .is_some_and(|segment| segment.key_len() < 16);
     let width = |key: ChunkKey| if narrow { key.narrowed() } else { key };
+    // The short lines that share a neighbour's vector, by their own key.
+    let mut aliased = std::collections::HashSet::new();
     for mut record in plan.records.occurrences() {
         record.key = width(record.key);
         record.anchor = width(record.anchor);
@@ -641,6 +705,13 @@ pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
             set.book_occurrences(plan.books.name(current), &mut effective);
             records.clear();
             keys.clear();
+            aliased.clear();
+            aliased.extend(
+                effective
+                    .iter()
+                    .filter(|(_, row)| row.window == ALIAS_WINDOW)
+                    .filter_map(|(_, row)| row.anchor),
+            );
             keys.extend(effective.iter().map(|(key, _)| *key));
             records.extend(
                 effective
@@ -651,6 +722,7 @@ pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
         coverage.records += 1;
         let reached = if plan.records.is_windowed() {
             records.contains(&(record.key, Some(record.anchor), record.window))
+                || (record.window == 0 && aliased.contains(&record.key))
         } else {
             keys.contains(&record.key)
         };
@@ -820,6 +892,9 @@ mod tests {
             bad_scales: 0,
             clipped: 0,
             cosines,
+            aliases: 0,
+            alias_faults: 0,
+            alias_min: None,
         }
     }
 

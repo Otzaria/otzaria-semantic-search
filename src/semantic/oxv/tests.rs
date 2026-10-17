@@ -952,3 +952,81 @@ fn a_newer_format_or_codec_is_unsupported_not_corrupt() {
         corrupted(with(at, value, false));
     }
 }
+
+/// An alias row: in format 3 it is window 0 with the alias role in the first reserved byte,
+/// and reads back as `ALIAS_WINDOW`; format 2 cannot write one, and refuses to read one.
+#[test]
+fn an_alias_row_exists_in_format_3_only() {
+    use super::format::{SEGMENT_FORMAT_V3, SEGMENT_FORMAT_VERSION};
+    use super::occurrence::{Occurrence, ALIAS_WINDOW, ROLE_ALIAS};
+    let dir = TempDir::new("alias_rows");
+    let mut random = Random(11);
+    let rows = [
+        Occurrence {
+            key: key(1),
+            book: 0,
+            hint: 0,
+            anchor: key(1),
+            window: 0,
+        },
+        Occurrence {
+            key: key(1),
+            book: 0,
+            hint: 1,
+            anchor: key(7),
+            window: ALIAS_WINDOW,
+        },
+    ];
+    let write = |format: u32, name: &str, random: &mut Random| {
+        let mut builder = SegmentBuilder::new(
+            spec(PackageKind::Base, 0, 30),
+            Codec::i8_sym_vec(DIM).unwrap(),
+        );
+        builder.set_format_version(format).unwrap();
+        builder.add_book("id:1", &[(key(1), 0)], &[], &[]).unwrap();
+        builder.add_occurrences("id:1", &rows).unwrap();
+        let path = dir.join(name);
+        builder.write(&path).map(|mut sink| {
+            sink.push_f32(&random.unit(DIM)).unwrap();
+            sink.finish().unwrap();
+            path
+        })
+    };
+    let path = write(SEGMENT_FORMAT_V3, "v3.oxv", &mut random).unwrap();
+    let segment = open(&path);
+    let read: Vec<Occurrence> = segment.occurrences().collect();
+    assert_eq!(read[1].window, ALIAS_WINDOW);
+    assert!(read[1].is_alias() && !read[0].is_alias());
+    assert_eq!(read[1].anchor, key(7).narrowed());
+    assert_eq!(
+        segment.slot_window(0),
+        0,
+        "an alias gives its vector no window"
+    );
+    let mut bytes = Vec::new();
+    read[1].encode_with(8, &mut bytes);
+    assert_eq!(bytes[24..], [0, ROLE_ALIAS, 0, 0]);
+    assert_eq!(Occurrence::decode_with(&bytes, 8), read[1]);
+
+    let refused = write(SEGMENT_FORMAT_VERSION, "v2.oxv", &mut random)
+        .err()
+        .unwrap();
+    assert!(refused.to_string().contains("format 3"), "{refused}");
+
+    // A format-2 row that claims the role. Open reads OCCURRENCES before any block CRC.
+    let mut builder = SegmentBuilder::new(
+        spec(PackageKind::Base, 0, 30),
+        Codec::i8_sym_vec(DIM).unwrap(),
+    );
+    builder.add_book("id:1", &[(key(1), 0)], &[], &[]).unwrap();
+    builder.add_occurrences("id:1", &rows[..1]).unwrap();
+    let plain = dir.join("plain.oxv");
+    let mut sink = builder.write(&plain).unwrap();
+    sink.push_f32(&random.unit(DIM)).unwrap();
+    sink.finish().unwrap();
+    let entry = section(&segment_header(&plain), SectionKind::Occurrences);
+    let mut bytes = std::fs::read(&plain).unwrap();
+    bytes[entry.offset as usize + 41] = ROLE_ALIAS;
+    std::fs::write(&plain, &bytes).unwrap();
+    assert!(corrupted(Segment::open(&plain)).contains("unknown role"));
+}

@@ -23,6 +23,14 @@ fn default_window_penalty() -> f32 {
     DEFAULT_WINDOW_PENALTY
 }
 
+/// Taken off the cosine of a short line found through the neighbour whose vector it shares
+/// (an alias, cosine ≥ 0.99 with its own): the window penalty, until one is measured.
+pub const DEFAULT_ALIAS_PENALTY: f32 = DEFAULT_WINDOW_PENALTY;
+
+fn default_alias_penalty() -> f32 {
+    DEFAULT_ALIAS_PENALTY
+}
+
 /// The lexical weight `alpha` for each kind of query
 /// [`analyze_query`](crate::hybrid::ranking::analyze_query) tells apart; `1 - alpha` goes
 /// to the semantic side. Read by
@@ -185,6 +193,10 @@ pub struct RankingProfile {
     /// best ([`DEFAULT_WINDOW_PENALTY`]). From 0 to 0.2.
     #[serde(default = "default_window_penalty")]
     pub window_penalty: f32,
+    /// Taken off the score of a short line that shares a neighbour's vector, after the scan,
+    /// in place of the window penalty ([`DEFAULT_ALIAS_PENALTY`]). From 0 to 0.2.
+    #[serde(default = "default_alias_penalty")]
+    pub alias_penalty: f32,
 }
 
 impl RankingProfile {
@@ -211,6 +223,7 @@ impl RankingProfile {
                 foundational_bonus: 0.0,
                 foundational_candidate_share: 0.0,
                 window_penalty: DEFAULT_WINDOW_PENALTY,
+                alias_penalty: DEFAULT_ALIAS_PENALTY,
             },
             SearchProfile::Balanced => Self {
                 profile,
@@ -234,6 +247,7 @@ impl RankingProfile {
                 foundational_bonus: 0.0,
                 foundational_candidate_share: 0.0,
                 window_penalty: DEFAULT_WINDOW_PENALTY,
+                alias_penalty: DEFAULT_ALIAS_PENALTY,
             },
             SearchProfile::Best => Self {
                 profile,
@@ -255,6 +269,7 @@ impl RankingProfile {
                 foundational_bonus: 0.0,
                 foundational_candidate_share: 0.0,
                 window_penalty: DEFAULT_WINDOW_PENALTY,
+                alias_penalty: DEFAULT_ALIAS_PENALTY,
             },
         }
     }
@@ -334,6 +349,12 @@ impl RankingProfile {
             "window_penalty",
             self.window_penalty,
             (0.0..=0.2).contains(&self.window_penalty),
+            "a number from 0 to 0.2",
+        )?;
+        require(
+            "alias_penalty",
+            self.alias_penalty,
+            (0.0..=0.2).contains(&self.alias_penalty),
             "a number from 0 to 0.2",
         )?;
         Ok(())
@@ -566,6 +587,7 @@ mod tests {
             assert!(object.remove("foundational_bonus").is_some());
             assert!(object.remove("foundational_candidate_share").is_some());
             assert!(object.remove("window_penalty").is_some());
+            assert!(object.remove("alias_penalty").is_some());
 
             let read: RankingProfile = serde_json::from_value(json).unwrap();
             assert_eq!(read, RankingProfile::from_profile(preset));
@@ -594,7 +616,20 @@ mod tests {
                 RankingProfile::from_profile(preset).window_penalty,
                 DEFAULT_WINDOW_PENALTY
             );
+            assert_eq!(
+                RankingProfile::from_profile(preset).alias_penalty,
+                DEFAULT_ALIAS_PENALTY
+            );
         }
+        let alias = RankingProfile {
+            alias_penalty: 0.21,
+            ..RankingProfile::default()
+        };
+        assert!(matches!(
+            alias.validate(),
+            Err(SemanticSearchError::InvalidRankingParameter { parameter, .. })
+                if parameter == "alias_penalty"
+        ));
         for (penalty, valid) in [
             (0.0, true),
             (0.2, true),

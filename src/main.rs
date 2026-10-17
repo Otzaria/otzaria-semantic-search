@@ -174,6 +174,9 @@ Options for 'assemble':
   --clip-q <q>               For i8-sym-dim: the calibration quantile (default: 1)
   --rotation <path>          For rot192-i8i4: what fit-rotation wrote. A delta, or a base
                              with --keep-epoch, takes the epoch from the ledger instead
+  --alias-threshold <c>      For rot192-i8i4: a short line shares a neighbour's vector
+                             when their cosine is at least c, e.g. 0.99 (default: none;
+                             0 is none). A delta keeps its chain's
   --keep-epoch               A base in the previous release's codec epoch
   --created-at <time>        The manifest's createdAt (default: now); the same inputs and
                              time give the same bytes
@@ -1000,6 +1003,11 @@ fn run_assemble(args: &[String]) {
             created_at: parse_arg(args, "--created-at")
                 .unwrap_or_else(|| utc_timestamp(SystemTime::now())),
             built_by,
+            alias_threshold: parse_arg(args, "--alias-threshold").map(|value| {
+                value
+                    .parse::<f32>()
+                    .unwrap_or_else(|_| exit_with("--alias-threshold", "not a number"))
+            }),
         })
         .unwrap_or_else(|error| exit_with("Assembly failed", error));
         let manifest = &report.manifest;
@@ -1033,6 +1041,15 @@ fn run_assemble(args: &[String]) {
             "Clipped:         {} component(s)",
             report.clipped_components
         );
+        if report.alias_records > 0 {
+            println!(
+                "Aliases:         {} short line(s), {} key(s) sharing a neighbour's vector, \
+                 least cosine {:.6}",
+                report.alias_records,
+                report.alias_keys,
+                report.alias_min_cosine.unwrap_or(f64::NAN)
+            );
+        }
         println!(
             "Ledger:          v{}, {} key(s), {} pair(s)",
             report.ledger.library_version, report.ledger.keys.count, report.ledger.pairs.count

@@ -74,9 +74,29 @@ impl Machine {
         books: &[(&str, &[usize])],
         previous: Option<&Ledger>,
     ) -> Plan {
+        let books: Vec<(&str, Vec<String>)> = books
+            .iter()
+            .map(|(book, texts)| (*book, texts.iter().map(|i| text(*i)).collect()))
+            .collect();
+        self.plan_texts(name, version, &books, previous, raw_shard)
+    }
+
+    /// [`Self::plan`] of these lines, embedded by `shard`.
+    fn plan_texts(
+        &self,
+        name: &str,
+        version: u32,
+        books: &[(&str, Vec<String>)],
+        previous: Option<&Ledger>,
+        shard: fn(&std::path::Path, &std::path::Path) -> PathBuf,
+    ) -> Plan {
         let lines: Vec<(u64, String, String)> = books
             .iter()
-            .flat_map(|(book, texts)| texts.iter().map(move |i| (book.to_string(), text(*i))))
+            .flat_map(|(book, texts)| {
+                texts
+                    .iter()
+                    .map(move |text| (book.to_string(), text.clone()))
+            })
             .enumerate()
             .map(|(at, (book, text))| (at as u64 + 1, book, text))
             .collect();
@@ -101,7 +121,7 @@ impl Machine {
             )
             .unwrap();
         }
-        let shard = raw_shard(&out, &self.dir.join(&format!("{name}-shard")));
+        let shard = shard(&out, &self.dir.join(&format!("{name}-shard")));
         Warehouse::open_for_append(&self.warehouse)
             .unwrap()
             .add_shards(
@@ -134,6 +154,7 @@ impl Machine {
             out_dir: self.dir.join(out),
             created_at: CREATED.to_string(),
             built_by: Some(serde_json::json!({ "runId": "test" })),
+            alias_threshold: None,
         })
         .unwrap()
     }
@@ -898,6 +919,7 @@ fn a_delta_is_refused_off_its_chain() {
         out_dir: machine.dir.join("refused"),
         created_at: CREATED.to_string(),
         built_by: None,
+        alias_threshold: None,
     };
     // No ledger; a ledger the plan was not split against; a compacted segment.
     assert!(assemble(&request(&p2, PackageKind::Delta, None)).is_err());
@@ -1024,6 +1046,7 @@ fn a_corrupt_warehouse_fails_assembly_the_gates_and_the_exact_reference() {
         out_dir: machine.dir.join("again"),
         created_at: CREATED.to_string(),
         built_by: None,
+        alias_threshold: None,
     })
     .err()
     .unwrap();
@@ -1109,6 +1132,7 @@ fn warehouse_metadata_is_checked_against_independent_plan_and_set_identities() {
             out_dir: machine.dir.join("refused"),
             created_at: CREATED.to_string(),
             built_by: None,
+            alias_threshold: None,
         })
         .err()
         .unwrap();
@@ -1157,6 +1181,7 @@ fn assembly_checks_the_embed_manifest_digest_before_using_its_package() {
         out_dir: machine.dir.join("refused"),
         created_at: CREATED.to_string(),
         built_by: None,
+        alias_threshold: None,
     })
     .err()
     .unwrap();
@@ -1696,4 +1721,234 @@ fn keys_sharing_their_first_eight_bytes_are_found() {
         Some((key(1, 4), key(1, 9)))
     );
     assert_eq!(shared_prefix(vec![key(1, 9), key(1, 4)], 16), None);
+}
+
+/// A recipe with windows whose cap is past every test line, so a short line's context is
+/// never a prefix of its neighbour's own text.
+fn alias_chunking() -> ChunkerConfig {
+    ChunkerConfig {
+        max_chunk_chars: 200,
+        ..windows_chunking()
+    }
+}
+
+/// A shard in which each short line right after a line that is not short embeds almost as
+/// that line does — what sharing a vector finds — and every other text as `raw_shard`.
+fn alias_shard(plan_dir: &std::path::Path, out: &std::path::Path) -> PathBuf {
+    use super::plan::{PlanRecord, PlanRecords, RECORDS_FILE};
+    use super::testing::{raw_shard_with, unit_vector};
+    let records = PlanRecords::open(&plan_dir.join(RECORDS_FILE)).unwrap();
+    let first: Vec<PlanRecord> = records.iter().filter(|record| record.window == 0).collect();
+    let near: std::collections::HashMap<[u8; 32], [u8; 32]> = first
+        .windows(2)
+        .filter(|pair| {
+            pair[1].short
+                && !pair[0].short
+                && pair[0].book == pair[1].book
+                && pair[1].ordinal == pair[0].ordinal + 1
+        })
+        .map(|pair| (pair[1].sha256, pair[0].sha256))
+        .collect();
+    raw_shard_with(plan_dir, out, &|sha, dim| match near.get(sha) {
+        Some(neighbour) => {
+            let mut vector = unit_vector(neighbour, dim);
+            for (value, noise) in vector.iter_mut().zip(unit_vector(sha, dim)) {
+                *value += 0.002 * noise;
+            }
+            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            vector.iter().map(|x| x / norm).collect()
+        }
+        None => unit_vector(sha, dim),
+    })
+}
+
+/// The library of the alias tests: enough lines for a rotation, and two books of short
+/// lines — two that follow a line they embed almost as, one first in its book.
+fn alias_library(more: &[(&'static str, Vec<String>)]) -> Vec<(&'static str, Vec<String>)> {
+    let mut books: Vec<(&'static str, Vec<String>)> = vec![
+        ("otzaria/00.txt", (0..300).map(text).collect()),
+        ("otzaria/01.txt", (300..600).map(text).collect()),
+        (
+            "otzaria/a.txt",
+            vec![
+                text(600),
+                "שורה קצרה א".to_string(),
+                text(601),
+                text(602),
+                "שורה קצרה ב".to_string(),
+            ],
+        ),
+        (
+            "otzaria/b.txt",
+            vec!["שורה קצרה ג".to_string(), text(603), text(604)],
+        ),
+    ];
+    books.extend(more.iter().cloned());
+    books
+}
+
+/// Short lines share a neighbour's vector in a format-3 release: they get no slot, an
+/// alias occurrence carries them, every gate passes and reports them, a scan of the
+/// neighbour's vector returns their place, a delta keeps them at its chain's threshold and
+/// refuses another, compaction keeps them, and a format-2 release refuses to alias.
+#[test]
+fn short_lines_share_a_neighbours_vector_end_to_end() {
+    use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
+    let machine = Machine::chunked("aliases", alias_chunking());
+    let p1 = machine.plan_texts("p1", 1, &alias_library(&[]), None, alias_shard);
+    let codec = {
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        fit_rot_i8i4(&warehouse, 10_000, 48, 16).unwrap()
+    };
+    let request = |plan: &Plan, kind, previous, epoch, out: &str, threshold| {
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        assemble(&AssembleRequest {
+            plan,
+            warehouse: &warehouse,
+            kind,
+            previous,
+            epoch,
+            out_dir: machine.dir.join(out),
+            created_at: CREATED.to_string(),
+            built_by: None,
+            alias_threshold: threshold,
+        })
+    };
+    let given = EpochChoice::Given(codec.clone());
+    let base = request(&p1, PackageKind::Base, None, given, "base1", Some(0.99)).unwrap();
+    assert_eq!((base.alias_records, base.alias_keys), (2, 2));
+    assert!(base.alias_min_cosine.unwrap() > 0.99);
+    assert_eq!(base.ledger.alias_threshold, Some(0.99));
+    let shorts: Vec<ChunkKey> = p1
+        .records
+        .iter()
+        .filter(|record| record.short)
+        .map(|record| record.key().narrowed())
+        .collect();
+    assert_eq!(shorts.len(), 3);
+
+    let segment = Segment::open(&base.out_dir.join(SEGMENT_FILE)).unwrap();
+    let slots: Vec<ChunkKey> = segment.keys().collect();
+    let aliased: Vec<_> = segment.occurrences().filter(|row| row.is_alias()).collect();
+    assert_eq!(aliased.len(), 2);
+    for row in &aliased {
+        assert!(
+            !slots.contains(&row.anchor),
+            "an alias ships no vector of its own"
+        );
+        assert!(slots.contains(&row.key), "it names its neighbour's");
+        assert!(shorts.contains(&row.anchor));
+        assert_eq!(row.window, ALIAS_WINDOW);
+    }
+    assert!(
+        slots.contains(&shorts[2]),
+        "the short line first in its book keeps its own"
+    );
+    drop(segment);
+    let report = machine.verify(&p1, "base1", None);
+    assert!(report.passed(), "{:?}", report.gates);
+    let g5 = g5_of(&report);
+    assert!(
+        g5.detail.contains("; 2 alias(es), least cosine 0.99"),
+        "{}",
+        g5.detail
+    );
+
+    let device = simulate_device(&machine.dir.join("device"), &[&base.out_dir]).unwrap();
+    assert!(coverage(&device, &p1).complete());
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    let neighbour = p1
+        .records
+        .iter()
+        .find(|record| record.key().narrowed() == aliased[0].key)
+        .unwrap();
+    let mut query = vec![0f32; warehouse.dim()];
+    warehouse.vector(warehouse.find(&neighbour.sha256).unwrap(), &mut query);
+    drop(warehouse);
+    let hits = device
+        .scan(
+            &query,
+            &crate::semantic::oxv::scan::ScanRequest {
+                top_k: 1,
+                books: None,
+                threads: 1,
+                window_penalty: 0.04,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(hits[0].key, aliased[0].key);
+    assert_eq!(hits[0].window, 0, "the hit ranks by its own line");
+    let places: Vec<(u32, u8)> = hits[0]
+        .records
+        .iter()
+        .map(|record| (record.hint, record.window))
+        .collect();
+    assert_eq!(places.last(), Some(&(aliased[0].hint, ALIAS_WINDOW)));
+    drop(device);
+
+    // A delta: a new book, the aliases unchanged, at the chain's threshold.
+    let ledger1 = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    let more = [("otzaria/c.txt", vec![text(605), "שורה קצרה ד".to_string()])];
+    let p2 = machine.plan_texts("p2", 2, &alias_library(&more), Some(&ledger1), alias_shard);
+    let refused = request(
+        &p2,
+        PackageKind::Delta,
+        Some(&ledger1),
+        EpochChoice::Previous,
+        "refused",
+        Some(0.5),
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("new threshold"), "{refused}");
+    let delta = request(
+        &p2,
+        PackageKind::Delta,
+        Some(&ledger1),
+        EpochChoice::Previous,
+        "delta2",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        (delta.alias_records, delta.ledger.alias_threshold),
+        (3, Some(0.99))
+    );
+    let report = machine.verify(&p2, "delta2", Some(&ledger1));
+    for gate in &report.gates {
+        assert!(
+            gate.passed() || gate.gate == "G7",
+            "{}: {}",
+            gate.gate,
+            gate.detail
+        );
+    }
+    let device = machine.dir.join("device2");
+    let chain = simulate_device(&device, &[&base.out_dir, &delta.out_dir]).unwrap();
+    assert!(coverage(&chain, &p2).complete());
+    drop(chain);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&p2)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&device).unwrap();
+    let rows = compacted.segments()[0]
+        .occurrences()
+        .filter(|row| row.is_alias())
+        .count();
+    assert_eq!(rows, 3);
+    assert!(coverage(&compacted, &p2).complete());
+
+    // Format 2 cannot carry one.
+    let refused = request(&p1, PackageKind::Base, None, NEW, "refused-v2", Some(0.99)).unwrap_err();
+    assert!(
+        refused.to_string().contains("segment format 3"),
+        "{refused}"
+    );
 }

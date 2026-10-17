@@ -19,6 +19,7 @@ use crate::cancellation::CancellationToken;
 use crate::distribution::package::PackageKind;
 use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
 use crate::semantic::chunk_key::ChunkKey;
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
 use crate::semantic::resolve::LiveKeySource;
@@ -296,7 +297,7 @@ pub fn compact(
                         }
                         resolved.push((key, record));
                     }
-                    None if has_keys && record.window == 0 => {
+                    None if has_keys && (record.window == 0 || record.window == ALIAS_WINDOW) => {
                         pruned += 1;
                     }
                     None => resolved.push((key, record)),
@@ -317,13 +318,19 @@ pub fn compact(
         let mut extras = Vec::new();
         let mut occurrences = Vec::new();
         let mut least = HashMap::<ChunkKey, u8>::new();
-        for (key, record) in &records {
+        // An alias marks another line's place: it gives the vector no record or window, and
+        // stays only while the vector keeps a record in the book.
+        for (key, record) in records
+            .iter()
+            .filter(|(_, record)| record.window != ALIAS_WINDOW)
+        {
             least
                 .entry(*key)
                 .and_modify(|window| *window = (*window).min(record.window))
                 .or_insert(record.window);
         }
         let mut recorded = std::collections::HashSet::new();
+        let mut placed = std::collections::HashSet::new();
         for (key, record) in records {
             if let Some(anchor) = record.anchor {
                 occurrences.push(crate::semantic::oxv::occurrence::Occurrence {
@@ -334,7 +341,7 @@ pub fn compact(
                     window: record.window,
                 });
             }
-            if !recorded.insert(key) {
+            if record.window == ALIAS_WINDOW || !recorded.insert(key) {
                 continue;
             }
             let Ok(position) = live_slots.binary_search_by(|probe| probe.0.cmp(&key)) else {
@@ -350,7 +357,9 @@ pub fn compact(
                 builder.minimize_slot_window(new_slot[position], least[&key]);
                 extras.push((record.hint, new_slot[position]));
             }
+            placed.insert(key);
         }
+        occurrences.retain(|row| !row.is_alias() || placed.contains(&row.key));
         builder
             .add_book_windowed_hashed(
                 name,

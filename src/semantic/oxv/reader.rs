@@ -348,11 +348,19 @@ impl Segment {
         let key_len = key_len(header.format_version);
         if let Some(entry) = sections.get(&SectionKind::Occurrences) {
             let row_len = occurrence_len(header.format_version);
-            if map[range(entry)]
-                .chunks_exact(row_len)
-                .any(|row| row[row_len - 3..] != [0, 0, 0])
-            {
-                return Err("an occurrence has nonzero reserved bytes".to_string());
+            // Format 3 gives the first reserved byte a role: an alias, of window 0.
+            let aliases = header.format_version >= super::format::SEGMENT_FORMAT_V3;
+            let sound = |row: &[u8]| match row[row_len - 3..] {
+                [0, 0, 0] => true,
+                [role, 0, 0] => {
+                    aliases && role == super::occurrence::ROLE_ALIAS && row[row_len - 4] == 0
+                }
+                _ => false,
+            };
+            if !map[range(entry)].chunks_exact(row_len).all(sound) {
+                return Err(
+                    "an occurrence has nonzero reserved bytes or an unknown role".to_string(),
+                );
             }
         }
         if sections.get(&SectionKind::BookHashes).is_some_and(|entry| {

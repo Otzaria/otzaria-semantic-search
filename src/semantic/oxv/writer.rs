@@ -267,6 +267,9 @@ impl SegmentBuilder {
             let Some(slot) = referenced.get(&record.key.0) else {
                 return Err(invalid("an occurrence needs a vector record in its book"));
             };
+            if record.is_alias() {
+                continue;
+            }
             if let Some(slot) = slot {
                 let slot = *slot as usize;
                 let (word, bit) = (slot / 64, slot % 64);
@@ -434,7 +437,11 @@ impl SegmentBuilder {
         let mut occurrence_bytes =
             Vec::with_capacity(self.occurrences.len() * occurrence_len(format_version));
         for row in &self.occurrences {
-            super::occurrence::Occurrence::decode(row).encode_with(key_len, &mut occurrence_bytes);
+            let row = super::occurrence::Occurrence::decode(row);
+            if row.is_alias() && key_len == 16 {
+                return Err(invalid("an alias occurrence needs segment format 3"));
+            }
+            row.encode_with(key_len, &mut occurrence_bytes);
         }
         let occurrence_count = self.occurrences.len() as u64;
         let occurrences_len = occurrence_bytes.len() as u64;
