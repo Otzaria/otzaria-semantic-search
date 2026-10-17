@@ -28,7 +28,7 @@ One directory, written by `export_semantic_plan` over the release index (in
 
 | File | Layout |
 |---|---|
-| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, pad [3], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first |
+| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, flags u8, pad [2], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first. `flags` bit 0, **short**: a first window whose line is shorter than `min_meaningful_chars` and so embedded with its neighbours' context (`Chunker::borrows_context`); only it may share a neighbour's vector. A plan written before the flag has 0 there and shares nothing |
 | `books.json` | JSON array of the books' stable keys, strictly ascending by bytes; a record's `book` is an index into it |
 | `embed.jsonl` | the texts to embed — §2 |
 | `embed-manifest.json` | what `embed.jsonl` is — §2 |
@@ -290,6 +290,16 @@ assembly. The plan must have been split against that ledger.
   one in which two distinct keys of the plan — or, for a delta, of the plan and the
   previous ledger — share them, naming both. The anchor family keeps `i8-sym-vec` and
   format 2, byte for byte.
+* **Short lines sharing a vector** (`--alias-threshold 0.99`, format 3 only, off by
+  default): a record the plan flags short, whose first-window neighbour at −1, +1, −2 or +2
+  in its book is not short and has a warehouse vector at least that cosine from its own,
+  ships no vector — an alias occurrence names the neighbour's key, at the short line's place,
+  with the short line's key as its anchor (see
+  [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.4). A key is aliased only if all its
+  records are. The ledger records the threshold; a delta takes it and refuses another, and
+  decides the previous release's aliases again from its ledger and the warehouse, so they
+  are stable. `assemble` prints how many records and keys share a vector and the least
+  cosine. `write_plan_ledger` cannot rebuild an aliased chain's ledger: it has no warehouse.
 * **Memory.** Records, ledger and warehouse are mapped. About 70 bytes are held per slot
   shipped (key, hint, warehouse record, the classification's entry), plus 64 MB of
   histograms for `i8-sym-dim`; a format-3 release also sorts every key of the plan (and,
@@ -335,7 +345,7 @@ release that was already assembled.
 | Gate | Checks |
 |------|--------|
 | G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped, and for `rot192-i8i4` at most 1e-4 of the tail's |
-| G5 | Every slot holds its key's warehouse vector, encoded. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998 — for `rot192-i8i4`, which drops 64 components, ≥ 0.997 and ≥ 0.99 (measured on v31: 0.9975 and 0.9938). Not applicable to a delta with no slot; any other empty sample fails |
+| G5 | Every slot holds its key's warehouse vector, encoded; every alias's two vectors are in the warehouse and at least the release ledger's threshold apart in cosine, and the detail reports the count and the least cosine. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998 — for `rot192-i8i4`, which drops 64 components, ≥ 0.997 and ≥ 0.99 (measured on v31: 0.9975 and 0.9938). Not applicable to a delta with no slot; any other empty sample fails |
 | G7 | A base is ≤ 3.5 × 10⁹ bytes (room for a set with long-line windows, about 2.73 × 10⁹); a delta is ≤ 0.15 × its base, otherwise publish a base |
 | G8 | Assembling again into `<out>.g8` gives the same segment, package, release manifest and ledger, byte for byte |
 | G9 | `verify_for_install` passes, reading every payload byte, under the manifest's `packageDigest`; the segment is the manifest's |
@@ -353,6 +363,10 @@ gives it these pieces in `distribution::gates`:
   of the set's live keys. `recall(found, exact)` compares it with the set's own scan
   (G6). For `rot192-i8i4` the floors are `G6_ROT_MIN_RECALL_AT_10` and
   `G6_ROT_MIN_RECALL_AT_50`, both 0.98.
+
+`coverage` counts a short line that shares a neighbour's vector as reached by an alias
+record whose anchor is its key. For G4, an alias record resolves the line at its hint whose
+key is the anchor, and scores it as the hit, less `alias_penalty`.
 
 In a format-3 set every key a segment hands out — a hit's, a record's, the exact
 reference's — is eight bytes followed by eight zeros (`ChunkKey::narrowed`); `coverage`
