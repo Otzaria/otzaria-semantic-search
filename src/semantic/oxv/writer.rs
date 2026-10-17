@@ -4,7 +4,8 @@
 //! order, each with its primary records (which take the next slots), its extras and its
 //! foreign records, and the tombstones. That is everything but the vectors, and it is small
 //! next to them: 16 bytes of key and 4 of hint per slot, 8 per extra, 24 per foreign record —
-//! about 130 MB for a full library, against 1.6 GB of vectors.
+//! about 130 MB for a full library, against 1.6 GB of vectors. Keys are collected at 16 bytes
+//! and written at the segment format's width: format 3 keeps their first eight.
 //!
 //! [`SegmentBuilder::write`] lays the file out, writes those tables, and hands back a
 //! [`VectorSink`] that takes the vectors in slot order through a 4 MiB buffer. Nothing holds
@@ -20,9 +21,10 @@ use crate::distribution::package::{validate_release_tag, PackageCounts, PackageK
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::format::{
-    align_up, BookEntry, DirectoryEntry, Header, SectionKind, BLOCK_SIZE, EXTRA_LEN,
-    FLAG_HAS_FOREIGN, FLAG_HAS_TOMBSTONES, FOREIGN_LEN, HAS_EXTRAS, HEADER_CRC_OFFSET, HEADER_LEN,
-    HINT_MASK, SECTION_ALIGN, SECTION_BLOCKSUMMED, SECTION_CRITICAL, VECTORS_ALIGN,
+    align_up, default_format_version, foreign_len, key_len, occurrence_len, BookEntry,
+    DirectoryEntry, Header, SectionKind, BLOCK_SIZE, EXTRA_LEN, FLAG_HAS_FOREIGN,
+    FLAG_HAS_TOMBSTONES, HAS_EXTRAS, HEADER_CRC_OFFSET, HEADER_LEN, HINT_MASK, READABLE_FORMATS,
+    SECTION_ALIGN, SECTION_BLOCKSUMMED, SECTION_CRITICAL, VECTORS_ALIGN,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -47,6 +49,8 @@ pub struct SegmentSpec {
 pub struct SegmentBuilder {
     spec: SegmentSpec,
     codec: Codec,
+    /// The format written; the codec's default when not set.
+    format_version: Option<u32>,
     books: Vec<BookEntry>,
     book_hashes: Vec<u64>,
     has_book_hashes: bool,
@@ -83,6 +87,7 @@ impl SegmentBuilder {
         Self {
             spec,
             codec,
+            format_version: None,
             books: Vec::new(),
             book_hashes: Vec::new(),
             has_book_hashes: false,
@@ -293,6 +298,18 @@ impl SegmentBuilder {
         self.windows[slot as usize] = self.windows[slot as usize].min(window);
     }
 
+    /// Write segment format `version` — 2, or 3 for 8-byte keys — instead of the codec's
+    /// [default](default_format_version).
+    pub fn set_format_version(&mut self, version: u32) -> io::Result<()> {
+        if !READABLE_FORMATS.contains(&version) {
+            return Err(invalid(format!(
+                "segment format {version} is not one this build writes"
+            )));
+        }
+        self.format_version = Some(version);
+        Ok(())
+    }
+
     /// Slots assigned so far.
     pub fn slot_count(&self) -> u32 {
         self.keys.len() as u32
@@ -329,6 +346,10 @@ impl SegmentBuilder {
                 "an extra record names slot {slot}, and the segment has {slot_count}"
             )));
         }
+        let format_version = self
+            .format_version
+            .unwrap_or_else(|| default_format_version(&self.codec));
+        let key_len = key_len(format_version);
         let has_foreign = !self.foreign.is_empty();
         let has_tombstones = !self.tombstones.is_empty();
         if self.spec.kind != PackageKind::Delta && (has_foreign || has_tombstones) {
@@ -361,15 +382,24 @@ impl SegmentBuilder {
         for index in &by_slot {
             extras_by_slot.extend_from_slice(&index.to_le_bytes());
         }
-        let mut foreign = Vec::with_capacity(self.foreign.len() * FOREIGN_LEN);
+        let mut foreign = Vec::with_capacity(self.foreign.len() * foreign_len(format_version));
         for (key, book, hint) in &self.foreign {
-            foreign.extend_from_slice(key);
+            foreign.extend_from_slice(&key[..key_len]);
             foreign.extend_from_slice(&book.to_le_bytes());
             foreign.extend_from_slice(&hint.to_le_bytes());
         }
-        let tombstones: Vec<u8> = self.tombstones.concat();
+        // Sorted keys stay sorted cut to their prefix; two that share one become one.
+        let mut narrow: Vec<&[u8]> = self.tombstones.iter().map(|key| &key[..key_len]).collect();
+        narrow.dedup();
+        let tombstone_count = narrow.len();
+        let tombstones: Vec<u8> = narrow.concat();
         let hint_bytes: Vec<u8> = hints.iter().flat_map(|hint| hint.to_le_bytes()).collect();
-        let key_bytes: Vec<u8> = self.keys.concat();
+        let key_bytes: Vec<u8> = self
+            .keys
+            .iter()
+            .flat_map(|key| &key[..key_len])
+            .copied()
+            .collect();
 
         let vector_bytes = self.codec.bytes_per_vector() as u64;
         let vectors_len = u64::from(slot_count) * vector_bytes;
@@ -401,7 +431,13 @@ impl SegmentBuilder {
             }
             parents.insert((record.anchor, record.window))
         });
-        let occurrences_len = self.occurrences.len() as u64 * 44;
+        let mut occurrence_bytes =
+            Vec::with_capacity(self.occurrences.len() * occurrence_len(format_version));
+        for row in &self.occurrences {
+            super::occurrence::Occurrence::decode(row).encode_with(key_len, &mut occurrence_bytes);
+        }
+        let occurrence_count = self.occurrences.len() as u64;
+        let occurrences_len = occurrence_bytes.len() as u64;
         let book_hash_bytes: Vec<u8> = if self.has_book_hashes {
             self.book_hashes
                 .iter()
@@ -421,7 +457,10 @@ impl SegmentBuilder {
             + blocks(book_hashes_len);
 
         // The layout: small metadata first, vectors last.
-        let fixed = |kind: SectionKind| kind.fixed_elem_size().expect("a fixed-size section");
+        let fixed = |kind: SectionKind| {
+            kind.fixed_elem_size(format_version)
+                .expect("a fixed-size section")
+        };
         let mut plan: Vec<(SectionKind, u32, u64, u64, bool)> = vec![
             (
                 SectionKind::Books,
@@ -467,9 +506,9 @@ impl SegmentBuilder {
             ),
             (
                 SectionKind::Tombstones,
-                16,
+                key_len as u32,
                 tombstones.len() as u64,
-                self.tombstones.len() as u64,
+                tombstone_count as u64,
                 false,
             ),
             (SectionKind::BlockCrcs, 4, crc_count * 4, crc_count, false),
@@ -482,7 +521,7 @@ impl SegmentBuilder {
             ),
             (
                 SectionKind::SlotKeys,
-                16,
+                key_len as u32,
                 key_bytes.len() as u64,
                 u64::from(slot_count),
                 true,
@@ -515,12 +554,12 @@ impl SegmentBuilder {
                 true,
             ));
         }
-        if !self.occurrences.is_empty() {
+        if occurrence_count > 0 {
             plan.push((
                 SectionKind::Occurrences,
-                44,
+                fixed(SectionKind::Occurrences),
                 occurrences_len,
-                self.occurrences.len() as u64,
+                occurrence_count,
                 true,
             ));
         }
@@ -577,6 +616,7 @@ impl SegmentBuilder {
             flags |= FLAG_HAS_TOMBSTONES;
         }
         let header = Header {
+            format_version,
             flags,
             dim: self.codec.dim() as u16,
             codec_id: self.codec.id(),
@@ -587,7 +627,7 @@ impl SegmentBuilder {
             slot_count: u64::from(slot_count),
             extra_count: self.extras.len() as u64,
             foreign_count: self.foreign.len() as u64,
-            tombstone_count: self.tombstones.len() as u64,
+            tombstone_count: tombstone_count as u64,
             book_count: self.books.len() as u32,
             from_library_version: self.spec.from_library_version,
             to_library_version: self.spec.to_library_version,
@@ -670,7 +710,7 @@ impl SegmentBuilder {
             scratch: Vec::new(),
             scales: has_scales.then(|| Vec::with_capacity(scales_len as usize)),
             windows: window_bytes,
-            occurrences: self.occurrences,
+            occurrences: occurrence_bytes,
             book_hashes: book_hash_bytes,
             clipped: 0,
         })
@@ -700,7 +740,8 @@ pub struct VectorSink {
     scales: Option<Vec<u8>>,
     /// SLOT_WINDOWS, when the segment has it: written after the scales.
     windows: Option<Vec<u8>>,
-    occurrences: Vec<[u8; 44]>,
+    /// OCCURRENCES, at the format's key width.
+    occurrences: Vec<u8>,
     book_hashes: Vec<u8>,
     clipped: u64,
 }
@@ -843,15 +884,11 @@ impl VectorSink {
                 .position(|entry| entry.kind == SectionKind::Occurrences.code())
                 .expect("occurrences section");
             self.out.pad_to(self.header.sections[entry].offset)?;
-            self.out.write_all(self.occurrences.as_flattened())?;
-            self.block_crcs.extend(
-                self.occurrences
-                    .as_flattened()
-                    .chunks(BLOCK_SIZE)
-                    .map(crc32fast::hash),
-            );
+            self.out.write_all(&self.occurrences)?;
+            self.block_crcs
+                .extend(self.occurrences.chunks(BLOCK_SIZE).map(crc32fast::hash));
             if let Some(digests) = &mut self.section_sha256 {
-                digests[entry] = Sha256::digest(self.occurrences.as_flattened()).into();
+                digests[entry] = Sha256::digest(&self.occurrences).into();
             }
         }
         if let Some(entry) = self

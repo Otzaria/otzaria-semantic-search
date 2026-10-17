@@ -188,9 +188,9 @@ pub fn compact(
     let deleted = set.deleted();
     let mut live_slots: Vec<(ChunkKey, u16, u32)> = Vec::with_capacity(info.slots_live as usize);
     for (seg, segment) in segments.iter().enumerate() {
-        for (slot, key) in segment.key_bytes().as_chunks::<16>().0.iter().enumerate() {
+        for (slot, key) in segment.keys().enumerate() {
             if !deleted[seg].is_set(slot as u32) {
-                live_slots.push((ChunkKey(*key), seg as u16, slot as u32));
+                live_slots.push((key, seg as u16, slot as u32));
             }
         }
     }
@@ -226,6 +226,10 @@ pub fn compact(
         },
         codec.clone(),
     );
+    // The set's own key width: a compaction never changes what its keys are.
+    builder
+        .set_format_version(segments[0].format_version())
+        .map_err(io_error("the segment format".to_string()))?;
     let mut order: Vec<(u16, u32)> = Vec::with_capacity(live_slots.len());
     let (mut pruned, mut refreshed) = (0u64, 0u64);
     let mut live_lines: Vec<(u32, u64)> = Vec::new();

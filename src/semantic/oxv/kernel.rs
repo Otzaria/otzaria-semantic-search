@@ -18,6 +18,20 @@
 //! The scale is applied in `f32` after the integer sum, in that order on every CPU, so the
 //! score is the same number everywhere.
 //!
+//! A `rot192-i8i4` vector is `ŷ = (s · σ_h · c_h, lo_t + q_t · step_t)` in the rotated space,
+//! so a query `q` is rotated once, `r = R · q`, and scores it as
+//!
+//! ```text
+//! score = s · Σ_h (r_h · σ_h) · c_h  +  Σ_t r_t · lo_t  +  Σ_t (r_t · step_t) · q_t
+//!       = (acc8 · s) · (1 / t8)  +  (C + acc4 · (1 / t4))
+//! ```
+//!
+//! — two exact integer sums, `acc8` of 16-bit head weights against the int8 codes and `acc4`
+//! of 16-bit tail weights against the 4-bit codes, each quantized under its own bound with
+//! the codes' largest magnitude (127 and 15), and a constant `C` of the query alone. The
+//! floats are combined in that order, so the score is again the same number on every CPU,
+//! and it is the cosine of the query with `Rᵀ · ŷ`, the vector decoded.
+//!
 //! **Every kernel computes the same integer.** Integer addition is associative, so the
 //! scalar loop, AVX2's `madd` and NEON's `mlal` reach the same `acc` whatever order they add
 //! in, on every CPU — and wrapping, should the bound ever be wrong, wraps them all alike.
@@ -34,6 +48,9 @@ use crate::semantic::oxv::codec::Codec;
 /// A kernel: the int8 components as the segment stores them, against a prepared query.
 pub(crate) type DotKernel = fn(&[i16], &[u8]) -> i32;
 
+/// A 4-bit kernel: the low nibble of byte `j` against `lo[j]`, the high one against `hi[j]`.
+pub(crate) type NibbleKernel = fn(&[i16], &[i16], &[u8]) -> i32;
+
 /// A query, prepared once for the codec epoch of the set it scans.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PreparedQuery {
@@ -46,6 +63,19 @@ pub(crate) enum PreparedQuery {
     Int8PerVector {
         q16: Box<[i16]>,
         inv_scale: f32,
+    },
+    /// For `rot192-i8i4`: the query rotated, its head and tail quantized apart.
+    Rotated {
+        /// The query's width, before the rotation.
+        dim: usize,
+        head: Box<[i16]>,
+        inv_head: f32,
+        /// The tail's weights for the even components — the low nibbles — and the odd ones.
+        tail_lo: Box<[i16]>,
+        tail_hi: Box<[i16]>,
+        inv_tail: f32,
+        /// `Σ r_t · lo_t`: what every vector's tail is worth before its codes.
+        constant: f32,
     },
     Float {
         q: Box<[f32]>,
@@ -61,6 +91,36 @@ impl PreparedQuery {
                 vector_dim: query.len() as u32,
             });
         }
+        if let Some(rotated) = codec.rotated() {
+            let mut r = vec![0f64; rotated.out_dim()];
+            crate::semantic::oxv::rotation::rotate(&rotated.rotation, query, &mut r);
+            let head = r[..rotated.head]
+                .iter()
+                .zip(rotated.scale.iter())
+                .map(|(r, spread)| r * f64::from(*spread))
+                .collect();
+            let (head, inv_head) = quantize_query(head, 127);
+            let tail = &r[rotated.head..];
+            let weights = tail
+                .iter()
+                .enumerate()
+                .map(|(d, r)| r * f64::from(rotated.step(d)))
+                .collect();
+            let mut constant = 0f64;
+            for (r, lo) in tail.iter().zip(rotated.lo.iter()) {
+                constant += r * f64::from(*lo);
+            }
+            let (tail, inv_tail) = quantize_query(weights, 15);
+            return Ok(Self::Rotated {
+                dim: query.len(),
+                head,
+                inv_head,
+                tail_lo: tail.iter().step_by(2).copied().collect(),
+                tail_hi: tail.iter().skip(1).step_by(2).copied().collect(),
+                inv_tail,
+                constant: constant as f32,
+            });
+        }
         Ok(match codec.scales() {
             Some(scales) => {
                 let weights = query
@@ -68,12 +128,12 @@ impl PreparedQuery {
                     .zip(scales)
                     .map(|(q, s)| f64::from(*q) * f64::from(*s) / 127.0)
                     .collect();
-                let (q16, inv_scale) = quantize_query(weights);
+                let (q16, inv_scale) = quantize_query(weights, 127);
                 Self::Int8 { q16, inv_scale }
             }
             None if codec.has_vector_scales() => {
                 let (q16, inv_scale) =
-                    quantize_query(query.iter().map(|q| f64::from(*q)).collect());
+                    quantize_query(query.iter().map(|q| f64::from(*q)).collect(), 127);
                 Self::Int8PerVector { q16, inv_scale }
             }
             None => Self::Float { q: query.into() },
@@ -84,29 +144,34 @@ impl PreparedQuery {
     pub(crate) fn dim(&self) -> usize {
         match self {
             Self::Int8 { q16, .. } | Self::Int8PerVector { q16, .. } => q16.len(),
+            Self::Rotated { dim, .. } => *dim,
             Self::Float { q } => q.len(),
         }
     }
 }
 
-/// `q16` and `1 / t` for the weights `w`, per the module documentation. In `f64`, then
-/// checked in integers: the bound is the guarantee, so it is verified rather than trusted
-/// to the rounding of `t`.
-fn quantize_query(w: Vec<f64>) -> (Box<[i16]>, f32) {
+/// `q16` and `1 / t` for the weights `w` against codes of magnitude at most `code_max`, per
+/// the module documentation. In `f64`, then checked in integers: the bound is the guarantee,
+/// so it is verified rather than trusted to the rounding of `t`.
+fn quantize_query(w: Vec<f64>, code_max: u32) -> (Box<[i16]>, f32) {
+    let code = f64::from(code_max);
     let max = w.iter().fold(0.0f64, |max, x| max.max(x.abs()));
     let sum: f64 = w.iter().map(|x| x.abs()).sum();
     if !(max > 0.0 && max.is_finite() && sum.is_finite()) {
         // A zero query scores everything zero; the runtime never hands one over.
         return (vec![0; w.len()].into_boxed_slice(), 0.0);
     }
-    let headroom = f64::from(i32::MAX) - 127.0 * w.len() as f64 / 2.0;
-    let mut t = (32767.0 / max).min(headroom / (127.0 * sum));
+    let headroom = f64::from(i32::MAX) - code * w.len() as f64 / 2.0;
+    let mut t = (32767.0 / max).min(headroom / (code * sum));
     loop {
         let q16: Vec<i16> = w
             .iter()
             .map(|x| (x * t).round().clamp(-32767.0, 32767.0) as i16)
             .collect();
-        let bound: i64 = q16.iter().map(|q| i64::from(q.unsigned_abs()) * 127).sum();
+        let bound: i64 = q16
+            .iter()
+            .map(|q| i64::from(q.unsigned_abs()) * i64::from(code_max))
+            .sum();
         if bound <= i64::from(i32::MAX) {
             return (q16.into_boxed_slice(), (1.0 / t) as f32);
         }
@@ -251,6 +316,153 @@ pub(crate) fn available() -> Vec<(DotKernel, &'static str)> {
     }
     #[cfg(target_arch = "aarch64")]
     kernels.push((dot_neon_baseline, "neon"));
+    kernels
+}
+
+/// The reference 4-bit kernel.
+pub(crate) fn nibbles_scalar(lo: &[i16], hi: &[i16], packed: &[u8]) -> i32 {
+    let mut total = 0i32;
+    for ((lo, hi), byte) in lo.iter().zip(hi).zip(packed) {
+        total = total
+            .wrapping_add(i32::from(*lo) * i32::from(byte & 0x0F))
+            .wrapping_add(i32::from(*hi) * i32::from(byte >> 4));
+    }
+    total
+}
+
+/// AVX2: sixteen bytes a step, widened to 16 bits, split into their nibbles and multiplied
+/// pairwise against the even and the odd weights by `vpmaddwd`.
+///
+/// # Safety
+///
+/// The CPU must support AVX2. [`select_nibbles`] only hands this out after detecting it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nibbles_avx2(lo: &[i16], hi: &[i16], packed: &[u8]) -> i32 {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_si128,
+        _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_srli_epi16, _mm_add_epi32,
+        _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
+    };
+    let n = lo.len().min(hi.len()).min(packed.len());
+    let steps = n / 16;
+    let mask = _mm256_set1_epi16(0x0F);
+    let mut acc = _mm256_setzero_si256();
+    for step in 0..steps {
+        let at = step * 16;
+        // SAFETY: `at + 16 <= n`, which all three slices are at least as long as, and every
+        // load is an unaligned one.
+        let (bytes, low_q, high_q) = unsafe {
+            (
+                _mm_loadu_si128(packed.as_ptr().add(at).cast::<__m128i>()),
+                _mm256_loadu_si256(lo.as_ptr().add(at).cast::<__m256i>()),
+                _mm256_loadu_si256(hi.as_ptr().add(at).cast::<__m256i>()),
+            )
+        };
+        let wide = _mm256_cvtepu8_epi16(bytes);
+        let low = _mm256_and_si256(wide, mask);
+        let high = _mm256_srli_epi16::<4>(wide);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(low_q, low));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(high_q, high));
+    }
+    let halves = _mm_add_epi32(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256::<1>(acc),
+    );
+    let pairs = _mm_add_epi32(halves, _mm_shuffle_epi32::<0b01_00_11_10>(halves));
+    let all = _mm_add_epi32(pairs, _mm_shuffle_epi32::<0b10_11_00_01>(pairs));
+    let total = _mm_cvtsi128_si32(all);
+    let rest = steps * 16;
+    total.wrapping_add(nibbles_scalar(&lo[rest..n], &hi[rest..n], &packed[rest..n]))
+}
+
+/// The safe entry [`select_nibbles`] returns once AVX2 is known to be there.
+#[cfg(target_arch = "x86_64")]
+fn nibbles_avx2_detected(lo: &[i16], hi: &[i16], packed: &[u8]) -> i32 {
+    // SAFETY: only reachable through `select_nibbles`, which returns it after
+    // `is_x86_feature_detected!("avx2")` — and through the tests, which check the same.
+    unsafe { nibbles_avx2(lo, hi, packed) }
+}
+
+/// NEON: sixteen bytes a step, widened to 16 bits, split into their nibbles and
+/// multiply-accumulated into four 32-bit lanes by `smlal`/`smlal2`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+fn nibbles_neon(lo: &[i16], hi: &[i16], packed: &[u8]) -> i32 {
+    use std::arch::aarch64::{
+        vaddq_s32, vaddvq_s32, vandq_u16, vdupq_n_s32, vdupq_n_u16, vget_low_s16, vget_low_u8,
+        vld1q_s16, vld1q_u8, vmlal_high_s16, vmlal_s16, vmovl_high_u8, vmovl_u8,
+        vreinterpretq_s16_u16, vshrq_n_u16,
+    };
+    let n = lo.len().min(hi.len()).min(packed.len());
+    let steps = n / 16;
+    let mask = vdupq_n_u16(0x0F);
+    let (mut low_acc, mut high_acc) = (vdupq_n_s32(0), vdupq_n_s32(0));
+    for step in 0..steps {
+        let at = step * 16;
+        // SAFETY: `at + 16 <= n`, which all three slices are at least as long as.
+        let (bytes, lo0, lo1, hi0, hi1) = unsafe {
+            (
+                vld1q_u8(packed.as_ptr().add(at)),
+                vld1q_s16(lo.as_ptr().add(at)),
+                vld1q_s16(lo.as_ptr().add(at + 8)),
+                vld1q_s16(hi.as_ptr().add(at)),
+                vld1q_s16(hi.as_ptr().add(at + 8)),
+            )
+        };
+        let (w0, w1) = (vmovl_u8(vget_low_u8(bytes)), vmovl_high_u8(bytes));
+        let (l0, l1) = (
+            vreinterpretq_s16_u16(vandq_u16(w0, mask)),
+            vreinterpretq_s16_u16(vandq_u16(w1, mask)),
+        );
+        let (h0, h1) = (
+            vreinterpretq_s16_u16(vshrq_n_u16::<4>(w0)),
+            vreinterpretq_s16_u16(vshrq_n_u16::<4>(w1)),
+        );
+        low_acc = vmlal_s16(low_acc, vget_low_s16(lo0), vget_low_s16(l0));
+        high_acc = vmlal_high_s16(high_acc, lo0, l0);
+        low_acc = vmlal_s16(low_acc, vget_low_s16(lo1), vget_low_s16(l1));
+        high_acc = vmlal_high_s16(high_acc, lo1, l1);
+        low_acc = vmlal_s16(low_acc, vget_low_s16(hi0), vget_low_s16(h0));
+        high_acc = vmlal_high_s16(high_acc, hi0, h0);
+        low_acc = vmlal_s16(low_acc, vget_low_s16(hi1), vget_low_s16(h1));
+        high_acc = vmlal_high_s16(high_acc, hi1, h1);
+    }
+    let total = vaddvq_s32(vaddq_s32(low_acc, high_acc));
+    let rest = steps * 16;
+    total.wrapping_add(nibbles_scalar(&lo[rest..n], &hi[rest..n], &packed[rest..n]))
+}
+
+/// The entry [`select_nibbles`] returns on aarch64.
+#[cfg(target_arch = "aarch64")]
+fn nibbles_neon_baseline(lo: &[i16], hi: &[i16], packed: &[u8]) -> i32 {
+    // SAFETY: NEON is part of the aarch64 baseline, as for `dot_neon_baseline`.
+    unsafe { nibbles_neon(lo, hi, packed) }
+}
+
+/// The fastest 4-bit kernel this CPU has, chosen as [`select`] chooses.
+pub(crate) fn select_nibbles() -> (NibbleKernel, &'static str) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return (nibbles_avx2_detected, "avx2");
+    }
+    #[cfg(target_arch = "aarch64")]
+    return (nibbles_neon_baseline, "neon");
+    #[allow(unreachable_code)]
+    (nibbles_scalar, "scalar")
+}
+
+/// Every 4-bit kernel this CPU can run.
+#[cfg(test)]
+pub(crate) fn available_nibbles() -> Vec<(NibbleKernel, &'static str)> {
+    let mut kernels: Vec<(NibbleKernel, &'static str)> = vec![(nibbles_scalar, "scalar")];
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        kernels.push((nibbles_avx2_detected, "avx2"));
+    }
+    #[cfg(target_arch = "aarch64")]
+    kernels.push((nibbles_neon_baseline, "neon"));
     kernels
 }
 
@@ -509,6 +721,136 @@ mod tests {
         let raw: Vec<f32> = codes.iter().map(|byte| f32::from(*byte as i8)).collect();
         let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
         raw.iter().map(|x| x / norm).collect()
+    }
+
+    /// Every 4-bit kernel gives the scalar one's integer at every width from 1 to 80 bytes,
+    /// on random weights and codes and on the extremes: ±32767 against 15.
+    #[test]
+    fn every_nibble_kernel_computes_the_scalar_kernels_integer() {
+        let kernels = available_nibbles();
+        assert!(kernels.iter().any(|(_, name)| *name == select_nibbles().1));
+        let mut random = Random(25);
+        for bytes in 1..=80 {
+            for extreme in [false, true] {
+                let mut weight = || -> i16 {
+                    if extreme {
+                        if random.next().is_multiple_of(2) {
+                            32767
+                        } else {
+                            -32767
+                        }
+                    } else {
+                        (random.next() % 65535) as i32 as i16
+                    }
+                };
+                let lo: Vec<i16> = (0..bytes).map(|_| weight()).collect();
+                let hi: Vec<i16> = (0..bytes).map(|_| weight()).collect();
+                let packed: Vec<u8> = (0..bytes)
+                    .map(|_| {
+                        if extreme {
+                            0xFF
+                        } else {
+                            (random.next() % 256) as u8
+                        }
+                    })
+                    .collect();
+                let reference = nibbles_scalar(&lo, &hi, &packed);
+                let exact: i64 = lo
+                    .iter()
+                    .zip(&hi)
+                    .zip(&packed)
+                    .map(|((lo, hi), byte)| {
+                        i64::from(*lo) * i64::from(byte & 15)
+                            + i64::from(*hi) * i64::from(byte >> 4)
+                    })
+                    .sum();
+                assert_eq!(i64::from(reference), exact, "{bytes} bytes");
+                for (kernel, name) in &kernels {
+                    assert_eq!(kernel(&lo, &hi, &packed), reference, "{name} at {bytes}");
+                }
+            }
+        }
+    }
+
+    /// A rotated query: its head and tail each fit their bound, the worst vectors sum
+    /// exactly on every kernel, and its score is the cosine of the query with the decoded
+    /// vector, the same `f32` from every kernel.
+    #[test]
+    fn a_rotated_score_is_the_same_on_every_kernel_and_is_the_decoded_cosine() {
+        let dim = 64;
+        let mut random = Random(26);
+        let corpus: Vec<Vec<f32>> = (0..400).map(|_| random.unit(dim)).collect();
+        let refs: Vec<&[f32]> = corpus.iter().map(Vec::as_slice).collect();
+        let codec = Codec::fit_rot_i8i4(&refs, 32, 16).unwrap();
+        let mut queries: Vec<Vec<f32>> = (0..8).map(|_| random.unit(dim)).collect();
+        queries.push({
+            let mut q = vec![1e-4f32; dim];
+            q[5] = 1.0;
+            q
+        });
+        let mut codes = vec![0u8; codec.bytes_per_vector()];
+        let mut decoded = vec![0f32; dim];
+        for query in &queries {
+            let PreparedQuery::Rotated {
+                dim: width,
+                head,
+                inv_head,
+                tail_lo,
+                tail_hi,
+                inv_tail,
+                constant,
+            } = PreparedQuery::new(query, &codec).unwrap()
+            else {
+                panic!("a rotated codec prepares a rotated query");
+            };
+            assert_eq!(width, dim);
+            let bound8: i64 = head.iter().map(|q| i64::from(q.unsigned_abs()) * 127).sum();
+            let bound4: i64 = tail_lo
+                .iter()
+                .chain(tail_hi.iter())
+                .map(|q| i64::from(q.unsigned_abs()) * 15)
+                .sum();
+            assert!(bound8 <= i64::from(i32::MAX) && bound4 <= i64::from(i32::MAX));
+            let worst_head: Vec<u8> = head
+                .iter()
+                .map(|q| (if *q < 0 { -127i8 } else { 127 }) as u8)
+                .collect();
+            for (kernel, name) in available() {
+                let exact: i64 = head
+                    .iter()
+                    .zip(&worst_head)
+                    .map(|(q, v)| i64::from(*q) * i64::from(*v as i8))
+                    .sum();
+                assert_eq!(i64::from(kernel(&head, &worst_head)), exact, "{name}");
+            }
+            for vector in &corpus[..50] {
+                let scale = codec.encode(vector, &mut codes).scale.unwrap();
+                let (head_codes, packed) = codes.split_at(head.len());
+                let scores: Vec<u32> = available()
+                    .into_iter()
+                    .zip(available_nibbles())
+                    .map(|((dot, _), (nibbles, _))| {
+                        let acc8 = dot(&head, head_codes);
+                        let acc4 = nibbles(&tail_lo, &tail_hi, packed);
+                        let score =
+                            acc8 as f32 * scale * inv_head + (constant + acc4 as f32 * inv_tail);
+                        score.to_bits()
+                    })
+                    .collect();
+                assert!(
+                    scores.windows(2).all(|pair| pair[0] == pair[1]),
+                    "{scores:?}"
+                );
+                let score = f64::from(f32::from_bits(scores[0]));
+                codec.decode(&codes, Some(scale), &mut decoded);
+                let of_decoded: f64 = query
+                    .iter()
+                    .zip(&decoded)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum();
+                assert!((score - of_decoded).abs() < 2e-3, "{score} vs {of_decoded}");
+            }
+        }
     }
 
     #[test]

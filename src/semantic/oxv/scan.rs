@@ -24,7 +24,9 @@
 use crate::cancellation::{CancellationToken, SCAN_CHECK_INTERVAL};
 use crate::errors::VectorStoreError;
 use crate::semantic::chunk_key::ChunkKey;
-use crate::semantic::oxv::kernel::{dot_f32, ordered, select, unordered, DotKernel, PreparedQuery};
+use crate::semantic::oxv::kernel::{
+    dot_f32, ordered, select, select_nibbles, unordered, DotKernel, NibbleKernel, PreparedQuery,
+};
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::resolve::{BookSet, RecordRef, SlotRef, VectorHit, MAX_RECORDS_PER_HIT};
 use std::cmp::Ordering;
@@ -247,6 +249,29 @@ fn scan_all(
             let found = merge_also(set, &scorer, request, found, also, cancel)?;
             Ok(hits(set, found, request, &scorer))
         }
+        PreparedQuery::Rotated {
+            head,
+            inv_head,
+            tail_lo,
+            tail_hi,
+            inv_tail,
+            constant,
+            ..
+        } => {
+            let scorer = Rotated {
+                head,
+                inv_head: *inv_head,
+                tail_lo,
+                tail_hi,
+                inv_tail: *inv_tail,
+                constant: *constant,
+                dot: select().0,
+                nibbles: select_nibbles().0,
+            };
+            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, found, also, cancel)?;
+            Ok(hits(set, found, request, &scorer))
+        }
         PreparedQuery::Float { q } => {
             let scorer = Float { q };
             let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
@@ -306,6 +331,37 @@ impl Scorer for Int8PerVector<'_> {
 
     fn penalize(&self, rank: i32, penalty: f32) -> i32 {
         ordered(unordered(rank) - penalty / self.inv_scale)
+    }
+}
+
+/// `rot192-i8i4`: two exact integer sums, combined in `f32` in one fixed order (see the
+/// `kernel` module), and the rank is that float's order.
+struct Rotated<'a> {
+    head: &'a [i16],
+    inv_head: f32,
+    tail_lo: &'a [i16],
+    tail_hi: &'a [i16],
+    inv_tail: f32,
+    constant: f32,
+    dot: DotKernel,
+    nibbles: NibbleKernel,
+}
+
+impl Scorer for Rotated<'_> {
+    #[inline]
+    fn rank(&self, vector: &[u8], scale: f32) -> i32 {
+        let (codes, packed) = vector.split_at(self.head.len());
+        let acc8 = (self.dot)(self.head, codes);
+        let acc4 = (self.nibbles)(self.tail_lo, self.tail_hi, packed);
+        ordered(acc8 as f32 * scale * self.inv_head + (self.constant + acc4 as f32 * self.inv_tail))
+    }
+
+    fn score(&self, rank: i32) -> f32 {
+        unordered(rank)
+    }
+
+    fn penalize(&self, rank: i32, penalty: f32) -> i32 {
+        ordered(unordered(rank) - penalty)
     }
 }
 
@@ -525,11 +581,12 @@ fn merge_also(
         let Some(segment) = set.segments.get(wanted.seg as usize) else {
             continue;
         };
-        if wanted.slot >= segment.segment.slot_count()
-            || segment.is_deleted(wanted.slot)
-            || returned.contains(&wanted.key)
-            || segment.segment.key(wanted.slot) != wanted.key
-        {
+        if wanted.slot >= segment.segment.slot_count() || segment.is_deleted(wanted.slot) {
+            continue;
+        }
+        // The key as the segment holds it, at its width: what the scan's hits carry.
+        let key = segment.segment.key(wanted.slot);
+        if !key.same_text(wanted.key) || returned.contains(&key) {
             continue;
         }
         let scale = segment.segment.vector_scale(wanted.slot).unwrap_or(1.0);
@@ -544,7 +601,7 @@ fn merge_also(
         }
         weighed.push(Candidate {
             rank,
-            key: wanted.key,
+            key,
             seg: wanted.seg,
             slot: wanted.slot,
         });

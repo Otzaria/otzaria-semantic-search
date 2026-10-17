@@ -19,6 +19,33 @@ impl Occurrence {
         bytes[40] = self.window;
         bytes
     }
+    /// The row a segment of key width `key_len` stores — [`Self::to_bytes`] at 16, the keys'
+    /// first eight bytes at 8.
+    pub fn encode_with(&self, key_len: usize, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.key.0[..key_len]);
+        out.extend_from_slice(&self.book.to_le_bytes());
+        out.extend_from_slice(&self.hint.to_le_bytes());
+        out.extend_from_slice(&self.anchor.0[..key_len]);
+        out.extend_from_slice(&[self.window, 0, 0, 0]);
+    }
+
+    /// A row of key width `key_len`; an 8-byte key reads as [`ChunkKey::narrowed`].
+    pub fn decode_with(bytes: &[u8], key_len: usize) -> Self {
+        let key = |at: usize| {
+            let mut key = [0u8; 16];
+            key[..key_len].copy_from_slice(&bytes[at..at + key_len]);
+            ChunkKey(key)
+        };
+        let at = key_len;
+        Self {
+            key: key(0),
+            book: u32::from_le_bytes(bytes[at..at + 4].try_into().expect("book")),
+            hint: u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("hint")),
+            anchor: key(at + 8),
+            window: bytes[2 * key_len + 8],
+        }
+    }
+
     pub fn decode(bytes: &[u8]) -> Self {
         Self {
             key: ChunkKey(bytes[..16].try_into().expect("key")),

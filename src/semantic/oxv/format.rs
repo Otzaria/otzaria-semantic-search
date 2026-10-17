@@ -10,8 +10,31 @@ use crate::distribution::package::PackageKind;
 /// `OXVSEG\r\n`: the CR-LF catches a file that went through a text-mode transfer.
 pub(crate) const MAGIC: [u8; 8] = *b"OXVSEG\r\n";
 
-/// The segment format this build reads and writes — `store.store_format_version`.
+/// The segment format of every codec but `rot192-i8i4` — `store.store_format_version`.
 pub const SEGMENT_FORMAT_VERSION: u32 = 2;
+/// Format 3: format 2 with 8-byte keys, for `rot192-i8i4` sets.
+pub const SEGMENT_FORMAT_V3: u32 = 3;
+/// The formats this build reads; it writes either.
+pub const READABLE_FORMATS: [u32; 2] = [SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_V3];
+
+/// The bytes of a key in SLOT_KEYS, TOMBSTONES, FOREIGN and OCCURRENCES: 16 in format 2,
+/// the first 8 in format 3.
+pub fn key_len(format_version: u32) -> usize {
+    if format_version >= SEGMENT_FORMAT_V3 {
+        8
+    } else {
+        16
+    }
+}
+
+/// The format a segment in `codec` is written in unless told otherwise.
+pub fn default_format_version(codec: &crate::semantic::oxv::codec::Codec) -> u32 {
+    if codec.id() == crate::semantic::oxv::codec::CODEC_ROT_I8I4 {
+        SEGMENT_FORMAT_V3
+    } else {
+        SEGMENT_FORMAT_VERSION
+    }
+}
 
 pub(crate) const HEADER_LEN: usize = 4096;
 
@@ -141,17 +164,19 @@ impl SectionKind {
         })
     }
 
-    /// The bytes one element takes, for the sections made of fixed-size elements.
-    pub(crate) fn fixed_elem_size(self) -> Option<u32> {
+    /// The bytes one element takes in format `version`, for the sections made of fixed-size
+    /// elements.
+    pub(crate) fn fixed_elem_size(self, version: u32) -> Option<u32> {
+        let key = key_len(version) as u32;
         match self {
             Self::Books => Some(BOOK_ENTRY_LEN as u32),
-            Self::SlotKeys | Self::Tombstones => Some(16),
+            Self::SlotKeys | Self::Tombstones => Some(key),
             Self::SlotHints | Self::ExtrasBySlot | Self::BlockCrcs | Self::VectorScales => Some(4),
             Self::SlotWindows => Some(1),
             Self::BookHashes => Some(8),
-            Self::Occurrences => Some(44),
+            Self::Occurrences => Some(occurrence_len(version) as u32),
             Self::Extras => Some(EXTRA_LEN as u32),
-            Self::Foreign => Some(FOREIGN_LEN as u32),
+            Self::Foreign => Some(foreign_len(version) as u32),
             Self::BookNames
             | Self::CodecParams
             | Self::Vectors
@@ -247,6 +272,8 @@ impl DirectoryEntry {
 /// The first 4,096 bytes of a segment, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Header {
+    /// One of [`READABLE_FORMATS`].
+    pub format_version: u32,
     pub flags: u32,
     pub dim: u16,
     pub codec_id: u16,
@@ -291,7 +318,11 @@ impl Header {
         );
         let mut out = vec![0u8; HEADER_LEN];
         out[0..8].copy_from_slice(&MAGIC);
-        out[8..12].copy_from_slice(&SEGMENT_FORMAT_VERSION.to_le_bytes());
+        assert!(
+            READABLE_FORMATS.contains(&self.format_version),
+            "a format this build writes"
+        );
+        out[8..12].copy_from_slice(&self.format_version.to_le_bytes());
         out[12..16].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
         out[16..20].copy_from_slice(&self.flags.to_le_bytes());
         out[20..22].copy_from_slice(&self.dim.to_le_bytes());
@@ -335,9 +366,9 @@ impl Header {
             return Err("it does not start with the segment magic".to_string());
         }
         let version = le_u32(bytes, 8);
-        if version != SEGMENT_FORMAT_VERSION {
+        if !READABLE_FORMATS.contains(&version) {
             return Err(format!(
-                "it is segment format {version}, and this build reads {SEGMENT_FORMAT_VERSION}"
+                "it is segment format {version}, and this build reads {READABLE_FORMATS:?}"
             ));
         }
         let header_len = le_u32(bytes, 12);
@@ -378,6 +409,7 @@ impl Header {
             })
             .collect();
         let header = Self {
+            format_version: version,
             flags,
             dim: le_u16(bytes, 20),
             codec_id: le_u16(bytes, 22),
@@ -420,7 +452,16 @@ pub(crate) struct BookEntry {
 
 pub(crate) const BOOK_ENTRY_LEN: usize = 40;
 pub(crate) const EXTRA_LEN: usize = 8;
-pub(crate) const FOREIGN_LEN: usize = 24;
+
+/// A foreign record: `{key, book u32, hint u32}`.
+pub(crate) fn foreign_len(version: u32) -> usize {
+    key_len(version) + 8
+}
+
+/// An occurrence: `{key, book u32, hint u32, anchor, window u8, 3 reserved}`.
+pub(crate) fn occurrence_len(version: u32) -> usize {
+    2 * key_len(version) + 12
+}
 
 impl BookEntry {
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
@@ -473,6 +514,7 @@ mod tests {
 
     fn sample() -> Header {
         Header {
+            format_version: SEGMENT_FORMAT_VERSION,
             flags: FLAG_DELTA | FLAG_HAS_TOMBSTONES,
             dim: 256,
             codec_id: 0x0101,
@@ -531,8 +573,23 @@ mod tests {
         assert!(reason(&future.encode()).contains("no single kind"));
 
         let mut version = bytes.clone();
-        version[8] = 3;
-        assert!(reason(&version).contains("segment format 3"));
+        version[8] = 4;
+        assert!(reason(&version).contains("segment format 4"));
+
+        let mut v3 = sample();
+        v3.format_version = SEGMENT_FORMAT_V3;
+        assert_eq!(Header::decode(&v3.encode()).unwrap(), v3);
+    }
+
+    #[test]
+    fn format_3_halves_every_key() {
+        assert_eq!(
+            (key_len(2), foreign_len(2), occurrence_len(2)),
+            (16, 24, 44)
+        );
+        assert_eq!((key_len(3), foreign_len(3), occurrence_len(3)), (8, 16, 28));
+        assert_eq!(SectionKind::SlotKeys.fixed_elem_size(3), Some(8));
+        assert_eq!(SectionKind::Tombstones.fixed_elem_size(2), Some(16));
     }
 
     #[test]

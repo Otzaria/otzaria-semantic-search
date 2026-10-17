@@ -2,7 +2,7 @@
 //! under any filter, with deleted slots and every kind of record.
 
 use super::codec::Codec;
-use super::kernel::{dot_f32, select, PreparedQuery};
+use super::kernel::{dot_f32, nibbles_scalar, select, PreparedQuery};
 use super::reader::Segment;
 use super::scan::{
     scan, scan_reporting, scan_with, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet,
@@ -157,6 +157,11 @@ impl Fixture {
                     PreparedQuery::Int8PerVector { q16, .. } => super::kernel::ordered(
                         kernel(q16, vector) as f32 * segment.vector_scale(slot).unwrap(),
                     ),
+                    PreparedQuery::Rotated { .. } => super::kernel::ordered(rotated_score(
+                        query,
+                        vector,
+                        segment.vector_scale(slot).unwrap(),
+                    )),
                     PreparedQuery::Float { q } => super::kernel::ordered(dot_f32(q, vector)),
                 };
                 all.push((rank, segment.key(slot), seg as u16, slot));
@@ -175,6 +180,31 @@ impl Fixture {
 
 fn int8(vectors: &[&[f32]]) -> Codec {
     Codec::calibrate_i8_sym_dim(vectors, 1.0).unwrap()
+}
+
+/// `rot192-i8i4` at this width: 32 int8 and 16 4-bit components, in format 3.
+fn rotated(vectors: &[&[f32]]) -> Codec {
+    Codec::fit_rot_i8i4(vectors, 32, 16).unwrap()
+}
+
+/// A rotated score the slow way: the scalar kernels, combined as the scan combines them.
+fn rotated_score(query: &PreparedQuery, vector: &[u8], scale: f32) -> f32 {
+    let PreparedQuery::Rotated {
+        head,
+        inv_head,
+        tail_lo,
+        tail_hi,
+        inv_tail,
+        constant,
+        ..
+    } = query
+    else {
+        panic!("a rotated query");
+    };
+    let (codes, packed) = vector.split_at(head.len());
+    let acc8 = super::kernel::dot_scalar(head, codes);
+    let acc4 = nibbles_scalar(tail_lo, tail_hi, packed);
+    acc8 as f32 * scale * inv_head + (constant + acc4 as f32 * inv_tail)
 }
 
 fn per_vector(vectors: &[&[f32]]) -> Codec {
@@ -228,6 +258,13 @@ fn ranked(
                     assert_eq!(hit.score, product * inv_scale);
                     super::kernel::ordered(product)
                 }
+                PreparedQuery::Rotated { .. } => {
+                    let scale = fixture.segments[hit.seg as usize]
+                        .vector_scale(hit.slot)
+                        .unwrap();
+                    assert_eq!(hit.score, rotated_score(query, vector, scale));
+                    super::kernel::ordered(hit.score)
+                }
                 PreparedQuery::Float { q } => {
                     assert_eq!(hit.score, dot_f32(q, vector));
                     super::kernel::ordered(hit.score)
@@ -247,6 +284,7 @@ fn the_top_k_is_the_head_of_a_full_sort() {
         (31u64, int8 as fn(&[&[f32]]) -> Codec),
         (32, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
         (37, per_vector),
+        (38, rotated),
     ] {
         let fixture = Fixture::new(40, 50, seed, codec);
         let mut random = Random(seed + 100);
@@ -317,7 +355,7 @@ fn equal_scores_are_ordered_by_key() {
 /// in the same order, with the same records.
 #[test]
 fn one_thread_and_eight_return_the_same_hits() {
-    for codec in [int8 as fn(&[&[f32]]) -> Codec, per_vector] {
+    for codec in [int8 as fn(&[&[f32]]) -> Codec, per_vector, rotated] {
         threads_agree(Fixture::new(200, 300, 33, codec));
     }
 }
@@ -729,7 +767,11 @@ fn a_scan_with_nothing_besides_is_the_scan_bit_for_bit() {
 /// filtered scan's hits and the best `k` of the others, merged in the scan's order.
 #[test]
 fn a_slot_the_filter_does_not_reach_is_weighed_beside_the_filtered_hits() {
-    for (seed, codec) in [(54u64, int8 as fn(&[&[f32]]) -> Codec), (55, per_vector)] {
+    for (seed, codec) in [
+        (54u64, int8 as fn(&[&[f32]]) -> Codec),
+        (55, per_vector),
+        (56, rotated),
+    ] {
         let fixture = Fixture::new(60, 40, seed, codec);
         let query =
             PreparedQuery::new(&Random(seed + 7).unit(DIM), fixture.segments[0].codec()).unwrap();

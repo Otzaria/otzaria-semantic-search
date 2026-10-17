@@ -1579,3 +1579,121 @@ fn a_legacy_plan_ignores_a_stale_windowed_book_hash_file() {
         .contains_key(super::plan::BOOK_HASHES_FILE));
     assert_eq!(plan.book_source_hashes().unwrap(), None);
 }
+
+/// `rot192-i8i4` end to end, at the stub's width: the fitted epoch is the same bytes twice
+/// and round-trips through its file; the base is format 3 and passes every gate, G8 too; a
+/// delta keeps the epoch from the ledger; the device set reaches the whole plan, its hits
+/// carry eight-byte keys, and compacting it gives the direct base's slots, still format 3.
+#[test]
+fn a_rotated_release_is_format_3_end_to_end() {
+    let machine = Machine::new("rotated_release");
+    // Enough vectors for the rotation to span the stub's 64 dimensions.
+    let v1 = library(2, 300, &[(C, &[600, 601])]);
+    let v2 = library(2, 300, &[(D, &[5, 305, 700])]);
+    let p1 = machine.plan("p1", 1, &borrowed(&v1), None);
+    let codec = {
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        let codec = fit_rot_i8i4(&warehouse, 1000, 48, 16).unwrap();
+        let again = fit_rot_i8i4(&warehouse, 1000, 48, 16).unwrap();
+        assert_eq!(codec.params(), again.params());
+        codec
+    };
+    let file = machine.dir.join("rotation.bin");
+    std::fs::write(&file, codec.params()).unwrap();
+    assert_eq!(read_rotation(&file).unwrap(), codec);
+    let given = EpochChoice::Given(codec.clone());
+
+    let base1 = machine.assemble(&p1, PackageKind::Base, None, given.clone(), "base1");
+    let store = &base1.manifest.identity.store;
+    assert_eq!(
+        (store.store_format_version, store.vector_precision.as_str()),
+        (3, "rot192-i8i4")
+    );
+    let segment = Segment::open(&base1.out_dir.join(SEGMENT_FILE)).unwrap();
+    assert_eq!((segment.format_version(), segment.key_len()), (3, 8));
+    let report = machine.verify(&p1, "base1", None);
+    assert!(report.passed(), "{:?}", report.gates);
+    let ledger1 = Ledger::open(&base1.out_dir, Some(1)).unwrap();
+    assert_eq!(ledger1.codec().unwrap(), codec);
+
+    let p2 = machine.plan("p2", 2, &borrowed(&v2), Some(&ledger1));
+    let delta = machine.assemble(
+        &p2,
+        PackageKind::Delta,
+        Some(&ledger1),
+        EpochChoice::Previous,
+        "delta2",
+    );
+    assert_eq!(delta.manifest.identity.store.store_format_version, 3);
+    let report = machine.verify(&p2, "delta2", Some(&ledger1));
+    for gate in &report.gates {
+        assert!(
+            gate.passed() || gate.gate == "G7",
+            "{}: {}",
+            gate.gate,
+            gate.detail
+        );
+    }
+    let base2 = machine.assemble(&p2, PackageKind::Base, None, given, "base2");
+
+    let work = &machine.dir;
+    let device = simulate_device(&work.join("device"), &[&base1.out_dir, &delta.out_dir]).unwrap();
+    assert!(coverage(&device, &p2).complete());
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    let mut query = vec![0f32; warehouse.dim()];
+    warehouse.vector(0, &mut query);
+    let hits = device
+        .scan(
+            &query,
+            &crate::semantic::oxv::scan::ScanRequest {
+                top_k: 5,
+                books: None,
+                threads: 1,
+                window_penalty: 0.0,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(!hits.is_empty() && hits.iter().all(|hit| hit.key.is_narrow()));
+    let reference = ExactReference::new(&device, &warehouse).unwrap();
+    assert_eq!(reference.len() as u64, device.info().slots_live);
+    drop(device);
+    compact(
+        &work.join("device"),
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&p2)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&work.join("device")).unwrap();
+    let direct = simulate_device(&work.join("direct"), &[&base2.out_dir]).unwrap();
+    assert_eq!(compacted.segments()[0].format_version(), 3);
+    assert_eq!(
+        contents(&compacted.segments()[0]),
+        contents(&direct.segments()[0])
+    );
+}
+
+/// Format 3 keeps eight bytes of a key, so two keys that share them are found, and the
+/// same key twice is not a pair.
+#[test]
+fn keys_sharing_their_first_eight_bytes_are_found() {
+    let key = |first: u8, last: u8| {
+        let mut key = [0u8; 16];
+        key[0] = first;
+        key[15] = last;
+        key
+    };
+    assert_eq!(
+        shared_prefix(vec![key(1, 0), key(2, 0), key(1, 0)], 8),
+        None
+    );
+    assert_eq!(
+        shared_prefix(vec![key(3, 0), key(1, 9), key(2, 0), key(1, 4)], 8),
+        Some((key(1, 4), key(1, 9)))
+    );
+    assert_eq!(shared_prefix(vec![key(1, 9), key(1, 4)], 16), None);
+}

@@ -590,6 +590,9 @@ fn check_segment(
     if hex(&segment.codec_params_sha256()) != document.codec_params_sha256 {
         return disagree("codec epoch");
     }
+    if segment.format_version() != document.identity.store.store_format_version {
+        return disagree("segment format");
+    }
     if segment.size() != entry.size {
         return disagree("size");
     }

@@ -51,6 +51,8 @@ Commands:
   warehouse-add [options]             Check shards and add their vectors to a warehouse.
   warehouse-verify [options]          Re-hash a warehouse against its digests and check its
                                       index; with --repair, rebuild a bad index.
+  fit-rotation [options]              Fit the rot192-i8i4 codec epoch on a warehouse's
+                                      vectors, for a base assembled with --rotation.
   assemble [options]                  Assemble a base or a delta from a plan and the
                                       warehouse; with --verify, check gates G1, G5, G7-G10.
   release-files [options]             List the files a release downloads as, in the shape
@@ -151,6 +153,12 @@ Options for 'warehouse-verify':
                              and rebuild an index that is not the verified keys'. Data
                              that fails its digests is never repaired
 
+Options for 'fit-rotation':
+  --warehouse <dir>          The warehouse to fit on
+  --sample <N>               Vectors to fit on, evenly spaced (default: 200000)
+  --out <path>               Receives the codec's parameters; its SHA-256 is printed. The
+                             same warehouse and sample write the same bytes
+
 Options for 'assemble':
   --plan <dir>               The plan
   --warehouse <dir>          The warehouse, holding every vector the release ships
@@ -161,8 +169,11 @@ Options for 'assemble':
   --previous <dir>           The ledger of the release the plan was split against:
                              required for a delta and for --keep-epoch
   --previous-version <N>     Its version, when the directory holds several
-  --codec <name>             A base's codec epoch: i8-sym-vec (default), i8-sym-dim, f32
+  --codec <name>             A base's codec epoch: i8-sym-vec (default), i8-sym-dim, f32,
+                             or rot192-i8i4 (segment format 3, 8-byte keys)
   --clip-q <q>               For i8-sym-dim: the calibration quantile (default: 1)
+  --rotation <path>          For rot192-i8i4: what fit-rotation wrote. A delta, or a base
+                             with --keep-epoch, takes the epoch from the ledger instead
   --keep-epoch               A base in the previous release's codec epoch
   --created-at <time>        The manifest's createdAt (default: now); the same inputs and
                              time give the same bytes
@@ -390,6 +401,7 @@ fn main() {
         "adopt-shard" => run_adopt_shard(&args),
         "warehouse-add" => run_warehouse_add(&args),
         "warehouse-verify" => run_warehouse_verify(&args),
+        "fit-rotation" => run_fit_rotation(&args),
         "assemble" => run_assemble(&args),
         "release-files" => run_release_files(&args),
         "model-checksum" => run_model_checksum(&args),
@@ -884,9 +896,44 @@ fn print_verified(warehouse: &otzaria_semantic_search::distribution::warehouse::
     }
 }
 
+fn run_fit_rotation(args: &[String]) {
+    use otzaria_semantic_search::distribution::assemble::{fit_rot_i8i4, ROTATION_SAMPLE};
+    use otzaria_semantic_search::distribution::warehouse::Warehouse;
+    use otzaria_semantic_search::semantic::oxv::codec::{ROT_HEAD, ROT_TAIL};
+
+    let warehouse = Warehouse::open(Path::new(&require_arg(args, "--warehouse")))
+        .unwrap_or_else(|error| exit_with("Could not open the warehouse", error));
+    let sample = parse_arg(args, "--sample").map_or(ROTATION_SAMPLE, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|_| exit_with("--sample", "not a number"))
+    });
+    let out = PathBuf::from(require_arg(args, "--out"));
+    let codec = fit_rot_i8i4(&warehouse, sample, ROT_HEAD, ROT_TAIL)
+        .unwrap_or_else(|error| exit_with("The rotation could not be fitted", error));
+    std::fs::write(&out, codec.params())
+        .unwrap_or_else(|error| exit_with(&format!("Writing {}", out.display()), error));
+    let digest: String = codec
+        .params_sha256()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    println!("\n=== Fitted {} ===", codec.name());
+    println!(
+        "Sample:          {} vector(s)",
+        sample.min(warehouse.len() as usize)
+    );
+    println!(
+        "Parameters:      {} bytes in {}",
+        codec.params().len(),
+        out.display()
+    );
+    println!("Epoch SHA-256:   {digest}");
+}
+
 fn run_assemble(args: &[String]) {
     use otzaria_semantic_search::distribution::assemble::{
-        assemble, AssembleRequest, EpochChoice, RELEASE_FILE,
+        assemble, read_rotation, AssembleRequest, EpochChoice, RELEASE_FILE,
     };
     use otzaria_semantic_search::distribution::gates::{
         verify_release, GateStatus, VerifyRequest, G5_SAMPLES,
@@ -895,7 +942,7 @@ fn run_assemble(args: &[String]) {
     use otzaria_semantic_search::distribution::package::PackageKind;
     use otzaria_semantic_search::distribution::plan::Plan;
     use otzaria_semantic_search::distribution::warehouse::Warehouse;
-    use otzaria_semantic_search::semantic::oxv::codec::CodecSpec;
+    use otzaria_semantic_search::semantic::oxv::codec::{CodecSpec, ROT_I8I4_NAME};
 
     let flag = |name: &str| args.iter().any(|arg| arg == name);
     let out = PathBuf::from(require_arg(args, "--out"));
@@ -928,9 +975,17 @@ fn run_assemble(args: &[String]) {
                     .unwrap_or_else(|_| exit_with("--clip-q", "not a number"))
             });
             let name = parse_arg(args, "--codec").unwrap_or_else(|| "i8-sym-vec".to_string());
-            EpochChoice::New(
-                CodecSpec::parse(&name, clip_q).unwrap_or_else(|error| exit_with("--codec", error)),
-            )
+            match parse_arg(args, "--rotation") {
+                Some(path) if name == ROT_I8I4_NAME => EpochChoice::Given(
+                    read_rotation(Path::new(&path))
+                        .unwrap_or_else(|error| exit_with("--rotation", error)),
+                ),
+                Some(_) => exit_with("--rotation", format!("is for --codec {ROT_I8I4_NAME}")),
+                None => EpochChoice::New(
+                    CodecSpec::parse(&name, clip_q)
+                        .unwrap_or_else(|error| exit_with("--codec", error)),
+                ),
+            }
         };
         let built_by = parse_arg(args, "--built-by").map(|json| {
             serde_json::from_str(&json).unwrap_or_else(|error| exit_with("--built-by", error))
