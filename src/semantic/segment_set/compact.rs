@@ -318,12 +318,11 @@ pub fn compact(
         let mut extras = Vec::new();
         let mut occurrences = Vec::new();
         let mut least = HashMap::<ChunkKey, u8>::new();
-        // An alias marks another line's place: it gives the vector no record or window, and
-        // stays only while the vector keeps a record in the book.
-        for (key, record) in records
-            .iter()
-            .filter(|(_, record)| record.window != ALIAS_WINDOW)
-        {
+        // An alias still needs its backing vector when the neighbour's own occurrence
+        // has gone stale. Keep a slot/extra for every surviving key; the complete
+        // occurrence snapshot supplies its actual roles, without inventing a normal
+        // occurrence at the alias's hint. An alias-only slot keeps the penalized role.
+        for (key, record) in &records {
             least
                 .entry(*key)
                 .and_modify(|window| *window = (*window).min(record.window))
@@ -341,7 +340,7 @@ pub fn compact(
                     window: record.window,
                 });
             }
-            if record.window == ALIAS_WINDOW || !recorded.insert(key) {
+            if !recorded.insert(key) {
                 continue;
             }
             let Ok(position) = live_slots.binary_search_by(|probe| probe.0.cmp(&key)) else {
