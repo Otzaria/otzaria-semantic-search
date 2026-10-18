@@ -1026,7 +1026,19 @@ fn an_alias_row_exists_in_format_3_only() {
     sink.finish().unwrap();
     let entry = section(&segment_header(&plain), SectionKind::Occurrences);
     let mut bytes = std::fs::read(&plain).unwrap();
-    bytes[entry.offset as usize + 41] = ROLE_ALIAS;
+    let row = entry.offset as usize;
+    bytes[row + 41] = ROLE_ALIAS;
     std::fs::write(&plain, &bytes).unwrap();
     assert!(corrupted(Segment::open(&plain)).contains("unknown role"));
+    // Nor is a window byte of 255 an alias, in either format: it is refused.
+    bytes[row + 41] = 0;
+    bytes[row + 40] = ALIAS_WINDOW;
+    std::fs::write(&plain, &bytes).unwrap();
+    assert!(corrupted(Segment::open(&plain)).contains("unknown role"));
+    drop(segment);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let entry = section(&segment_header(&path), SectionKind::Occurrences);
+    bytes[entry.offset as usize + 24] = ALIAS_WINDOW;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(corrupted(Segment::open(&path)).contains("unknown role"));
 }

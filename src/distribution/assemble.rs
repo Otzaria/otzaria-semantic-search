@@ -214,6 +214,13 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         _ => SEGMENT_FORMAT_VERSION,
     };
     check_key_prefixes(plan, delta, key_len(format_version))?;
+    if let Some(asked) = request.alias_threshold {
+        if !(asked.is_finite() && (0.0..=1.0).contains(&asked)) {
+            return Err(malformed(format!(
+                "the alias threshold is {asked}, and it must be in [0, 1]: 0 shares nothing"
+            )));
+        }
+    }
     let alias_threshold = match delta {
         Some(previous) => {
             let chain = previous.manifest.alias_threshold;

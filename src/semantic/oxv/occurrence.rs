@@ -62,7 +62,9 @@ impl Occurrence {
         }
     }
 
-    /// Whether it is an alias: see [`ALIAS_WINDOW`].
+    /// Whether it is an alias: see [`ALIAS_WINDOW`]. Only a format-3 row's role byte reads
+    /// as one: no recipe makes window 255, and a reader refuses a row whose window byte is
+    /// 255, so a format-2 row never is one.
     pub fn is_alias(&self) -> bool {
         self.window == ALIAS_WINDOW
     }

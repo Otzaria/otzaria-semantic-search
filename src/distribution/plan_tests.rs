@@ -424,6 +424,27 @@ fn a_short_first_window_round_trips_in_oxvrec2() {
     let records = PlanRecords::open(&path).unwrap();
     assert_eq!(records.get(0), record);
 
+    // Window 255 is an alias's, which no recipe makes.
+    let mut alias = RecordsWriter::create_windowed(&dir.join("alias.bin")).unwrap();
+    alias
+        .push(PlanRecord {
+            short: false,
+            ..record
+        })
+        .unwrap();
+    assert!(alias
+        .push(PlanRecord {
+            window: u8::MAX,
+            short: false,
+            ..record
+        })
+        .is_err());
+    let mut forged = bytes.clone();
+    forged[16 + 8] = u8::MAX;
+    forged[16 + 9] = 0;
+    std::fs::write(dir.join("forged.bin"), &forged).unwrap();
+    assert!(PlanRecords::open(&dir.join("forged.bin")).is_err());
+
     let plain = dir.join("plain.bin");
     let mut writer = RecordsWriter::create(&plain).unwrap();
     writer.push(record).unwrap();

@@ -16,7 +16,7 @@
 //!   same book that are not short, in that order;
 //! * the cosine of the two warehouse vectors, summed in `f64` in component order, picks the
 //!   best candidate — the first in that order on a tie — and it must be at least the
-//!   threshold;
+//!   threshold, an `f32` widened as it is (0.99 is 0.99000000953…);
 //! * a key is aliased only if every record of it, in the whole plan, found a target. A
 //!   target is never short, so it is never aliased itself: no chains.
 

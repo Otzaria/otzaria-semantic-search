@@ -29,8 +29,10 @@
 //! — two exact integer sums, `acc8` of 16-bit head weights against the int8 codes and `acc4`
 //! of 16-bit tail weights against the 4-bit codes, each quantized under its own bound with
 //! the codes' largest magnitude (127 and 15), and a constant `C` of the query alone. The
-//! floats are combined in that order, so the score is again the same number on every CPU,
-//! and it is the cosine of the query with `Rᵀ · ŷ`, the vector decoded.
+//! floats are combined in that order, so the score is again the same number on every CPU.
+//! It is the dot product of the query with `Rᵀ · ŷ`, the vector decoded, which is not quite
+//! unit length: about the cosine — on v31, 0.0013 from it on average, with 0.5% of the
+//! top 50's pairs on the other side of 0.55.
 //!
 //! **Every kernel computes the same integer.** Integer addition is associative, so the
 //! scalar loop, AVX2's `madd` and NEON's `mlal` reach the same `acc` whatever order they add

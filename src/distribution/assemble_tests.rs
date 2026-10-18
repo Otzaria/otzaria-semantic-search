@@ -1945,6 +1945,26 @@ fn short_lines_share_a_neighbours_vector_end_to_end() {
     assert_eq!(rows, 3);
     assert!(coverage(&compacted, &p2).complete());
 
+    // A threshold that is not one, and a ledger rebuilt without the warehouse.
+    for bad in [f32::NAN, -0.1, 1.5] {
+        let given = EpochChoice::Given(codec.clone());
+        let refused = request(&p1, PackageKind::Base, None, given, "bad", Some(bad)).unwrap_err();
+        assert!(refused.to_string().contains("[0, 1]"), "{bad}: {refused}");
+    }
+    let rebuilt = super::ledger::write_plan_ledger(
+        &p2,
+        Some(&ledger1),
+        &codec,
+        base.ledger.base,
+        0,
+        &machine.dir.join("rebuilt"),
+    )
+    .unwrap_err();
+    assert!(
+        rebuilt.to_string().contains("assemble the release"),
+        "{rebuilt}"
+    );
+
     // Format 2 cannot carry one.
     let refused = request(&p1, PackageKind::Base, None, NEW, "refused-v2", Some(0.99)).unwrap_err();
     assert!(

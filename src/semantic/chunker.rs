@@ -171,11 +171,12 @@ impl ChunkerConfig {
                         "less than half of window_chars",
                     );
                 }
-                if self.max_windows_per_line > usize::from(u8::MAX) + 1 {
+                // Window 255 is no window: it is what an alias occurrence reads as.
+                if self.max_windows_per_line > usize::from(u8::MAX) {
                     return refuse(
                         "max_windows_per_line",
                         self.max_windows_per_line,
-                        "at most 256",
+                        "at most 255",
                     );
                 }
             }
@@ -1307,7 +1308,7 @@ mod tests {
             (
                 "max_windows_per_line",
                 ChunkerConfig {
-                    max_windows_per_line: 257,
+                    max_windows_per_line: 256,
                     ..windows.clone()
                 },
             ),

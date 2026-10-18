@@ -33,7 +33,7 @@
 //! affine over a range frozen per component:
 //! `q_d = clamp(round_half_away((y_d − lo_d) / (hi_d − lo_d) · 15), 0, 15)`. The other
 //! components are dropped. 160 bytes and a scale a vector; it decodes as `Rᵀ · ŷ`, so a
-//! score stays a cosine in the model's space. A tail component past its range clips.
+//! score stays about a cosine in the model's space. A tail component past its range clips.
 //!
 //! Measured on 400k vectors of the v31 base against the exact scan of their `i8-sym-vec`
 //! decodings, 4000 queries: `σ_h = √std_h` lifts recall@10 from 0.979 to 0.982 (no scale,
@@ -626,23 +626,36 @@ impl Codec {
                 scale: Some(encode_per_vector(vector, out)),
             },
             CodecKind::RotI8I4(rotated) => {
-                let mut y64 = vec![0f64; rotated.out_dim()];
-                super::rotation::rotate(&rotated.rotation, vector, &mut y64);
-                let y: Vec<f32> = y64.iter().map(|value| *value as f32).collect();
+                // On the stack for the library's 192 components; the heap only past 256.
+                let mut stack = [0f64; 256];
+                let mut heap = Vec::new();
+                let y: &mut [f64] = if rotated.out_dim() <= stack.len() {
+                    &mut stack[..rotated.out_dim()]
+                } else {
+                    heap.resize(rotated.out_dim(), 0.0);
+                    &mut heap
+                };
+                super::rotation::rotate(&rotated.rotation, vector, y);
                 let (head, packed) = out.split_at_mut(rotated.head);
-                let whitened: Vec<f32> = y[..rotated.head]
-                    .iter()
-                    .zip(rotated.scale.iter())
-                    .map(|(y, scale)| y / scale)
-                    .collect();
-                let scale = encode_per_vector(&whitened, head);
+                let whitened = |d: usize| y[d] as f32 / rotated.scale[d];
+                // `encode_per_vector` over the whitened head, without collecting it.
+                let max = (0..rotated.head).fold(0.0f32, |max, d| max.max(whitened(d).abs()));
+                let scale = max / 127.0;
+                for (d, byte) in head.iter_mut().enumerate() {
+                    *byte = if scale > 0.0 {
+                        quantize_per_vector(whitened(d), scale) as u8
+                    } else {
+                        0
+                    };
+                }
                 let mut clipped = 0;
                 for (j, byte) in packed.iter_mut().enumerate() {
                     let mut nibbles = [0u8; 2];
                     for (half, nibble) in nibbles.iter_mut().enumerate() {
                         let d = 2 * j + half;
                         let (lo, hi) = (rotated.lo[d], rotated.hi[d]);
-                        let code = ((y[rotated.head + d] - lo) / (hi - lo) * 15.0).round();
+                        let value = y[rotated.head + d] as f32;
+                        let code = ((value - lo) / (hi - lo) * 15.0).round();
                         clipped += usize::from(!(0.0..=15.0).contains(&code));
                         *nibble = code.clamp(0.0, 15.0) as u8;
                     }

@@ -292,7 +292,8 @@ assembly. The plan must have been split against that ledger.
   format 2, byte for byte.
 * **Short lines sharing a vector** (`--alias-threshold 0.99`, format 3 only, off by
   default): a record the plan flags short, whose first-window neighbour at −1, +1, −2 or +2
-  in its book is not short and has a warehouse vector at least that cosine from its own,
+  in its book is not short and has a warehouse vector at least that cosine from its own
+  (the `f32` threshold as given, compared in `f64`; it must be in [0, 1]),
   ships no vector — an alias occurrence names the neighbour's key, at the short line's place,
   with the short line's key as its anchor (see
   [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.4). A key is aliased only if all its

@@ -33,6 +33,7 @@ use crate::errors::PackError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::official_index::readable_store_identity;
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingRecipe};
 use crate::semantic::versioning::{IndexVersion, ModelIdentity, ModelPackage};
 use memmap2::Mmap;
@@ -183,6 +184,12 @@ impl RecordsWriter {
                 record.window
             )));
         }
+        if record.window == ALIAS_WINDOW {
+            return Err(malformed(format!(
+                "record {:?} is window {ALIAS_WINDOW}, which no recipe makes: it is an alias's",
+                (record.book, record.ordinal)
+            )));
+        }
         if record.short && record.window != 0 {
             return Err(malformed(format!(
                 "record {:?} is short and window {}: only a first window borrows context",
@@ -284,6 +291,11 @@ impl PlanRecords {
             }
             if record.short && record.window != 0 {
                 return Err(malformed("only a first window can be short"));
+            }
+            if record.window == ALIAS_WINDOW {
+                return Err(malformed(format!(
+                    "a record is window {ALIAS_WINDOW}, which no recipe makes"
+                )));
             }
             let at = record.position();
             if last.is_some_and(|last| at <= last) {

@@ -624,6 +624,12 @@ pub fn write_plan_ledger(
     deltas_since_base: u64,
     dir: &Path,
 ) -> Result<LedgerManifest, PackError> {
+    if let Some(threshold) = previous.and_then(|ledger| ledger.manifest.alias_threshold) {
+        return Err(malformed(format!(
+            "the previous ledger shares short lines' vectors at {threshold}, and a ledger \
+             rebuilt from a plan alone cannot decide which: assemble the release instead"
+        )));
+    }
     let none = Aliases::none();
     let classified = classify(
         &plan.records,

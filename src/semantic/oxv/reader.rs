@@ -350,7 +350,9 @@ impl Segment {
             let row_len = occurrence_len(header.format_version);
             // Format 3 gives the first reserved byte a role: an alias, of window 0.
             let aliases = header.format_version >= super::format::SEGMENT_FORMAT_V3;
+            // Window 255 is only ever an alias's role, never a window byte.
             let sound = |row: &[u8]| match row[row_len - 3..] {
+                _ if row[row_len - 4] == super::occurrence::ALIAS_WINDOW => false,
                 [0, 0, 0] => true,
                 [role, 0, 0] => {
                     aliases && role == super::occurrence::ROLE_ALIAS && row[row_len - 4] == 0
