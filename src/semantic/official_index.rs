@@ -32,7 +32,7 @@ use crate::semantic::backend::Pooling;
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
 use crate::semantic::oxv::codec::ROT_I8I4_NAME;
 use crate::semantic::oxv::format::{SEGMENT_FORMAT_V3, SEGMENT_FORMAT_VERSION};
-use crate::semantic::oxv::scan::{default_scan_threads, ScanRequest};
+use crate::semantic::oxv::scan::{default_scan_threads, ScanPenalties, ScanRequest};
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::resolve::{BookSet, SlotRef, VectorHit};
 use crate::semantic::segment_set::{self, SegmentSet, SetInfo, STORE_BACKEND_ID};
@@ -331,15 +331,40 @@ impl OfficialSemanticIndex {
         window_penalty: f32,
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, SemanticSearchError> {
-        Ok(self.set.scan_with(
+        self.search_hits_with_penalties(
+            query_vector,
+            top_k,
+            books,
+            also,
+            ScanPenalties {
+                window: window_penalty,
+                alias: window_penalty,
+            },
+            cancel,
+        )
+    }
+
+    /// [`Self::search_hits_with`] with an independent alias penalty used for top-k
+    /// selection and subsequent occurrence score restoration.
+    pub(crate) fn search_hits_with_penalties(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        books: Option<&BookSet>,
+        also: &[SlotRef],
+        penalties: ScanPenalties,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, SemanticSearchError> {
+        Ok(self.set.scan_with_penalties(
             query_vector,
             &ScanRequest {
                 top_k,
                 books,
                 threads: self.scan_threads,
-                window_penalty,
+                window_penalty: penalties.window,
             },
             also,
+            penalties,
             cancel,
         )?)
     }

@@ -60,6 +60,262 @@ fn rejection(path: &Path) -> String {
 }
 
 #[test]
+fn alias_penalty_selects_top_k_role_before_the_heap_and_restores_the_actual_penalty() {
+    use super::kernel::PreparedQuery;
+    use super::scan::{scan_with_penalties, ScanPenalties, ScanRequest, ScanSegment, ScanSet};
+    use crate::semantic::resolve::BookSet;
+
+    let dir = TempDir::new("occurrence_alias_custom_penalty");
+    let path = dir.join("base.oxv");
+    let mut builder = SegmentBuilder::new(spec(PackageKind::Base, 0, 30), Codec::f32(2).unwrap());
+    builder.set_format_version(3).unwrap();
+    // The alias book also owns an unrelated normal first-window vector, so both keys
+    // compete for top_k=1 under the same filter.
+    builder
+        .add_book_windowed("a", &[(key(1), 7)], &[1], &[], &[])
+        .unwrap();
+    builder
+        .add_occurrences(
+            "a",
+            &[Occurrence {
+                key: key(1),
+                book: 0,
+                hint: 7,
+                anchor: key(1),
+                window: 1,
+            }],
+        )
+        .unwrap();
+    builder
+        .add_book_windowed("b", &[(key(2), 8)], &[0], &[(9, 0)], &[])
+        .unwrap();
+    builder
+        .add_occurrences(
+            "b",
+            &[
+                Occurrence {
+                    key: key(1),
+                    book: 1,
+                    hint: 9,
+                    anchor: key(1),
+                    window: 255,
+                },
+                Occurrence {
+                    key: key(2),
+                    book: 1,
+                    hint: 8,
+                    anchor: key(2),
+                    window: 0,
+                },
+            ],
+        )
+        .unwrap();
+    let mut sink = builder.write(&path).unwrap();
+    sink.push_f32(&[1.0, 0.0]).unwrap();
+    sink.push_f32(&[0.95, 0.3122499]).unwrap();
+    sink.finish().unwrap();
+    let segment = Segment::open(&path).unwrap();
+    let query = PreparedQuery::new(&[1.0, 0.0], segment.codec()).unwrap();
+    let views = [ScanSegment {
+        segment: &segment,
+        deleted: &[],
+        links: &[],
+    }];
+    let set = ScanSet {
+        segments: &views,
+        reverse_links: &[],
+    };
+    let books: BookSet = ["b"].into_iter().collect();
+    assert_eq!(
+        super::scan::penalty_sort_key(
+            1,
+            super::scan::ScanPenalties {
+                window: -0.0,
+                alias: 0.01,
+            },
+        ),
+        super::scan::penalty_sort_key(
+            0,
+            super::scan::ScanPenalties {
+                window: -0.0,
+                alias: 0.01,
+            },
+        )
+    );
+    let request = ScanRequest {
+        top_k: 1,
+        books: Some(&books),
+        threads: 1,
+        window_penalty: 0.2,
+    };
+    assert!(matches!(
+        scan_with_penalties(
+            &set,
+            &query,
+            &request,
+            &[],
+            ScanPenalties {
+                window: 0.1,
+                alias: 0.01,
+            },
+            &CancellationToken::new(),
+        ),
+        Err(VectorStoreError::SearchFailed { .. })
+    ));
+
+    let alias_cheaper = scan_with_penalties(
+        &set,
+        &query,
+        &request,
+        &[],
+        ScanPenalties {
+            window: 0.2,
+            alias: 0.01,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(alias_cheaper.len(), 1);
+    assert!(alias_cheaper[0].key.same_text(key(1)));
+    assert_eq!(alias_cheaper[0].window, 255);
+    assert_eq!(alias_cheaper[0].applied_penalty, 0.01);
+    assert_eq!(alias_cheaper[0].window_penalty, 0.2);
+    assert_eq!(alias_cheaper[0].records[0].window, 255);
+    assert!(alias_cheaper[0].score > 0.98);
+
+    let costlier_request = ScanRequest {
+        window_penalty: 0.01,
+        ..request
+    };
+    let alias_costlier = scan_with_penalties(
+        &set,
+        &query,
+        &costlier_request,
+        &[],
+        ScanPenalties {
+            window: 0.01,
+            alias: 0.2,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(alias_costlier.len(), 1);
+    assert!(
+        alias_costlier[0].key.same_text(key(2)),
+        "{alias_costlier:?}"
+    );
+    assert_eq!(alias_costlier[0].window, 0);
+    assert_eq!(alias_costlier[0].applied_penalty, 0.0);
+
+    let unfiltered_request = ScanRequest {
+        books: None,
+        top_k: 2,
+        ..request
+    };
+    let unfiltered_alias_cheaper = scan_with_penalties(
+        &set,
+        &query,
+        &unfiltered_request,
+        &[],
+        ScanPenalties {
+            window: 0.2,
+            alias: 0.01,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let selected = unfiltered_alias_cheaper
+        .iter()
+        .find(|hit| hit.key.same_text(key(1)))
+        .unwrap();
+    assert_eq!(selected.window, 255);
+    assert_eq!(selected.applied_penalty, 0.01);
+    assert_eq!(selected.records[0].window, 255);
+
+    let unfiltered_alias_costlier = scan_with_penalties(
+        &set,
+        &query,
+        &ScanRequest {
+            window_penalty: 0.01,
+            ..unfiltered_request
+        },
+        &[],
+        ScanPenalties {
+            window: 0.01,
+            alias: 0.2,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let selected = unfiltered_alias_costlier
+        .iter()
+        .find(|hit| hit.key.same_text(key(1)))
+        .unwrap();
+    assert_eq!(selected.window, 1);
+    assert_eq!(selected.applied_penalty, 0.01);
+    assert_eq!(selected.records[0].window, 1);
+
+    // A newer complete snapshot withdraws the alias even though the base segment's
+    // source snapshot still has it. Unfiltered scans must use the newer role.
+    let delta_path = dir.join("delta.oxv");
+    let mut delta_builder =
+        SegmentBuilder::new(spec(PackageKind::Delta, 30, 31), Codec::f32(2).unwrap());
+    delta_builder.set_format_version(3).unwrap();
+    delta_builder
+        .add_book_windowed_hashed("c", &[], &[], &[], &[(key(1), 77)], Some(0))
+        .unwrap();
+    delta_builder
+        .add_occurrences(
+            "c",
+            &[Occurrence {
+                key: key(1),
+                book: 0,
+                hint: 77,
+                anchor: key(1),
+                window: 1,
+            }],
+        )
+        .unwrap();
+    delta_builder.write(&delta_path).unwrap().finish().unwrap();
+    let delta = Segment::open(&delta_path).unwrap();
+    let delta_views = [
+        ScanSegment {
+            segment: &segment,
+            deleted: &[],
+            links: &[],
+        },
+        ScanSegment {
+            segment: &delta,
+            deleted: &[],
+            links: &[],
+        },
+    ];
+    let delta_set = ScanSet {
+        segments: &delta_views,
+        reverse_links: &[],
+    };
+    let withdrawn = scan_with_penalties(
+        &delta_set,
+        &query,
+        &unfiltered_request,
+        &[],
+        ScanPenalties {
+            window: 0.2,
+            alias: 0.01,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let selected = withdrawn
+        .iter()
+        .find(|hit| hit.key.same_text(key(1)))
+        .unwrap();
+    assert_eq!(selected.window, 1);
+    assert_eq!(selected.applied_penalty, 0.2);
+    assert_eq!(selected.records[0].book.as_ref(), "c");
+}
+
+#[test]
 fn occurrence_snapshot_round_trip_and_payload_crc() {
     let dir = TempDir::new("occurrence_snapshot_round_trip");
     let path = dir.join("base.oxv");

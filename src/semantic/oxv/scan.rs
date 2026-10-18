@@ -27,6 +27,7 @@ use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::kernel::{
     dot_f32, ordered, select, select_nibbles, unordered, DotKernel, NibbleKernel, PreparedQuery,
 };
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::resolve::{BookSet, RecordRef, SlotRef, VectorHit, MAX_RECORDS_PER_HIT};
 use std::cmp::Ordering;
@@ -103,6 +104,21 @@ pub struct ScanRequest<'a> {
     pub window_penalty: f32,
 }
 
+/// Penalties used when choosing the representative occurrence before top-k selection.
+/// The public request keeps its historical window-only shape; callers that know the
+/// alias penalty use the explicit-penalty entry points.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScanPenalties {
+    pub window: f32,
+    pub alias: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ScanConfig<'request, 'books> {
+    request: &'request ScanRequest<'books>,
+    penalties: ScanPenalties,
+}
+
 /// The thread count the application gets by default: half the cores, at most eight. A
 /// scan is memory-bound, and past the cores of one memory channel more threads add
 /// contention, not speed.
@@ -169,6 +185,7 @@ pub(crate) fn scan(
 /// gives way to them, so the result holds up to twice `request.top_k` hits. A slot past
 /// its segment's end, deleted, or holding another key is passed over. With `also` empty,
 /// exactly [`scan`].
+#[cfg(test)]
 pub(crate) fn scan_with(
     set: &ScanSet<'_>,
     query: &PreparedQuery,
@@ -176,7 +193,28 @@ pub(crate) fn scan_with(
     also: &[SlotRef],
     cancel: &CancellationToken,
 ) -> Result<Vec<VectorHit>, VectorStoreError> {
-    scan_all(set, query, request, also, cancel, None)
+    scan_with_penalties(
+        set,
+        query,
+        request,
+        also,
+        ScanPenalties {
+            window: request.window_penalty,
+            alias: request.window_penalty,
+        },
+        cancel,
+    )
+}
+
+pub(crate) fn scan_with_penalties(
+    set: &ScanSet<'_>,
+    query: &PreparedQuery,
+    request: &ScanRequest<'_>,
+    also: &[SlotRef],
+    penalties: ScanPenalties,
+    cancel: &CancellationToken,
+) -> Result<Vec<VectorHit>, VectorStoreError> {
+    scan_all(set, query, request, also, penalties, cancel, None)
 }
 
 /// [`scan`], with each thread's progress — slots visited at its last checkpoint — written
@@ -188,7 +226,18 @@ pub(crate) fn scan_reporting(
     cancel: &CancellationToken,
     progress: Option<&[AtomicUsize]>,
 ) -> Result<Vec<VectorHit>, VectorStoreError> {
-    scan_all(set, query, request, &[], cancel, progress)
+    scan_all(
+        set,
+        query,
+        request,
+        &[],
+        ScanPenalties {
+            window: request.window_penalty,
+            alias: request.window_penalty,
+        },
+        cancel,
+        progress,
+    )
 }
 
 fn scan_all(
@@ -196,6 +245,7 @@ fn scan_all(
     query: &PreparedQuery,
     request: &ScanRequest<'_>,
     also: &[SlotRef],
+    penalties: ScanPenalties,
     cancel: &CancellationToken,
     progress: Option<&[AtomicUsize]>,
 ) -> Result<Vec<VectorHit>, VectorStoreError> {
@@ -203,6 +253,21 @@ fn scan_all(
     if !request.window_penalty.is_finite() || request.window_penalty < 0.0 {
         return Err(VectorStoreError::SearchFailed {
             reason: "window penalty must be finite and nonnegative".to_string(),
+        });
+    }
+    if !penalties.window.is_finite() || penalties.window < 0.0 {
+        return Err(VectorStoreError::SearchFailed {
+            reason: "window penalty must be finite and nonnegative".to_string(),
+        });
+    }
+    if penalties.window != request.window_penalty {
+        return Err(VectorStoreError::SearchFailed {
+            reason: "scan penalties must match the request's window penalty".to_string(),
+        });
+    }
+    if !penalties.alias.is_finite() || penalties.alias < 0.0 {
+        return Err(VectorStoreError::SearchFailed {
+            reason: "alias penalty must be finite and nonnegative".to_string(),
         });
     }
     if request.top_k == 0 {
@@ -225,6 +290,7 @@ fn scan_all(
         .max(1)
         .min(work.total.div_ceil(MIN_SLOTS_PER_THREAD).max(1));
     let shares = work.split(threads);
+    let config = ScanConfig { request, penalties };
 
     match query {
         PreparedQuery::Int8 { q16, inv_scale } => {
@@ -234,9 +300,9 @@ fn scan_all(
                 inv_scale: *inv_scale,
                 kernel,
             };
-            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, request, found, also, cancel)?;
-            Ok(hits(set, found, request, &scorer))
+            let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
+            Ok(hits(set, found, request, penalties, &scorer))
         }
         PreparedQuery::Int8PerVector { q16, inv_scale } => {
             let (kernel, _) = select();
@@ -245,9 +311,9 @@ fn scan_all(
                 inv_scale: *inv_scale,
                 kernel,
             };
-            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, request, found, also, cancel)?;
-            Ok(hits(set, found, request, &scorer))
+            let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
+            Ok(hits(set, found, request, penalties, &scorer))
         }
         PreparedQuery::Rotated {
             head,
@@ -268,15 +334,15 @@ fn scan_all(
                 dot: select().0,
                 nibbles: select_nibbles().0,
             };
-            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, request, found, also, cancel)?;
-            Ok(hits(set, found, request, &scorer))
+            let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
+            Ok(hits(set, found, request, penalties, &scorer))
         }
         PreparedQuery::Float { q } => {
             let scorer = Float { q };
-            let found = run_shares(set, &scorer, request, top_k, &shares, cancel, progress)?;
-            let found = merge_also(set, &scorer, request, found, also, cancel)?;
-            Ok(hits(set, found, request, &scorer))
+            let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
+            let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
+            Ok(hits(set, found, request, penalties, &scorer))
         }
     }
 }
@@ -511,7 +577,7 @@ impl Work {
 fn run_shares(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
-    request: &ScanRequest<'_>,
+    config: ScanConfig<'_, '_>,
     k: usize,
     shares: &[Vec<Piece>],
     cancel: &CancellationToken,
@@ -525,13 +591,13 @@ fn run_shares(
             .skip(1)
             .map(|(index, share)| {
                 let counter = report(index);
-                scope.spawn(move || scan_share(set, scorer, request, k, share, cancel, counter))
+                scope.spawn(move || scan_share(set, scorer, config, k, share, cancel, counter))
             })
             .collect();
         let mut results = vec![scan_share(
             set,
             scorer,
-            request,
+            config,
             k,
             &shares[0],
             cancel,
@@ -564,6 +630,7 @@ fn merge_also(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
     request: &ScanRequest<'_>,
+    penalties: ScanPenalties,
     mut found: Vec<Candidate>,
     also: &[SlotRef],
     cancel: &CancellationToken,
@@ -591,19 +658,21 @@ fn merge_also(
         }
         let scale = segment.segment.vector_scale(wanted.slot).unwrap_or(1.0);
         let mut rank = scorer.rank(segment.segment.vector(wanted.slot), scale);
-        let Some(window) = effective_window(set, wanted.seg, wanted.slot, request.books)
-            .or_else(|| effective_window(set, wanted.seg, wanted.slot, None))
+        let Some(window) = effective_role(set, wanted.seg, wanted.slot, request.books, penalties)
+            .or_else(|| effective_role(set, wanted.seg, wanted.slot, None, penalties))
         else {
             continue;
         };
-        if request.window_penalty != 0.0 && window > 0 {
-            rank = scorer.penalize(rank, request.window_penalty);
+        let applied_penalty = penalty_for(window, penalties);
+        if applied_penalty != 0.0 {
+            rank = scorer.penalize(rank, applied_penalty);
         }
         weighed.push(Candidate {
             rank,
             key,
             seg: wanted.seg,
             slot: wanted.slot,
+            window,
         });
     }
     weighed.sort_unstable_by(Candidate::best_first);
@@ -621,7 +690,7 @@ fn merge_also(
 fn scan_share(
     set: &ScanSet<'_>,
     scorer: &impl Scorer,
-    request: &ScanRequest<'_>,
+    config: ScanConfig<'_, '_>,
     k: usize,
     share: &[Piece],
     cancel: &CancellationToken,
@@ -636,11 +705,11 @@ fn scan_share(
             [piece.start as usize * width..piece.end as usize * width];
         let scan = Pass {
             set,
-            books: request.books,
+            books: config.request.books,
             segment,
             scorer,
             piece,
-            penalty: request.window_penalty,
+            penalties: config.penalties,
             cancel,
             progress,
         };
@@ -676,7 +745,7 @@ struct Pass<'p, 's, S> {
     segment: &'p ScanSegment<'s>,
     scorer: &'p S,
     piece: &'p Piece,
-    penalty: f32,
+    penalties: ScanPenalties,
     cancel: &'p CancellationToken,
     progress: Option<&'p AtomicUsize>,
 }
@@ -708,13 +777,16 @@ impl<S: Scorer> Pass<'_, '_, S> {
             if top.heap.len() == top.k && top.heap.peek().is_some_and(|worst| rank < worst.rank) {
                 continue;
             }
-            let Some(window) = effective_window(self.set, self.piece.seg, slot, self.books) else {
+            let Some(window) =
+                effective_role(self.set, self.piece.seg, slot, self.books, self.penalties)
+            else {
                 continue;
             };
-            if window > 0 && self.penalty != 0.0 {
-                rank = self.scorer.penalize(rank, self.penalty);
+            let applied_penalty = penalty_for(window, self.penalties);
+            if applied_penalty != 0.0 {
+                rank = self.scorer.penalize(rank, applied_penalty);
             }
-            top.offer(rank, self.piece.seg, slot, || {
+            top.offer(rank, self.piece.seg, slot, window, || {
                 self.segment.segment.key(slot)
             });
         }
@@ -729,6 +801,7 @@ struct Candidate {
     key: ChunkKey,
     seg: u16,
     slot: u32,
+    window: u8,
 }
 
 impl Candidate {
@@ -739,6 +812,7 @@ impl Candidate {
             .cmp(&a.rank)
             .then_with(|| a.key.cmp(&b.key))
             .then_with(|| (a.seg, a.slot).cmp(&(b.seg, b.slot)))
+            .then_with(|| a.window.cmp(&b.window))
     }
 }
 
@@ -771,13 +845,21 @@ impl TopK {
     /// Keep the candidate if it is among the best `k` so far. The key is read only when
     /// the rank alone cannot decide.
     #[inline]
-    fn offer(&mut self, rank: i32, seg: u16, slot: u32, key: impl FnOnce() -> ChunkKey) {
+    fn offer(
+        &mut self,
+        rank: i32,
+        seg: u16,
+        slot: u32,
+        window: u8,
+        key: impl FnOnce() -> ChunkKey,
+    ) {
         if self.heap.len() < self.k {
             self.heap.push(Candidate {
                 rank,
                 key: key(),
                 seg,
                 slot,
+                window,
             });
             return;
         }
@@ -792,6 +874,7 @@ impl TopK {
             key: key(),
             seg,
             slot,
+            window,
         };
         if Candidate::best_first(&candidate, worst) == Ordering::Less {
             self.heap.pop();
@@ -805,64 +888,119 @@ fn hits(
     set: &ScanSet<'_>,
     found: Vec<Candidate>,
     request: &ScanRequest<'_>,
+    penalties: ScanPenalties,
     scorer: &impl Scorer,
 ) -> Vec<VectorHit> {
     found
         .into_iter()
         .map(|candidate| VectorHit {
             window_penalty: request.window_penalty,
+            applied_penalty: penalty_for(candidate.window, penalties),
             score: scorer.score(candidate.rank),
             key: candidate.key,
-            records: records(set, candidate.seg, candidate.slot, request.books),
-            window: effective_window(set, candidate.seg, candidate.slot, request.books)
-                .or_else(|| effective_window(set, candidate.seg, candidate.slot, None))
-                .unwrap_or(0),
+            records: records(set, candidate.seg, candidate.slot, request.books, penalties),
+            window: candidate.window,
             seg: candidate.seg,
             slot: candidate.slot,
         })
         .collect()
 }
 
-/// Cheapest role among occurrences admitted by this query. A snapshot supersedes
-/// the old vector holder's book and role; it can also remove that book entirely.
-fn effective_window(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> Option<u8> {
-    let source = set.segments[seg as usize].segment;
-    // An unfiltered slot's own minimum is already stored alongside the vector.
-    // Only newer snapshots can override it; a fresh base stays a byte lookup.
-    if books.is_none() && seg as usize + 1 == set.segments.len() {
-        return Some(source.slot_window(slot));
+fn penalty_for(window: u8, penalties: ScanPenalties) -> f32 {
+    match window {
+        0 => 0.0,
+        ALIAS_WINDOW => penalties.alias,
+        _ => penalties.window,
     }
-    let key = source.key(slot);
+}
+
+pub(super) fn penalty_sort_key(window: u8, penalties: ScanPenalties) -> u32 {
+    let penalty = penalty_for(window, penalties);
+    if penalty == 0.0 {
+        0
+    } else {
+        penalty.to_bits()
+    }
+}
+
+/// Cheapest role among the current occurrence snapshot admitted by this query. A
+/// snapshot supersedes the old vector holder's book and role; a role's penalty, not its
+/// ordinal alone, determines which occurrence represents the vector in top-k.
+fn effective_role(
+    set: &ScanSet<'_>,
+    seg: u16,
+    slot: u32,
+    books: Option<&BookSet>,
+    penalties: ScanPenalties,
+) -> Option<u8> {
+    let source = set.segments[seg as usize].segment;
+    // Preserve the common unfiltered newest-segment byte lookup. Only when aliases
+    // are cheaper than inner windows can an uncached alias change the stored role.
+    if books.is_none() && seg as usize + 1 == set.segments.len() {
+        let stored = source.slot_window(slot);
+        if penalties.alias >= penalties.window || stored == 0 || stored == ALIAS_WINDOW {
+            return Some(stored);
+        }
+        let key = source.key(slot);
+        return source
+            .key_occurrences(key)
+            .map(|rows| least_role(rows.map(|row| row.window), penalties))
+            .unwrap_or(Some(stored));
+    }
     let snapshots = if books.is_none() {
         &set.segments[seg as usize + 1..]
     } else {
         set.segments
     };
+    let key = source.key(slot);
     for view in snapshots.iter().rev() {
         if let Some(snapshot) = view.segment.key_occurrences(key) {
-            return snapshot
-                .filter(|record| {
-                    books.is_none_or(|books| {
-                        books.contains(&view.segment.books()[record.book as usize].name)
+            return least_role(
+                snapshot
+                    .filter(|record| {
+                        books.is_none_or(|books| {
+                            books.contains(&view.segment.books()[record.book as usize].name)
+                        })
                     })
-                })
-                .map(|record| record.window)
-                .min();
+                    .map(|record| record.window),
+                penalties,
+            );
         }
     }
-    Some(source.slot_window(slot))
+    let stored = source.slot_window(slot);
+    if penalties.alias < penalties.window && stored > 0 && stored < ALIAS_WINDOW {
+        return source
+            .key_occurrences(key)
+            .map(|rows| least_role(rows.map(|row| row.window), penalties))
+            .unwrap_or(Some(stored));
+    }
+    Some(stored)
+}
+
+fn least_role(windows: impl Iterator<Item = u8>, penalties: ScanPenalties) -> Option<u8> {
+    windows.min_by(|a, b| {
+        penalty_sort_key(*a, penalties)
+            .cmp(&penalty_sort_key(*b, penalties))
+            .then_with(|| a.cmp(b))
+    })
 }
 
 /// Every record of a slot's key: its primary record, its extras, and the foreign records
 /// of later deltas that resolve to it — the books `books` admits first, at most
 /// [`MAX_RECORDS_PER_HIT`] in all.
-fn records(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> Vec<RecordRef> {
+fn records(
+    set: &ScanSet<'_>,
+    seg: u16,
+    slot: u32,
+    books: Option<&BookSet>,
+    penalties: ScanPenalties,
+) -> Vec<RecordRef> {
     let segment = set.segments[seg as usize].segment;
     let mut records = Vec::new();
     // A snapshot is complete for its key, including removals. Consult newest first.
     for view in set.segments.iter().rev() {
         if let Some(snapshot) = view.segment.key_occurrences(segment.key(slot)) {
-            return snapshot_records(view.segment, snapshot, books);
+            return snapshot_records(view.segment, snapshot, books, penalties);
         }
     }
     let book = &segment.books()[segment.book_of_slot(slot)];
@@ -906,7 +1044,7 @@ fn records(set: &ScanSet<'_>, seg: u16, slot: u32, books: Option<&BookSet>) -> V
             });
         }
     }
-    finish_records(&mut records, books);
+    finish_records(&mut records, books, penalties);
     records
 }
 
@@ -916,13 +1054,15 @@ fn snapshot_records(
     segment: &Segment,
     snapshot: impl Iterator<Item = super::occurrence::Occurrence>,
     books: Option<&BookSet>,
+    penalties: ScanPenalties,
 ) -> Vec<RecordRef> {
     use super::occurrence::Occurrence;
-    type Ranked = ((usize, u8, u32), RecordRef);
+    type Ranked = ((usize, u32, u8, u32), RecordRef);
     fn flush(
         segment: &Segment,
         group: &mut Vec<Occurrence>,
         books: Option<&BookSet>,
+        penalties: ScanPenalties,
         admitted: &mut Vec<Ranked>,
         other: &mut Vec<Ranked>,
     ) {
@@ -936,7 +1076,12 @@ fn snapshot_records(
             other
         };
         for (round, row) in group.drain(..).enumerate() {
-            let rank = (round, row.window, row.book);
+            let rank = (
+                round,
+                penalty_sort_key(row.window, penalties),
+                row.window,
+                row.book,
+            );
             let at = selected.partition_point(|(other, _)| *other < rank);
             if at < MAX_RECORDS_PER_HIT {
                 selected.insert(
@@ -961,17 +1106,34 @@ fn snapshot_records(
     let mut current = None;
     for row in snapshot {
         if current != Some(row.book) {
-            flush(segment, &mut group, books, &mut admitted, &mut other);
+            flush(
+                segment,
+                &mut group,
+                books,
+                penalties,
+                &mut admitted,
+                &mut other,
+            );
             current = Some(row.book);
         }
         // The least-penalized parent represents a book first; stable hints break ties.
-        let at = group.partition_point(|other: &Occurrence| other.window <= row.window);
+        let row_rank = (penalty_sort_key(row.window, penalties), row.window);
+        let at = group.partition_point(|other: &Occurrence| {
+            (penalty_sort_key(other.window, penalties), other.window) <= row_rank
+        });
         if at < MAX_RECORDS_PER_HIT {
             group.insert(at, row);
             group.truncate(MAX_RECORDS_PER_HIT);
         }
     }
-    flush(segment, &mut group, books, &mut admitted, &mut other);
+    flush(
+        segment,
+        &mut group,
+        books,
+        penalties,
+        &mut admitted,
+        &mut other,
+    );
     admitted
         .into_iter()
         .chain(other)
@@ -981,9 +1143,9 @@ fn snapshot_records(
 }
 
 /// A frequent parent must not crowd every other book out of a shared vector's cap.
-fn finish_records(records: &mut Vec<RecordRef>, books: Option<&BookSet>) {
+fn finish_records(records: &mut Vec<RecordRef>, books: Option<&BookSet>, penalties: ScanPenalties) {
     // Prefer the least-penalized representative of each book.
-    records.sort_by_key(|record| record.window);
+    records.sort_by_key(|record| (penalty_sort_key(record.window, penalties), record.window));
     let mut rounds = std::collections::HashMap::new();
     let mut ranked: Vec<_> = records
         .drain(..)
