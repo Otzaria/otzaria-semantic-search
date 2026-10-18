@@ -47,7 +47,10 @@ use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
 use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::kernel::PreparedQuery;
 use crate::semantic::oxv::reader::Segment;
-use crate::semantic::oxv::scan::{scan_with, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet};
+use crate::semantic::oxv::scan;
+use crate::semantic::oxv::scan::{
+    Link, ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet,
+};
 use crate::semantic::resolve::{SlotRef, VectorHit};
 use crate::semantic::versioning::{
     hex, IdentityField, IdentityMismatch, IndexVersion, VectorProvenance,
@@ -358,6 +361,27 @@ impl SegmentSet {
         also: &[SlotRef],
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, VectorStoreError> {
+        self.scan_with_penalties(
+            query,
+            request,
+            also,
+            ScanPenalties {
+                window: request.window_penalty,
+                alias: request.window_penalty,
+            },
+            cancel,
+        )
+    }
+
+    /// [`Self::scan_with`] with an independent alias penalty used during top-k selection.
+    pub(crate) fn scan_with_penalties(
+        &self,
+        query: &[f32],
+        request: &ScanRequest<'_>,
+        also: &[SlotRef],
+        penalties: ScanPenalties,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<VectorHit>, VectorStoreError> {
         let prepared = PreparedQuery::new(query, self.codec())?;
         let views: Vec<ScanSegment<'_>> = self
             .segments
@@ -374,7 +398,7 @@ impl SegmentSet {
             segments: &views,
             reverse_links: &self.reverse,
         };
-        scan_with(&set, &prepared, request, also, cancel)
+        scan::scan_with_penalties(&set, &prepared, request, also, penalties, cancel)
     }
 
     /// The newest entry for a book is authoritative, including an unknown hash.

@@ -41,8 +41,10 @@ pub struct RecordRef {
 /// One vector a scan returned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorHit {
-    /// Query penalty, retained so each resolved occurrence receives its own score.
+    /// Long-window penalty, retained so each resolved occurrence receives its own score.
     pub window_penalty: f32,
+    /// Penalty actually applied to this hit's representative occurrence during scan.
+    pub applied_penalty: f32,
     /// Codec similarity after the least penalty among admitted occurrences.
     pub score: f32,
     /// The key of the text the vector was embedded from.
