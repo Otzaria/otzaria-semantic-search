@@ -563,6 +563,26 @@ impl Warehouse {
             .and_then(|entry| self.confirmed(entry))
     }
 
+    /// [`Self::find_key`] for a key stored at `prefix.len()` bytes — 16, or the 8 of a
+    /// format-3 segment — when exactly one text's digest starts with them.
+    pub fn find_key_prefix(&self, prefix: &[u8]) -> Option<u64> {
+        if let Ok(key) = <&[u8; 16]>::try_from(prefix) {
+            return self.find_key(key);
+        }
+        let entries = self.entries()?;
+        let at = entries.partition_point(|entry| entry[..prefix.len()] < *prefix);
+        let found = entries
+            .get(at)
+            .filter(|entry| entry[..prefix.len()] == *prefix)?;
+        if entries
+            .get(at + 1)
+            .is_some_and(|next| next[..prefix.len()] == *prefix)
+        {
+            return None;
+        }
+        self.confirmed(found)
+    }
+
     /// The entry's record, if it is counted and `keys.bin` holds the entry's key there.
     fn confirmed(&self, entry: &[u8; ENTRY]) -> Option<u64> {
         let record = u64::from_le_bytes(entry[32..].try_into().expect("8"));

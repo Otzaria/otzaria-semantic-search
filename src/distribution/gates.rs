@@ -24,7 +24,8 @@ use crate::distribution::plan::Plan;
 use crate::distribution::warehouse::Warehouse;
 use crate::errors::{ArtifactError, PackError, SemanticSearchError};
 use crate::semantic::chunk_key::ChunkKey;
-use crate::semantic::oxv::codec::CodecSpec;
+use crate::semantic::oxv::codec::{Codec, CodecSpec};
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::segment_set::{
     install_package, InstallExpectation, InstallSource, ReleaseManifest, SegmentSet,
@@ -42,6 +43,15 @@ pub const G5_SAMPLES: usize = 20_000;
 pub const G5_MIN_MEAN_COSINE: f64 = 0.9995;
 /// G5: the least 0.1st-percentile cosine.
 pub const G5_MIN_P001_COSINE: f64 = 0.998;
+/// G5 for `rot192-i8i4`, which drops the components past its 192 and so cannot reach the
+/// int8 floors: the least mean cosine, and the least 0.1st percentile. On v31 it measures
+/// 0.9975 and 0.9938.
+pub const G5_ROT_MIN_MEAN_COSINE: f64 = 0.997;
+pub const G5_ROT_MIN_P001_COSINE: f64 = 0.99;
+/// G6 for `rot192-i8i4`, checked by the validator: the least recall@10 and recall@50 of the
+/// set's scan against the exact `f32` one ([`ExactReference`]).
+pub const G6_ROT_MIN_RECALL_AT_10: f64 = 0.98;
+pub const G6_ROT_MIN_RECALL_AT_50: f64 = 0.98;
 /// G7: the largest base, in bytes.
 pub const G7_MAX_BASE_BYTES: u64 = 3_500_000_000;
 /// G7: the largest delta, as a fraction of its base; a larger one is published as a base.
@@ -128,10 +138,19 @@ pub fn verify_release(request: &VerifyRequest<'_>) -> Result<GateReport, PackErr
         ));
     }
     let segment = Segment::open(&dir.join(SEGMENT_FILE))?;
-    let content = content_pass(&segment, request.warehouse, request.samples);
+    // The threshold the release's own ledger records its aliases at.
+    let alias_threshold = Ledger::open(dir, Some(manifest.to_library_version))
+        .ok()
+        .and_then(|ledger| ledger.manifest.alias_threshold);
+    let content = content_pass(
+        &segment,
+        request.warehouse,
+        request.samples,
+        alias_threshold,
+    );
     let gates = vec![
         g1(&manifest, &segment, &content),
-        g5(&content, manifest.kind),
+        g5(&content, manifest.kind, segment.codec()),
         g7(&manifest, request.previous),
         g8(request, &manifest)?,
         g9(dir, &manifest),
@@ -154,9 +173,19 @@ struct Content {
     bad_scales: u64,
     clipped: u64,
     cosines: Vec<f64>,
+    /// Alias occurrences, those whose vectors are missing or under the threshold, and the
+    /// least cosine of a short line's vector with the one it shares.
+    aliases: u64,
+    alias_faults: u64,
+    alias_min: Option<f64>,
 }
 
-fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Content {
+fn content_pass(
+    segment: &Segment,
+    warehouse: &Warehouse,
+    samples: usize,
+    alias_threshold: Option<f32>,
+) -> Content {
     let codec = segment.codec();
     let dim = codec.dim();
     let slots = segment.slot_count();
@@ -173,13 +202,17 @@ fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Con
         bad_scales: 0,
         clipped: 0,
         cosines: Vec::new(),
+        aliases: 0,
+        alias_faults: 0,
+        alias_min: None,
     };
     for slot in 0..slots {
         let scale = segment.vector_scale(slot);
         if scale.is_some_and(|scale| !(scale.is_finite() && scale > 0.0)) {
             content.bad_scales += 1;
         }
-        let Some(record) = warehouse.find_key(&segment.key(slot).0) else {
+        let key = segment.key(slot);
+        let Some(record) = warehouse.find_key_prefix(&key.0[..segment.key_len()]) else {
             content.without_vector += 1;
             continue;
         };
@@ -194,6 +227,24 @@ fn content_pass(segment: &Segment, warehouse: &Warehouse, samples: usize) -> Con
         if (slot as usize).is_multiple_of(step) {
             codec.decode(segment.vector(slot), scale, &mut decoded);
             content.cosines.push(cosine(&original, &decoded));
+        }
+    }
+    let width = segment.key_len();
+    for row in segment.occurrences().filter(|row| row.is_alias()) {
+        content.aliases += 1;
+        let pair = warehouse
+            .find_key_prefix(&row.anchor.0[..width])
+            .zip(warehouse.find_key_prefix(&row.key.0[..width]));
+        let Some((own, shared)) = pair else {
+            content.alias_faults += 1;
+            continue;
+        };
+        warehouse.vector(own, &mut original);
+        warehouse.vector(shared, &mut decoded);
+        let value = cosine(&original, &decoded);
+        content.alias_min = Some(content.alias_min.map_or(value, |least| least.min(value)));
+        if alias_threshold.is_none_or(|threshold| value < f64::from(threshold)) {
+            content.alias_faults += 1;
         }
     }
     content
@@ -234,7 +285,8 @@ fn not_applicable(gate: &'static str, detail: String) -> Gate {
 }
 
 /// G1: the identity is complete and the segment's own; every scale is finite and
-/// positive; `i8-sym-dim` clips at most [`G1_MAX_CLIP_RATE`] of the components.
+/// positive; `i8-sym-dim` clips at most [`G1_MAX_CLIP_RATE`] of the components, and
+/// `rot192-i8i4` as much of its tail's.
 fn g1(manifest: &ReleaseManifest, segment: &Segment, content: &Content) -> Gate {
     let codec = segment.codec();
     let mut faults = Vec::new();
@@ -260,8 +312,8 @@ fn g1(manifest: &ReleaseManifest, segment: &Segment, content: &Content) -> Gate 
     if bad > 0 {
         faults.push(format!("{bad} scale(s) are not finite and positive"));
     }
-    let components = content.slots * codec.dim() as u64;
-    let clip = if codec.clip_q().is_none() {
+    let components = content.slots * codec.clippable_components() as u64;
+    let clip = if !codec.can_clip() {
         "no clipping in this codec".to_string()
     } else if components == 0 {
         "no component to clip: the segment ships no vector".to_string()
@@ -285,11 +337,21 @@ fn g1(manifest: &ReleaseManifest, segment: &Segment, content: &Content) -> Gate 
     )
 }
 
+/// G5's floors for `codec`: `(mean, p0.1)`.
+pub fn g5_floors(codec: &Codec) -> (f64, f64) {
+    if codec.rotated().is_some() {
+        (G5_ROT_MIN_MEAN_COSINE, G5_ROT_MIN_P001_COSINE)
+    } else {
+        (G5_MIN_MEAN_COSINE, G5_MIN_P001_COSINE)
+    }
+}
+
 /// G5: every slot holds its key's warehouse vector, encoded; on the sample, the decoded
-/// vectors' cosine with their originals has a mean of at least [`G5_MIN_MEAN_COSINE`] and
-/// a 0.1st percentile of at least [`G5_MIN_P001_COSINE`]. Not applicable to a delta with no
-/// slot; any other empty or non-finite sample fails.
-fn g5(content: &Content, kind: PackageKind) -> Gate {
+/// vectors' cosine with their originals has a mean and a 0.1st percentile of at least the
+/// codec's [floors](g5_floors). Not applicable to a delta with no slot; any other empty or
+/// non-finite sample fails.
+fn g5(content: &Content, kind: PackageKind, codec: &Codec) -> Gate {
+    let (min_mean, min_p001) = g5_floors(codec);
     if content.slots == 0 {
         return match kind {
             PackageKind::Delta => not_applicable(
@@ -322,6 +384,13 @@ fn g5(content: &Content, kind: PackageKind) -> Gate {
             content.mismatched
         ));
     }
+    if content.alias_faults > 0 {
+        faults.push(format!(
+            "{} of {} alias(es) share a vector under the release's threshold, or one the \
+             warehouse lacks",
+            content.alias_faults, content.aliases
+        ));
+    }
     let non_finite = cosines.iter().filter(|cosine| !cosine.is_finite()).count();
     let measured = if cosines.is_empty() {
         faults.push(format!(
@@ -338,10 +407,9 @@ fn g5(content: &Content, kind: PackageKind) -> Gate {
     } else {
         let mean = cosines.iter().sum::<f64>() / cosines.len() as f64;
         let p001 = cosines[((cosines.len() - 1) as f64 * 0.001) as usize];
-        if !(mean >= G5_MIN_MEAN_COSINE && p001 >= G5_MIN_P001_COSINE) {
+        if !(mean >= min_mean && p001 >= min_p001) {
             faults.push(format!(
-                "cosine mean {mean:.6} and p0.1 {p001:.6}, under {G5_MIN_MEAN_COSINE} and \
-                 {G5_MIN_P001_COSINE}"
+                "cosine mean {mean:.6} and p0.1 {p001:.6}, under {min_mean} and {min_p001}"
             ));
         }
         Some((mean, p001))
@@ -352,9 +420,14 @@ fn g5(content: &Content, kind: PackageKind) -> Gate {
             true,
             format!(
                 "{} slot(s) encode their vectors; on {} sampled, cosine mean {mean:.6}, \
-                 p0.1 {p001:.6}",
+                 p0.1 {p001:.6}{}",
                 content.slots,
-                cosines.len()
+                cosines.len(),
+                match content.alias_min {
+                    Some(least) =>
+                        format!("; {} alias(es), least cosine {least:.6}", content.aliases),
+                    None => String::new(),
+                }
             ),
         ),
         _ => gate("G5", false, faults.join("; ")),
@@ -415,6 +488,7 @@ fn g8(request: &VerifyRequest<'_>, manifest: &ReleaseManifest) -> Result<Gate, P
         |ledger: &Ledger| ledger.manifest.codec.params_sha256 == manifest.codec_params_sha256;
     let epoch = match (manifest.kind, request.previous) {
         (PackageKind::Base, Some(ledger)) if keeps(ledger) => EpochChoice::Previous,
+        (PackageKind::Base, _) if codec.rotated().is_some() => EpochChoice::Given(codec.clone()),
         (PackageKind::Base, _) => EpochChoice::New(match codec.clip_q() {
             Some(clip_q) => CodecSpec::I8SymDim { clip_q },
             None => CodecSpec::parse(codec.name(), 1.0).map_err(malformed)?,
@@ -437,6 +511,15 @@ fn g8(request: &VerifyRequest<'_>, manifest: &ReleaseManifest) -> Result<Gate, P
         out_dir: scratch.clone(),
         created_at: manifest.created_at.clone(),
         built_by: manifest.built_by.clone(),
+        // A base decided at its own ledger's threshold; a delta takes its chain's.
+        alias_threshold: match manifest.kind {
+            PackageKind::Delta => None,
+            _ => {
+                Ledger::open(request.release_dir, Some(manifest.to_library_version))?
+                    .manifest
+                    .alias_threshold
+            }
+        },
     });
     let same =
         |name: &str| -> Result<bool, PackError> {
@@ -606,12 +689,29 @@ pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
     let mut effective = Vec::new();
     let mut records = std::collections::HashSet::new();
     let mut keys = std::collections::HashSet::new();
-    for record in plan.records.occurrences() {
+    // The plan's keys at the width the set holds them.
+    let narrow = set
+        .segments()
+        .first()
+        .is_some_and(|segment| segment.key_len() < 16);
+    let width = |key: ChunkKey| if narrow { key.narrowed() } else { key };
+    // The short lines that share a neighbour's vector, by their own key.
+    let mut aliased = std::collections::HashSet::new();
+    for mut record in plan.records.occurrences() {
+        record.key = width(record.key);
+        record.anchor = width(record.anchor);
         if record.book != current {
             current = record.book;
             set.book_occurrences(plan.books.name(current), &mut effective);
             records.clear();
             keys.clear();
+            aliased.clear();
+            aliased.extend(
+                effective
+                    .iter()
+                    .filter(|(_, row)| row.window == ALIAS_WINDOW)
+                    .filter_map(|(_, row)| row.anchor),
+            );
             keys.extend(effective.iter().map(|(key, _)| *key));
             records.extend(
                 effective
@@ -622,6 +722,7 @@ pub fn coverage(set: &SegmentSet, plan: &Plan) -> Coverage {
         coverage.records += 1;
         let reached = if plan.records.is_windowed() {
             records.contains(&(record.key, Some(record.anchor), record.window))
+                || (record.window == 0 && aliased.contains(&record.key))
         } else {
             keys.contains(&record.key)
         };
@@ -667,12 +768,14 @@ impl<'a> ExactReference<'a> {
                     continue;
                 }
                 let key = segment.key(slot);
-                let record = warehouse.find_key(&key.0).ok_or_else(|| {
-                    malformed(format!(
-                        "the warehouse holds no vector of key {}",
-                        hex(&key.0)
-                    ))
-                })?;
+                let record = warehouse
+                    .find_key_prefix(&key.0[..segment.key_len()])
+                    .ok_or_else(|| {
+                        malformed(format!(
+                            "the warehouse holds no vector of key {}",
+                            hex(&key.0)
+                        ))
+                    })?;
                 entries.push((record, key));
             }
         }
@@ -774,6 +877,11 @@ pub fn recall(found: &[ChunkKey], exact: &[ChunkKey]) -> f64 {
 mod tests {
     use super::*;
 
+    /// G5 at the int8 floors.
+    fn g5(content: &Content, kind: PackageKind) -> Gate {
+        super::g5(content, kind, &Codec::i8_sym_vec(4).unwrap())
+    }
+
     fn content(slots: u64, cosines: Vec<f64>) -> Content {
         Content {
             slots,
@@ -784,6 +892,9 @@ mod tests {
             bad_scales: 0,
             clipped: 0,
             cosines,
+            aliases: 0,
+            alias_faults: 0,
+            alias_min: None,
         }
     }
 

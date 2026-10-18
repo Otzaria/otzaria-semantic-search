@@ -7,7 +7,9 @@
 //! ```text
 //! records.bin          b"OXVREC1\n", u64 count, then {book u32, ordinal u32, sha256 [32]}
 //!                      per embedded line, strictly ascending by (book, ordinal); b"OXVREC2\n"
-//!                      adds {window u8, pad [3]} after ordinal and ascends by window too
+//!                      adds {window u8, flags u8, pad [2]} after ordinal and ascends by
+//!                      window too. Flag bit 0, `short`: a first window shorter than the
+//!                      recipe's `min_meaningful_chars`, embedded with its neighbours' context
 //! books.json           the books' stable keys, a JSON array in strictly ascending byte
 //!                      order; a record's book is an index into it
 //! embed.jsonl          the texts no warehouse vector exists for, one per key, in order of
@@ -31,6 +33,7 @@ use crate::errors::PackError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
 use crate::semantic::official_index::readable_store_identity;
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::recipe::{ChunkingAlgorithm, EmbeddingRecipe};
 use crate::semantic::versioning::{IndexVersion, ModelIdentity, ModelPackage};
 use memmap2::Mmap;
@@ -61,6 +64,8 @@ const WINDOWED_RECORDS_MAGIC: &[u8; 8] = b"OXVREC2\n";
 const RECORDS_HEADER: usize = 16;
 const RECORD_LEN: usize = 40;
 const WINDOWED_RECORD_LEN: usize = 44;
+/// Bit 0 of an `OXVREC2` record's flags byte: [`PlanRecord::short`].
+const RECORD_SHORT: u8 = 1;
 
 /// What a planner asks of the vectors already embedded — the warehouse's: whether one is
 /// held for the text whose SHA-256 is `sha256`.
@@ -77,6 +82,10 @@ pub struct PlanRecord {
     pub ordinal: u32,
     /// Which window of the line; 0, the line's first, in a plan without windows.
     pub window: u8,
+    /// A first window too short to stand alone, embedded with its neighbours' context
+    /// (`Chunker::borrows_context`): what may share a neighbour's vector. Only an `OXVREC2`
+    /// plan records it; an older plan, and an `OXVREC1` one, read as `false`.
+    pub short: bool,
     /// SHA-256 of the text the model is given.
     pub sha256: [u8; 32],
 }
@@ -100,7 +109,7 @@ impl PlanRecord {
         out.extend_from_slice(&self.book.to_le_bytes());
         out.extend_from_slice(&self.ordinal.to_le_bytes());
         if windowed {
-            out.extend_from_slice(&[self.window, 0, 0, 0]);
+            out.extend_from_slice(&[self.window, u8::from(self.short) * RECORD_SHORT, 0, 0]);
         }
         out.extend_from_slice(&self.sha256);
         out
@@ -113,6 +122,7 @@ impl PlanRecord {
             book: u32::from_le_bytes(bytes[..4].try_into().expect("4")),
             ordinal: u32::from_le_bytes(bytes[4..8].try_into().expect("4")),
             window: if windowed { bytes[8] } else { 0 },
+            short: windowed && bytes[9] & RECORD_SHORT != 0,
             sha256: bytes[digest..digest + 32].try_into().expect("32"),
         }
     }
@@ -170,6 +180,19 @@ impl RecordsWriter {
             return Err(malformed(format!(
                 "record {:?} is window {} of its line, and an OXVREC1 plan holds first \
                  windows only",
+                (record.book, record.ordinal),
+                record.window
+            )));
+        }
+        if record.window == ALIAS_WINDOW {
+            return Err(malformed(format!(
+                "record {:?} is window {ALIAS_WINDOW}, which no recipe makes: it is an alias's",
+                (record.book, record.ordinal)
+            )));
+        }
+        if record.short && record.window != 0 {
+            return Err(malformed(format!(
+                "record {:?} is short and window {}: only a first window borrows context",
                 (record.book, record.ordinal),
                 record.window
             )));
@@ -265,6 +288,14 @@ impl PlanRecords {
                 })
             {
                 return Err(malformed("a windowed plan line must begin with window 0"));
+            }
+            if record.short && record.window != 0 {
+                return Err(malformed("only a first window can be short"));
+            }
+            if record.window == ALIAS_WINDOW {
+                return Err(malformed(format!(
+                    "a record is window {ALIAS_WINDOW}, which no recipe makes"
+                )));
             }
             let at = record.position();
             if last.is_some_and(|last| at <= last) {
@@ -865,6 +896,7 @@ pub fn plan_from_corpus(
                 book: index as u32,
                 ordinal: ordinals[&chunk.line_id],
                 window: chunk.window,
+                short: chunk.window == 0 && chunker.borrows_context(&chunk.anchor_text),
                 sha256,
             })?;
             embed.offer(&sha256, &chunk.embedding_text)?;

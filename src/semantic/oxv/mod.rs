@@ -19,10 +19,11 @@
 //! | module | what it does |
 //! |---|---|
 //! | [`format`](mod@format) | the header, the section directory and the fixed-size records |
-//! | [`codec`] | how a unit vector becomes a slot's bytes: `f32`, and int8 with per-dimension scales |
+//! | [`codec`] | how a unit vector becomes a slot's bytes: `f32`, int8, and a rotation to int8 and 4 bits |
 //! | [`writer`] | tables first, then the vectors streamed in slot order |
 //! | [`reader`] | map a segment, check what is cheap to check, read records in place |
-//! | `kernel` | the exact integer dot product, scalar, AVX2 and NEON |
+//! | `kernel` | the exact integer dot products, 8- and 4-bit, scalar, AVX2 and NEON |
+//! | `rotation` | `rot192-i8i4`'s rotation: applied, and fitted by a deterministic eigen-decomposition |
 //! | [`scan`] | every live slot scored, on several threads, under a book filter, the best `k` kept |
 
 pub mod codec;
@@ -30,9 +31,12 @@ pub mod format;
 pub(crate) mod kernel;
 pub mod occurrence;
 pub mod reader;
+pub(crate) mod rotation;
 pub mod scan;
 pub mod writer;
 
+#[cfg(test)]
+mod measure_tests;
 #[cfg(test)]
 mod scan_tests;
 #[cfg(test)]

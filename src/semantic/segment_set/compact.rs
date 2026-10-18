@@ -19,6 +19,7 @@ use crate::cancellation::CancellationToken;
 use crate::distribution::package::PackageKind;
 use crate::errors::{ArtifactError, SemanticSearchError, VectorStoreError};
 use crate::semantic::chunk_key::ChunkKey;
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
 use crate::semantic::resolve::LiveKeySource;
@@ -188,9 +189,9 @@ pub fn compact(
     let deleted = set.deleted();
     let mut live_slots: Vec<(ChunkKey, u16, u32)> = Vec::with_capacity(info.slots_live as usize);
     for (seg, segment) in segments.iter().enumerate() {
-        for (slot, key) in segment.key_bytes().as_chunks::<16>().0.iter().enumerate() {
+        for (slot, key) in segment.keys().enumerate() {
             if !deleted[seg].is_set(slot as u32) {
-                live_slots.push((ChunkKey(*key), seg as u16, slot as u32));
+                live_slots.push((key, seg as u16, slot as u32));
             }
         }
     }
@@ -226,6 +227,10 @@ pub fn compact(
         },
         codec.clone(),
     );
+    // The set's own key width: a compaction never changes what its keys are.
+    builder
+        .set_format_version(segments[0].format_version())
+        .map_err(io_error("the segment format".to_string()))?;
     let mut order: Vec<(u16, u32)> = Vec::with_capacity(live_slots.len());
     let (mut pruned, mut refreshed) = (0u64, 0u64);
     let mut live_lines: Vec<(u32, u64)> = Vec::new();
@@ -292,7 +297,7 @@ pub fn compact(
                         }
                         resolved.push((key, record));
                     }
-                    None if has_keys && record.window == 0 => {
+                    None if has_keys && (record.window == 0 || record.window == ALIAS_WINDOW) => {
                         pruned += 1;
                     }
                     None => resolved.push((key, record)),
@@ -313,6 +318,10 @@ pub fn compact(
         let mut extras = Vec::new();
         let mut occurrences = Vec::new();
         let mut least = HashMap::<ChunkKey, u8>::new();
+        // An alias still needs its backing vector when the neighbour's own occurrence
+        // has gone stale. Keep a slot/extra for every surviving key; the complete
+        // occurrence snapshot supplies its actual roles, without inventing a normal
+        // occurrence at the alias's hint. An alias-only slot keeps the penalized role.
         for (key, record) in &records {
             least
                 .entry(*key)
@@ -320,6 +329,7 @@ pub fn compact(
                 .or_insert(record.window);
         }
         let mut recorded = std::collections::HashSet::new();
+        let mut placed = std::collections::HashSet::new();
         for (key, record) in records {
             if let Some(anchor) = record.anchor {
                 occurrences.push(crate::semantic::oxv::occurrence::Occurrence {
@@ -346,7 +356,9 @@ pub fn compact(
                 builder.minimize_slot_window(new_slot[position], least[&key]);
                 extras.push((record.hint, new_slot[position]));
             }
+            placed.insert(key);
         }
+        occurrences.retain(|row| !row.is_alias() || placed.contains(&row.key));
         builder
             .add_book_windowed_hashed(
                 name,

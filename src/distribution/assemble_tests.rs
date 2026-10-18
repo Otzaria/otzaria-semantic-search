@@ -74,9 +74,29 @@ impl Machine {
         books: &[(&str, &[usize])],
         previous: Option<&Ledger>,
     ) -> Plan {
+        let books: Vec<(&str, Vec<String>)> = books
+            .iter()
+            .map(|(book, texts)| (*book, texts.iter().map(|i| text(*i)).collect()))
+            .collect();
+        self.plan_texts(name, version, &books, previous, raw_shard)
+    }
+
+    /// [`Self::plan`] of these lines, embedded by `shard`.
+    fn plan_texts(
+        &self,
+        name: &str,
+        version: u32,
+        books: &[(&str, Vec<String>)],
+        previous: Option<&Ledger>,
+        shard: fn(&std::path::Path, &std::path::Path) -> PathBuf,
+    ) -> Plan {
         let lines: Vec<(u64, String, String)> = books
             .iter()
-            .flat_map(|(book, texts)| texts.iter().map(move |i| (book.to_string(), text(*i))))
+            .flat_map(|(book, texts)| {
+                texts
+                    .iter()
+                    .map(move |text| (book.to_string(), text.clone()))
+            })
             .enumerate()
             .map(|(at, (book, text))| (at as u64 + 1, book, text))
             .collect();
@@ -101,7 +121,7 @@ impl Machine {
             )
             .unwrap();
         }
-        let shard = raw_shard(&out, &self.dir.join(&format!("{name}-shard")));
+        let shard = shard(&out, &self.dir.join(&format!("{name}-shard")));
         Warehouse::open_for_append(&self.warehouse)
             .unwrap()
             .add_shards(
@@ -134,6 +154,7 @@ impl Machine {
             out_dir: self.dir.join(out),
             created_at: CREATED.to_string(),
             built_by: Some(serde_json::json!({ "runId": "test" })),
+            alias_threshold: None,
         })
         .unwrap()
     }
@@ -898,6 +919,7 @@ fn a_delta_is_refused_off_its_chain() {
         out_dir: machine.dir.join("refused"),
         created_at: CREATED.to_string(),
         built_by: None,
+        alias_threshold: None,
     };
     // No ledger; a ledger the plan was not split against; a compacted segment.
     assert!(assemble(&request(&p2, PackageKind::Delta, None)).is_err());
@@ -1024,6 +1046,7 @@ fn a_corrupt_warehouse_fails_assembly_the_gates_and_the_exact_reference() {
         out_dir: machine.dir.join("again"),
         created_at: CREATED.to_string(),
         built_by: None,
+        alias_threshold: None,
     })
     .err()
     .unwrap();
@@ -1109,6 +1132,7 @@ fn warehouse_metadata_is_checked_against_independent_plan_and_set_identities() {
             out_dir: machine.dir.join("refused"),
             created_at: CREATED.to_string(),
             built_by: None,
+            alias_threshold: None,
         })
         .err()
         .unwrap();
@@ -1157,6 +1181,7 @@ fn assembly_checks_the_embed_manifest_digest_before_using_its_package() {
         out_dir: machine.dir.join("refused"),
         created_at: CREATED.to_string(),
         built_by: None,
+        alias_threshold: None,
     })
     .err()
     .unwrap();
@@ -1578,4 +1603,603 @@ fn a_legacy_plan_ignores_a_stale_windowed_book_hash_file() {
         .files
         .contains_key(super::plan::BOOK_HASHES_FILE));
     assert_eq!(plan.book_source_hashes().unwrap(), None);
+}
+
+/// `rot192-i8i4` end to end, at the stub's width: the fitted epoch is the same bytes twice
+/// and round-trips through its file; the base is format 3 and passes every gate, G8 too; a
+/// delta keeps the epoch from the ledger; the device set reaches the whole plan, its hits
+/// carry eight-byte keys, and compacting it gives the direct base's slots, still format 3.
+#[test]
+fn a_rotated_release_is_format_3_end_to_end() {
+    let machine = Machine::new("rotated_release");
+    // Enough vectors for the rotation to span the stub's 64 dimensions.
+    let v1 = library(2, 300, &[(C, &[600, 601])]);
+    let v2 = library(2, 300, &[(D, &[5, 305, 700])]);
+    let p1 = machine.plan("p1", 1, &borrowed(&v1), None);
+    let codec = {
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        let codec = fit_rot_i8i4(&warehouse, 1000, 48, 16).unwrap();
+        let again = fit_rot_i8i4(&warehouse, 1000, 48, 16).unwrap();
+        assert_eq!(codec.params(), again.params());
+        codec
+    };
+    let file = machine.dir.join("rotation.bin");
+    std::fs::write(&file, codec.params()).unwrap();
+    assert_eq!(read_rotation(&file).unwrap(), codec);
+    let given = EpochChoice::Given(codec.clone());
+
+    let base1 = machine.assemble(&p1, PackageKind::Base, None, given.clone(), "base1");
+    let store = &base1.manifest.identity.store;
+    assert_eq!(
+        (store.store_format_version, store.vector_precision.as_str()),
+        (3, "rot192-i8i4")
+    );
+    let segment = Segment::open(&base1.out_dir.join(SEGMENT_FILE)).unwrap();
+    assert_eq!((segment.format_version(), segment.key_len()), (3, 8));
+    let report = machine.verify(&p1, "base1", None);
+    assert!(report.passed(), "{:?}", report.gates);
+    let ledger1 = Ledger::open(&base1.out_dir, Some(1)).unwrap();
+    assert_eq!(ledger1.codec().unwrap(), codec);
+
+    let p2 = machine.plan("p2", 2, &borrowed(&v2), Some(&ledger1));
+    let delta = machine.assemble(
+        &p2,
+        PackageKind::Delta,
+        Some(&ledger1),
+        EpochChoice::Previous,
+        "delta2",
+    );
+    assert_eq!(delta.manifest.identity.store.store_format_version, 3);
+    let report = machine.verify(&p2, "delta2", Some(&ledger1));
+    for gate in &report.gates {
+        assert!(
+            gate.passed() || gate.gate == "G7",
+            "{}: {}",
+            gate.gate,
+            gate.detail
+        );
+    }
+    let base2 = machine.assemble(&p2, PackageKind::Base, None, given, "base2");
+
+    let work = &machine.dir;
+    let device = simulate_device(&work.join("device"), &[&base1.out_dir, &delta.out_dir]).unwrap();
+    assert!(coverage(&device, &p2).complete());
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    let mut query = vec![0f32; warehouse.dim()];
+    warehouse.vector(0, &mut query);
+    let hits = device
+        .scan(
+            &query,
+            &crate::semantic::oxv::scan::ScanRequest {
+                top_k: 5,
+                books: None,
+                threads: 1,
+                window_penalty: 0.0,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(!hits.is_empty() && hits.iter().all(|hit| hit.key.is_narrow()));
+    let reference = ExactReference::new(&device, &warehouse).unwrap();
+    assert_eq!(reference.len() as u64, device.info().slots_live);
+    drop(device);
+    compact(
+        &work.join("device"),
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&p2)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&work.join("device")).unwrap();
+    let direct = simulate_device(&work.join("direct"), &[&base2.out_dir]).unwrap();
+    assert_eq!(compacted.segments()[0].format_version(), 3);
+    assert_eq!(
+        contents(&compacted.segments()[0]),
+        contents(&direct.segments()[0])
+    );
+}
+
+/// Format 3 keeps eight bytes of a key, so two keys that share them are found, and the
+/// same key twice is not a pair.
+#[test]
+fn keys_sharing_their_first_eight_bytes_are_found() {
+    let key = |first: u8, last: u8| {
+        let mut key = [0u8; 16];
+        key[0] = first;
+        key[15] = last;
+        key
+    };
+    assert_eq!(
+        shared_prefix(vec![key(1, 0), key(2, 0), key(1, 0)], 8),
+        None
+    );
+    assert_eq!(
+        shared_prefix(vec![key(3, 0), key(1, 9), key(2, 0), key(1, 4)], 8),
+        Some((key(1, 4), key(1, 9)))
+    );
+    assert_eq!(shared_prefix(vec![key(1, 9), key(1, 4)], 16), None);
+}
+
+/// A recipe with windows whose cap is past every test line, so a short line's context is
+/// never a prefix of its neighbour's own text.
+fn alias_chunking() -> ChunkerConfig {
+    ChunkerConfig {
+        max_chunk_chars: 200,
+        ..windows_chunking()
+    }
+}
+
+/// A shard in which each short line right after a line that is not short embeds almost as
+/// that line does — what sharing a vector finds — and every other text as `raw_shard`.
+fn alias_shard(plan_dir: &std::path::Path, out: &std::path::Path) -> PathBuf {
+    use super::plan::{PlanRecord, PlanRecords, RECORDS_FILE};
+    use super::testing::{raw_shard_with, unit_vector};
+    let records = PlanRecords::open(&plan_dir.join(RECORDS_FILE)).unwrap();
+    let first: Vec<PlanRecord> = records.iter().filter(|record| record.window == 0).collect();
+    let near: std::collections::HashMap<[u8; 32], [u8; 32]> = first
+        .windows(2)
+        .filter(|pair| {
+            pair[1].short
+                && !pair[0].short
+                && pair[0].book == pair[1].book
+                && pair[1].ordinal == pair[0].ordinal + 1
+        })
+        .map(|pair| (pair[1].sha256, pair[0].sha256))
+        .collect();
+    raw_shard_with(plan_dir, out, &|sha, dim| match near.get(sha) {
+        Some(neighbour) => {
+            let mut vector = unit_vector(neighbour, dim);
+            for (value, noise) in vector.iter_mut().zip(unit_vector(sha, dim)) {
+                *value += 0.002 * noise;
+            }
+            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            vector.iter().map(|x| x / norm).collect()
+        }
+        None => unit_vector(sha, dim),
+    })
+}
+
+/// The library of the alias tests: enough lines for a rotation, and two books of short
+/// lines — two that follow a line they embed almost as, one first in its book.
+fn alias_library(more: &[(&'static str, Vec<String>)]) -> Vec<(&'static str, Vec<String>)> {
+    let mut books: Vec<(&'static str, Vec<String>)> = vec![
+        ("otzaria/00.txt", (0..300).map(text).collect()),
+        ("otzaria/01.txt", (300..600).map(text).collect()),
+        (
+            "otzaria/a.txt",
+            vec![
+                text(600),
+                "שורה קצרה א".to_string(),
+                text(601),
+                text(602),
+                "שורה קצרה ב".to_string(),
+            ],
+        ),
+        (
+            "otzaria/b.txt",
+            vec!["שורה קצרה ג".to_string(), text(603), text(604)],
+        ),
+    ];
+    books.extend(more.iter().cloned());
+    books
+}
+
+/// Short lines share a neighbour's vector in a format-3 release: they get no slot, an
+/// alias occurrence carries them, every gate passes and reports them, a scan of the
+/// neighbour's vector returns their place, a delta keeps them at its chain's threshold and
+/// refuses another, compaction keeps them, and a format-2 release refuses to alias.
+#[test]
+fn short_lines_share_a_neighbours_vector_end_to_end() {
+    use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
+    let machine = Machine::chunked("aliases", alias_chunking());
+    let p1 = machine.plan_texts("p1", 1, &alias_library(&[]), None, alias_shard);
+    let codec = {
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        fit_rot_i8i4(&warehouse, 10_000, 48, 16).unwrap()
+    };
+    let request = |plan: &Plan, kind, previous, epoch, out: &str, threshold| {
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        assemble(&AssembleRequest {
+            plan,
+            warehouse: &warehouse,
+            kind,
+            previous,
+            epoch,
+            out_dir: machine.dir.join(out),
+            created_at: CREATED.to_string(),
+            built_by: None,
+            alias_threshold: threshold,
+        })
+    };
+    let given = EpochChoice::Given(codec.clone());
+    let base = request(&p1, PackageKind::Base, None, given, "base1", Some(0.99)).unwrap();
+    assert_eq!((base.alias_records, base.alias_keys), (2, 2));
+    assert!(base.alias_min_cosine.unwrap() > 0.99);
+    assert_eq!(base.ledger.alias_threshold, Some(0.99));
+    let shorts: Vec<ChunkKey> = p1
+        .records
+        .iter()
+        .filter(|record| record.short)
+        .map(|record| record.key().narrowed())
+        .collect();
+    assert_eq!(shorts.len(), 3);
+
+    let segment = Segment::open(&base.out_dir.join(SEGMENT_FILE)).unwrap();
+    let slots: Vec<ChunkKey> = segment.keys().collect();
+    let aliased: Vec<_> = segment.occurrences().filter(|row| row.is_alias()).collect();
+    assert_eq!(aliased.len(), 2);
+    for row in &aliased {
+        assert!(
+            !slots.contains(&row.anchor),
+            "an alias ships no vector of its own"
+        );
+        assert!(slots.contains(&row.key), "it names its neighbour's");
+        assert!(shorts.contains(&row.anchor));
+        assert_eq!(row.window, ALIAS_WINDOW);
+    }
+    assert!(
+        slots.contains(&shorts[2]),
+        "the short line first in its book keeps its own"
+    );
+    drop(segment);
+    let report = machine.verify(&p1, "base1", None);
+    assert!(report.passed(), "{:?}", report.gates);
+    let g5 = g5_of(&report);
+    assert!(
+        g5.detail.contains("; 2 alias(es), least cosine 0.99"),
+        "{}",
+        g5.detail
+    );
+
+    let device = simulate_device(&machine.dir.join("device"), &[&base.out_dir]).unwrap();
+    assert!(coverage(&device, &p1).complete());
+    let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+    let neighbour = p1
+        .records
+        .iter()
+        .find(|record| record.key().narrowed() == aliased[0].key)
+        .unwrap();
+    let mut query = vec![0f32; warehouse.dim()];
+    warehouse.vector(warehouse.find(&neighbour.sha256).unwrap(), &mut query);
+    drop(warehouse);
+    let hits = device
+        .scan(
+            &query,
+            &crate::semantic::oxv::scan::ScanRequest {
+                top_k: 1,
+                books: None,
+                threads: 1,
+                window_penalty: 0.04,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(hits[0].key, aliased[0].key);
+    assert_eq!(hits[0].window, 0, "the hit ranks by its own line");
+    let places: Vec<(u32, u8)> = hits[0]
+        .records
+        .iter()
+        .map(|record| (record.hint, record.window))
+        .collect();
+    assert_eq!(places.last(), Some(&(aliased[0].hint, ALIAS_WINDOW)));
+    drop(device);
+
+    // A delta: a new book, the aliases unchanged, at the chain's threshold.
+    let ledger1 = Ledger::open(&base.out_dir, Some(1)).unwrap();
+    let more = [("otzaria/c.txt", vec![text(605), "שורה קצרה ד".to_string()])];
+    let p2 = machine.plan_texts("p2", 2, &alias_library(&more), Some(&ledger1), alias_shard);
+    let refused = request(
+        &p2,
+        PackageKind::Delta,
+        Some(&ledger1),
+        EpochChoice::Previous,
+        "refused",
+        Some(0.5),
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("new threshold"), "{refused}");
+    let delta = request(
+        &p2,
+        PackageKind::Delta,
+        Some(&ledger1),
+        EpochChoice::Previous,
+        "delta2",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        (delta.alias_records, delta.ledger.alias_threshold),
+        (3, Some(0.99))
+    );
+    let report = machine.verify(&p2, "delta2", Some(&ledger1));
+    for gate in &report.gates {
+        assert!(
+            gate.passed() || gate.gate == "G7",
+            "{}: {}",
+            gate.gate,
+            gate.detail
+        );
+    }
+    let device = machine.dir.join("device2");
+    let chain = simulate_device(&device, &[&base.out_dir, &delta.out_dir]).unwrap();
+    assert!(coverage(&chain, &p2).complete());
+    drop(chain);
+    compact(
+        &device,
+        &CompactionPolicy {
+            force: true,
+            ..CompactionPolicy::default()
+        },
+        Some(&Live::of(&p2)),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let compacted = SegmentSet::open(&device).unwrap();
+    let rows = compacted.segments()[0]
+        .occurrences()
+        .filter(|row| row.is_alias())
+        .count();
+    assert_eq!(rows, 3);
+    assert!(coverage(&compacted, &p2).complete());
+
+    // A threshold that is not one, and a ledger rebuilt without the warehouse.
+    for bad in [f32::NAN, -0.1, 1.5] {
+        let given = EpochChoice::Given(codec.clone());
+        let refused = request(&p1, PackageKind::Base, None, given, "bad", Some(bad)).unwrap_err();
+        assert!(refused.to_string().contains("[0, 1]"), "{bad}: {refused}");
+    }
+    let rebuilt = super::ledger::write_plan_ledger(
+        &p2,
+        Some(&ledger1),
+        &codec,
+        base.ledger.base,
+        0,
+        &machine.dir.join("rebuilt"),
+    )
+    .unwrap_err();
+    assert!(
+        rebuilt.to_string().contains("assemble the release"),
+        "{rebuilt}"
+    );
+
+    // Format 2 cannot carry one.
+    let refused = request(&p1, PackageKind::Base, None, NEW, "refused-v2", Some(0.99)).unwrap_err();
+    assert!(
+        refused.to_string().contains("segment format 3"),
+        "{refused}"
+    );
+}
+
+/// What a device set answers, independent of how its segments are laid out: every live key,
+/// every book's effective records, and the hits of a few scans with their scores and
+/// records.
+type SetView = (
+    Vec<ChunkKey>,
+    Vec<Vec<(ChunkKey, u32, u8, Option<ChunkKey>)>>,
+    Vec<Vec<(ChunkKey, u32, Vec<(String, u32, u8, Option<ChunkKey>)>)>>,
+);
+
+fn set_view(set: &SegmentSet, books: &[&str], queries: &[Vec<f32>]) -> SetView {
+    let mut live: Vec<ChunkKey> = set
+        .segments()
+        .iter()
+        .enumerate()
+        .flat_map(|(seg, segment)| {
+            (0..segment.slot_count())
+                .filter(move |slot| set.is_live(seg as u16, *slot))
+                .map(move |slot| segment.key(slot))
+        })
+        .collect();
+    live.sort();
+    let mut records = Vec::new();
+    let mut out = Vec::new();
+    for book in books {
+        set.book_occurrences(book, &mut out);
+        let mut rows: Vec<_> = out
+            .iter()
+            .map(|(key, record)| (*key, record.hint, record.window, record.anchor))
+            .collect();
+        rows.sort();
+        records.push(rows);
+    }
+    let scans = queries
+        .iter()
+        .map(|query| {
+            set.scan(
+                query,
+                &crate::semantic::oxv::scan::ScanRequest {
+                    top_k: 20,
+                    books: None,
+                    threads: 1,
+                    window_penalty: 0.04,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| {
+                let mut places: Vec<_> = hit
+                    .records
+                    .iter()
+                    .map(|record| {
+                        (
+                            record.book.to_string(),
+                            record.hint,
+                            record.window,
+                            record.anchor,
+                        )
+                    })
+                    .collect();
+                places.sort();
+                (hit.key, hit.score.to_bits(), places)
+            })
+            .collect()
+        })
+        .collect();
+    (live, records, scans)
+}
+
+/// The libraries of the chain test: v2 drops the line a short line shared, so that line
+/// embeds anew under its own slot, and adds a book with a new alias; v3 drops the line
+/// before another alias's short line, which then shares a new neighbour.
+fn chain_library(version: u32) -> Vec<(&'static str, Vec<String>)> {
+    let short = |name: &str| format!("שורה קצרה {name}");
+    let mut books: Vec<(&'static str, Vec<String>)> = vec![
+        ("otzaria/00.txt", (0..300).map(text).collect()),
+        ("otzaria/01.txt", (300..600).map(text).collect()),
+    ];
+    let a = match version {
+        1 => vec![text(600), short("א"), text(601), text(602), short("ב")],
+        2 => vec![short("א"), text(601), text(602), short("ב")],
+        _ => vec![short("א"), text(601), short("ב")],
+    };
+    books.push(("otzaria/a.txt", a));
+    books.push(("otzaria/b.txt", vec![short("ג"), text(603), text(604)]));
+    if version >= 2 {
+        books.push(("otzaria/c.txt", vec![text(605), short("ד")]));
+    }
+    books
+}
+
+/// How CI publishes: each release a delta against the last base's ledger and a base in the
+/// same epoch from that ledger. A device that applied base(1), delta(2) and delta(3) — the
+/// last assembled against base(2)'s ledger — answers exactly as base(3) and as
+/// base(2) + delta(3): the same live keys, records, alias occurrences and scans, before
+/// and after compaction. In `rot192-i8i4` with short lines sharing vectors, and in
+/// `i8-sym-vec`.
+#[test]
+fn a_device_on_the_delta_chain_answers_as_each_base_does() {
+    for rotated in [true, false] {
+        let machine = Machine::chunked(
+            if rotated { "chain_rot" } else { "chain_i8" },
+            alias_chunking(),
+        );
+        let p1 = machine.plan_texts("p1", 1, &chain_library(1), None, alias_shard);
+        let (first, threshold) = if rotated {
+            let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+            let codec = fit_rot_i8i4(&warehouse, 10_000, 48, 16).unwrap();
+            (EpochChoice::Given(codec), Some(0.99))
+        } else {
+            (NEW, None)
+        };
+        let request = |plan: &Plan, kind, previous, epoch, out: &str| {
+            let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+            assemble(&AssembleRequest {
+                plan,
+                warehouse: &warehouse,
+                kind,
+                previous,
+                epoch,
+                out_dir: machine.dir.join(out),
+                created_at: CREATED.to_string(),
+                built_by: None,
+                alias_threshold: threshold,
+            })
+            .unwrap()
+        };
+        let base1 = request(&p1, PackageKind::Base, None, first, "base1");
+        let ledger1 = Ledger::open(&base1.out_dir, Some(1)).unwrap();
+        let p2 = machine.plan_texts("p2", 2, &chain_library(2), Some(&ledger1), alias_shard);
+        let delta2 = request(
+            &p2,
+            PackageKind::Delta,
+            Some(&ledger1),
+            EpochChoice::Previous,
+            "delta2",
+        );
+        let base2 = request(
+            &p2,
+            PackageKind::Base,
+            Some(&ledger1),
+            EpochChoice::Previous,
+            "base2",
+        );
+        let ledger2 = Ledger::open(&base2.out_dir, Some(2)).unwrap();
+        let p3 = machine.plan_texts("p3", 3, &chain_library(3), Some(&ledger2), alias_shard);
+        let delta3 = request(
+            &p3,
+            PackageKind::Delta,
+            Some(&ledger2),
+            EpochChoice::Previous,
+            "delta3",
+        );
+        let base3 = request(
+            &p3,
+            PackageKind::Base,
+            Some(&ledger2),
+            EpochChoice::Previous,
+            "base3",
+        );
+        if rotated {
+            assert_eq!(base1.alias_records, 2);
+            assert_eq!(
+                base2.alias_records, 2,
+                "ב and the new ד; א lost its neighbour"
+            );
+            // In v3 א and ב embed one context, so one key at two places shares 601.
+            assert_eq!(
+                (base3.alias_records, base3.alias_keys),
+                (3, 2),
+                "א and ב share 601 now, and ד its line"
+            );
+        } else {
+            assert_eq!(base1.alias_records + base3.alias_records, 0);
+        }
+
+        let books: Vec<&str> = chain_library(3).iter().map(|(book, _)| *book).collect();
+        let warehouse = Warehouse::open(&machine.warehouse).unwrap();
+        let queries: Vec<Vec<f32>> = p3
+            .records
+            .iter()
+            .filter(|record| record.book >= 2)
+            .map(|record| {
+                let mut query = vec![0f32; warehouse.dim()];
+                warehouse.vector(warehouse.find(&record.sha256).unwrap(), &mut query);
+                query
+            })
+            .collect();
+        drop(warehouse);
+        let dir = |name: &str| machine.dir.join(name);
+        let views = |name: &str| {
+            let set = SegmentSet::open(&dir(name)).unwrap();
+            assert!(coverage(&set, &p3).complete(), "{name}");
+            set_view(&set, &books, &queries)
+        };
+        drop(
+            simulate_device(
+                &dir("long"),
+                &[&base1.out_dir, &delta2.out_dir, &delta3.out_dir],
+            )
+            .unwrap(),
+        );
+        drop(simulate_device(&dir("short"), &[&base2.out_dir, &delta3.out_dir]).unwrap());
+        drop(simulate_device(&dir("fresh"), &[&base3.out_dir]).unwrap());
+        let fresh = views("fresh");
+        let aliases = fresh
+            .1
+            .iter()
+            .flatten()
+            .filter(|row| row.2 == crate::semantic::oxv::occurrence::ALIAS_WINDOW)
+            .count();
+        // One row for א and ב: a key's places under one anchor keep their first hint.
+        assert_eq!(aliases, if rotated { 2 } else { 0 });
+        assert_eq!(views("long"), fresh, "base(1) + delta(2) + delta(3)");
+        assert_eq!(views("short"), fresh, "base(2) + delta(3)");
+        for name in ["long", "short"] {
+            compact(
+                &dir(name),
+                &CompactionPolicy {
+                    force: true,
+                    ..CompactionPolicy::default()
+                },
+                Some(&Live::of(&p3)),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(views(name), fresh, "{name}, compacted");
+        }
+    }
 }

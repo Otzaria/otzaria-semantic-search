@@ -59,6 +59,25 @@ impl ChunkKey {
         u64::from_be_bytes(self.0[..8].try_into().expect("a key holds 16 bytes"))
     }
 
+    /// The key as a format-3 segment stores it: its first eight bytes, the rest zero.
+    pub fn narrowed(self) -> Self {
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&self.0[..8]);
+        Self(key)
+    }
+
+    /// Whether the key is in [`Self::narrowed`] form.
+    pub fn is_narrow(self) -> bool {
+        self.0[8..] == [0; 8]
+    }
+
+    /// Whether two keys name one text at the width either was stored at: equal, or equal in
+    /// their first eight bytes when one of them is narrow. Compares a computed 16-byte key
+    /// with a key read from a segment of either format.
+    pub fn same_text(self, other: Self) -> bool {
+        self == other || ((self.is_narrow() || other.is_narrow()) && self.0[..8] == other.0[..8])
+    }
+
     /// 32 lowercase hex digits.
     pub fn to_hex(self) -> String {
         use fmt::Write;
@@ -131,6 +150,21 @@ mod tests {
         let high = ChunkKey([0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert!(low < high);
         assert!(low.column_value() < high.column_value());
+    }
+
+    #[test]
+    fn a_narrow_key_names_the_text_of_its_prefix() {
+        let key = ChunkKey::of("a line that stands alone");
+        let narrow = key.narrowed();
+        assert!(narrow.is_narrow() && !key.is_narrow());
+        assert_eq!(narrow.column_value(), key.column_value());
+        assert!(key.same_text(narrow) && narrow.same_text(key) && key.same_text(key));
+        let other = ChunkKey::of("another line");
+        assert!(!other.same_text(narrow) && !other.same_text(key));
+        // Two full keys that share a prefix are still two texts.
+        let mut twin = key;
+        twin.0[15] ^= 1;
+        assert!(!twin.same_text(key) && twin.same_text(narrow));
     }
 
     #[test]

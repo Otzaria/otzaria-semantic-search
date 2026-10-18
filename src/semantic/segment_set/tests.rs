@@ -2967,3 +2967,120 @@ fn compaction_never_upgrades_a_legacy_key_to_a_partial_occurrence_snapshot() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1.hint, 9);
 }
+
+/// A live short line still needs its shared vector after the neighbour's own text
+/// disappears. Slots and cross-book extras must survive without fabricating normal
+/// occurrences, and a later normal occurrence must still give the slot its best role.
+#[test]
+fn compaction_keeps_alias_backing_slots_without_a_live_neighbour() {
+    use crate::semantic::oxv::occurrence::{Occurrence, ALIAS_WINDOW};
+    use crate::semantic::oxv::writer::SegmentBuilder;
+    for normal_survives in [false, true] {
+        let work = TempDir::new("alias_only_compaction");
+        let dir = work.join("vectors");
+        let mut identity = identity();
+        identity.store.store_format_version = 3;
+        let mut spec = spec(PackageKind::Base, 0, 29);
+        spec.identity_digest = identity.identity_digest();
+        let mut builder = SegmentBuilder::new(spec, codec());
+        builder.set_format_version(3).unwrap();
+        for (name, anchor, window) in [
+            ("a", key(7), ALIAS_WINDOW),
+            ("b", key(8), ALIAS_WINDOW),
+            ("c", key(1), 0),
+        ] {
+            if name == "a" {
+                builder.add_book(name, &[(key(1), 0)], &[], &[]).unwrap();
+            } else {
+                builder.add_book(name, &[], &[(0, 0)], &[]).unwrap();
+            }
+            let mut rows = vec![Occurrence {
+                key: key(1),
+                book: 0,
+                hint: 1,
+                anchor,
+                window,
+            }];
+            if name == "a" {
+                rows.push(Occurrence {
+                    key: key(1),
+                    book: 0,
+                    hint: 0,
+                    anchor: key(1),
+                    window: 0,
+                });
+            }
+            builder.add_occurrences(name, &rows).unwrap();
+        }
+        let path = work.join("base.oxv");
+        let mut sink = builder.write(&path).unwrap();
+        sink.push_f32(&vector_of(1)).unwrap();
+        let written = sink.finish().unwrap();
+        let manifest = ReleaseManifest::for_segment(
+            &written,
+            &identity,
+            codec().params_sha256(),
+            test_provenance(),
+            "2026-10-18T00:00:00Z".to_string(),
+        );
+        install_package(
+            &dir,
+            &InstallSource {
+                segment: &path,
+                manifest_json: &manifest.to_json(),
+            },
+            &InstallExpectation {
+                identity,
+                published_manifest_sha256: None,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let live = Fixed {
+            version: 29,
+            books: BTreeMap::from([
+                ("a".to_string(), vec![(4, key(7).column_value())]),
+                ("b".to_string(), vec![(5, key(8).column_value())]),
+                (
+                    "c".to_string(),
+                    if normal_survives {
+                        vec![(6, key(1).column_value())]
+                    } else {
+                        vec![]
+                    },
+                ),
+            ]),
+        };
+        for _ in 0..2 {
+            let report = compact(
+                &dir,
+                &CompactionPolicy {
+                    force: true,
+                    ..CompactionPolicy::default()
+                },
+                Some(&live),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(report.slots_after, 1);
+            let set = SegmentSet::open(&dir).unwrap();
+            assert_eq!(
+                set.segments()[0].slot_window(0),
+                if normal_survives { 0 } else { ALIAS_WINDOW }
+            );
+            for (name, hint, anchor) in [("a", 4, key(7)), ("b", 5, key(8))] {
+                let mut records = Vec::new();
+                set.book_occurrences(name, &mut records);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].0, key(1).narrowed());
+                assert_eq!(
+                    (records[0].1.hint, records[0].1.window, records[0].1.anchor),
+                    (hint, ALIAS_WINDOW, Some(anchor.narrowed()))
+                );
+            }
+            let mut records = Vec::new();
+            set.book_occurrences("c", &mut records);
+            assert_eq!(records.len(), usize::from(normal_survives));
+        }
+    }
+}

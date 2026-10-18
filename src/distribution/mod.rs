@@ -19,6 +19,7 @@
 //! release manifest an installation takes — so the vectors and the identity that
 //! describes them come from a single pass over a single model. [`shard`] cuts the same
 //! work in two, for a library embedded on machines that never see the corpus.
+pub mod alias;
 pub mod assemble;
 pub mod builder;
 pub mod corpus;

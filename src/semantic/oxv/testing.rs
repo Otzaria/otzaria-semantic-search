@@ -117,7 +117,22 @@ pub(crate) fn write_segment(
     books: &[TestBook],
     tombstones: &[ChunkKey],
 ) -> WrittenSegment {
+    write_segment_in(path, spec, codec, books, tombstones, None)
+}
+
+/// [`write_segment`] in segment format `format`, or the codec's default.
+pub(crate) fn write_segment_in(
+    path: &Path,
+    spec: SegmentSpec,
+    codec: Codec,
+    books: &[TestBook],
+    tombstones: &[ChunkKey],
+    format: Option<u32>,
+) -> WrittenSegment {
     let mut builder = SegmentBuilder::new(spec, codec);
+    if let Some(format) = format {
+        builder.set_format_version(format).unwrap();
+    }
     let mut vectors = Vec::new();
     for book in books {
         let primary: Vec<(ChunkKey, u32)> = book.primary.iter().map(|(k, h, _)| (*k, *h)).collect();

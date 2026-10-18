@@ -30,7 +30,8 @@ use crate::config::profiles::DEFAULT_WINDOW_PENALTY;
 use crate::errors::{ArtifactError, SemanticSearchError};
 use crate::semantic::backend::Pooling;
 use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
-use crate::semantic::oxv::format::SEGMENT_FORMAT_VERSION;
+use crate::semantic::oxv::codec::ROT_I8I4_NAME;
+use crate::semantic::oxv::format::{SEGMENT_FORMAT_V3, SEGMENT_FORMAT_VERSION};
 use crate::semantic::oxv::scan::{default_scan_threads, ScanRequest};
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::resolve::{BookSet, SlotRef, VectorHit};
@@ -43,17 +44,41 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-/// The store this build reads: `otzaria-oxv` segments, format 2, in the `i8-sym-vec` codec.
+/// The default store: `otzaria-oxv` segments, format 2, in the `i8-sym-vec` codec — what
+/// a plan declares, and what every release of the anchor family is.
 ///
 /// What the installation *requires*, not something read out of the set: a set in another
 /// codec or format is a rejection naming `store.vector_precision` or
-/// `store.store_format_version`.
+/// `store.store_format_version`. See [`readable_store_identities`] for every store this build
+/// opens.
 pub fn readable_store_identity() -> StoreIdentity {
     StoreIdentity {
         backend_id: STORE_BACKEND_ID.to_string(),
         store_format_version: SEGMENT_FORMAT_VERSION,
         vector_precision: "i8-sym-vec".to_string(),
     }
+}
+
+/// Every store this build opens: the default, and format 3 — 8-byte keys — in
+/// `rot192-i8i4`.
+pub fn readable_store_identities() -> [StoreIdentity; 2] {
+    [
+        readable_store_identity(),
+        StoreIdentity {
+            backend_id: STORE_BACKEND_ID.to_string(),
+            store_format_version: SEGMENT_FORMAT_V3,
+            vector_precision: ROT_I8I4_NAME.to_string(),
+        },
+    ]
+}
+
+/// The store an installation requires of an artifact that declares `declared`: that one
+/// when this build reads it, and otherwise the default, so the rejection names what differs.
+pub fn readable_store_for(declared: &StoreIdentity) -> StoreIdentity {
+    readable_store_identities()
+        .into_iter()
+        .find(|readable| readable == declared)
+        .unwrap_or_else(readable_store_identity)
 }
 
 /// The model this installation will embed queries with, and the text recipe it
@@ -229,7 +254,7 @@ impl OfficialSemanticIndex {
         let expected = IndexVersion {
             text,
             model: model.identity(&runtime)?,
-            store: readable_store_identity(),
+            store: readable_store_for(&set.identity().store),
         };
         set.identity().verify_matches(&expected)?;
         let book_count = count_books(&set);
@@ -899,5 +924,27 @@ mod tests {
             .search(LINES[0].1, 1, None, &CancellationToken::new())
             .unwrap();
         assert_eq!(hits[0].key, ChunkKey::of(LINES[0].1));
+    }
+
+    /// The build opens the anchor's store and format 3 in `rot192-i8i4`, each as itself; any
+    /// other store is held to the default, so its rejection names what differs.
+    #[test]
+    fn both_readable_stores_are_expected_as_themselves() {
+        let [anchor, rotated] = readable_store_identities();
+        assert_eq!(anchor, readable_store_identity());
+        assert_eq!(
+            (
+                rotated.store_format_version,
+                rotated.vector_precision.as_str()
+            ),
+            (3, "rot192-i8i4")
+        );
+        assert_eq!(readable_store_for(&rotated), rotated);
+        assert_eq!(readable_store_for(&anchor), anchor);
+        let mixed = StoreIdentity {
+            store_format_version: 3,
+            ..anchor.clone()
+        };
+        assert_eq!(readable_store_for(&mixed), anchor);
     }
 }

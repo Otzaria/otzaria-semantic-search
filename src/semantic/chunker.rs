@@ -171,11 +171,12 @@ impl ChunkerConfig {
                         "less than half of window_chars",
                     );
                 }
-                if self.max_windows_per_line > usize::from(u8::MAX) + 1 {
+                // Window 255 is no window: it is what an alias occurrence reads as.
+                if self.max_windows_per_line > usize::from(u8::MAX) {
                     return refuse(
                         "max_windows_per_line",
                         self.max_windows_per_line,
-                        "at most 256",
+                        "at most 255",
                     );
                 }
             }
@@ -277,6 +278,14 @@ impl Chunker {
     /// the line is not embedded. Takes, and panics on, the same `lines` as that.
     pub fn embedded_windows(&self, lines: &[LineRef<'_>], index: usize) -> Vec<EmbeddedWindow> {
         self.windows_of(lines, index)
+    }
+
+    /// Whether a line of this text is embedded with its neighbours' context: one the recipe
+    /// embeds that is shorter than `min_meaningful_chars`. What a plan records as
+    /// `PlanRecord::short`.
+    pub fn borrows_context(&self, line_text: &str) -> bool {
+        let n = line_text.trim().chars().count();
+        n >= self.config.min_embeddable_chars && n < self.config.min_meaningful_chars
     }
 
     /// Every line's key, in order: `Some` for a line the recipe embeds, `None` for one it
@@ -1299,7 +1308,7 @@ mod tests {
             (
                 "max_windows_per_line",
                 ChunkerConfig {
-                    max_windows_per_line: 257,
+                    max_windows_per_line: 256,
                     ..windows.clone()
                 },
             ),

@@ -669,6 +669,13 @@ fn check_header(manifest: &ReleaseManifest, segment: &Segment) -> Result<(), Art
             manifest.identity.store.vector_precision.clone(),
         );
     }
+    if segment.format_version() != manifest.identity.store.store_format_version {
+        return disagree(
+            "segment format",
+            segment.format_version().to_string(),
+            manifest.identity.store.store_format_version.to_string(),
+        );
+    }
     if segment.kind() != manifest.kind
         || segment.from_library_version() != manifest.from_library_version
         || segment.to_library_version() != manifest.to_library_version
@@ -815,8 +822,7 @@ impl NewGeneration {
                 wants.entry(key).or_default().foreign.push(index);
             }
             for (seg, older) in older.iter().enumerate() {
-                let keys = older.key_bytes();
-                for (slot, key) in keys.as_chunks::<16>().0.iter().enumerate() {
+                for (slot, key) in older.keys().enumerate() {
                     if slot % (1 << 20) == 0 && cancel.is_cancelled() {
                         return Err(SemanticSearchError::Cancelled);
                     }
@@ -824,7 +830,7 @@ impl NewGeneration {
                     if self.deleted[seg].is_set(slot) {
                         continue;
                     }
-                    let Some(want) = wants.get(&ChunkKey(*key)) else {
+                    let Some(want) = wants.get(&key) else {
                         continue;
                     };
                     if want.tombstone && self.deleted[seg].set(slot) {

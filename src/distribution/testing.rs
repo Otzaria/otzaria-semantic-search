@@ -139,6 +139,15 @@ pub(crate) fn unit_vector(seed: &[u8; 32], dim: usize) -> Vec<f32> {
 /// The shard an external worker would write for the whole of `plan_dir`'s embed plan, in
 /// `out`: each text's [`unit_vector`], under the deterministic stand-in's mode.
 pub(crate) fn raw_shard(plan_dir: &Path, out: &Path) -> PathBuf {
+    raw_shard_with(plan_dir, out, &|sha, dim| unit_vector(sha, dim))
+}
+
+/// [`raw_shard`] with each text's vector `vector_of(its SHA-256, dim)`.
+pub(crate) fn raw_shard_with(
+    plan_dir: &Path,
+    out: &Path,
+    vector_of: &dyn Fn(&[u8; 32], usize) -> Vec<f32>,
+) -> PathBuf {
     use crate::distribution::files::hex;
     use crate::distribution::plan::{read_embed_plan, EmbedManifest};
     use crate::distribution::shard::*;
@@ -149,7 +158,7 @@ pub(crate) fn raw_shard(plan_dir: &Path, out: &Path) -> PathBuf {
         let (_, record) = record.unwrap();
         let sha = crate::distribution::files::sha256(record.embedding_text.as_bytes());
         keys.extend_from_slice(&sha);
-        for value in unit_vector(&sha, dim) {
+        for value in vector_of(&sha, dim) {
             vectors.extend_from_slice(&value.to_le_bytes());
         }
     }

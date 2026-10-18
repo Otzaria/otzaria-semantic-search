@@ -35,6 +35,7 @@ use crate::hybrid::ranking::{
 };
 use crate::semantic::engine::SemanticEngine;
 use crate::semantic::official_index::{OfficialSemanticIndex, ReloadOutcome};
+use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::resolve::{CandidateResolver, NoResolver, ResolvedLine, VectorHit};
 use crate::semantic::segment_set::SetInfo;
 use crate::semantic::types::{
@@ -184,6 +185,7 @@ impl SemanticSide {
         filters: Option<&SearchFilters>,
         share: f32,
         window_penalty: f32,
+        alias_penalty: f32,
         resolver: &dyn CandidateResolver,
         cancel: &CancellationToken,
         telemetry: &mut SearchTelemetry,
@@ -208,6 +210,7 @@ impl SemanticSide {
             base_top_k,
             Some(&base_filters),
             window_penalty,
+            alias_penalty,
             resolver,
             cancel,
             &mut base_telemetry,
@@ -283,6 +286,7 @@ impl SemanticSide {
         top_k: usize,
         filters: Option<&SearchFilters>,
         window_penalty: f32,
+        alias_penalty: f32,
         resolver: &dyn CandidateResolver,
         cancel: &CancellationToken,
         telemetry: &mut SearchTelemetry,
@@ -314,7 +318,7 @@ impl SemanticSide {
         let resolve_started = std::time::Instant::now();
         let lines = resolver.resolve(&hits, filters, cancel)?;
         telemetry.resolve_ms = Some(resolve_started.elapsed().as_millis() as u64);
-        let (candidates, unresolved) = candidates_of(&hits, lines);
+        let (candidates, unresolved) = candidates_of(&hits, lines, alias_penalty);
         telemetry.semantic_unresolved = unresolved;
         Ok(candidates)
     }
@@ -366,6 +370,7 @@ impl SemanticSide {
 fn candidates_of(
     hits: &[VectorHit],
     mut lines: Vec<ResolvedLine>,
+    alias_penalty: f32,
 ) -> (Vec<SemanticCandidate>, u32) {
     // Stable, so each hit keeps its lines' order.
     lines.sort_by_key(|line| line.hit);
@@ -405,10 +410,11 @@ fn candidates_of(
                     } else {
                         0.0
                     }
-                    - if line.window > 0 {
-                        hit.window_penalty
-                    } else {
-                        0.0
+                    - match line.window {
+                        0 => 0.0,
+                        // A short line found through the neighbour whose vector it shares.
+                        ALIAS_WINDOW => alias_penalty,
+                        _ => hit.window_penalty,
                     },
             })
         })
@@ -856,6 +862,7 @@ impl HybridCoordinator {
                             top_k,
                             params.filters.as_ref(),
                             setup.ranking_profile.window_penalty,
+                            setup.ranking_profile.alias_penalty,
                             resolver,
                             cancel,
                             &mut setup.telemetry,
@@ -873,6 +880,7 @@ impl HybridCoordinator {
                                 params.filters.as_ref(),
                                 setup.ranking_profile.foundational_candidate_share,
                                 setup.ranking_profile.window_penalty,
+                                setup.ranking_profile.alias_penalty,
                                 resolver,
                                 cancel,
                                 &mut setup.telemetry,
@@ -3240,7 +3248,7 @@ mod tests {
             line(2, "c.txt", 3),
             line(0, "a.txt", 7),
         ];
-        let (candidates, unresolved) = candidates_of(&hits, lines);
+        let (candidates, unresolved) = candidates_of(&hits, lines, 0.04);
         let order: Vec<(&str, u64)> = candidates
             .iter()
             .map(|candidate| {
@@ -3284,8 +3292,11 @@ mod tests {
             title: String::new(),
             reference: String::new(),
         };
-        let (candidates, unresolved) =
-            candidates_of(&hits, vec![line(0, 10, 1), line(1, 20, 0), line(2, 30, 0)]);
+        let (candidates, unresolved) = candidates_of(
+            &hits,
+            vec![line(0, 10, 1), line(1, 20, 0), line(2, 30, 0)],
+            0.04,
+        );
         assert_eq!(unresolved, 0);
         assert_eq!(
             candidates
@@ -3297,6 +3308,20 @@ mod tests {
         for (candidate, expected) in candidates.iter().zip([0.98, 0.97, 0.95]) {
             assert!((candidate.similarity_score - expected).abs() < 1e-6);
         }
+
+        // A short line found through the neighbour whose vector it shares takes the alias
+        // penalty, not the window penalty, and its neighbour none.
+        let (candidates, _) = candidates_of(
+            &hits[..1],
+            vec![line(0, 10, 0), line(0, 11, ALIAS_WINDOW)],
+            0.1,
+        );
+        let scores: Vec<(u64, f32)> = candidates
+            .iter()
+            .map(|candidate| (candidate.metadata.line_id, candidate.similarity_score))
+            .collect();
+        assert_eq!(scores[0].0, 10);
+        assert!((scores[0].1 - 0.99).abs() < 1e-6 && (scores[1].1 - 0.89).abs() < 1e-6);
     }
 
     /// A text repeated in many places is one vector, and every line it resolves to scores
@@ -3353,7 +3378,7 @@ mod tests {
             .collect();
         // A worse hit's line, after them all.
         resolved.insert(3, line(1, "otzaria/f.txt", 3));
-        let (candidates, unresolved) = candidates_of(&hits, resolved);
+        let (candidates, unresolved) = candidates_of(&hits, resolved, 0.04);
         assert_eq!(unresolved, 0);
 
         let coordinator = HybridCoordinator::new(None);

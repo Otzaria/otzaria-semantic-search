@@ -16,6 +16,7 @@
 //! `tombstones.bin` has the keys file's layout. Every lookup is a binary search over a
 //! mapped file, so a split holds neither file in memory.
 
+use crate::distribution::alias::Aliases;
 use crate::distribution::files::{
     hex, io_error, malformed, partial_path, read_json, write_json, KeyMap, KeySet,
 };
@@ -77,6 +78,10 @@ pub struct LedgerManifest {
     /// Windowed plan records preserve the full occurrence snapshot for the next delta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrences: Option<LedgerFile>,
+    /// The cosine a short line needed to share a neighbour's vector in this chain
+    /// ([`alias`](super::alias)); absent where none does. A delta decides at the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +469,8 @@ pub(crate) enum Disposition {
     /// A second record of a key in one book: a record is a book and a key, and its hint
     /// is the first line that holds it.
     Repeat,
+    /// A short line that shares a neighbour's vector: no record of its own key.
+    Alias,
 }
 
 /// What [`classify`] found.
@@ -490,6 +497,7 @@ pub(crate) fn classify(
     records: &PlanRecords,
     books: &BookList,
     previous: Option<&Ledger>,
+    aliases: &Aliases,
     mut visit: impl FnMut(u64, &PlanRecord, Disposition) -> Result<(), PackError>,
 ) -> Result<Classified, PackError> {
     let mut slots: KeyMap<[u8; 16], u32> = KeyMap::default();
@@ -507,7 +515,9 @@ pub(crate) fn classify(
                 previous.and_then(|ledger| ledger.books().index_of(books.name(record.book)));
         }
         let key = record.key_bytes();
-        let disposition = if !in_book.insert(key) {
+        let disposition = if aliases.is_aliased(index as u64) {
+            Disposition::Alias
+        } else if !in_book.insert(key) {
             Disposition::Repeat
         } else if let Some(at) = previous.and_then(|ledger| ledger.find_key(&key)) {
             let (word, bit) = ((at / 64) as usize, at % 64);
@@ -569,7 +579,8 @@ pub fn split(
     tombstones: &Path,
 ) -> Result<SplitCounts, PackError> {
     let mut revived = 0u64;
-    let classified = classify(records, books, previous, |_, record, disposition| {
+    let none = Aliases::none();
+    let classified = classify(records, books, previous, &none, |_, record, disposition| {
         if matches!(disposition, Disposition::Slot { .. })
             && warehouse.is_some_and(|warehouse| warehouse.holds(&record.sha256))
         {
@@ -613,7 +624,20 @@ pub fn write_plan_ledger(
     deltas_since_base: u64,
     dir: &Path,
 ) -> Result<LedgerManifest, PackError> {
-    let classified = classify(&plan.records, &plan.books, previous, |_, _, _| Ok(()))?;
+    if let Some(threshold) = previous.and_then(|ledger| ledger.manifest.alias_threshold) {
+        return Err(malformed(format!(
+            "the previous ledger shares short lines' vectors at {threshold}, and a ledger \
+             rebuilt from a plan alone cannot decide which: assemble the release instead"
+        )));
+    }
+    let none = Aliases::none();
+    let classified = classify(
+        &plan.records,
+        &plan.books,
+        previous,
+        &none,
+        |_, _, _| Ok(()),
+    )?;
     write_ledger(
         dir,
         plan.manifest.library_version,
@@ -627,6 +651,8 @@ pub fn write_plan_ledger(
         &plan.books,
         previous,
         &classified,
+        None,
+        &none,
         None,
     )
 }
@@ -647,6 +673,8 @@ pub(crate) fn write_ledger(
     previous: Option<&Ledger>,
     classified: &Classified,
     passage_package: Option<&ModelPackage>,
+    aliases: &Aliases,
+    alias_threshold: Option<f32>,
 ) -> Result<LedgerManifest, PackError> {
     let mut keys = SortedFileWriter::keys(&dir.join(keys_file_name(library_version)))?;
     let mut new = classified.new_keys.iter().peekable();
@@ -679,14 +707,16 @@ pub(crate) fn write_ledger(
         book_keys.clear();
         Ok(())
     };
-    for record in records.iter() {
+    for (index, record) in records.iter().enumerate() {
         if current != Some(record.book) {
             if let Some(book) = current {
                 flush(book, &mut book_keys)?;
             }
             current = Some(record.book);
         }
-        book_keys.push(record.key_bytes());
+        if !aliases.is_aliased(index as u64) {
+            book_keys.push(record.key_bytes());
+        }
     }
     if let Some(book) = current {
         flush(book, &mut book_keys)?;
@@ -718,6 +748,7 @@ pub(crate) fn write_ledger(
         } else {
             None
         },
+        alias_threshold,
     };
     write_json(&dir.join(manifest_file_name(library_version)), &manifest)?;
     Ok(manifest)

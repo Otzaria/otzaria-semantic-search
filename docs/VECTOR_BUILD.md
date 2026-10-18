@@ -28,7 +28,7 @@ One directory, written by `export_semantic_plan` over the release index (in
 
 | File | Layout |
 |---|---|
-| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, pad [3], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first |
+| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, flags u8, pad [2], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first. `flags` bit 0, **short**: a first window whose line is shorter than `min_meaningful_chars` and so embedded with its neighbours' context (`Chunker::borrows_context`); only it may share a neighbour's vector. A plan written before the flag has 0 there and shares nothing |
 | `books.json` | JSON array of the books' stable keys, strictly ascending by bytes; a record's `book` is an index into it |
 | `embed.jsonl` | the texts to embed — §2 |
 | `embed-manifest.json` | what `embed.jsonl` is — §2 |
@@ -246,6 +246,7 @@ rule for a worker that is not ONNX Runtime on a CPU. The worker's own plan was a
 ```sh
 otzaria-semantic-search assemble --kind base --plan $P --warehouse $W --out $R \
     [--codec i8-sym-vec|i8-sym-dim|f32] [--clip-q 1] [--keep-epoch --previous $L] \
+    [--codec rot192-i8i4 --rotation $F] \
     [--created-at T] [--built-by '{"runId":"…"}'] [--verify]
 otzaria-semantic-search assemble --kind delta --plan $P --warehouse $W --previous $L \
     [--previous-version N] --out $R [--verify]
@@ -269,9 +270,41 @@ assembly. The plan must have been split against that ledger.
   warehouse. A delta always keeps its ledger's epoch. The codec's name is the identity's
   `store.vector_precision`, so a delta in another epoch or identity is refused by the
   ledger.
+* **`rot192-i8i4`** — the windows family's codec, 160 bytes and a scale a vector
+  ([`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.5) — is fitted once, before its first
+  base, and the file is the epoch:
+
+  ```sh
+  otzaria-semantic-search fit-rotation --warehouse $W [--sample 200000] --out $F
+  ```
+
+  It reads `--sample` vectors evenly spaced over the warehouse, takes the 192 leading
+  eigenvectors of their uncentered second moment (a deterministic Jacobi decomposition in
+  `f64`), each head component's scale (the square root of its standard deviation) and each
+  tail component's range (its least and greatest value), and writes the
+  codec's parameters section — 197,652 bytes — printing its SHA-256: the same warehouse
+  and sample write the same bytes. `assemble --codec rot192-i8i4 --rotation $F` builds the
+  base in it; the ledger then carries the parameters, so a delta, or a base with
+  `--keep-epoch`, needs no file. A release in this codec is **segment format 3**
+  (`store.store_format_version` 3), which stores eight bytes of each key: assembly refuses
+  one in which two distinct keys of the plan — or, for a delta, of the plan and the
+  previous ledger — share them, naming both. The anchor family keeps `i8-sym-vec` and
+  format 2, byte for byte.
+* **Short lines sharing a vector** (`--alias-threshold 0.99`, format 3 only, off by
+  default): a record the plan flags short, whose first-window neighbour at −1, +1, −2 or +2
+  in its book is not short and has a warehouse vector at least that cosine from its own
+  (the `f32` threshold as given, compared in `f64`; it must be in [0, 1]),
+  ships no vector — an alias occurrence names the neighbour's key, at the short line's place,
+  with the short line's key as its anchor (see
+  [`ARTIFACT_CONTRACT.md`](ARTIFACT_CONTRACT.md) §3.4). A key is aliased only if all its
+  records are. The ledger records the threshold; a delta takes it and refuses another, and
+  decides the previous release's aliases again from its ledger and the warehouse, so they
+  are stable. `assemble` prints how many records and keys share a vector and the least
+  cosine. `write_plan_ledger` cannot rebuild an aliased chain's ledger: it has no warehouse.
 * **Memory.** Records, ledger and warehouse are mapped. About 70 bytes are held per slot
   shipped (key, hint, warehouse record, the classification's entry), plus 64 MB of
-  histograms for `i8-sym-dim`. The test `assembly_memory_is_bounded` holds the growth to
+  histograms for `i8-sym-dim`; a format-3 release also sorts every key of the plan (and,
+  for a delta, of the ledger), 16 bytes each, for the prefix check. The test `assembly_memory_is_bounded` holds the growth to
   under 200 bytes a slot.
 * **Deterministic.** The same plan, warehouse, ledger and `--created-at` give the same
   bytes.
@@ -312,8 +345,8 @@ release that was already assembled.
 
 | Gate | Checks |
 |------|--------|
-| G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped |
-| G5 | Every slot holds its key's warehouse vector, encoded. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998. Not applicable to a delta with no slot; any other empty sample fails |
+| G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped, and for `rot192-i8i4` at most 1e-4 of the tail's |
+| G5 | Every slot holds its key's warehouse vector, encoded; every alias's two vectors are in the warehouse and at least the release ledger's threshold apart in cosine, and the detail reports the count and the least cosine. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998 — for `rot192-i8i4`, which drops 64 components, ≥ 0.997 and ≥ 0.99 (measured on v31: 0.9975 and 0.9938). Not applicable to a delta with no slot; any other empty sample fails |
 | G7 | A base is ≤ 3.5 × 10⁹ bytes (room for a set with long-line windows, about 2.73 × 10⁹); a delta is ≤ 0.15 × its base, otherwise publish a base |
 | G8 | Assembling again into `<out>.g8` gives the same segment, package, release manifest and ledger, byte for byte |
 | G9 | `verify_for_install` passes, reading every payload byte, under the manifest's `packageDigest`; the segment is the manifest's |
@@ -329,7 +362,17 @@ gives it these pieces in `distribution::gates`:
   resolving (G4).
 * `ExactReference::new(set, warehouse).top_k(query, k, threads)` is the exact f32 scan
   of the set's live keys. `recall(found, exact)` compares it with the set's own scan
-  (G6).
+  (G6). For `rot192-i8i4` the floors are `G6_ROT_MIN_RECALL_AT_10` and
+  `G6_ROT_MIN_RECALL_AT_50`, both 0.98.
+
+`coverage` counts a short line that shares a neighbour's vector as reached by an alias
+record whose anchor is its key. For G4, an alias record resolves the line at its hint whose
+key is the anchor, and scores it as the hit, less `alias_penalty`.
+
+In a format-3 set every key a segment hands out — a hit's, a record's, the exact
+reference's — is eight bytes followed by eight zeros (`ChunkKey::narrowed`); `coverage`
+compares the plan's keys at that width. Compare a computed key with one by
+`ChunkKey::same_text`.
 
 On empty input, `coverage` of a plan with no record is complete, and `recall` of an empty
 `exact` is 1.0: a validator must refuse empty input itself rather than rely on them.

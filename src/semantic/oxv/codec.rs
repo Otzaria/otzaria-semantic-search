@@ -8,6 +8,7 @@
 //! | `0x0001` | `f32` | 4 × dim | none — the reference, and tests |
 //! | `0x0101` | `i8-sym-dim` | dim | one scale per dimension, fixed for a codec epoch |
 //! | `0x0102` | `i8-sym-vec` | dim, + 4 in VECTOR_SCALES | none: a scale per vector — the default |
+//! | `0x0103` | `rot192-i8i4` | head + tail / 2, + 4 in VECTOR_SCALES | a rotation and the tail's ranges |
 //! | `0x02xx` | binary or PQ | — | reserved for an ancillary first-pass tier |
 //!
 //! **A codec epoch** is one set of parameters. Every segment of a set shares it — the set
@@ -24,6 +25,21 @@
 //! vectors it keeps recall@10 above 0.99 against full precision for int8 and fp32 queries
 //! (0.9918 / 0.9914), where `i8-sym-dim` reaches 0.9866.
 //!
+//! `rot192-i8i4`, for format-3 sets: `y = R · x`, `R` the `out_dim × dim` rotation onto
+//! the leading eigenvectors of the corpus's second moment (see [`Codec::fit_rot_i8i4`]).
+//! The first `head` components (128) are divided by a frozen per-component scale `σ_h`
+//! and stored as `i8-sym-vec` — `s = max |y_h / σ_h| / 127` in VECTOR_SCALES — and the
+//! next `tail` (64) as 4-bit codes, two to a byte (the even component in the low nibble),
+//! affine over a range frozen per component:
+//! `q_d = clamp(round_half_away((y_d − lo_d) / (hi_d − lo_d) · 15), 0, 15)`. The other
+//! components are dropped. 160 bytes and a scale a vector; it decodes as `Rᵀ · ŷ`, so a
+//! score stays about a cosine in the model's space. A tail component past its range clips.
+//!
+//! Measured on 400k vectors of the v31 base against the exact scan of their `i8-sym-vec`
+//! decodings, 4000 queries: `σ_h = √std_h` lifts recall@10 from 0.979 to 0.982 (no scale,
+//! or `σ_h = std_h`, 0.980); the affine tail is the float tail's recall, where a symmetric
+//! 4-bit tail — per vector or per component — loses a further 0.002–0.004.
+//!
 //! `i8-sym-dim`: `v_d = clamp(round_half_away(x_d / S_d · 127), −127, 127)`, in `f32`.
 //! A component past its dimension's scale is *clipped*, and [`Codec::encode`] counts the
 //! clipped components so a build can hold the rate to its gate.
@@ -37,6 +53,13 @@ pub const CODEC_F32: u16 = 0x0001;
 pub const CODEC_I8_SYM_DIM: u16 = 0x0101;
 /// Symmetric int8 with one scale per vector: the default.
 pub const CODEC_I8_SYM_VEC: u16 = 0x0102;
+/// A rotation, then int8 for the head and 4 bits for the tail.
+pub const CODEC_ROT_I8I4: u16 = 0x0103;
+/// Its name.
+pub const ROT_I8I4_NAME: &str = "rot192-i8i4";
+/// Its layout: components kept in int8, and in 4 bits after them.
+pub const ROT_HEAD: usize = 128;
+pub const ROT_TAIL: usize = 64;
 
 /// What a build asks for: the codec, before any calibration it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -66,6 +89,10 @@ impl CodecSpec {
             "i8-sym-vec" => Ok(Self::I8SymVec),
             "i8-sym-dim" => Ok(Self::I8SymDim { clip_q }),
             "f32" => Ok(Self::F32),
+            ROT_I8I4_NAME => Err(format!(
+                "{ROT_I8I4_NAME} is fitted, not named: fit it with fit-rotation and give the \
+                 file to assemble with --rotation"
+            )),
             other => Err(format!(
                 "{other:?} is not a codec; the codecs are i8-sym-vec, i8-sym-dim and f32"
             )),
@@ -107,12 +134,39 @@ pub struct Codec {
 enum CodecKind {
     F32,
     I8SymVec,
+    RotI8I4(Box<Rotated>),
     I8SymDim {
         /// What clipped one component in `1 − clip_q` of the calibration set. Recorded, not
         /// used: the scales are what quantize.
         clip_q: f32,
         scales: Box<[f32]>,
     },
+}
+
+/// The parameters of `rot192-i8i4`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Rotated {
+    pub head: usize,
+    pub tail: usize,
+    /// Each head component's spread: it is quantized as `y / scale`, so every head
+    /// component spans the codes alike.
+    pub scale: Box<[f32]>,
+    /// Each tail component's range: `lo` encodes as 0, `hi` as 15.
+    pub lo: Box<[f32]>,
+    pub hi: Box<[f32]>,
+    /// `head + tail` rows of `dim` components, row-major.
+    pub rotation: Box<[f32]>,
+}
+
+impl Rotated {
+    pub(crate) fn out_dim(&self) -> usize {
+        self.head + self.tail
+    }
+
+    /// What one code of tail component `d` is worth.
+    pub(crate) fn step(&self, d: usize) -> f32 {
+        (self.hi[d] - self.lo[d]) / 15.0
+    }
 }
 
 impl Codec {
@@ -211,6 +265,144 @@ impl Codec {
         Self::i8_sym_dim(scales, clip_q)
     }
 
+    /// `rot192-i8i4` with this rotation — `head + tail` rows of `dim` — head scales and
+    /// tail ranges.
+    ///
+    /// The params section is `{version, dim, out_dim, head, tail}` as `u32`s, then `scale`
+    /// (`head` `f32`s), `lo` and `hi` (`tail` `f32`s each), then the rotation (`out_dim × dim`
+    /// `f32`s, row-major): all of it is the epoch, so its SHA-256 freezes the matrix.
+    pub fn rot_i8i4(
+        dim: usize,
+        head: usize,
+        tail: usize,
+        scale: Vec<f32>,
+        lo: Vec<f32>,
+        hi: Vec<f32>,
+        rotation: Vec<f32>,
+    ) -> Result<Self, String> {
+        let dim = valid_dim(dim)?;
+        if head == 0 || !tail.is_multiple_of(2) || head + tail > dim {
+            return Err(format!(
+                "a rotated layout of {head} int8 and {tail} 4-bit components does not fit width \
+                 {dim}: the head is not empty, the tail is even, and both fit"
+            ));
+        }
+        if scale.len() != head
+            || lo.len() != tail
+            || hi.len() != tail
+            || rotation.len() != (head + tail) * dim
+        {
+            return Err(format!(
+                "a rotated codec of {head} + {tail} components of width {dim} has {head} scales, \
+                 {tail} ranges and {} rotation entries",
+                (head + tail) * dim
+            ));
+        }
+        if let Some(d) = (0..head).find(|&d| !(scale[d].is_finite() && scale[d] > 0.0)) {
+            return Err(format!(
+                "head component {d} has scale {}, and a scale is finite and positive",
+                scale[d]
+            ));
+        }
+        if let Some(d) =
+            (0..tail).find(|&d| !(lo[d].is_finite() && hi[d].is_finite() && lo[d] < hi[d]))
+        {
+            return Err(format!(
+                "tail component {d} ranges over [{}, {}], and a range is finite and not empty",
+                lo[d], hi[d]
+            ));
+        }
+        if rotation.iter().any(|value| !value.is_finite()) {
+            return Err("the rotation holds a value that is not finite".to_string());
+        }
+        let mut params = Vec::with_capacity(20 + 4 * head + 8 * tail + 4 * rotation.len());
+        for value in [
+            PARAMS_VERSION,
+            dim as u32,
+            (head + tail) as u32,
+            head as u32,
+            tail as u32,
+        ] {
+            params.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in scale.iter().chain(&lo).chain(&hi).chain(&rotation) {
+            params.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(Self::with_params(
+            dim,
+            CodecKind::RotI8I4(Box::new(Rotated {
+                head,
+                tail,
+                scale: scale.into_boxed_slice(),
+                lo: lo.into_boxed_slice(),
+                hi: hi.into_boxed_slice(),
+                rotation: rotation.into_boxed_slice(),
+            })),
+            params,
+        ))
+    }
+
+    /// Fit `rot192-i8i4` on `vectors`: the rotation onto the `head + tail` leading
+    /// eigenvectors of their uncentered second moment `E[x xᵀ]` (the `rotation` module), each
+    /// head component's scale as the square root of its standard deviation over them, and
+    /// each tail component's range as the least and greatest it takes. The same vectors in the same order fit the same bytes.
+    pub fn fit_rot_i8i4(vectors: &[&[f32]], head: usize, tail: usize) -> Result<Self, String> {
+        use super::rotation::{principal_rows, rotate, second_moment};
+        let dim = vectors
+            .first()
+            .map(|vector| vector.len())
+            .ok_or("there are no vectors to fit on")?;
+        if let Some(vector) = vectors.iter().find(|vector| vector.len() != dim) {
+            return Err(format!(
+                "the vectors to fit on are {dim} and {} wide",
+                vector.len()
+            ));
+        }
+        if head + tail > dim {
+            return Err(format!("{head} + {tail} components do not fit width {dim}"));
+        }
+        let moment = second_moment(vectors.iter().copied(), dim);
+        let rotation = principal_rows(moment, dim, head + tail);
+        let (mut lo, mut hi) = (vec![f32::INFINITY; tail], vec![f32::NEG_INFINITY; tail]);
+        let (mut sum, mut squares) = (vec![0f64; head], vec![0f64; head]);
+        let mut y = vec![0f64; head + tail];
+        for vector in vectors {
+            rotate(&rotation, vector, &mut y);
+            for (d, value) in y[..head].iter().enumerate() {
+                let value = f64::from(*value as f32);
+                sum[d] += value;
+                squares[d] += value * value;
+            }
+            for (d, value) in y[head..].iter().enumerate() {
+                let value = *value as f32;
+                lo[d] = lo[d].min(value);
+                hi[d] = hi[d].max(value);
+            }
+        }
+        let n = vectors.len() as f64;
+        let scale = sum
+            .iter()
+            .zip(&squares)
+            .map(|(sum, squares)| {
+                let mean = sum / n;
+                let spread = (squares / n - mean * mean).max(0.0).sqrt().sqrt() as f32;
+                // A component that never varies still needs a scale to divide by.
+                if spread > 0.0 && spread.is_finite() {
+                    spread
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        for (lo, hi) in lo.iter_mut().zip(hi.iter_mut()) {
+            // A component that never varies still needs a range to divide by.
+            if *hi <= *lo {
+                *hi = *lo + 1e-6;
+            }
+        }
+        Self::rot_i8i4(dim, head, tail, scale, lo, hi, rotation)
+    }
+
     /// The codec a segment declares: its id, its width and its parameters section.
     pub fn from_params(id: u16, dim: usize, params: &[u8]) -> Result<Self, String> {
         if params.len() < 8 {
@@ -262,6 +454,47 @@ impl Codec {
                 }
                 Self::i8_sym_vec(dim)?
             }
+            CODEC_ROT_I8I4 => {
+                if params.len() < 20 {
+                    return Err("rot192-i8i4 parameters are too short for their layout".into());
+                }
+                let (out_dim, head, tail) = (
+                    le_u32(params, 8) as usize,
+                    le_u32(params, 12) as usize,
+                    le_u32(params, 16) as usize,
+                );
+                if head.checked_add(tail) != Some(out_dim) || out_dim > dim {
+                    return Err(format!(
+                        "rot192-i8i4 parameters declare {out_dim} components as {head} + {tail}"
+                    ));
+                }
+                let expected = 20 + 4 * head + 8 * tail + 4 * out_dim * dim;
+                if params.len() != expected {
+                    return Err(format!(
+                        "rot192-i8i4 parameters for {out_dim} × {dim} are {} bytes, not \
+                         {expected}",
+                        params.len()
+                    ));
+                }
+                let floats: Vec<f32> = params[20..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes))
+                    .collect();
+                let (scale, rest) = floats.split_at(head);
+                let (lo, rest) = rest.split_at(tail);
+                let (hi, rotation) = rest.split_at(tail);
+                Self::rot_i8i4(
+                    dim,
+                    head,
+                    tail,
+                    scale.to_vec(),
+                    lo.to_vec(),
+                    hi.to_vec(),
+                    rotation.to_vec(),
+                )?
+            }
             other => {
                 return Err(format!(
                     "codec {other:#06x} is not one this build implements"
@@ -287,12 +520,38 @@ impl Codec {
             CodecKind::F32 => CODEC_F32,
             CodecKind::I8SymVec => CODEC_I8_SYM_VEC,
             CodecKind::I8SymDim { .. } => CODEC_I8_SYM_DIM,
+            CodecKind::RotI8I4(_) => CODEC_ROT_I8I4,
         }
     }
 
     /// Whether each vector carries its own scale, stored in VECTOR_SCALES.
     pub fn has_vector_scales(&self) -> bool {
-        matches!(self.kind, CodecKind::I8SymVec)
+        matches!(self.kind, CodecKind::I8SymVec | CodecKind::RotI8I4(_))
+    }
+
+    /// Whether a component can fall outside what the codec encodes, and is counted when it
+    /// does: `i8-sym-dim`'s scales and `rot192-i8i4`'s tail ranges.
+    pub fn can_clip(&self) -> bool {
+        matches!(
+            self.kind,
+            CodecKind::I8SymDim { .. } | CodecKind::RotI8I4(_)
+        )
+    }
+
+    /// The components a clip rate is counted over: `dim`, or the rotated codec's tail.
+    pub fn clippable_components(&self) -> usize {
+        match &self.kind {
+            CodecKind::RotI8I4(rotated) => rotated.tail,
+            _ => self.dim,
+        }
+    }
+
+    /// `rot192-i8i4`'s parameters; `None` for the other codecs.
+    pub(crate) fn rotated(&self) -> Option<&Rotated> {
+        match &self.kind {
+            CodecKind::RotI8I4(rotated) => Some(rotated),
+            _ => None,
+        }
     }
 
     /// The codec's name, which is what a store identity declares as `vector_precision`.
@@ -306,9 +565,10 @@ impl Codec {
 
     /// The bytes one slot's vector takes.
     pub fn bytes_per_vector(&self) -> usize {
-        match self.kind {
+        match &self.kind {
             CodecKind::F32 => 4 * self.dim,
             CodecKind::I8SymVec | CodecKind::I8SymDim { .. } => self.dim,
+            CodecKind::RotI8I4(rotated) => rotated.head + rotated.tail / 2,
         }
     }
 
@@ -326,7 +586,7 @@ impl Codec {
     pub fn scales(&self) -> Option<&[f32]> {
         match &self.kind {
             CodecKind::I8SymDim { scales, .. } => Some(scales),
-            CodecKind::F32 | CodecKind::I8SymVec => None,
+            CodecKind::F32 | CodecKind::I8SymVec | CodecKind::RotI8I4(_) => None,
         }
     }
 
@@ -334,12 +594,12 @@ impl Codec {
     pub fn clip_q(&self) -> Option<f32> {
         match &self.kind {
             CodecKind::I8SymDim { clip_q, .. } => Some(*clip_q),
-            CodecKind::F32 | CodecKind::I8SymVec => None,
+            CodecKind::F32 | CodecKind::I8SymVec | CodecKind::RotI8I4(_) => None,
         }
     }
 
     /// Encode `vector` into `out`, which must be [`Self::bytes_per_vector`] long, and
-    /// return how many components were clipped and — for `i8-sym-vec` — its scale.
+    /// return how many components were clipped and — for a codec with one — its scale.
     ///
     /// # Panics
     ///
@@ -361,20 +621,48 @@ impl Codec {
                     scale: None,
                 }
             }
-            CodecKind::I8SymVec => {
-                let max = vector
-                    .iter()
-                    .fold(0.0f32, |max, value| max.max(value.abs()));
+            CodecKind::I8SymVec => Encoded {
+                clipped: 0,
+                scale: Some(encode_per_vector(vector, out)),
+            },
+            CodecKind::RotI8I4(rotated) => {
+                // On the stack for the library's 192 components; the heap only past 256.
+                let mut stack = [0f64; 256];
+                let mut heap = Vec::new();
+                let y: &mut [f64] = if rotated.out_dim() <= stack.len() {
+                    &mut stack[..rotated.out_dim()]
+                } else {
+                    heap.resize(rotated.out_dim(), 0.0);
+                    &mut heap
+                };
+                super::rotation::rotate(&rotated.rotation, vector, y);
+                let (head, packed) = out.split_at_mut(rotated.head);
+                let whitened = |d: usize| y[d] as f32 / rotated.scale[d];
+                // `encode_per_vector` over the whitened head, without collecting it.
+                let max = (0..rotated.head).fold(0.0f32, |max, d| max.max(whitened(d).abs()));
                 let scale = max / 127.0;
-                for (byte, value) in out.iter_mut().zip(vector) {
+                for (d, byte) in head.iter_mut().enumerate() {
                     *byte = if scale > 0.0 {
-                        quantize_per_vector(*value, scale) as u8
+                        quantize_per_vector(whitened(d), scale) as u8
                     } else {
                         0
                     };
                 }
+                let mut clipped = 0;
+                for (j, byte) in packed.iter_mut().enumerate() {
+                    let mut nibbles = [0u8; 2];
+                    for (half, nibble) in nibbles.iter_mut().enumerate() {
+                        let d = 2 * j + half;
+                        let (lo, hi) = (rotated.lo[d], rotated.hi[d]);
+                        let value = y[rotated.head + d] as f32;
+                        let code = ((value - lo) / (hi - lo) * 15.0).round();
+                        clipped += usize::from(!(0.0..=15.0).contains(&code));
+                        *nibble = code.clamp(0.0, 15.0) as u8;
+                    }
+                    *byte = nibbles[0] | (nibbles[1] << 4);
+                }
                 Encoded {
-                    clipped: 0,
+                    clipped,
                     scale: Some(scale),
                 }
             }
@@ -395,7 +683,7 @@ impl Codec {
 
     /// The vector `bytes` decodes to: exact for `f32`, `v_d · S_d / 127` for `i8-sym-dim`,
     /// `v_d · s` for `i8-sym-vec` with the vector's own scale `s` (`scale`, required there
-    /// and ignored elsewhere).
+    /// and for `rot192-i8i4`, ignored elsewhere), and `Rᵀ · ŷ` for `rot192-i8i4`.
     pub fn decode(&self, bytes: &[u8], scale: Option<f32>, out: &mut [f32]) {
         assert_eq!(bytes.len(), self.bytes_per_vector());
         assert_eq!(out.len(), self.dim);
@@ -416,8 +704,41 @@ impl Codec {
                     *value = f32::from(*byte as i8) * scale / 127.0;
                 }
             }
+            CodecKind::RotI8I4(rotated) => {
+                let scale = scale.expect("a rot192-i8i4 vector decodes with its scale");
+                let mut y = Vec::with_capacity(rotated.out_dim());
+                y.extend(
+                    bytes[..rotated.head]
+                        .iter()
+                        .zip(rotated.scale.iter())
+                        .map(|(byte, spread)| f64::from(f32::from(*byte as i8) * scale * spread)),
+                );
+                for (j, byte) in bytes[rotated.head..].iter().enumerate() {
+                    for (half, code) in [byte & 0x0F, byte >> 4].into_iter().enumerate() {
+                        let d = 2 * j + half;
+                        y.push(f64::from(rotated.lo[d] + f32::from(code) * rotated.step(d)));
+                    }
+                }
+                super::rotation::unrotate(&rotated.rotation, &y, out);
+            }
         }
     }
+}
+
+/// `i8-sym-vec` of `vector` into `out`: the codes, and the scale returned.
+fn encode_per_vector(vector: &[f32], out: &mut [u8]) -> f32 {
+    let max = vector
+        .iter()
+        .fold(0.0f32, |max, value| max.max(value.abs()));
+    let scale = max / 127.0;
+    for (byte, value) in out.iter_mut().zip(vector) {
+        *byte = if scale > 0.0 {
+            quantize_per_vector(*value, scale) as u8
+        } else {
+            0
+        };
+    }
+    scale
 }
 
 /// One component under one scale: `clamp(round_half_away(x / S · 127), −127, 127)`, and
@@ -450,6 +771,7 @@ pub fn codec_name(id: u16) -> Option<&'static str> {
         CODEC_F32 => Some("f32"),
         CODEC_I8_SYM_DIM => Some("i8-sym-dim"),
         CODEC_I8_SYM_VEC => Some("i8-sym-vec"),
+        CODEC_ROT_I8I4 => Some(ROT_I8I4_NAME),
         _ => None,
     }
 }
@@ -579,5 +901,108 @@ mod tests {
         let mut zero = [9u8; 4];
         let encoded = codec.encode(&[0.0; 4], &mut zero);
         assert_eq!((zero, encoded.scale), ([0; 4], Some(0.0)));
+    }
+
+    /// `rot192-i8i4`: its parameters round trip and name the epoch, matrix included; the same
+    /// vectors fit the same bytes; a vector encodes to the same bytes every time, two tail
+    /// codes a byte, decodes to its projection, and counts what its ranges clip.
+    #[test]
+    fn a_rotated_codec_fits_deterministically_and_encodes_its_tail() {
+        use crate::semantic::oxv::rotation::{rotate, unrotate};
+        use crate::semantic::oxv::testing::Random;
+        let dim = 32;
+        let mut random = Random(41);
+        let vectors: Vec<Vec<f32>> = (0..500).map(|_| random.unit(dim)).collect();
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let codec = Codec::fit_rot_i8i4(&refs, 16, 8).unwrap();
+        let again = Codec::fit_rot_i8i4(&refs, 16, 8).unwrap();
+        assert_eq!(codec.params(), again.params());
+        assert_eq!(codec.params_sha256(), again.params_sha256());
+        assert_eq!((codec.id(), codec.name()), (CODEC_ROT_I8I4, ROT_I8I4_NAME));
+        assert_eq!(codec.bytes_per_vector(), 16 + 4);
+        assert!(codec.has_vector_scales() && codec.can_clip());
+        assert_eq!(codec.clippable_components(), 8);
+        assert_eq!(codec.params().len(), 20 + 16 * 4 + 2 * 8 * 4 + 24 * dim * 4);
+        assert_eq!(
+            Codec::from_params(CODEC_ROT_I8I4, dim, codec.params()).unwrap(),
+            codec
+        );
+
+        let mut other = codec.params().to_vec();
+        let last = other.len() - 1;
+        other[last] ^= 1;
+        let other = Codec::from_params(CODEC_ROT_I8I4, dim, &other).unwrap();
+        assert_ne!(other.params_sha256(), codec.params_sha256());
+        assert!(Codec::from_params(CODEC_ROT_I8I4, dim + 1, codec.params()).is_err());
+        assert!(Codec::from_params(CODEC_ROT_I8I4, dim, &codec.params()[..100]).is_err());
+        let mut layout = codec.params().to_vec();
+        layout[12..16].copy_from_slice(&17u32.to_le_bytes());
+        assert!(Codec::from_params(CODEC_ROT_I8I4, dim, &layout).is_err());
+        let rotation = vec![0.0; 24 * dim];
+        let build = |scale: f32, tail: usize, lo: f32, rotation: Vec<f32>| {
+            Codec::rot_i8i4(
+                dim,
+                16,
+                tail,
+                vec![scale; 16],
+                vec![lo; tail],
+                vec![1.0; tail],
+                rotation,
+            )
+        };
+        assert!(build(1.0, 8, 0.0, rotation.clone()).is_ok());
+        assert!(
+            build(1.0, 7, 0.0, vec![0.0; 23 * dim]).is_err(),
+            "an odd tail"
+        );
+        assert!(
+            build(1.0, 8, 1.0, rotation.clone()).is_err(),
+            "an empty range"
+        );
+        assert!(
+            build(0.0, 8, 0.0, rotation.clone()).is_err(),
+            "a zero scale"
+        );
+        let mut nan = rotation;
+        nan[3] = f32::NAN;
+        assert!(build(1.0, 8, 0.0, nan).is_err());
+        assert!(CodecSpec::parse(ROT_I8I4_NAME, 1.0)
+            .unwrap_err()
+            .contains("--rotation"));
+
+        let rotated = codec.rotated().unwrap();
+        let (mut codes, mut twice) = (vec![0u8; 20], vec![0u8; 20]);
+        let (mut y, mut decoded, mut projected) =
+            (vec![0f64; 24], vec![0f32; dim], vec![0f32; dim]);
+        for vector in &vectors[..50] {
+            let encoded = codec.encode(vector, &mut codes);
+            codec.encode(vector, &mut twice);
+            assert_eq!(codes, twice);
+            assert_eq!(
+                encoded.clipped, 0,
+                "fitted on these vectors: inside every range"
+            );
+            rotate(&rotated.rotation, vector, &mut y);
+            for (j, byte) in codes[16..].iter().enumerate() {
+                for (half, code) in [byte & 0x0F, byte >> 4].into_iter().enumerate() {
+                    let d = 2 * j + half;
+                    let value = y[16 + d] as f32;
+                    let expected =
+                        ((value - rotated.lo[d]) / (rotated.hi[d] - rotated.lo[d]) * 15.0).round();
+                    assert_eq!(f32::from(code), expected);
+                }
+            }
+            codec.decode(&codes, encoded.scale, &mut decoded);
+            unrotate(&rotated.rotation, &y, &mut projected);
+            let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+            for (a, b) in decoded.iter().zip(&projected) {
+                ab += f64::from(a * b);
+                aa += f64::from(a * a);
+                bb += f64::from(b * b);
+            }
+            assert!(ab / (aa.sqrt() * bb.sqrt()) > 0.99);
+        }
+        let loud: Vec<f32> = vectors[0].iter().map(|x| x * 50.0).collect();
+        assert!(codec.encode(&loud, &mut codes).clipped > 0);
     }
 }

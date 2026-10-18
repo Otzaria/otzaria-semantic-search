@@ -9,7 +9,9 @@
 //!
 //! Every slot's vector comes from the warehouse, by the full SHA-256 of its text, and is
 //! encoded in the codec epoch: a new one for a base (`i8-sym-vec` by default; `i8-sym-dim`
-//! calibrated here on the slots' own vectors, exactly), the previous release's for a delta.
+//! calibrated here on the slots' own vectors, exactly; `rot192-i8i4` as `fit-rotation`
+//! fitted it), the previous release's for a delta. A `rot192-i8i4` release is segment format
+//! 3, which stores eight bytes of each key: one in which two keys share them is refused.
 //! The codec is part of the release's identity — [`release_identity`]. Assembly writes the
 //! package — `segment.oxv`, `manifest.json`, `payloads.json` — the release manifest
 //! `release.json`, and the ledger the next release is planned against.
@@ -35,6 +37,7 @@ use crate::distribution::warehouse::Warehouse;
 use crate::errors::PackError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::{Codec, CodecSpec};
+use crate::semantic::oxv::format::{default_format_version, key_len, SEGMENT_FORMAT_VERSION};
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::writer::{SegmentBuilder, SegmentSpec, VectorSink, WrittenSegment};
 use crate::semantic::segment_set::{ReleaseFile, ReleaseManifest};
@@ -54,10 +57,12 @@ pub const INDEX_SCHEMA_VERSION: u32 = 5;
 const WINDOW: usize = 4096;
 
 /// Which codec epoch a segment is encoded in.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EpochChoice {
     /// A new epoch, for a base.
     New(CodecSpec),
+    /// A new epoch whose parameters were fitted beforehand — `rot192-i8i4`'s — for a base.
+    Given(Codec),
     /// The previous release's: always a delta's, and a base's that keeps the chain's.
     Previous,
 }
@@ -75,6 +80,9 @@ pub struct AssembleRequest<'a> {
     pub created_at: String,
     /// Which build made it, for people: the manifest's `builtBy`.
     pub built_by: Option<serde_json::Value>,
+    /// The cosine a short line needs to share a neighbour's vector ([`alias`](super::alias)),
+    /// format 3 only; `None` or 0 for none. A delta takes its ledger's, and refuses another.
+    pub alias_threshold: Option<f32>,
 }
 
 /// What an assembly wrote.
@@ -86,16 +94,65 @@ pub struct AssembleReport {
     pub manifest_sha256: String,
     /// The ledger of this release, in `out_dir`.
     pub ledger: LedgerManifest,
-    /// Components the codec clipped: always 0 but for `i8-sym-dim`.
+    /// Components the codec clipped: always 0 but for `i8-sym-dim` and `rot192-i8i4`.
     pub clipped_components: u64,
+    /// Plan records that share a neighbour's vector, the distinct keys they spare, and the
+    /// least cosine of one with its neighbour.
+    pub alias_records: u64,
+    pub alias_keys: u64,
+    pub alias_min_cosine: Option<f64>,
 }
 
 /// The identity a release built from a plan declares: the plan's, with the codec's name as
-/// its `store.vector_precision`.
+/// its `store.vector_precision` and the format it is written in as its
+/// `store.store_format_version`.
 pub fn release_identity(plan_identity: &IndexVersion, codec: &Codec) -> IndexVersion {
     let mut identity = plan_identity.clone();
     identity.store.vector_precision = codec.name().to_string();
+    identity.store.store_format_version = default_format_version(codec);
     identity
+}
+
+/// Refuse a release in a format that stores `key_len` bytes of a key when two distinct keys
+/// of the plan — or, for a delta, of the plan and the release before — share them: a set
+/// could not tell their vectors apart.
+pub(crate) fn check_key_prefixes(
+    plan: &Plan,
+    previous: Option<&Ledger>,
+    key_len: usize,
+) -> Result<(), PackError> {
+    if key_len >= 16 {
+        return Ok(());
+    }
+    let mut keys: Vec<[u8; 16]> = plan
+        .records
+        .iter()
+        .map(|record| record.key_bytes())
+        .collect();
+    if let Some(previous) = previous {
+        keys.extend((0..previous.key_count()).map(|index| previous.key(index)));
+    }
+    match shared_prefix(keys, key_len) {
+        Some((one, other)) => Err(malformed(format!(
+            "keys {} and {} share their first {key_len} bytes, which is all segment format 3 \
+             stores of a key: this release cannot be assembled in that format",
+            hex(&one),
+            hex(&other)
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Two distinct keys of `keys` that share their first `key_len` bytes, if any.
+pub(crate) fn shared_prefix(
+    mut keys: Vec<[u8; 16]>,
+    key_len: usize,
+) -> Option<([u8; 16], [u8; 16])> {
+    keys.sort_unstable();
+    keys.dedup();
+    keys.windows(2)
+        .find(|pair| pair[0][..key_len] == pair[1][..key_len])
+        .map(|pair| (pair[0], pair[1]))
 }
 
 /// Check the warehouse against the plan's independent identity and, when present, its
@@ -143,14 +200,55 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
             ))
         }
     };
-    let kept_epoch = match (request.epoch, delta) {
+    let kept_epoch = match (&request.epoch, delta) {
         (EpochChoice::Previous, _) | (_, Some(_)) => Some(
             request
                 .previous
                 .ok_or_else(|| malformed("keeping the epoch needs the previous ledger"))?
                 .codec()?,
         ),
-        (EpochChoice::New(_), None) => None,
+        (EpochChoice::New(_) | EpochChoice::Given(_), None) => None,
+    };
+    let format_version = match (&kept_epoch, &request.epoch) {
+        (Some(codec), _) | (None, EpochChoice::Given(codec)) => default_format_version(codec),
+        _ => SEGMENT_FORMAT_VERSION,
+    };
+    check_key_prefixes(plan, delta, key_len(format_version))?;
+    if let Some(asked) = request.alias_threshold {
+        if !(asked.is_finite() && (0.0..=1.0).contains(&asked)) {
+            return Err(malformed(format!(
+                "the alias threshold is {asked}, and it must be in [0, 1]: 0 shares nothing"
+            )));
+        }
+    }
+    let alias_threshold = match delta {
+        Some(previous) => {
+            let chain = previous.manifest.alias_threshold;
+            if request
+                .alias_threshold
+                .is_some_and(|asked| Some(asked) != chain && !(asked == 0.0 && chain.is_none()))
+            {
+                return Err(malformed(format!(
+                    "the chain shares short lines' vectors at {chain:?} and this build asks for \
+                     {:?}: a new threshold starts with a base",
+                    request.alias_threshold
+                )));
+            }
+            chain
+        }
+        None => request.alias_threshold.filter(|threshold| *threshold > 0.0),
+    };
+    if alias_threshold.is_some() && key_len(format_version) == 16 {
+        return Err(malformed(
+            "a short line shares a neighbour's vector only in segment format 3 (rot192-i8i4)",
+        ));
+    }
+    let aliases = crate::distribution::alias::decide(&plan.records, warehouse, alias_threshold)?;
+    let earlier_aliases = match delta.and_then(|old| old.occurrences.as_ref().map(|o| (old, o))) {
+        Some((old, records)) => {
+            crate::distribution::alias::decide(records, warehouse, old.manifest.alias_threshold)?
+        }
+        None => crate::distribution::alias::Aliases::none(),
     };
     if let Some(previous) = delta {
         let codec = kept_epoch.as_ref().expect("a delta keeps the epoch");
@@ -199,8 +297,8 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
     let windows = slot_windows(&plan.records);
     let all_occurrences =
         plan.records.is_windowed() && delta.is_none_or(|old| old.occurrences.is_none());
-    let changed = changed_occurrences(plan, delta)?;
-    let mut occurrences = plan.records.occurrences();
+    let changed = changed_occurrences(plan, delta, &aliases, &earlier_aliases)?;
+    let mut occurrences = aliases.occurrences(&plan.records);
     let mut book = BookRecords::new(u32::MAX);
     let mut slot_records: Vec<u64> = Vec::new();
     let (mut missing, mut first_missing) = (0u64, None);
@@ -208,6 +306,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         &plan.records,
         &plan.books,
         delta,
+        &aliases,
         |_, record, disposition| {
             if record.book != book.book {
                 book.add_to(&mut builder, plan, source_hashes.as_ref())?;
@@ -226,7 +325,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
             if all_occurrences
                 || changed
                     .as_ref()
-                    .is_some_and(|changed| changed.contains(&record.key_bytes()))
+                    .is_some_and(|changed| changed.contains(&occurrence.key.0))
             {
                 book.occurrences.push(occurrence);
             }
@@ -256,7 +355,7 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
                 {
                     book.foreign.push((record.key(), record.ordinal))
                 }
-                Disposition::Held | Disposition::Repeat => {}
+                Disposition::Held | Disposition::Repeat | Disposition::Alias => {}
             }
             Ok(())
         },
@@ -286,12 +385,21 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         );
     }
 
-    let codec = match (kept_epoch, request.epoch) {
+    let codec = match (kept_epoch, &request.epoch) {
         (Some(codec), _) => codec,
         (None, EpochChoice::New(CodecSpec::I8SymDim { clip_q })) => {
-            calibrate_i8_sym_dim(warehouse, &slot_records, clip_q)?
+            calibrate_i8_sym_dim(warehouse, &slot_records, *clip_q)?
         }
         (None, EpochChoice::New(spec)) => spec.build(dim, &[]).map_err(malformed)?,
+        (None, EpochChoice::Given(codec)) => {
+            if codec.dim() != dim {
+                return Err(malformed(format!(
+                    "the given codec is {} wide, and the warehouse's vectors {dim}",
+                    codec.dim()
+                )));
+            }
+            codec.clone()
+        }
         (None, EpochChoice::Previous) => unreachable!("kept above"),
     };
     let identity = release_identity(&plan.manifest.identity, &codec);
@@ -354,6 +462,8 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         delta,
         &classified,
         Some(package),
+        &aliases,
+        alias_threshold,
     )?;
     Ok(AssembleReport {
         out_dir: out.clone(),
@@ -361,6 +471,9 @@ pub fn assemble(request: &AssembleRequest<'_>) -> Result<AssembleReport, PackErr
         manifest,
         ledger,
         clipped_components: written.clipped_components,
+        alias_records: aliases.len(),
+        alias_keys: aliases.keys,
+        alias_min_cosine: aliases.min_cosine(),
     })
 }
 
@@ -427,6 +540,8 @@ impl BookRecords {
 fn changed_occurrences(
     plan: &Plan,
     previous: Option<&Ledger>,
+    aliases: &crate::distribution::alias::Aliases,
+    earlier_aliases: &crate::distribution::alias::Aliases,
 ) -> Result<Option<crate::distribution::files::KeySet<[u8; 16]>>, PackError> {
     use crate::distribution::files::KeySet;
     use crate::semantic::oxv::occurrence::Occurrence;
@@ -441,8 +556,8 @@ fn changed_occurrences(
         // An older producer has no occurrence snapshot; rewrite locations once.
         return Ok(Some(changed));
     };
-    let mut current = plan.records.occurrences().peekable();
-    let mut earlier = old.occurrences().peekable();
+    let mut current = aliases.occurrences(&plan.records).peekable();
+    let mut earlier = earlier_aliases.occurrences(old).peekable();
     let mut names: BTreeSet<&str> = plan.books.names().iter().map(String::as_str).collect();
     names.extend(previous.books().names().iter().map(String::as_str));
     for name in names {
@@ -603,6 +718,46 @@ pub(crate) fn calibrate_i8_sym_dim(
         })
         .collect();
     Codec::i8_sym_dim(scales, clip_q).map_err(malformed)
+}
+
+/// The vectors [`fit_rot_i8i4`] fits on by default.
+pub const ROTATION_SAMPLE: usize = 200_000;
+
+/// Fit `rot192-i8i4` — `head` int8 and `tail` 4-bit components, 128 and 64 for the
+/// library — on `sample` of the warehouse's vectors, records `i · len / sample` in order, as
+/// [`Codec::fit_rot_i8i4`] fits it: the same warehouse and sample, the same bytes.
+pub fn fit_rot_i8i4(
+    warehouse: &Warehouse,
+    sample: usize,
+    head: usize,
+    tail: usize,
+) -> Result<Codec, PackError> {
+    warehouse.verify()?;
+    let len = warehouse.len();
+    let take = (sample as u64).min(len);
+    if take == 0 {
+        return Err(malformed("there are no vectors to fit a rotation on"));
+    }
+    let dim = warehouse.dim();
+    let mut vectors = vec![0f32; take as usize * dim];
+    for (index, vector) in vectors.chunks_exact_mut(dim).enumerate() {
+        let record = (index as u128 * u128::from(len) / u128::from(take)) as u64;
+        warehouse.vector(record, vector);
+    }
+    let refs: Vec<&[f32]> = vectors.chunks_exact(dim).collect();
+    Codec::fit_rot_i8i4(&refs, head, tail).map_err(malformed)
+}
+
+/// The codec a `fit-rotation` file holds: its bytes are `rot192-i8i4`'s parameters section.
+pub fn read_rotation(path: &Path) -> Result<Codec, PackError> {
+    use crate::semantic::oxv::codec::CODEC_ROT_I8I4;
+    let bytes = std::fs::read(path).map_err(io_error(format!("reading {}", path.display())))?;
+    let dim = bytes
+        .get(4..8)
+        .map(|width| u32::from_le_bytes(width.try_into().expect("four bytes")) as usize)
+        .ok_or_else(|| malformed(format!("{} is too short for a rotation", path.display())))?;
+    Codec::from_params(CODEC_ROT_I8I4, dim, &bytes)
+        .map_err(|reason| malformed(format!("{}: {reason}", path.display())))
 }
 
 /// The release manifest at `release` with `files` — what a client downloads, in order:

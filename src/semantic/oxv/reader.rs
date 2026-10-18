@@ -18,8 +18,9 @@ use crate::errors::VectorStoreError;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::format::{
-    le_u32, BookEntry, DirectoryEntry, Header, SectionKind, BLOCK_SIZE, BOOK_ENTRY_LEN, EXTRA_LEN,
-    FOREIGN_LEN, HAS_EXTRAS, HEADER_LEN, HINT_MASK, SECTION_ALIGN, VECTORS_ALIGN,
+    foreign_len, key_len, le_u16, le_u32, occurrence_len, BookEntry, DirectoryEntry, Header,
+    SectionKind, BLOCK_SIZE, BOOK_ENTRY_LEN, EXTRA_LEN, HAS_EXTRAS, HEADER_CRC_OFFSET, HEADER_LEN,
+    HINT_MASK, MAGIC, READABLE_FORMATS, SECTION_ALIGN, VECTORS_ALIGN,
 };
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -47,6 +48,8 @@ pub struct Segment {
     header: Header,
     kind: PackageKind,
     codec: Codec,
+    /// 16 bytes in format 2, 8 in format 3.
+    key_len: usize,
     books: Box<[SegmentBook]>,
     hints: Range<usize>,
     keys: Range<usize>,
@@ -81,9 +84,10 @@ impl Segment {
     ///
     /// # Errors
     ///
-    /// [`VectorStoreError::OpenFailed`] when the file cannot be opened or mapped, and
-    /// [`VectorStoreError::Corrupted`] — naming the file and what is wrong — for anything
-    /// about its bytes.
+    /// [`VectorStoreError::OpenFailed`] when the file cannot be opened or mapped, or is a
+    /// sound segment of a format or codec this build does not read — newer than it, not
+    /// damaged — and [`VectorStoreError::Corrupted`], naming the file and what is wrong, for
+    /// anything else about its bytes.
     pub fn open(path: &Path) -> Result<Self, VectorStoreError> {
         if cfg!(target_endian = "big") {
             return Err(VectorStoreError::OpenFailed {
@@ -102,6 +106,11 @@ impl Segment {
         let map = unsafe { Mmap::map(&file) }.map_err(|error| VectorStoreError::OpenFailed {
             reason: format!("{}: could not be mapped: {error}", path.display()),
         })?;
+        if let Some(reason) = unsupported(&map) {
+            return Err(VectorStoreError::OpenFailed {
+                reason: format!("segment {}: {reason}", path.display()),
+            });
+        }
         Self::check(path, map).map_err(|reason| VectorStoreError::Corrupted {
             reason: format!("segment {}: {reason}", path.display()),
         })
@@ -159,7 +168,7 @@ impl Segment {
                     if sections.insert(kind, *entry).is_some() {
                         return Err(format!("{label} appears twice"));
                     }
-                    if let Some(size) = kind.fixed_elem_size() {
+                    if let Some(size) = kind.fixed_elem_size(header.format_version) {
                         if entry.elem_size != size
                             || entry.elem_count.checked_mul(u64::from(size)) != Some(entry.length)
                         {
@@ -211,7 +220,7 @@ impl Segment {
             None if count == 0 => Ok(DirectoryEntry {
                 kind: kind.code(),
                 flags: 0,
-                elem_size: kind.fixed_elem_size().unwrap_or(1),
+                elem_size: kind.fixed_elem_size(header.format_version).unwrap_or(1),
                 offset: 0,
                 length: 0,
                 elem_count: 0,
@@ -336,14 +345,24 @@ impl Segment {
         {
             return Err("OCCURRENCES must be critical and block-summed".to_string());
         }
+        let key_len = key_len(header.format_version);
         if let Some(entry) = sections.get(&SectionKind::Occurrences) {
-            if map[range(entry)]
-                .as_chunks::<44>()
-                .0
-                .iter()
-                .any(|row| row[41..44] != [0, 0, 0])
-            {
-                return Err("an occurrence has nonzero reserved bytes".to_string());
+            let row_len = occurrence_len(header.format_version);
+            // Format 3 gives the first reserved byte a role: an alias, of window 0.
+            let aliases = header.format_version >= super::format::SEGMENT_FORMAT_V3;
+            // Window 255 is only ever an alias's role, never a window byte.
+            let sound = |row: &[u8]| match row[row_len - 3..] {
+                _ if row[row_len - 4] == super::occurrence::ALIAS_WINDOW => false,
+                [0, 0, 0] => true,
+                [role, 0, 0] => {
+                    aliases && role == super::occurrence::ROLE_ALIAS && row[row_len - 4] == 0
+                }
+                _ => false,
+            };
+            if !map[range(entry)].chunks_exact(row_len).all(sound) {
+                return Err(
+                    "an occurrence has nonzero reserved bytes or an unknown role".to_string(),
+                );
             }
         }
         if sections.get(&SectionKind::BookHashes).is_some_and(|entry| {
@@ -448,6 +467,7 @@ impl Segment {
             path: path.to_path_buf(),
             kind,
             codec,
+            key_len,
             books: books.into_boxed_slice(),
             hints: range(&hints_entry),
             keys: range(&keys_entry),
@@ -528,7 +548,9 @@ impl Segment {
                 }
             }
         }
-        let (tombstones, _) = self.map[self.tombstones.clone()].as_chunks::<16>();
+        let tombstones: Vec<&[u8]> = self.map[self.tombstones.clone()]
+            .chunks_exact(self.key_len)
+            .collect();
         if tombstones.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err("its tombstones are not sorted and unique".into());
         }
@@ -579,6 +601,16 @@ impl Segment {
 
     pub fn codec(&self) -> &Codec {
         &self.codec
+    }
+
+    /// The segment's format: 2, or 3 for 8-byte keys.
+    pub fn format_version(&self) -> u32 {
+        self.header.format_version
+    }
+
+    /// The bytes of a key as the segment stores it: 16, or 8 in format 3.
+    pub fn key_len(&self) -> usize {
+        self.key_len
     }
 
     pub fn segment_id(&self) -> [u8; 16] {
@@ -656,14 +688,33 @@ impl Segment {
         self.books.partition_point(|book| book.extras.end <= index)
     }
 
+    /// Slot `slot`'s key; in format 3, its eight bytes as [`ChunkKey::narrowed`]. Compare
+    /// it with a computed key by [`ChunkKey::same_text`].
     pub fn key(&self, slot: u32) -> ChunkKey {
-        let at = self.keys.start + slot as usize * 16;
-        ChunkKey(self.map[at..at + 16].try_into().expect("16 bytes"))
+        self.key_at(self.keys.start + slot as usize * self.key_len)
     }
 
-    /// Every slot's key, as the section stores them: 16 bytes each, in slot order.
+    /// Every slot's key, as [`Self::key`] reads it, in slot order.
+    pub fn keys(&self) -> impl Iterator<Item = ChunkKey> + '_ {
+        self.map[self.keys.clone()]
+            .chunks_exact(self.key_len)
+            .map(|bytes| {
+                let mut key = [0u8; 16];
+                key[..bytes.len()].copy_from_slice(bytes);
+                ChunkKey(key)
+            })
+    }
+
+    /// Every slot's key, as the section stores them: [`Self::key_len`] bytes each, in slot
+    /// order.
     pub fn key_bytes(&self) -> &[u8] {
         &self.map[self.keys.clone()]
+    }
+
+    fn key_at(&self, at: usize) -> ChunkKey {
+        let mut key = [0u8; 16];
+        key[..self.key_len].copy_from_slice(&self.map[at..at + self.key_len]);
+        ChunkKey(key)
     }
 
     /// The record ordinal a slot was built at.
@@ -716,13 +767,12 @@ impl Segment {
     }
 
     pub fn occurrences(&self) -> impl Iterator<Item = super::occurrence::Occurrence> + '_ {
+        let key_len = self.key_len;
         self.occurrences
             .as_ref()
             .map_or(&[][..], |range| &self.map[range.clone()])
-            .as_chunks::<44>()
-            .0
-            .iter()
-            .map(|row| super::occurrence::Occurrence::decode(row))
+            .chunks_exact(occurrence_len(self.header.format_version))
+            .map(move |row| super::occurrence::Occurrence::decode_with(row, key_len))
     }
 
     /// A complete snapshot for this key, or None when this segment does not update it.
@@ -734,13 +784,20 @@ impl Segment {
             .occurrences
             .as_ref()
             .map(|range| &self.map[range.clone()])?;
-        let rows = bytes.as_chunks::<44>().0;
-        let start = rows.partition_point(|row| row[..16] < key.0[..]);
-        let end = start + rows[start..].partition_point(|row| row[..16] == key.0);
-        (end > start).then(|| {
-            rows[start..end]
-                .iter()
-                .map(|row| super::occurrence::Occurrence::decode(row))
+        let key_len = self.key_len;
+        // A key of the other width finds nothing: the set holds its keys at one width.
+        if key_len < 16 && !key.is_narrow() {
+            return None;
+        }
+        let row_len = occurrence_len(self.header.format_version);
+        let row = move |index: usize| &bytes[index * row_len..(index + 1) * row_len];
+        let count = bytes.len() / row_len;
+        let wanted = key.0;
+        let start = partition(count, |index| row(index)[..key_len] < wanted[..key_len]);
+        let end = partition(count, |index| row(index)[..key_len] <= wanted[..key_len]);
+        (end > start).then(move || {
+            (start..end)
+                .map(move |index| super::occurrence::Occurrence::decode_with(row(index), key_len))
         })
     }
 
@@ -792,19 +849,56 @@ impl Segment {
 
     /// Foreign record `index`: `(key, book, hint)`.
     pub fn foreign_record(&self, index: u32) -> (ChunkKey, u32, u32) {
-        let at = self.foreign.start + index as usize * FOREIGN_LEN;
+        let at = self.foreign.start + index as usize * foreign_len(self.header.format_version);
         (
-            ChunkKey(self.map[at..at + 16].try_into().expect("16 bytes")),
-            le_u32(&self.map, at + 16),
-            le_u32(&self.map, at + 20),
+            self.key_at(at),
+            le_u32(&self.map, at + self.key_len),
+            le_u32(&self.map, at + self.key_len + 4),
         )
     }
 
     /// Tombstone `index`, in key order.
     pub fn tombstone(&self, index: u32) -> ChunkKey {
-        let at = self.tombstones.start + index as usize * 16;
-        ChunkKey(self.map[at..at + 16].try_into().expect("16 bytes"))
+        self.key_at(self.tombstones.start + index as usize * self.key_len)
     }
+}
+
+/// Why a file that is a sound segment — its magic and its header's CRC — cannot be read by
+/// this build: a format or a codec newer than it. `None` for anything else, which
+/// [`Segment::check`] judges.
+fn unsupported(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < HEADER_LEN
+        || bytes[..8] != MAGIC
+        || le_u32(bytes, HEADER_CRC_OFFSET) != crc32fast::hash(&bytes[..HEADER_CRC_OFFSET])
+    {
+        return None;
+    }
+    let version = le_u32(bytes, 8);
+    if !READABLE_FORMATS.contains(&version) {
+        return Some(format!(
+            "it is segment format {version}, which this build does not read: it reads \
+             {READABLE_FORMATS:?}"
+        ));
+    }
+    let codec = le_u16(bytes, 22);
+    crate::semantic::oxv::codec::codec_name(codec)
+        .is_none()
+        .then(|| format!("its codec {codec:#06x} is not one this build implements"))
+}
+
+/// The first index in `0..count` at which `before` is false, for a `before` that is true
+/// and then false.
+fn partition(count: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, count);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if before(middle) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
 }
 
 fn range(entry: &DirectoryEntry) -> Range<usize> {
