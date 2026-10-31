@@ -508,7 +508,7 @@ impl IndexVersion {
         require_text(F::Pooling, &self.model.pooling)?;
         require_positive(F::MaxTokens, self.model.max_tokens as u64)?;
         if let Some(cap) = self.model.query_max_tokens {
-            if cap < 2 || cap > self.model.max_tokens {
+            if cap < 3 || cap > self.model.max_tokens {
                 return Err(ArtifactError::IncompleteIdentity {
                     field: F::QueryMaxTokens,
                     reason: "must include special tokens and not exceed the passage cap"
@@ -803,7 +803,7 @@ mod tests {
             identity.mismatches_against(&sample_identity())[0].field,
             IdentityField::QueryMaxTokens
         );
-        for cap in [0, 1, 513] {
+        for cap in [0, 1, 2, 513] {
             identity.model.query_max_tokens = Some(cap);
             assert!(
                 identity.validate_complete().is_err(),

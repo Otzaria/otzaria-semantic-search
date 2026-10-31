@@ -235,6 +235,7 @@ mod with_the_backend {
             pooling: "in-graph".to_string(),
             max_tokens: 32,
             query_max_tokens: None,
+            passage_package: None,
             embedding_text_version: 2,
             normalization_version: 1,
             // Any recipe's, so long as the set declares the same one.

@@ -1,4 +1,22 @@
-#![cfg(feature = "onnx-backend")]
+#![cfg(all(
+    feature = "onnx-backend",
+    any(
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "linux",
+            target_env = "gnu",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ),
+        all(
+            target_os = "windows",
+            target_env = "msvc",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )
+))]
 
 use otzaria_semantic_search::semantic::backend::{EmbeddingBackend, Pooling};
 use otzaria_semantic_search::semantic::onnx_backend::{OnnxBackend, OnnxBackendConfig};
