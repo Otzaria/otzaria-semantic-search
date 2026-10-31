@@ -410,6 +410,11 @@ impl IndexPackage {
         let mut canonical = String::from("otzaria-artifact-digest-v2\n");
         canonical.push_str(&format!("metadata_version={}\n", manifest.metadata_version));
         for field in IdentityField::ALL {
+            if field == IdentityField::QueryMaxTokens
+                && manifest.identity.model.query_max_tokens.is_none()
+            {
+                continue;
+            }
             canonical.push_str(&format!(
                 "{}={}\n",
                 field.path(),

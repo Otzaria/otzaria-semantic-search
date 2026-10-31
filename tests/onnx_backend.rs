@@ -234,6 +234,7 @@ mod with_the_backend {
             embedding_dim: 4,
             pooling: "in-graph".to_string(),
             max_tokens: 32,
+            query_max_tokens: None,
             embedding_text_version: 2,
             normalization_version: 1,
             // Any recipe's, so long as the set declares the same one.
@@ -288,6 +289,7 @@ mod with_the_backend {
                 embedding_dim: local.embedding_dim,
                 pooling: local.pooling,
                 max_tokens: local.max_tokens,
+                query_max_tokens: None,
                 embedding_text_version: local.embedding_text_version,
                 normalization_version: local.normalization_version,
                 chunking_identity: local.chunking_identity,

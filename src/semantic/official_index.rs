@@ -106,6 +106,7 @@ pub struct LocalModel {
     pub embedding_dim: u32,
     pub pooling: String,
     pub max_tokens: usize,
+    pub query_max_tokens: Option<usize>,
     pub embedding_text_version: u32,
     pub normalization_version: u32,
     pub chunking_identity: u64,
@@ -122,6 +123,7 @@ impl LocalModel {
             embedding_dim: family.embedding_dim,
             pooling: family.pooling.clone(),
             max_tokens: family.max_tokens,
+            query_max_tokens: family.query_max_tokens,
             embedding_text_version: family.embedding_text_version,
             normalization_version: family.normalization_version,
             chunking_identity: family.chunking_identity,
@@ -148,6 +150,7 @@ impl LocalModel {
             embedding_dim: self.embedding_dim,
             pooling: self.pooling.clone(),
             max_tokens: self.max_tokens,
+            query_max_tokens: self.query_max_tokens,
             embedding_text_version: self.embedding_text_version,
             normalization_version: self.normalization_version,
             chunking_identity: self.chunking_identity,
@@ -243,7 +246,7 @@ impl OfficialSemanticIndex {
                 model_path: model.model_path.clone(),
                 embedding_dim: model.embedding_dim,
                 pooling: model.pooling_strategy()?,
-                max_tokens: model.max_tokens,
+                max_tokens: model.query_max_tokens.unwrap_or(model.max_tokens),
                 // One query at a time is all this path ever embeds.
                 batch_size: 1,
             },
@@ -386,6 +389,11 @@ impl OfficialSemanticIndex {
         texts: &[&str],
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
+        if self.expected.model.query_max_tokens.is_some() {
+            return Err(SemanticSearchError::Config(
+                "this query-only package cannot encode passages; use the verified FP32 passage package".to_string(),
+            ));
+        }
         let mut vectors = Vec::with_capacity(texts.len());
         for text in texts {
             cancel.checkpoint()?;
@@ -538,6 +546,7 @@ mod tests {
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
+            query_max_tokens: None,
             embedding_text_version,
             normalization_version: 1,
             chunking_identity: chunking.identity(),
@@ -971,5 +980,20 @@ mod tests {
             ..anchor.clone()
         };
         assert_eq!(readable_store_for(&mixed), anchor);
+    }
+    #[test]
+    fn local_model_keeps_passage_and_query_caps_distinct() {
+        let mut identity = family(
+            vec![ModelPackage {
+                checksum: "a".repeat(64),
+                quantization: "int8".to_string(),
+            }],
+            2,
+        );
+        identity.max_tokens = 256;
+        identity.query_max_tokens = Some(128);
+        let local = LocalModel::of_family(PathBuf::from("query.int8.onnx"), &identity, "int8");
+        assert_eq!(local.max_tokens, 256);
+        assert_eq!(local.query_max_tokens, Some(128));
     }
 }

@@ -1,0 +1,12 @@
+{
+  "min_meaningful_chars": 20,
+  "context_window_lines": 2,
+  "max_chunk_chars": 512,
+  "min_embeddable_chars": 5,
+  "chunking_version": 2,
+  "embedding_text_version": 2,
+  "normalization_version": 1,
+  "window_chars": 512,
+  "window_overlap_chars": 128,
+  "max_windows_per_line": 6
+}
