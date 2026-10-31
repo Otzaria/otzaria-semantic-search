@@ -33,13 +33,13 @@ fn qa491_production_backend_matches_role_capped_reference() {
         let backend = OnnxBackend::open(
             &graph,
             &root.join("tokenizer.json"),
-            cap,
+            256,
             Pooling::InGraph,
             &OnnxBackendConfig::default(),
             Some(&library),
         )
         .expect("actual QA491 graph must load");
-        assert_eq!(backend.max_tokens(), cap);
+        assert_eq!(backend.max_tokens(), 256);
         let mut capped = false;
         for case in variant["cases"].as_array().unwrap() {
             let input = case["input"].as_str().unwrap();
@@ -49,11 +49,14 @@ fn qa491_production_backend_matches_role_capped_reference() {
                 .iter()
                 .map(|x| x.as_u64().unwrap() as u32)
                 .collect();
-            let ids = backend.tokenize(input).unwrap();
+            let ids = backend.tokenize_capped(input, cap).unwrap();
             assert_eq!(ids, expected_ids);
             assert!(ids.len() <= cap);
             capped |= ids.len() == cap;
-            let v = backend.embed_batch_raw(&[input]).unwrap().remove(0);
+            let v = backend
+                .embed_batch_raw_capped(&[input], cap)
+                .unwrap()
+                .remove(0);
             assert_eq!(v.len(), 256);
             let expected: Vec<f64> = case["vector"]
                 .as_array()
@@ -82,6 +85,16 @@ fn qa491_production_backend_matches_role_capped_reference() {
             count += 1;
         }
         assert!(capped, "long text must exercise role cap {cap}");
+        let long = variant["cases"].as_array().unwrap().last().unwrap()["input"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            backend.tokenize(long).unwrap().len(),
+            256,
+            "query cap must not mutate the loaded passage tokenizer"
+        );
+        assert!(backend.tokenize_capped(long, 0).is_err());
+        assert!(backend.tokenize_capped(long, 257).is_err());
     }
     println!("QA491 actual production backend: cases={count}, min_cosine={lowest:.12}, max_abs={largest:.12}");
 }

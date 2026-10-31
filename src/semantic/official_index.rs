@@ -246,7 +246,7 @@ impl OfficialSemanticIndex {
                 model_path: model.model_path.clone(),
                 embedding_dim: model.embedding_dim,
                 pooling: model.pooling_strategy()?,
-                max_tokens: model.query_max_tokens.unwrap_or(model.max_tokens),
+                max_tokens: model.max_tokens,
                 // One query at a time is all this path ever embeds.
                 batch_size: 1,
             },
@@ -379,7 +379,13 @@ impl OfficialSemanticIndex {
         // its passages were built with — scores nonsense with full confidence.
         let text =
             crate::semantic::recipe::query_input(self.text_recipe, self.normalization, query)?;
-        Ok(self.runtime.embed_one(&text)?)
+        Ok(self.runtime.embed_one_capped(
+            &text,
+            self.expected
+                .model
+                .query_max_tokens
+                .unwrap_or(self.expected.model.max_tokens),
+        )?)
     }
 
     /// Each text embedded as a stored passage is, under the recipe these vectors were built
@@ -389,11 +395,6 @@ impl OfficialSemanticIndex {
         texts: &[&str],
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
-        if self.expected.model.query_max_tokens.is_some() {
-            return Err(SemanticSearchError::Config(
-                "this query-only package cannot encode passages; use the verified FP32 passage package".to_string(),
-            ));
-        }
         let mut vectors = Vec::with_capacity(texts.len());
         for text in texts {
             cancel.checkpoint()?;

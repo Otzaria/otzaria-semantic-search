@@ -1468,14 +1468,38 @@ impl OnnxBackend {
     /// Shared by [`EmbeddingBackend::tokenize`] and [`EmbeddingBackend::embed_batch_raw`]
     /// so that what the goldens assert is what inference consumes.
     fn token_ids(&self, text: &str) -> Result<Vec<u32>, EmbeddingError> {
+        self.token_ids_capped(text, self.max_tokens)
+    }
+
+    fn token_ids_capped(&self, text: &str, max_tokens: usize) -> Result<Vec<u32>, EmbeddingError> {
+        if max_tokens <= self.special_tokens || max_tokens > self.max_tokens {
+            return Err(EmbeddingError::InferenceFailed { reason: format!("role cap {max_tokens} must exceed {} special tokens and not exceed loaded cap {}", self.special_tokens, self.max_tokens) });
+        }
+        let mut capped;
+        let tokenizer = if max_tokens == self.max_tokens {
+            &self.tokenizer
+        } else {
+            capped = self.tokenizer.clone();
+            let mut truncation = capped
+                .get_truncation()
+                .cloned()
+                .expect("loaded tokenizer truncation");
+            truncation.max_length = max_tokens;
+            capped.with_truncation(Some(truncation)).map_err(|error| {
+                EmbeddingError::InferenceFailed {
+                    reason: format!("role truncation failed: {error}"),
+                }
+            })?;
+            &capped
+        };
         let encoding =
-            self.tokenizer
+            tokenizer
                 .encode(text, true)
                 .map_err(|e| EmbeddingError::InferenceFailed {
                     reason: format!("tokenizing a {}-byte text failed: {e}", text.len()),
                 })?;
         let ids = encoding.get_ids();
-        if ids.len() > self.max_tokens {
+        if ids.len() > max_tokens {
             // Unreachable while truncation is configured — but the alternative is feeding
             // the graph a length the probe never proved.
             return Err(EmbeddingError::InferenceFailed {
@@ -1483,7 +1507,7 @@ impl OnnxBackend {
                     "the tokenizer produced {} ids against a cap of {}; truncation should have \
                      prevented this",
                     ids.len(),
-                    self.max_tokens
+                    max_tokens
                 ),
             });
         }
@@ -1658,9 +1682,21 @@ impl EmbeddingBackend for OnnxBackend {
     ///
     /// Neither normalized nor screened — `EmbeddingRuntime::embed_batch` does both.
     fn embed_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch_raw_capped(texts, self.max_tokens)
+    }
+
+    fn tokenize_capped(&self, text: &str, max_tokens: usize) -> Result<Vec<u32>, EmbeddingError> {
+        self.token_ids_capped(text, max_tokens)
+    }
+
+    fn embed_batch_raw_capped(
+        &self,
+        texts: &[&str],
+        max_tokens: usize,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let sequences = texts
             .iter()
-            .map(|text| self.token_ids(text))
+            .map(|text| self.token_ids_capped(text, max_tokens))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut out = Vec::with_capacity(sequences.len());
