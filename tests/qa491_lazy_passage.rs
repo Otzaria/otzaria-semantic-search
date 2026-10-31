@@ -59,12 +59,7 @@ fn fixture_set(dir: &Path, model: &ModelIdentity, version: u32) {
         &identity,
         params,
         VectorProvenance {
-            passage_package: model
-                .query_packages
-                .iter()
-                .find(|p| p.quantization == "fp32")
-                .unwrap()
-                .clone(),
+            passage_package: model.query_packages.iter().last().unwrap().clone(),
             worker: EmbeddingWorker {
                 backend: "synthetic-test-fixture-not-semantic".into(),
                 device: "test".into(),
@@ -224,6 +219,43 @@ fn qa491_lazy_fp32_passages_use_the_production_official_index() {
         .map(|(a, b)| (f64::from(*a) - b.as_f64().unwrap()).abs())
         .fold(0.0, f64::max);
     assert!(error <= 1e-5, "FP32 passage parity {error}");
+    let mut fp32_query = OfficialSemanticIndex::open(OfficialIndexConfig {
+        vectors_dir: vectors.clone(),
+        text: TextIdentity::with_line_text_version(1),
+        model: LocalModel::of_family(temp.join("document.fp32.onnx"), &model, "fp32"),
+        deployment: EmbeddingDeployment {
+            onnx_runtime: Some(PathBuf::from(
+                std::env::var("OTZARIA_ONNX_RUNTIME").unwrap(),
+            )),
+        },
+        scan_threads: None,
+    })
+    .unwrap();
+    let mut mislabeled = model.clone();
+    mislabeled
+        .query_packages
+        .iter_mut()
+        .find(|p| p.quantization == "fp32")
+        .unwrap()
+        .quantization = "int8".into();
+    let mislabeled_vectors = temp.join("mislabeled-vectors");
+    fixture_set(&mislabeled_vectors, &mislabeled, 1);
+    fixture_set(&mislabeled_vectors, &mislabeled, 2);
+    std::fs::rename(&vectors, &original_vectors).unwrap();
+    std::fs::rename(&mislabeled_vectors, &vectors).unwrap();
+    let generation = fp32_query.generation();
+    assert!(
+        fp32_query.reload_vectors().is_err(),
+        "FP32-as-query must reject an artifact with canonical checksum but wrong precision label"
+    );
+    assert_eq!(fp32_query.generation(), generation);
+    assert!(
+        index.reload_vectors().is_err(),
+        "INT8-as-query must reject the wrong FP32 precision label too"
+    );
+    std::fs::rename(&vectors, &mislabeled_vectors).unwrap();
+    std::fs::rename(&original_vectors, &vectors).unwrap();
+    drop(fp32_query);
     std::fs::remove_file(temp.join("document.fp32.onnx")).unwrap();
     assert_eq!(
         index.embed_passages(&[text], &cancel).unwrap(),

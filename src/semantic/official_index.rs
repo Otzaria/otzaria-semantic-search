@@ -568,8 +568,24 @@ impl OfficialSemanticIndex {
         }
         let set = SegmentSet::open(&dir)?;
         set.identity().verify_matches(&self.expected)?;
-        if let Some(passage) = &self.passage {
-            verify_passage_membership(&set, &passage.package)?;
+        if self.expected.model.query_max_tokens.is_some() {
+            let passage_package = self
+                .passage
+                .as_ref()
+                .map(|p| &p.package)
+                .or_else(|| {
+                    self.expected
+                        .model
+                        .query_packages
+                        .iter()
+                        .find(|p| p.quantization == "fp32")
+                })
+                .ok_or_else(|| {
+                    SemanticSearchError::Config(
+                        "the role-capped model has no verified FP32 passage package".to_string(),
+                    )
+                })?;
+            verify_passage_membership(&set, passage_package)?;
         }
         if set.generation() == from_generation {
             return Ok(ReloadOutcome::Unchanged {
