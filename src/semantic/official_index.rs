@@ -187,10 +187,29 @@ impl LocalModel {
 
 const FP32_PASSAGE_GRAPH: &str = "document.fp32.onnx";
 
+fn verify_passage_membership(
+    set: &SegmentSet,
+    package: &ModelPackage,
+) -> Result<(), SemanticSearchError> {
+    if !set
+        .identity()
+        .model
+        .query_packages
+        .iter()
+        .any(|accepted| accepted.quantization == "fp32" && accepted == package)
+    {
+        return Err(SemanticSearchError::Config(
+            "the declared FP32 passage package is not accepted by the installed vector set"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 struct LazyPassageRuntime {
     config: EmbeddingConfig,
     deployment: EmbeddingDeployment,
-    checksum: String,
+    package: ModelPackage,
     tokenizer_checksum: String,
     runtime: Mutex<Option<EmbeddingRuntime>>,
 }
@@ -198,16 +217,18 @@ struct LazyPassageRuntime {
 impl LazyPassageRuntime {
     fn with_runtime<T>(
         &self,
+        cancel: &CancellationToken,
         use_runtime: impl FnOnce(&EmbeddingRuntime) -> Result<T, SemanticSearchError>,
     ) -> Result<T, SemanticSearchError> {
         let mut loaded = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
+        cancel.checkpoint()?;
         if loaded.is_none() {
             let package = crate::semantic::model_package::validate_model(&self.config.model_path)?;
             let tokenizer = package
                 .files()
                 .iter()
                 .find(|file| file.relpath == "tokenizer.json");
-            if package.checksum() != self.checksum
+            if package.checksum() != self.package.checksum
                 || tokenizer.is_none_or(|file| file.sha256 != self.tokenizer_checksum)
             {
                 return Err(SemanticSearchError::Config(
@@ -217,7 +238,13 @@ impl LazyPassageRuntime {
             let mut runtime =
                 EmbeddingRuntime::with_deployment(self.config.clone(), self.deployment.clone());
             runtime.load()?;
-            if runtime.model_checksum() != Some(self.checksum.as_str())
+            let after = crate::semantic::model_package::validate_model(&self.config.model_path)?;
+            if after.checksum() != self.package.checksum {
+                return Err(SemanticSearchError::Config(
+                    "the FP32 passage files changed during loading".to_string(),
+                ));
+            }
+            if runtime.model_checksum() != Some(self.package.checksum.as_str())
                 || runtime.tokenizer_checksum() != Some(self.tokenizer_checksum.as_str())
             {
                 return Err(SemanticSearchError::Config(
@@ -324,7 +351,7 @@ impl OfficialSemanticIndex {
                     batch_size: 1,
                 },
                 deployment: deployment.clone(),
-                checksum: package.checksum.clone(),
+                package: package.clone(),
                 tokenizer_checksum: String::new(),
                 runtime: Mutex::new(None),
             })
@@ -332,6 +359,13 @@ impl OfficialSemanticIndex {
             None
         };
         let set = SegmentSet::open(&vectors_dir)?;
+        if let Some(package) = model
+            .passage_package
+            .as_ref()
+            .filter(|_| model.query_max_tokens.is_some())
+        {
+            verify_passage_membership(&set, package)?;
+        }
 
         let mut runtime = EmbeddingRuntime::with_deployment(
             EmbeddingConfig {
@@ -509,7 +543,7 @@ impl OfficialSemanticIndex {
             Ok(vectors)
         };
         match &self.passage {
-            Some(passage) => passage.with_runtime(embed),
+            Some(passage) => passage.with_runtime(cancel, embed),
             None => embed(&self.runtime),
         }
     }
@@ -534,6 +568,9 @@ impl OfficialSemanticIndex {
         }
         let set = SegmentSet::open(&dir)?;
         set.identity().verify_matches(&self.expected)?;
+        if let Some(passage) = &self.passage {
+            verify_passage_membership(&set, &passage.package)?;
+        }
         if set.generation() == from_generation {
             return Ok(ReloadOutcome::Unchanged {
                 generation: from_generation,

@@ -20,21 +20,21 @@ use otzaria_semantic_search::{
 };
 use std::path::{Path, PathBuf};
 
-fn fixture_set(dir: &Path, model: &ModelIdentity) {
+fn fixture_set(dir: &Path, model: &ModelIdentity, version: u32) {
     let identity = IndexVersion {
         text: TextIdentity::with_line_text_version(1),
         model: model.clone(),
         store: readable_store_identity(),
     };
-    let stage = dir.with_extension("stage");
+    let stage = dir.with_extension(format!("stage-{version}"));
     std::fs::create_dir(&stage).unwrap();
     let mut b = SegmentBuilder::new(
         SegmentSpec {
             kind: PackageKind::Base,
             identity_digest: identity.identity_digest(),
             from_library_version: 0,
-            to_library_version: 1,
-            library_release_tag: "v1-qa491-test".into(),
+            to_library_version: version,
+            library_release_tag: format!("v{version}-qa491-test"),
         },
         Codec::i8_sym_vec(256).unwrap(),
     );
@@ -99,9 +99,9 @@ fn qa491_lazy_fp32_passages_use_the_production_official_index() {
     let model: ModelIdentity =
         serde_json::from_slice(&std::fs::read(source.join("model.json")).unwrap()).unwrap();
     let vectors = temp.join("vectors");
-    fixture_set(&vectors, &model);
-    let index = OfficialSemanticIndex::open(OfficialIndexConfig {
-        vectors_dir: vectors,
+    fixture_set(&vectors, &model, 1);
+    let config = OfficialIndexConfig {
+        vectors_dir: vectors.clone(),
         text: TextIdentity::with_line_text_version(1),
         model: LocalModel::of_family(temp.join("query.int8.onnx"), &model, "int8"),
         deployment: EmbeddingDeployment {
@@ -110,8 +110,41 @@ fn qa491_lazy_fp32_passages_use_the_production_official_index() {
             )),
         },
         scan_threads: None,
-    })
-    .unwrap();
+    };
+    let mut forged = model.clone();
+    forged
+        .query_packages
+        .iter_mut()
+        .find(|p| p.quantization == "fp32")
+        .unwrap()
+        .checksum = "0".repeat(64);
+    let mut forged_config = config.clone();
+    forged_config.model = LocalModel::of_family(temp.join("query.int8.onnx"), &forged, "int8");
+    match OfficialSemanticIndex::open(forged_config) {
+        Err(error) => assert!(error.to_string().contains("not accepted by the installed vector set"), "wrong failure: {error}"),
+        Ok(_) => panic!("a forged local FP32 declaration must not override the artifact's canonical FP32 package"),
+    }
+    assert!(!temp.join("document.fp32.onnx").exists());
+    let mut index = OfficialSemanticIndex::open(config).unwrap();
+    let forged_vectors = temp.join("forged-vectors");
+    fixture_set(&forged_vectors, &forged, 1);
+    fixture_set(&forged_vectors, &forged, 2);
+    let original_vectors = temp.join("original-vectors");
+    std::fs::rename(&vectors, &original_vectors).unwrap();
+    std::fs::rename(&forged_vectors, &vectors).unwrap();
+    let generation = index.generation();
+    assert!(
+        index.reload_vectors().is_err(),
+        "a reloaded artifact cannot replace the canonical FP32 membership"
+    );
+    assert_eq!(
+        index.generation(),
+        generation,
+        "a failed reload must retain the old set"
+    );
+    assert_eq!(index.identity().model.query_packages, model.query_packages);
+    std::fs::rename(&vectors, &forged_vectors).unwrap();
+    std::fs::rename(&original_vectors, &vectors).unwrap();
     let cancel = CancellationToken::new();
     let query = "תפילה קודם הנץ החמה";
     let text = "תפילה קודם הנץ החמה";
@@ -171,6 +204,13 @@ fn qa491_lazy_fp32_passages_use_the_production_official_index() {
     std::fs::copy(source.join("tokenizer.json"), temp.join("tokenizer.json")).unwrap();
     let encoded = index.embed_passages(&[text], &cancel).unwrap();
     assert_eq!(encoded[0].len(), 256);
+    assert!(encoded[0].iter().all(|v| v.is_finite()));
+    let norm = encoded[0]
+        .iter()
+        .map(|v| f64::from(*v).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!((norm - 1.0).abs() <= 1e-5, "FP32 output norm {norm}");
     let golden: serde_json::Value = serde_json::from_slice(
         &std::fs::read(std::env::var("OTZARIA_QA491_GOLDENS").unwrap()).unwrap(),
     )
