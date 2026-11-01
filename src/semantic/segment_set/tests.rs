@@ -3262,21 +3262,29 @@ fn a_fallback_is_a_generation_a_host_of_the_new_one_accepts() {
     }
     assert!(!falls_back_to(&newer, &older), "no package in common");
 
-    // A role-capped host also needs its FP32 passage package among the set's.
-    let newer = role_capped(&["a", "f"]);
+    // A role-capped host also needs its one FP32 passage package among the set's: a
+    // fallback needs one both accept.
+    let newer = role_capped(&["a", "f", "e"]);
+    assert!(
+        falls_back_to(&newer, &role_capped(&["a", "f"])),
+        "a host of a and f opens both"
+    );
     assert!(
         !falls_back_to(&newer, &role_capped(&["a"])),
-        "the newer's FP32 passage package is not the older's"
+        "no FP32 package in common"
     );
-    assert!(falls_back_to(&newer, &role_capped(&["a", "f", "b"])));
-    assert!(falls_back_to(
-        &role_capped(&["a"]),
-        &role_capped(&["a", "b"])
-    ));
+    assert!(
+        !falls_back_to(&newer, &role_capped(&["a", "d"])),
+        "an FP32 package the newer does not accept"
+    );
+    assert!(
+        !falls_back_to(&role_capped(&["a"]), &role_capped(&["a", "b"])),
+        "no role-capped host opens a set without an FP32 package"
+    );
 }
 
-/// [`identity`] with a query cap, accepting the packages [`test_identity`] names `a` (int8)
-/// and `f` (fp32), and `b`, another int8.
+/// [`identity`] with a query cap, accepting the packages named by one hex digit: `d`, `e` and
+/// `f` are FP32 — `f` the one [`test_identity`] names — and the others int8.
 fn role_capped(packages: &[&str]) -> IndexVersion {
     let mut identity = identity();
     identity.model.query_max_tokens = Some(128);
@@ -3284,23 +3292,41 @@ fn role_capped(packages: &[&str]) -> IndexVersion {
         .iter()
         .map(|digit| ModelPackage {
             checksum: digit.repeat(64),
-            quantization: if *digit == "f" { "fp32" } else { "int8" }.to_string(),
+            quantization: if ["d", "e", "f"].contains(digit) {
+                "fp32"
+            } else {
+                "int8"
+            }
+            .to_string(),
         })
         .collect();
     identity
 }
 
-/// A role-capped base is no fallback for one whose FP32 passage package it does not accept,
-/// and is for one whose packages it accepts besides others.
+/// A role-capped base keeps the one it replaced as `PREVIOUS` when some host opens both — a
+/// query package and an FP32 passage package both accept — and collects it otherwise.
 #[test]
-fn a_role_capped_base_keeps_previous_only_when_it_accepts_the_passage_package() {
-    for (older, kept) in [
-        (role_capped(&["a"]), false),
-        (role_capped(&["a", "f", "b"]), true),
+fn a_role_capped_base_keeps_previous_only_when_a_host_opens_both() {
+    for (older, newer, kept) in [
+        (role_capped(&["a"]), role_capped(&["a", "f"]), false),
+        (
+            role_capped(&["a", "d"]),
+            role_capped(&["a", "f", "e"]),
+            false,
+        ),
+        (
+            role_capped(&["a", "f", "b"]),
+            role_capped(&["a", "f"]),
+            true,
+        ),
+        (
+            role_capped(&["a", "f"]),
+            role_capped(&["a", "f", "e"]),
+            true,
+        ),
     ] {
         let work = TempDir::new("set_role_capped_previous");
         let dir = work.join("vectors");
-        let newer = role_capped(&["a", "f"]);
         install_for(&dir, &base_release_for(&work, &v29(), &older), &older).unwrap();
         let old = info(&dir).unwrap().unwrap().segments[0].id.clone();
 
