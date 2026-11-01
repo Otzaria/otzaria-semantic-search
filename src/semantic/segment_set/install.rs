@@ -18,7 +18,8 @@
 //! 6. **write a new generation**, numbered past every one on disk — its `.del` and `.links`
 //!    files and `set.json`;
 //! 7. **flip** — `PREVIOUS` ← the generation the install was built on, the one the set
-//!    opened at, then `CURRENT`;
+//!    opened at, then `CURRENT`; a generation of another model is no fallback, so `PREVIOUS`
+//!    is not written for it, and one already naming it is removed after the flip;
 //! 8. **collect garbage**.
 
 use super::files::{
@@ -39,7 +40,9 @@ use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::scan::{Link, LINK_UNRESOLVED};
 use crate::semantic::oxv::writer::WrittenSegment;
-use crate::semantic::versioning::{hex, IndexVersion, VectorProvenance};
+use crate::semantic::versioning::{
+    hex, IdentityField, IdentityGroup, IndexVersion, VectorProvenance,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -946,14 +949,20 @@ impl NewGeneration {
         // CURRENT names, if it and its generation read. Never CURRENT's bytes as they are: an
         // unreadable CURRENT would overwrite the one pointer that still opens, and on a
         // fallback CURRENT names the generation that did not. A pointer whose generation does
-        // not read is no fallback, and in PREVIOUS it would stop every collection.
+        // not read is no fallback, and in PREVIOUS it would stop every collection. Nor is one
+        // a host of this generation refuses: it would only keep its segments on disk.
+        let refused = |pointer: &Pointer| {
+            read_generation(dir, pointer)
+                .is_ok_and(|older| !falls_back_to(&document.identity, &older.identity))
+        };
         let previous = match base {
             Some(base) => Some(base.clone()),
             None => read_pointer(dir, CURRENT)
                 .ok()
                 .flatten()
                 .filter(|pointer| read_generation(dir, pointer).is_ok()),
-        };
+        }
+        .filter(|pointer| !refused(pointer));
         if let Some(previous) = previous {
             if read_pointer(dir, PREVIOUS).ok().flatten().as_ref() != Some(&previous) {
                 let bytes = serde_json::to_vec(&previous).expect("a pointer serializes");
@@ -966,10 +975,39 @@ impl NewGeneration {
         let current = dir.join(CURRENT);
         write_pointer(dir, CURRENT, &bytes).map_err(space_or_io(&current, bytes.len()))?;
         reached(Step::CurrentFlipped)?;
+        // Only after the flip, which leaves CURRENT beside it: PREVIOUS alone stops collection.
+        if read_pointer(dir, PREVIOUS)
+            .ok()
+            .flatten()
+            .is_some_and(|p| refused(&p))
+        {
+            let path = dir.join(PREVIOUS);
+            if let Err(error) = retry::remove_file(&path) {
+                log::warn!("{} stays until the next install: {error}", path.display());
+            }
+        }
 
         collect_garbage(dir);
         Ok(document)
     }
+}
+
+/// Whether a host that opens a set of `newer` can fall back to one of `older`: the same text
+/// and model, a query package both accept — a host expects only the one it loaded — and any
+/// store, since a host reads a set's own.
+pub(crate) fn falls_back_to(newer: &IndexVersion, older: &IndexVersion) -> bool {
+    let shares_a_package = newer.model.query_packages.iter().any(|package| {
+        older
+            .model
+            .query_packages
+            .iter()
+            .any(|accepted| accepted.checksum == package.checksum)
+    });
+    shares_a_package
+        && older.mismatches_against(newer).iter().all(|mismatch| {
+            mismatch.field == IdentityField::QueryPackages
+                || mismatch.field.group() == IdentityGroup::Store
+        })
 }
 
 /// Flush a file the host wrote, where it lies, before the set takes it. Unix flushes through

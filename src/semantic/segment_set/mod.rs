@@ -194,8 +194,8 @@ impl SegmentSet {
     /// - It never writes, recovers or collects anything: not `staging/`, not a half-written
     ///   pointer, not garbage, and not the lock file.
     /// - A generation an install's garbage collection removes while it is being opened —
-    ///   which takes two flips during one open — fails the open, and the caller may simply
-    ///   open again.
+    ///   which takes two flips during one open, or one when a base of another model replaces
+    ///   the generation `CURRENT` named — fails the open, and the caller may simply open again.
     /// - A segment already mapped stays readable after it is unlinked, so a set opened this
     ///   way keeps answering from its generation whatever is collected after.
     ///
