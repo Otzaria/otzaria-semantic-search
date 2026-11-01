@@ -94,6 +94,7 @@ use tokenizers::{
     PostProcessor, Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
 };
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
@@ -1144,11 +1145,51 @@ impl<T> Drop for Lease<'_, T> {
 
 // ─────────────────────────────── the backend ───────────────────────────────
 
+/// Retain a few immutable role variants; arbitrary caller caps cannot grow the cache.
+#[derive(Default)]
+struct CappedTokenizers {
+    entries: Mutex<VecDeque<(usize, Arc<Tokenizer>)>>,
+}
+
+impl CappedTokenizers {
+    const CAPACITY: usize = 4;
+
+    fn get(&self, base: &Tokenizer, max_tokens: usize) -> Result<Arc<Tokenizer>, EmbeddingError> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(index) = entries.iter().position(|(cap, _)| *cap == max_tokens) {
+            let entry = entries.remove(index).expect("cached cap index");
+            let tokenizer = Arc::clone(&entry.1);
+            entries.push_back(entry);
+            return Ok(tokenizer);
+        }
+
+        // Build under the lock so concurrent first queries share one clone, then encode unlocked.
+        let mut capped = base.clone();
+        let mut truncation = capped
+            .get_truncation()
+            .cloned()
+            .expect("loaded tokenizer truncation");
+        truncation.max_length = max_tokens;
+        capped.with_truncation(Some(truncation)).map_err(|error| {
+            EmbeddingError::InferenceFailed {
+                reason: format!("role truncation failed: {error}"),
+            }
+        })?;
+        let tokenizer = Arc::new(capped);
+        if entries.len() == Self::CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((max_tokens, Arc::clone(&tokenizer)));
+        Ok(tokenizer)
+    }
+}
+
 /// Real ONNX inference: ONNX Runtime, the package's `tokenizer.json`, the graph's own
 /// pooling. Construct with [`OnnxBackend::open`].
 pub struct OnnxBackend {
     /// Padding off, truncation at `max_tokens`. `encode(&self)`, so shared unlocked.
     tokenizer: Tokenizer,
+    capped_tokenizers: CappedTokenizers,
     pool: Pool<Worker>,
     wiring: Wiring,
     /// The graph's output width.
@@ -1328,6 +1369,7 @@ impl OnnxBackend {
 
         let mut backend = Self {
             tokenizer: tokenizer_impl,
+            capped_tokenizers: CappedTokenizers::default(),
             pool: Pool::new(workers),
             dim: wiring.declared_dim.unwrap_or(0),
             wiring,
@@ -1468,14 +1510,27 @@ impl OnnxBackend {
     /// Shared by [`EmbeddingBackend::tokenize`] and [`EmbeddingBackend::embed_batch_raw`]
     /// so that what the goldens assert is what inference consumes.
     fn token_ids(&self, text: &str) -> Result<Vec<u32>, EmbeddingError> {
+        self.token_ids_capped(text, self.max_tokens)
+    }
+
+    fn token_ids_capped(&self, text: &str, max_tokens: usize) -> Result<Vec<u32>, EmbeddingError> {
+        if max_tokens <= self.special_tokens || max_tokens > self.max_tokens {
+            return Err(EmbeddingError::InferenceFailed { reason: format!("role cap {max_tokens} must exceed {} special tokens and not exceed loaded cap {}", self.special_tokens, self.max_tokens) });
+        }
+        let capped = if max_tokens == self.max_tokens {
+            None
+        } else {
+            Some(self.capped_tokenizers.get(&self.tokenizer, max_tokens)?)
+        };
+        let tokenizer = capped.as_deref().unwrap_or(&self.tokenizer);
         let encoding =
-            self.tokenizer
+            tokenizer
                 .encode(text, true)
                 .map_err(|e| EmbeddingError::InferenceFailed {
                     reason: format!("tokenizing a {}-byte text failed: {e}", text.len()),
                 })?;
         let ids = encoding.get_ids();
-        if ids.len() > self.max_tokens {
+        if ids.len() > max_tokens {
             // Unreachable while truncation is configured — but the alternative is feeding
             // the graph a length the probe never proved.
             return Err(EmbeddingError::InferenceFailed {
@@ -1483,7 +1538,7 @@ impl OnnxBackend {
                     "the tokenizer produced {} ids against a cap of {}; truncation should have \
                      prevented this",
                     ids.len(),
-                    self.max_tokens
+                    max_tokens
                 ),
             });
         }
@@ -1658,9 +1713,21 @@ impl EmbeddingBackend for OnnxBackend {
     ///
     /// Neither normalized nor screened — `EmbeddingRuntime::embed_batch` does both.
     fn embed_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch_raw_capped(texts, self.max_tokens)
+    }
+
+    fn tokenize_capped(&self, text: &str, max_tokens: usize) -> Result<Vec<u32>, EmbeddingError> {
+        self.token_ids_capped(text, max_tokens)
+    }
+
+    fn embed_batch_raw_capped(
+        &self,
+        texts: &[&str],
+        max_tokens: usize,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let sequences = texts
             .iter()
-            .map(|text| self.token_ids(text))
+            .map(|text| self.token_ids_capped(text, max_tokens))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut out = Vec::with_capacity(sequences.len());
@@ -1913,6 +1980,221 @@ mod tests {
         let (_, specials) = load_tokenizer(&fixture("dynamic.onnx"), &fixture("tokenizer.json"), 3)
             .expect("3 fits");
         assert_eq!(specials, 2);
+    }
+
+    fn uncached_role_ids(base: &Tokenizer, text: &str, cap: usize) -> Vec<u32> {
+        let mut tokenizer = base.clone();
+        let mut truncation = tokenizer.get_truncation().unwrap().clone();
+        truncation.max_length = cap;
+        tokenizer.with_truncation(Some(truncation)).unwrap();
+        tokenizer.encode(text, true).unwrap().get_ids().to_vec()
+    }
+
+    #[test]
+    fn capped_tokenizers_reuse_variants_without_mutating_the_default() {
+        let (base, _) =
+            load_tokenizer(&fixture("dynamic.onnx"), &fixture("tokenizer.json"), 32).unwrap();
+        let cache = CappedTokenizers::default();
+        let text = "the quick brown fox jumps over the dog ".repeat(20);
+        let original = base.encode(text.as_str(), true).unwrap();
+        let first = cache.get(&base, 8).unwrap();
+        for cap in [16, 8, 12, 8] {
+            let variant = cache.get(&base, cap).unwrap();
+            assert_eq!(
+                variant.encode(text.as_str(), true).unwrap().get_ids(),
+                &uncached_role_ids(&base, &text, cap)
+            );
+            assert_eq!(variant.get_truncation().unwrap().max_length, cap);
+            if cap == 8 {
+                assert!(
+                    Arc::ptr_eq(&first, &variant),
+                    "a warm cap must reuse the same tokenizer"
+                );
+            }
+        }
+        assert_eq!(base.get_truncation().unwrap().max_length, 32);
+        assert_eq!(
+            base.encode(text.as_str(), true).unwrap().get_ids(),
+            original.get_ids()
+        );
+    }
+
+    #[test]
+    fn role_capped_tokenization_populates_and_reuses_the_backend_cache() {
+        if !runtime_configured() {
+            return;
+        }
+        let backend = open_fixture("dynamic.onnx", 32, &tuning(1, 1)).unwrap();
+        let text = "the quick brown fox jumps over the dog ".repeat(20);
+        let default_ids = backend.tokenize(&text).unwrap();
+        assert!(backend.capped_tokenizers.entries.lock().unwrap().is_empty());
+        let ids = backend.tokenize_capped(&text, 8).unwrap();
+        let first = {
+            let entries = backend.capped_tokenizers.entries.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].0, 8);
+            Arc::clone(&entries[0].1)
+        };
+        for _ in 0..20 {
+            assert_eq!(backend.tokenize_capped(&text, 8).unwrap(), ids);
+            assert!(Arc::ptr_eq(
+                &first,
+                &backend
+                    .capped_tokenizers
+                    .get(&backend.tokenizer, 8)
+                    .unwrap()
+            ));
+        }
+        assert_eq!(backend.tokenize(&text).unwrap(), default_ids);
+        for cap in [0, 1, 2, 33] {
+            assert!(backend.tokenize_capped(&text, cap).is_err());
+        }
+        assert_eq!(backend.capped_tokenizers.entries.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn capped_tokenizers_share_cold_variants_across_concurrent_caps() {
+        let (base, _) =
+            load_tokenizer(&fixture("dynamic.onnx"), &fixture("tokenizer.json"), 32).unwrap();
+        let cache = CappedTokenizers::default();
+        let barrier = std::sync::Barrier::new(12);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..12)
+                .map(|index| {
+                    let (base, cache, barrier) = (&base, &cache, &barrier);
+                    scope.spawn(move || {
+                        let cap = if index % 2 == 0 { 8 } else { 16 };
+                        let text = "the quick brown fox jumps over the dog ".repeat(20);
+                        barrier.wait();
+                        let first = cache.get(base, cap).unwrap();
+                        for _ in 0..20 {
+                            let variant = cache.get(base, cap).unwrap();
+                            assert!(Arc::ptr_eq(&first, &variant));
+                            assert_eq!(
+                                variant.encode(text.as_str(), true).unwrap().get_ids(),
+                                &uncached_role_ids(base, &text, cap)
+                            );
+                        }
+                        (cap, first)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for cap in [8, 16] {
+            let variants: Vec<_> = results.iter().filter(|(c, _)| *c == cap).collect();
+            assert!(
+                variants
+                    .iter()
+                    .all(|(_, variant)| Arc::ptr_eq(variant, &variants[0].1)),
+                "concurrent misses must share one configured clone per cap"
+            );
+        }
+        assert_eq!(base.get_truncation().unwrap().max_length, 32);
+    }
+
+    #[test]
+    fn capped_tokenizer_cache_is_bounded_and_evicted_readers_remain_valid() {
+        let (base, _) =
+            load_tokenizer(&fixture("dynamic.onnx"), &fixture("tokenizer.json"), 32).unwrap();
+        let cache = CappedTokenizers::default();
+        let held = cache.get(&base, 8).unwrap();
+        for cap in 9..=12 {
+            cache.get(&base, cap).unwrap();
+            assert!(cache.entries.lock().unwrap().len() <= CappedTokenizers::CAPACITY);
+        }
+        cache.get(&base, 9).unwrap(); // Keep this cap recent; 10 is now the oldest.
+        cache.get(&base, 13).unwrap();
+        {
+            let entries = cache.entries.lock().unwrap();
+            assert_eq!(entries.len(), 4);
+            assert!(entries.iter().any(|(cap, _)| *cap == 9));
+            assert!(!entries.iter().any(|(cap, _)| *cap == 10));
+        }
+        let text = "the quick brown fox jumps over the dog ".repeat(20);
+        assert_eq!(
+            held.encode(text.as_str(), true).unwrap().get_ids(),
+            &uncached_role_ids(&base, &text, 8)
+        );
+        let rebuilt = cache.get(&base, 8).unwrap();
+        assert!(
+            !Arc::ptr_eq(&held, &rebuilt),
+            "the evicted reader remains alive independently of the cache"
+        );
+        assert_eq!(
+            rebuilt.encode(text.as_str(), true).unwrap().get_ids(),
+            held.encode(text.as_str(), true).unwrap().get_ids()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an existing official tokenizer in OTZARIA_TEST_TOKENIZER; no download"]
+    fn official_tokenizer_cache_preserves_ids_and_reports_clone_cost() {
+        use sha2::Digest;
+        let path = PathBuf::from(
+            std::env::var_os("OTZARIA_TEST_TOKENIZER").expect("existing tokenizer path"),
+        );
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(std::fs::read(&path).unwrap())),
+            "0664287976ecb078bdfd8f5e5515dc87d8cb7f985a79a481aa1cdf7a7321c0e9"
+        );
+        let (base, _) = load_tokenizer(&fixture("dynamic.onnx"), &path, 256).unwrap();
+        let cache = CappedTokenizers::default();
+        let goldens: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/data/onnx_golden_vectors_int8.json"
+        ))
+        .unwrap();
+        let cases = goldens["cases"].as_array().unwrap();
+        for case in cases {
+            let text = case["input"].as_str().unwrap();
+            assert_eq!(
+                base.encode(text, true).unwrap().get_ids(),
+                &ids_of(&case["token_ids"])
+            );
+            for cap in [128, 64, 128] {
+                assert_eq!(
+                    cache
+                        .get(&base, cap)
+                        .unwrap()
+                        .encode(text, true)
+                        .unwrap()
+                        .get_ids(),
+                    &uncached_role_ids(&base, text, cap)
+                );
+            }
+        }
+        let warm = cache.get(&base, 128).unwrap();
+        let measure = |cached: bool| {
+            let started = std::time::Instant::now();
+            for case in cases.iter().cycle().take(100) {
+                let text = case["input"].as_str().unwrap();
+                let ids = if cached {
+                    let tokenizer = cache.get(&base, 128).unwrap();
+                    assert!(Arc::ptr_eq(&warm, &tokenizer));
+                    tokenizer.encode(text, true).unwrap().get_ids().to_vec()
+                } else {
+                    uncached_role_ids(&base, text, 128)
+                };
+                std::hint::black_box(ids);
+            }
+            started.elapsed()
+        };
+        let (mut uncached, mut cached) = (Vec::new(), Vec::new());
+        for round in 0..5 {
+            if round % 2 == 0 {
+                uncached.push(measure(false));
+                cached.push(measure(true));
+            } else {
+                cached.push(measure(true));
+                uncached.push(measure(false));
+            }
+        }
+        uncached.sort();
+        cached.sort();
+        println!("Official tokenizer exact parity: cases={}, caps=64/128/256; host={} debug_assertions={}; 5 alternating rounds of100 queries, uncached_median_us={} cached_median_us={}", cases.len(), std::env::consts::ARCH, cfg!(debug_assertions), uncached[2].as_micros(), cached[2].as_micros());
     }
 
     /// The load-time probe is `max_tokens` tokens long, so its cost is the cap's. A cap

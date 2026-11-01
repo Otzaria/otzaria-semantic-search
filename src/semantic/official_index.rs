@@ -43,6 +43,7 @@ use crate::semantic::versioning::{
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 /// The default store: `otzaria-oxv` segments, format 2, in the `i8-sym-vec` codec — what
 /// a plan declares, and what every release of the anchor family is.
@@ -106,6 +107,9 @@ pub struct LocalModel {
     pub embedding_dim: u32,
     pub pooling: String,
     pub max_tokens: usize,
+    pub query_max_tokens: Option<usize>,
+    /// Verified FP32 sibling used lazily for role-capped passage highlights.
+    pub passage_package: Option<ModelPackage>,
     pub embedding_text_version: u32,
     pub normalization_version: u32,
     pub chunking_identity: u64,
@@ -122,6 +126,14 @@ impl LocalModel {
             embedding_dim: family.embedding_dim,
             pooling: family.pooling.clone(),
             max_tokens: family.max_tokens,
+            query_max_tokens: family.query_max_tokens,
+            passage_package: family.query_max_tokens.and_then(|_| {
+                family
+                    .query_packages
+                    .iter()
+                    .find(|p| p.quantization == "fp32")
+                    .cloned()
+            }),
             embedding_text_version: family.embedding_text_version,
             normalization_version: family.normalization_version,
             chunking_identity: family.chunking_identity,
@@ -148,6 +160,7 @@ impl LocalModel {
             embedding_dim: self.embedding_dim,
             pooling: self.pooling.clone(),
             max_tokens: self.max_tokens,
+            query_max_tokens: self.query_max_tokens,
             embedding_text_version: self.embedding_text_version,
             normalization_version: self.normalization_version,
             chunking_identity: self.chunking_identity,
@@ -169,6 +182,78 @@ impl LocalModel {
         crate::semantic::backend::ensure_pooling_is_implemented(pooling)
             .map_err(|e| SemanticSearchError::Config(e.to_string()))?;
         Ok(pooling)
+    }
+}
+
+const FP32_PASSAGE_GRAPH: &str = "document.fp32.onnx";
+
+fn verify_passage_membership(
+    set: &SegmentSet,
+    package: &ModelPackage,
+) -> Result<(), SemanticSearchError> {
+    if !set
+        .identity()
+        .model
+        .query_packages
+        .iter()
+        .any(|accepted| accepted.quantization == "fp32" && accepted == package)
+    {
+        return Err(SemanticSearchError::Config(
+            "the declared FP32 passage package is not accepted by the installed vector set"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct LazyPassageRuntime {
+    config: EmbeddingConfig,
+    deployment: EmbeddingDeployment,
+    package: ModelPackage,
+    tokenizer_checksum: String,
+    runtime: Mutex<Option<EmbeddingRuntime>>,
+}
+
+impl LazyPassageRuntime {
+    fn with_runtime<T>(
+        &self,
+        cancel: &CancellationToken,
+        use_runtime: impl FnOnce(&EmbeddingRuntime) -> Result<T, SemanticSearchError>,
+    ) -> Result<T, SemanticSearchError> {
+        let mut loaded = self.runtime.lock().unwrap_or_else(PoisonError::into_inner);
+        cancel.checkpoint()?;
+        if loaded.is_none() {
+            let package = crate::semantic::model_package::validate_model(&self.config.model_path)?;
+            let tokenizer = package
+                .files()
+                .iter()
+                .find(|file| file.relpath == "tokenizer.json");
+            if package.checksum() != self.package.checksum
+                || tokenizer.is_none_or(|file| file.sha256 != self.tokenizer_checksum)
+            {
+                return Err(SemanticSearchError::Config(
+                    "the FP32 passage package is not the family's verified package".to_string(),
+                ));
+            }
+            let mut runtime =
+                EmbeddingRuntime::with_deployment(self.config.clone(), self.deployment.clone());
+            runtime.load()?;
+            let after = crate::semantic::model_package::validate_model(&self.config.model_path)?;
+            if after.checksum() != self.package.checksum {
+                return Err(SemanticSearchError::Config(
+                    "the FP32 passage files changed during loading".to_string(),
+                ));
+            }
+            if runtime.model_checksum() != Some(self.package.checksum.as_str())
+                || runtime.tokenizer_checksum() != Some(self.tokenizer_checksum.as_str())
+            {
+                return Err(SemanticSearchError::Config(
+                    "the FP32 passage package changed while loading".to_string(),
+                ));
+            }
+            *loaded = Some(runtime);
+        }
+        use_runtime(loaded.as_ref().expect("loaded above"))
     }
 }
 
@@ -206,6 +291,7 @@ pub enum ReloadOutcome {
 pub struct OfficialSemanticIndex {
     set: SegmentSet,
     runtime: EmbeddingRuntime,
+    passage: Option<LazyPassageRuntime>,
     /// The text normalization the vectors were built under, applied to every query.
     normalization: TextNormalizationRecipe,
     /// The text recipe likewise: under version 2 it marks every query as one, as the
@@ -236,7 +322,50 @@ impl OfficialSemanticIndex {
         let text_recipe = EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
         let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
 
+        let passage = if model.query_max_tokens.is_some() {
+            let package = model
+                .passage_package
+                .as_ref()
+                .filter(|p| p.quantization == "fp32")
+                .ok_or_else(|| {
+                    SemanticSearchError::Config(
+                        "a role-capped family requires its verified FP32 passage package"
+                            .to_string(),
+                    )
+                })?;
+            if !matches!(
+                (
+                    model.model_quantization.as_str(),
+                    model.model_path.file_name().and_then(|name| name.to_str())
+                ),
+                ("int8", Some("query.int8.onnx")) | ("fp32", Some("document.fp32.onnx"))
+            ) {
+                return Err(SemanticSearchError::Config("a role-capped query package must use query.int8.onnx beside document.fp32.onnx".to_string()));
+            }
+            Some(LazyPassageRuntime {
+                config: EmbeddingConfig {
+                    model_path: model.model_path.with_file_name(FP32_PASSAGE_GRAPH),
+                    embedding_dim: model.embedding_dim,
+                    pooling: model.pooling_strategy()?,
+                    max_tokens: model.max_tokens,
+                    batch_size: 1,
+                },
+                deployment: deployment.clone(),
+                package: package.clone(),
+                tokenizer_checksum: String::new(),
+                runtime: Mutex::new(None),
+            })
+        } else {
+            None
+        };
         let set = SegmentSet::open(&vectors_dir)?;
+        if let Some(package) = model
+            .passage_package
+            .as_ref()
+            .filter(|_| model.query_max_tokens.is_some())
+        {
+            verify_passage_membership(&set, package)?;
+        }
 
         let mut runtime = EmbeddingRuntime::with_deployment(
             EmbeddingConfig {
@@ -257,10 +386,17 @@ impl OfficialSemanticIndex {
             store: readable_store_for(&set.identity().store),
         };
         set.identity().verify_matches(&expected)?;
+        let passage = passage
+            .filter(|_| model.model_quantization != "fp32")
+            .map(|mut passage| {
+                passage.tokenizer_checksum = expected.model.tokenizer_checksum.clone();
+                passage
+            });
         let book_count = count_books(&set);
         let index = Self {
             set,
             runtime,
+            passage,
             normalization,
             text_recipe,
             expected,
@@ -376,7 +512,13 @@ impl OfficialSemanticIndex {
         // its passages were built with — scores nonsense with full confidence.
         let text =
             crate::semantic::recipe::query_input(self.text_recipe, self.normalization, query)?;
-        Ok(self.runtime.embed_one(&text)?)
+        Ok(self.runtime.embed_one_capped(
+            &text,
+            self.expected
+                .model
+                .query_max_tokens
+                .unwrap_or(self.expected.model.max_tokens),
+        )?)
     }
 
     /// Each text embedded as a stored passage is, under the recipe these vectors were built
@@ -386,14 +528,24 @@ impl OfficialSemanticIndex {
         texts: &[&str],
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
-        let mut vectors = Vec::with_capacity(texts.len());
-        for text in texts {
-            cancel.checkpoint()?;
-            let normalized = self.normalization.apply(text);
-            let input = self.text_recipe.passage_text(&normalized);
-            vectors.push(self.runtime.embed_one(&input)?);
+        if texts.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(vectors)
+        cancel.checkpoint()?;
+        let embed = |runtime: &EmbeddingRuntime| {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                cancel.checkpoint()?;
+                let normalized = self.normalization.apply(text);
+                let input = self.text_recipe.passage_text(&normalized);
+                vectors.push(runtime.embed_one(&input)?);
+            }
+            Ok(vectors)
+        };
+        match &self.passage {
+            Some(passage) => passage.with_runtime(cancel, embed),
+            None => embed(&self.runtime),
+        }
     }
 
     /// Open the generation `CURRENT` names now, if it is not the open one, keeping the
@@ -416,6 +568,25 @@ impl OfficialSemanticIndex {
         }
         let set = SegmentSet::open(&dir)?;
         set.identity().verify_matches(&self.expected)?;
+        if self.expected.model.query_max_tokens.is_some() {
+            let passage_package = self
+                .passage
+                .as_ref()
+                .map(|p| &p.package)
+                .or_else(|| {
+                    self.expected
+                        .model
+                        .query_packages
+                        .iter()
+                        .find(|p| p.quantization == "fp32")
+                })
+                .ok_or_else(|| {
+                    SemanticSearchError::Config(
+                        "the role-capped model has no verified FP32 passage package".to_string(),
+                    )
+                })?;
+            verify_passage_membership(&set, passage_package)?;
+        }
         if set.generation() == from_generation {
             return Ok(ReloadOutcome::Unchanged {
                 generation: from_generation,
@@ -538,6 +709,7 @@ mod tests {
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
+            query_max_tokens: None,
             embedding_text_version,
             normalization_version: 1,
             chunking_identity: chunking.identity(),
@@ -971,5 +1143,20 @@ mod tests {
             ..anchor.clone()
         };
         assert_eq!(readable_store_for(&mixed), anchor);
+    }
+    #[test]
+    fn local_model_keeps_passage_and_query_caps_distinct() {
+        let mut identity = family(
+            vec![ModelPackage {
+                checksum: "a".repeat(64),
+                quantization: "int8".to_string(),
+            }],
+            2,
+        );
+        identity.max_tokens = 256;
+        identity.query_max_tokens = Some(128);
+        let local = LocalModel::of_family(PathBuf::from("query.int8.onnx"), &identity, "int8");
+        assert_eq!(local.max_tokens, 256);
+        assert_eq!(local.query_max_tokens, Some(128));
     }
 }

@@ -921,6 +921,7 @@ mod tests {
             embedding_dim: DIM,
             pooling: "in-graph".to_string(),
             max_tokens: 512,
+            query_max_tokens: None,
             embedding_text_version: 1,
             normalization_version: 1,
             chunking_identity: chunking.identity(),

@@ -104,6 +104,9 @@ pub struct ModelIdentity {
     /// Token cap the embedded texts were built under: it decides how much of a long
     /// line reached the model at all.
     pub max_tokens: usize,
+    /// A distinct query cap; absent keeps the passage cap and existing identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_max_tokens: Option<usize>,
     /// Which text a vector was built from — line alone, title + reference + line,
     /// neighbour context. The recipe is S1's decision; the field exists so that the
     /// decision is recorded in the artifact rather than compiled into a reader.
@@ -235,6 +238,7 @@ pub enum IdentityField {
     EmbeddingDim,
     Pooling,
     MaxTokens,
+    QueryMaxTokens,
     EmbeddingTextVersion,
     NormalizationVersion,
     ChunkingIdentity,
@@ -256,7 +260,7 @@ pub enum IdentityGroup {
 
 impl IdentityField {
     /// Every comparable field, in the order rejections report them.
-    pub const ALL: [IdentityField; 14] = [
+    pub const ALL: [IdentityField; 15] = [
         Self::LineTextVersion,
         Self::KeyVersion,
         Self::FamilyId,
@@ -264,6 +268,7 @@ impl IdentityField {
         Self::EmbeddingDim,
         Self::Pooling,
         Self::MaxTokens,
+        Self::QueryMaxTokens,
         Self::EmbeddingTextVersion,
         Self::NormalizationVersion,
         Self::ChunkingIdentity,
@@ -281,6 +286,7 @@ impl IdentityField {
             | Self::EmbeddingDim
             | Self::Pooling
             | Self::MaxTokens
+            | Self::QueryMaxTokens
             | Self::EmbeddingTextVersion
             | Self::NormalizationVersion
             | Self::ChunkingIdentity
@@ -302,6 +308,7 @@ impl IdentityField {
             Self::EmbeddingDim => "model.embedding_dim",
             Self::Pooling => "model.pooling",
             Self::MaxTokens => "model.max_tokens",
+            Self::QueryMaxTokens => "model.query_max_tokens",
             Self::EmbeddingTextVersion => "model.embedding_text_version",
             Self::NormalizationVersion => "model.normalization_version",
             Self::ChunkingIdentity => "model.chunking_identity",
@@ -370,6 +377,10 @@ impl IndexVersion {
             F::EmbeddingDim => self.model.embedding_dim.to_string(),
             F::Pooling => self.model.pooling.clone(),
             F::MaxTokens => self.model.max_tokens.to_string(),
+            F::QueryMaxTokens => self
+                .model
+                .query_max_tokens
+                .map_or_else(String::new, |cap| cap.to_string()),
             F::EmbeddingTextVersion => self.model.embedding_text_version.to_string(),
             F::NormalizationVersion => self.model.normalization_version.to_string(),
             F::ChunkingIdentity => self.model.chunking_identity.to_string(),
@@ -453,6 +464,9 @@ impl IndexVersion {
         let mut hasher = Sha256::new();
         hasher.update(b"otzaria-vector-identity-v1\n");
         for field in IdentityField::ALL {
+            if field == IdentityField::QueryMaxTokens && self.model.query_max_tokens.is_none() {
+                continue;
+            }
             hasher.update(field.path().as_bytes());
             hasher.update(b"=");
             hasher.update(self.value(field).as_bytes());
@@ -493,6 +507,15 @@ impl IndexVersion {
         require_positive(F::EmbeddingDim, self.model.embedding_dim.into())?;
         require_text(F::Pooling, &self.model.pooling)?;
         require_positive(F::MaxTokens, self.model.max_tokens as u64)?;
+        if let Some(cap) = self.model.query_max_tokens {
+            if cap < 3 || cap > self.model.max_tokens {
+                return Err(ArtifactError::IncompleteIdentity {
+                    field: F::QueryMaxTokens,
+                    reason: "must include special tokens and not exceed the passage cap"
+                        .to_string(),
+                });
+            }
+        }
         require_positive(
             F::EmbeddingTextVersion,
             self.model.embedding_text_version.into(),
@@ -673,6 +696,7 @@ pub(crate) fn test_model_identity() -> ModelIdentity {
         embedding_dim: 1024,
         pooling: "in-graph".to_string(),
         max_tokens: 512,
+        query_max_tokens: None,
         embedding_text_version: 1,
         normalization_version: 1,
         chunking_identity: 0x51A1_1E55,
@@ -733,6 +757,7 @@ mod tests {
             (F::EmbeddingDim, |v| v.model.embedding_dim = 256),
             (F::Pooling, |v| v.model.pooling = "mean".to_string()),
             (F::MaxTokens, |v| v.model.max_tokens = 8192),
+            (F::QueryMaxTokens, |v| v.model.query_max_tokens = Some(128)),
             (F::EmbeddingTextVersion, |v| {
                 v.model.embedding_text_version = 2
             }),
@@ -754,6 +779,37 @@ mod tests {
                 v.store.vector_precision = "int8".to_string()
             }),
         ]
+    }
+
+    #[test]
+    fn absent_query_cap_keeps_existing_json_and_digest() {
+        let identity = sample_identity();
+        let json = serde_json::to_string(&identity).unwrap();
+        assert!(!json.contains("query_max_tokens"));
+        let decoded: IndexVersion = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.model.query_max_tokens, None);
+        assert_eq!(
+            decoded.identity_digest_hex(),
+            "7eaaa0554112cbcb5ada13948ed536044ff9c49443a020b015085d0ac1a18e60"
+        );
+    }
+
+    #[test]
+    fn explicit_query_cap_is_validated_and_compared() {
+        let mut identity = sample_identity();
+        identity.model.query_max_tokens = Some(128);
+        assert!(identity.validate_complete().is_ok());
+        assert_eq!(
+            identity.mismatches_against(&sample_identity())[0].field,
+            IdentityField::QueryMaxTokens
+        );
+        for cap in [0, 1, 2, 513] {
+            identity.model.query_max_tokens = Some(cap);
+            assert!(
+                identity.validate_complete().is_err(),
+                "invalid query cap {cap}"
+            );
+        }
     }
 
     #[test]
@@ -988,7 +1044,9 @@ mod tests {
     /// the JSON rather than off a hand-written list is the point: this is exactly the set
     /// of fields an artifact carries on disk.
     fn serialized_field_paths() -> Vec<String> {
-        let value = serde_json::to_value(sample_identity()).unwrap();
+        let mut identity = sample_identity();
+        identity.model.query_max_tokens = Some(128);
+        let value = serde_json::to_value(identity).unwrap();
         let mut paths = Vec::new();
         for (group, fields) in value.as_object().expect("the identity is a JSON object") {
             for field in fields
@@ -1027,7 +1085,9 @@ mod tests {
         for path in serialized_field_paths() {
             let (group, field) = path.split_once('.').expect("group.field");
 
-            let mut document = serde_json::to_value(sample_identity()).unwrap();
+            let mut identity = sample_identity();
+            identity.model.query_max_tokens = Some(128);
+            let mut document = serde_json::to_value(identity).unwrap();
             let slot = &mut document[group][field];
             *slot = match slot {
                 serde_json::Value::String(_) => serde_json::Value::String(String::new()),

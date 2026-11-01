@@ -347,6 +347,26 @@ impl EmbeddingRuntime {
     /// re-checks the same invariant against the same `MIN_VECTOR_NORM`, because it
     /// is public and accepts vectors that never came through here.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch_capped(texts, self.max_tokens())
+    }
+
+    pub fn embed_one_capped(
+        &self,
+        text: &str,
+        max_tokens: usize,
+    ) -> Result<Vec<f32>, EmbeddingError> {
+        self.embed_batch_capped(&[text], max_tokens)?
+            .pop()
+            .ok_or_else(|| EmbeddingError::InferenceFailed {
+                reason: "backend returned no vector for a single input".to_string(),
+            })
+    }
+
+    pub fn embed_batch_capped(
+        &self,
+        texts: &[&str],
+        max_tokens: usize,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let Some(backend) = self.backend.as_deref() else {
             return Err(EmbeddingError::NotLoaded);
         };
@@ -355,7 +375,7 @@ impl EmbeddingRuntime {
         let mut results = Vec::with_capacity(texts.len());
 
         for group in texts.chunks(self.batch_size()) {
-            let raw = backend.embed_batch_raw(group)?;
+            let raw = backend.embed_batch_raw_capped(group, max_tokens)?;
 
             // Vectors get their metadata by position upstream, so a short batch
             // would attach one line's text to another line's reference.

@@ -173,6 +173,29 @@ pub trait EmbeddingBackend: Send + Sync {
     /// * empty slice in, empty `Vec` out;
     /// * at most [`EmbeddingConfig::batch_size`] inputs.
     fn embed_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+
+    /// A per-call cap below the loaded maximum, preserving the tokenizer's special tokens.
+    fn tokenize_capped(&self, text: &str, max_tokens: usize) -> Result<Vec<u32>, EmbeddingError> {
+        if max_tokens != self.max_tokens() {
+            return Err(EmbeddingError::InferenceFailed {
+                reason: "this backend cannot apply a distinct role token cap".to_string(),
+            });
+        }
+        self.tokenize(text)
+    }
+
+    fn embed_batch_raw_capped(
+        &self,
+        texts: &[&str],
+        max_tokens: usize,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if max_tokens != self.max_tokens() {
+            return Err(EmbeddingError::InferenceFailed {
+                reason: "this backend cannot apply a distinct role token cap".to_string(),
+            });
+        }
+        self.embed_batch_raw(texts)
+    }
 }
 
 /// One backend's capabilities, stated without building it, plus its constructor.
