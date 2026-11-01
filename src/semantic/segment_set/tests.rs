@@ -7,7 +7,9 @@ use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::scan::ScanRequest;
 use crate::semantic::oxv::testing::{key, spec, write_segment, Random, TempDir, TestBook};
 use crate::semantic::resolve::{BookSet, LiveKeySource, ResolveError, SlotRef};
-use crate::semantic::versioning::{test_identity, test_provenance, StoreIdentity};
+use crate::semantic::versioning::{
+    hex, test_identity, test_provenance, ModelPackage, StoreIdentity,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const DIM: usize = 32;
@@ -3083,4 +3085,427 @@ fn compaction_keeps_alias_backing_slots_without_a_live_neighbour() {
             assert_eq!(records.len(), usize::from(normal_survives));
         }
     }
+}
+
+/// [`identity`] of another model family, as a model upgrade publishes it.
+fn another_model() -> IndexVersion {
+    let mut identity = identity();
+    identity.model.family_id = "another/model@0".to_string();
+    identity
+}
+
+/// A base of `library` released for `identity`.
+fn base_release_for(
+    dir: &TempDir,
+    library: &Library,
+    identity: &IndexVersion,
+) -> (PathBuf, String) {
+    let mut spec = spec(PackageKind::Base, 0, library.version);
+    spec.identity_digest = identity.identity_digest();
+    let path = dir.join(&format!(
+        "base-{}-{}.oxv",
+        library.version,
+        hex(&identity.identity_digest())
+    ));
+    let books = books_for(&library.pairs(), &library.keys(), 0);
+    let written = write_segment(&path, spec, codec(), &books, &[]);
+    let manifest = ReleaseManifest::for_segment(
+        &written,
+        identity,
+        codec().params_sha256(),
+        test_provenance(),
+        "2026-11-01T00:00:00Z".to_string(),
+    );
+    (path, manifest.to_json())
+}
+
+fn install_for(
+    dir: &Path,
+    release: &(PathBuf, String),
+    identity: &IndexVersion,
+) -> Result<ApplyReport, SemanticSearchError> {
+    install_package(
+        dir,
+        &InstallSource {
+            segment: &release.0,
+            manifest_json: &release.1,
+        },
+        &InstallExpectation {
+            identity: identity.clone(),
+            published_manifest_sha256: None,
+        },
+        &CancellationToken::new(),
+    )
+}
+
+/// The generation directories and segment ids on disk.
+fn generations_and_segments(dir: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
+    let generations = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("gen-"))
+        .collect();
+    let segments = std::fs::read_dir(dir.join(SEGMENTS_DIR))
+        .unwrap()
+        .flatten()
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.split('.').next().unwrap_or_default().to_string()
+        })
+        .collect();
+    (generations, segments)
+}
+
+/// A host refuses a generation of another model, so it is no fallback: a base of a new model
+/// leaves no `PREVIOUS`, and the old model's set goes at once rather than at the next install.
+#[test]
+fn a_base_of_another_model_leaves_no_previous_and_the_old_set_goes() {
+    let work = TempDir::new("set_another_model");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    assert_eq!(previous_generation(&dir), 1);
+
+    let report = install_for(
+        &dir,
+        &base_release_for(&work, &v31(), &another_model()),
+        &another_model(),
+    )
+    .unwrap();
+    assert_eq!(report.generation, 3);
+    assert_eq!(files::read_pointer(&dir, PREVIOUS).unwrap(), None);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!((set.generation(), set.info().library_version), (3, 31));
+    assert!(!set.info().recovered_from_previous);
+    assert_eq!(set.identity(), &another_model());
+    let live = set.info().segments[0].id.clone();
+    drop(set);
+    assert_eq!(
+        generations_and_segments(&dir),
+        (
+            BTreeSet::from(["gen-000003".to_string()]),
+            BTreeSet::from([live])
+        )
+    );
+}
+
+/// Over a fallback — `CURRENT` broken, the set answering from `PREVIOUS` — a base of another
+/// model removes the `PREVIOUS` it was built on, and every generation of the old model goes.
+#[test]
+fn a_base_of_another_model_over_a_fallback_leaves_no_previous() {
+    let work = TempDir::new("set_another_model_fallback");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), None)).unwrap();
+    break_current(&dir, Broken::Garbage);
+    assert!(
+        SegmentSet::open(&dir)
+            .unwrap()
+            .info()
+            .recovered_from_previous
+    );
+
+    install_for(
+        &dir,
+        &base_release_for(&work, &v31(), &another_model()),
+        &another_model(),
+    )
+    .unwrap();
+    assert_eq!(files::read_pointer(&dir, PREVIOUS).unwrap(), None);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 3);
+    assert!(!set.info().recovered_from_previous);
+    drop(set);
+    assert_eq!(
+        generations_and_segments(&dir).0,
+        BTreeSet::from(["gen-000003".to_string()])
+    );
+}
+
+/// A base of the same model keeps the generation it replaced as `PREVIOUS`, segments and all.
+#[test]
+fn a_base_of_the_same_model_keeps_previous() {
+    let work = TempDir::new("set_same_model");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let old = info(&dir).unwrap().unwrap().segments[0].id.clone();
+
+    install(&dir, &release(&work, &v31(), None)).unwrap();
+    assert_eq!(previous_generation(&dir), 1);
+    let (generations, segments) = generations_and_segments(&dir);
+    assert_eq!(
+        generations,
+        BTreeSet::from(["gen-000001".to_string(), "gen-000002".to_string()])
+    );
+    assert!(segments.contains(&old));
+}
+
+/// What a host of the newer generation accepts of the older: the same text and model, every
+/// query package — and any store, which a host reads as the set declares it.
+#[test]
+fn a_fallback_is_a_generation_a_host_of_the_new_one_accepts() {
+    use super::install::falls_back_to;
+    let newer = identity();
+    assert!(falls_back_to(&newer, &identity()));
+    assert!(!falls_back_to(&newer, &another_model()));
+    let mut older = identity();
+    older.store.store_format_version = 3;
+    assert!(falls_back_to(&newer, &older), "another store");
+    // A host expects only the package it loaded: one both accept is enough.
+    let mut older = identity();
+    older.model.query_packages.pop();
+    assert!(falls_back_to(&newer, &older), "a package of the newer's");
+    let mut older = identity();
+    for package in &mut older.model.query_packages {
+        package.checksum = "0".repeat(64);
+    }
+    assert!(!falls_back_to(&newer, &older), "no package in common");
+
+    // A role-capped host also needs its one FP32 passage package among the set's: a
+    // fallback needs one both accept.
+    let newer = role_capped(&["a", "f", "e"]);
+    assert!(
+        falls_back_to(&newer, &role_capped(&["a", "f"])),
+        "a host of a and f opens both"
+    );
+    assert!(
+        !falls_back_to(&newer, &role_capped(&["a"])),
+        "no FP32 package in common"
+    );
+    assert!(
+        !falls_back_to(&newer, &role_capped(&["a", "d"])),
+        "an FP32 package the newer does not accept"
+    );
+    assert!(
+        !falls_back_to(&role_capped(&["a"]), &role_capped(&["a", "b"])),
+        "no role-capped host opens a set without an FP32 package"
+    );
+}
+
+/// [`identity`] with a query cap, accepting the packages named by one hex digit: `d`, `e` and
+/// `f` are FP32 — `f` the one [`test_identity`] names — and the others int8.
+fn role_capped(packages: &[&str]) -> IndexVersion {
+    let mut identity = identity();
+    identity.model.query_max_tokens = Some(128);
+    identity.model.query_packages = packages
+        .iter()
+        .map(|digit| ModelPackage {
+            checksum: digit.repeat(64),
+            quantization: if ["d", "e", "f"].contains(digit) {
+                "fp32"
+            } else {
+                "int8"
+            }
+            .to_string(),
+        })
+        .collect();
+    identity
+}
+
+/// A role-capped base keeps the one it replaced as `PREVIOUS` when some host opens both — a
+/// query package and an FP32 passage package both accept — and collects it otherwise.
+#[test]
+fn a_role_capped_base_keeps_previous_only_when_a_host_opens_both() {
+    for (older, newer, kept) in [
+        (role_capped(&["a"]), role_capped(&["a", "f"]), false),
+        (
+            role_capped(&["a", "d"]),
+            role_capped(&["a", "f", "e"]),
+            false,
+        ),
+        (
+            role_capped(&["a", "f", "b"]),
+            role_capped(&["a", "f"]),
+            true,
+        ),
+        (
+            role_capped(&["a", "f"]),
+            role_capped(&["a", "f", "e"]),
+            true,
+        ),
+    ] {
+        let work = TempDir::new("set_role_capped_previous");
+        let dir = work.join("vectors");
+        install_for(&dir, &base_release_for(&work, &v29(), &older), &older).unwrap();
+        let old = info(&dir).unwrap().unwrap().segments[0].id.clone();
+
+        install_for(&dir, &base_release_for(&work, &v31(), &newer), &newer).unwrap();
+        let previous = files::read_pointer(&dir, PREVIOUS).unwrap();
+        assert_eq!(
+            previous.map(|pointer| pointer.generation),
+            kept.then_some(1)
+        );
+        let (generations, segments) = generations_and_segments(&dir);
+        assert_eq!(segments.contains(&old), kept);
+        assert_eq!(generations.contains("gen-000001"), kept);
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(set.identity(), &newer);
+    }
+}
+
+/// The generation an install was built on is not written to `PREVIOUS` when it is of another
+/// model: an install cut off after the flip leaves nothing to keep the old set, and the next
+/// open collects it.
+#[test]
+fn a_base_of_another_model_never_writes_previous() {
+    let work = TempDir::new("set_another_model_no_previous");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let old = info(&dir).unwrap().unwrap().segments[0].id.clone();
+
+    CRASH_AT.with(|crash| crash.set(Some(Step::CurrentFlipped)));
+    let crashed = install_for(
+        &dir,
+        &base_release_for(&work, &v31(), &another_model()),
+        &another_model(),
+    );
+    CRASH_AT.with(|crash| crash.set(None));
+    assert!(crashed.is_err());
+    assert_eq!(files::read_pointer(&dir, PREVIOUS).unwrap(), None);
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    drop(set);
+    let (generations, segments) = generations_and_segments(&dir);
+    assert_eq!(generations, BTreeSet::from(["gen-000002".to_string()]));
+    assert!(!segments.contains(&old));
+}
+
+/// A base of another model cut off at any step leaves the old model's set or the new one; the
+/// install repeated lands, and then nothing of the old model is left.
+#[test]
+fn a_crash_installing_another_model_leaves_the_old_set_or_the_new() {
+    for step in [
+        Step::Staged,
+        Step::Moved,
+        Step::GenerationWritten,
+        Step::PreviousWritten,
+        Step::CurrentFlipped,
+    ] {
+        let work = TempDir::new("set_crash_another_model");
+        let dir = work.join("vectors");
+        install(&dir, &release(&work, &v29(), None)).unwrap();
+        install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+        let old: BTreeSet<String> = info(&dir)
+            .unwrap()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|segment| segment.id.clone())
+            .collect();
+        let base = base_release_for(&work, &v31(), &another_model());
+
+        CRASH_AT.with(|crash| crash.set(Some(step)));
+        let crashed = install_for(&dir, &base, &another_model());
+        CRASH_AT.with(|crash| crash.set(None));
+        assert!(crashed.is_err(), "{step:?}");
+
+        let set = SegmentSet::open(&dir).unwrap();
+        let expected = if step == Step::CurrentFlipped { 3 } else { 2 };
+        assert_eq!(set.generation(), expected, "{step:?}");
+        assert!(!set.info().recovered_from_previous, "{step:?}");
+        drop(set);
+
+        install_for(&dir, &base, &another_model()).unwrap();
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(set.identity(), &another_model(), "{step:?}");
+        assert_eq!(set.info().library_version, 31, "{step:?}");
+        drop(set);
+        let (_, segments) = generations_and_segments(&dir);
+        assert!(segments.is_disjoint(&old), "{step:?}: {segments:?}");
+    }
+}
+
+/// An unusable PREVIOUS must not prevent a cross-model base from collecting the old set.
+/// Until CURRENT flips, even a damaged pointer is left as it was.
+#[test]
+fn a_cross_model_base_cleans_an_unreadable_previous_only_after_the_flip() {
+    for damage in [
+        "pointer",
+        "missing-generation",
+        "generation-digest",
+        "directory",
+    ] {
+        for crash_at in [
+            None,
+            Some(Step::PreviousWritten),
+            Some(Step::CurrentFlipped),
+        ] {
+            let work = TempDir::new("set_unreadable_previous");
+            let dir = work.join("vectors");
+            install(&dir, &release(&work, &v29(), None)).unwrap();
+            install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+            let old = generations_and_segments(&dir).1;
+            let previous = files::read_pointer(&dir, PREVIOUS).unwrap().unwrap();
+            match damage {
+                "pointer" => std::fs::write(dir.join(PREVIOUS), b"damaged").unwrap(),
+                "missing-generation" => {
+                    std::fs::remove_dir_all(dir.join(files::generation_dir(previous.generation)))
+                        .unwrap()
+                }
+                "generation-digest" => std::fs::write(dir.join(&previous.set), b"damaged").unwrap(),
+                "directory" => {
+                    std::fs::remove_file(dir.join(PREVIOUS)).unwrap();
+                    std::fs::create_dir(dir.join(PREVIOUS)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(dir.join(PREVIOUS)).ok();
+            let identity = another_model();
+            let base = base_release_for(&work, &v31(), &identity);
+            CRASH_AT.with(|crash| crash.set(crash_at));
+            let result = install_for(&dir, &base, &identity);
+            CRASH_AT.with(|crash| crash.set(None));
+            if let Some(step) = crash_at {
+                assert!(result.is_err(), "{damage}: {step:?}");
+                assert!(dir.join(PREVIOUS).exists());
+                assert_eq!(std::fs::read(dir.join(PREVIOUS)).ok(), before);
+                let set = SegmentSet::open(&dir).unwrap();
+                let expected = if step == Step::CurrentFlipped { 3 } else { 2 };
+                assert_eq!(set.generation(), expected, "{damage}: {step:?}");
+                drop(set);
+                install_for(&dir, &base, &identity).unwrap();
+            } else {
+                result.unwrap();
+            }
+            let kept_new_generation = crash_at == Some(Step::CurrentFlipped);
+            let previous = files::read_pointer(&dir, PREVIOUS).unwrap();
+            assert_eq!(
+                previous.as_ref().map(|p| p.generation),
+                kept_new_generation.then_some(3)
+            );
+            let set = SegmentSet::open(&dir).unwrap();
+            assert_eq!(set.identity(), &identity);
+            let live = set.info().segments[0].id.clone();
+            let generation = files::generation_dir(set.generation());
+            drop(set);
+            let (generations, segments) = generations_and_segments(&dir);
+            assert!(segments.is_disjoint(&old), "{damage}: {crash_at:?}");
+            let mut expected = BTreeSet::from([generation]);
+            if kept_new_generation {
+                expected.insert(files::generation_dir(3));
+            }
+            assert_eq!(generations, expected);
+            assert_eq!(segments, BTreeSet::from([live]));
+        }
+    }
+}
+
+/// Cleanup cannot remove user contents or turn a completed install into a failure.
+#[test]
+fn a_cross_model_base_survives_a_previous_that_cannot_be_removed() {
+    let work = TempDir::new("set_previous_cleanup_failure");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    std::fs::create_dir(dir.join(PREVIOUS)).unwrap();
+    let held = dir.join(PREVIOUS).join("keep");
+    std::fs::write(&held, b"untouched").unwrap();
+    let identity = another_model();
+    let base = base_release_for(&work, &v31(), &identity);
+    let report = install_for(&dir, &base, &identity).unwrap();
+    assert_eq!(report.generation, 2);
+    assert_eq!(SegmentSet::open(&dir).unwrap().identity(), &identity);
+    assert_eq!(std::fs::read(&held).unwrap(), b"untouched");
+    assert_eq!(generations_and_segments(&dir).0.len(), 2);
 }
