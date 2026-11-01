@@ -994,7 +994,9 @@ impl NewGeneration {
 
 /// Whether a host that opens a set of `newer` can fall back to one of `older`: the same text
 /// and model, a query package both accept — a host expects only the one it loaded — and any
-/// store, since a host reads a set's own.
+/// store, since a host reads a set's own. A role-capped host also requires its FP32 passage
+/// package among the set's (`verify_passage_membership`): any FP32 package `newer` accepts
+/// may be that one, so `older` must accept each of them.
 pub(crate) fn falls_back_to(newer: &IndexVersion, older: &IndexVersion) -> bool {
     let shares_a_package = newer.model.query_packages.iter().any(|package| {
         older
@@ -1003,7 +1005,15 @@ pub(crate) fn falls_back_to(newer: &IndexVersion, older: &IndexVersion) -> bool 
             .iter()
             .any(|accepted| accepted.checksum == package.checksum)
     });
+    let accepts_the_passage_packages = newer.model.query_max_tokens.is_none()
+        || newer
+            .model
+            .query_packages
+            .iter()
+            .filter(|package| package.quantization == "fp32")
+            .all(|package| older.model.query_packages.contains(package));
     shares_a_package
+        && accepts_the_passage_packages
         && older.mismatches_against(newer).iter().all(|mismatch| {
             mismatch.field == IdentityField::QueryPackages
                 || mismatch.field.group() == IdentityGroup::Store

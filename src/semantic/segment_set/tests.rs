@@ -7,7 +7,9 @@ use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::scan::ScanRequest;
 use crate::semantic::oxv::testing::{key, spec, write_segment, Random, TempDir, TestBook};
 use crate::semantic::resolve::{BookSet, LiveKeySource, ResolveError, SlotRef};
-use crate::semantic::versioning::{test_identity, test_provenance, StoreIdentity};
+use crate::semantic::versioning::{
+    hex, test_identity, test_provenance, ModelPackage, StoreIdentity,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const DIM: usize = 32;
@@ -3100,7 +3102,11 @@ fn base_release_for(
 ) -> (PathBuf, String) {
     let mut spec = spec(PackageKind::Base, 0, library.version);
     spec.identity_digest = identity.identity_digest();
-    let path = dir.join(&format!("base-{}-another-model.oxv", library.version));
+    let path = dir.join(&format!(
+        "base-{}-{}.oxv",
+        library.version,
+        hex(&identity.identity_digest())
+    ));
     let books = books_for(&library.pairs(), &library.keys(), 0);
     let written = write_segment(&path, spec, codec(), &books, &[]);
     let manifest = ReleaseManifest::for_segment(
@@ -3255,6 +3261,61 @@ fn a_fallback_is_a_generation_a_host_of_the_new_one_accepts() {
         package.checksum = "0".repeat(64);
     }
     assert!(!falls_back_to(&newer, &older), "no package in common");
+
+    // A role-capped host also needs its FP32 passage package among the set's.
+    let newer = role_capped(&["a", "f"]);
+    assert!(
+        !falls_back_to(&newer, &role_capped(&["a"])),
+        "the newer's FP32 passage package is not the older's"
+    );
+    assert!(falls_back_to(&newer, &role_capped(&["a", "f", "b"])));
+    assert!(falls_back_to(
+        &role_capped(&["a"]),
+        &role_capped(&["a", "b"])
+    ));
+}
+
+/// [`identity`] with a query cap, accepting the packages [`test_identity`] names `a` (int8)
+/// and `f` (fp32), and `b`, another int8.
+fn role_capped(packages: &[&str]) -> IndexVersion {
+    let mut identity = identity();
+    identity.model.query_max_tokens = Some(128);
+    identity.model.query_packages = packages
+        .iter()
+        .map(|digit| ModelPackage {
+            checksum: digit.repeat(64),
+            quantization: if *digit == "f" { "fp32" } else { "int8" }.to_string(),
+        })
+        .collect();
+    identity
+}
+
+/// A role-capped base is no fallback for one whose FP32 passage package it does not accept,
+/// and is for one whose packages it accepts besides others.
+#[test]
+fn a_role_capped_base_keeps_previous_only_when_it_accepts_the_passage_package() {
+    for (older, kept) in [
+        (role_capped(&["a"]), false),
+        (role_capped(&["a", "f", "b"]), true),
+    ] {
+        let work = TempDir::new("set_role_capped_previous");
+        let dir = work.join("vectors");
+        let newer = role_capped(&["a", "f"]);
+        install_for(&dir, &base_release_for(&work, &v29(), &older), &older).unwrap();
+        let old = info(&dir).unwrap().unwrap().segments[0].id.clone();
+
+        install_for(&dir, &base_release_for(&work, &v31(), &newer), &newer).unwrap();
+        let previous = files::read_pointer(&dir, PREVIOUS).unwrap();
+        assert_eq!(
+            previous.map(|pointer| pointer.generation),
+            kept.then_some(1)
+        );
+        let (generations, segments) = generations_and_segments(&dir);
+        assert_eq!(segments.contains(&old), kept);
+        assert_eq!(generations.contains("gen-000001"), kept);
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(set.identity(), &newer);
+    }
 }
 
 /// The generation an install was built on is not written to `PREVIOUS` when it is of another
