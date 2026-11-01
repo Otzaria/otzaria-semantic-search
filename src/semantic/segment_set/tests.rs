@@ -3416,3 +3416,96 @@ fn a_crash_installing_another_model_leaves_the_old_set_or_the_new() {
         assert!(segments.is_disjoint(&old), "{step:?}: {segments:?}");
     }
 }
+
+/// An unusable PREVIOUS must not prevent a cross-model base from collecting the old set.
+/// Until CURRENT flips, even a damaged pointer is left as it was.
+#[test]
+fn a_cross_model_base_cleans_an_unreadable_previous_only_after_the_flip() {
+    for damage in [
+        "pointer",
+        "missing-generation",
+        "generation-digest",
+        "directory",
+    ] {
+        for crash_at in [
+            None,
+            Some(Step::PreviousWritten),
+            Some(Step::CurrentFlipped),
+        ] {
+            let work = TempDir::new("set_unreadable_previous");
+            let dir = work.join("vectors");
+            install(&dir, &release(&work, &v29(), None)).unwrap();
+            install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+            let old = generations_and_segments(&dir).1;
+            let previous = files::read_pointer(&dir, PREVIOUS).unwrap().unwrap();
+            match damage {
+                "pointer" => std::fs::write(dir.join(PREVIOUS), b"damaged").unwrap(),
+                "missing-generation" => {
+                    std::fs::remove_dir_all(dir.join(files::generation_dir(previous.generation)))
+                        .unwrap()
+                }
+                "generation-digest" => std::fs::write(dir.join(&previous.set), b"damaged").unwrap(),
+                "directory" => {
+                    std::fs::remove_file(dir.join(PREVIOUS)).unwrap();
+                    std::fs::create_dir(dir.join(PREVIOUS)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(dir.join(PREVIOUS)).ok();
+            let identity = another_model();
+            let base = base_release_for(&work, &v31(), &identity);
+            CRASH_AT.with(|crash| crash.set(crash_at));
+            let result = install_for(&dir, &base, &identity);
+            CRASH_AT.with(|crash| crash.set(None));
+            if let Some(step) = crash_at {
+                assert!(result.is_err(), "{damage}: {step:?}");
+                assert!(dir.join(PREVIOUS).exists());
+                assert_eq!(std::fs::read(dir.join(PREVIOUS)).ok(), before);
+                let set = SegmentSet::open(&dir).unwrap();
+                let expected = if step == Step::CurrentFlipped { 3 } else { 2 };
+                assert_eq!(set.generation(), expected, "{damage}: {step:?}");
+                drop(set);
+                install_for(&dir, &base, &identity).unwrap();
+            } else {
+                result.unwrap();
+            }
+            let kept_new_generation = crash_at == Some(Step::CurrentFlipped);
+            let previous = files::read_pointer(&dir, PREVIOUS).unwrap();
+            assert_eq!(
+                previous.as_ref().map(|p| p.generation),
+                kept_new_generation.then_some(3)
+            );
+            let set = SegmentSet::open(&dir).unwrap();
+            assert_eq!(set.identity(), &identity);
+            let live = set.info().segments[0].id.clone();
+            let generation = files::generation_dir(set.generation());
+            drop(set);
+            let (generations, segments) = generations_and_segments(&dir);
+            assert!(segments.is_disjoint(&old), "{damage}: {crash_at:?}");
+            let mut expected = BTreeSet::from([generation]);
+            if kept_new_generation {
+                expected.insert(files::generation_dir(3));
+            }
+            assert_eq!(generations, expected);
+            assert_eq!(segments, BTreeSet::from([live]));
+        }
+    }
+}
+
+/// Cleanup cannot remove user contents or turn a completed install into a failure.
+#[test]
+fn a_cross_model_base_survives_a_previous_that_cannot_be_removed() {
+    let work = TempDir::new("set_previous_cleanup_failure");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    std::fs::create_dir(dir.join(PREVIOUS)).unwrap();
+    let held = dir.join(PREVIOUS).join("keep");
+    std::fs::write(&held, b"untouched").unwrap();
+    let identity = another_model();
+    let base = base_release_for(&work, &v31(), &identity);
+    let report = install_for(&dir, &base, &identity).unwrap();
+    assert_eq!(report.generation, 2);
+    assert_eq!(SegmentSet::open(&dir).unwrap().identity(), &identity);
+    assert_eq!(std::fs::read(&held).unwrap(), b"untouched");
+    assert_eq!(generations_and_segments(&dir).0.len(), 2);
+}

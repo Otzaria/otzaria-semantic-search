@@ -19,7 +19,8 @@
 //!    files and `set.json`;
 //! 7. **flip** — `PREVIOUS` ← the generation the install was built on, the one the set
 //!    opened at, then `CURRENT`; a generation of another model is no fallback, so `PREVIOUS`
-//!    is not written for it, and one already naming it is removed after the flip;
+//!    is not written for it; an incompatible or unreadable `PREVIOUS` is removed after
+//!    the flip;
 //! 8. **collect garbage**.
 
 use super::files::{
@@ -951,9 +952,9 @@ impl NewGeneration {
         // fallback CURRENT names the generation that did not. A pointer whose generation does
         // not read is no fallback, and in PREVIOUS it would stop every collection. Nor is one
         // a host of this generation refuses: it would only keep its segments on disk.
-        let refused = |pointer: &Pointer| {
+        let usable_fallback = |pointer: &Pointer| {
             read_generation(dir, pointer)
-                .is_ok_and(|older| !falls_back_to(&document.identity, &older.identity))
+                .is_ok_and(|older| falls_back_to(&document.identity, &older.identity))
         };
         let previous = match base {
             Some(base) => Some(base.clone()),
@@ -962,7 +963,7 @@ impl NewGeneration {
                 .flatten()
                 .filter(|pointer| read_generation(dir, pointer).is_ok()),
         }
-        .filter(|pointer| !refused(pointer));
+        .filter(usable_fallback);
         if let Some(previous) = previous {
             if read_pointer(dir, PREVIOUS).ok().flatten().as_ref() != Some(&previous) {
                 let bytes = serde_json::to_vec(&previous).expect("a pointer serializes");
@@ -975,15 +976,29 @@ impl NewGeneration {
         let current = dir.join(CURRENT);
         write_pointer(dir, CURRENT, &bytes).map_err(space_or_io(&current, bytes.len()))?;
         reached(Step::CurrentFlipped)?;
-        // Only after the flip, which leaves CURRENT beside it: PREVIOUS alone stops collection.
-        if read_pointer(dir, PREVIOUS)
-            .ok()
-            .flatten()
-            .is_some_and(|p| refused(&p))
-        {
+        // Only after the durable flip: until then PREVIOUS may be the only fallback.
+        // An unreadable pointer or generation is no fallback either, and would stop every
+        // collection. Treat an empty directory like write_pointer does; never remove its
+        // contents recursively. Cleanup is best effort because CURRENT has already flipped.
+        let discard_previous = match read_pointer(dir, PREVIOUS) {
+            Ok(Some(pointer)) => !usable_fallback(&pointer),
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if discard_previous {
             let path = dir.join(PREVIOUS);
-            if let Err(error) = retry::remove_file(&path) {
-                log::warn!("{} stays until the next install: {error}", path.display());
+            let removed = if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                retry::remove_dir(&path)
+            } else {
+                retry::remove_file(&path)
+            };
+            if let Err(error) = removed.and_then(|()| sync_set_dir(dir)) {
+                log::warn!(
+                    "Cleanup of {} is incomplete until the next install: {error}",
+                    path.display()
+                );
+                // Do not collect generations before the pointer's removal is durable.
+                return Ok(document);
             }
         }
 
