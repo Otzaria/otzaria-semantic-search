@@ -18,6 +18,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  onnx-msrv:
+    name: ONNX binding MSRV (Rust 1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: onnx-msrv-1.92
+      # No runtime download or inference: the regular matrix below covers those.
+      - run: cargo check --locked --all-targets --features onnx-backend
+
   check-and-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

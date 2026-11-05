@@ -61,15 +61,14 @@ crc32fast = "1.5"
 #
 # Pinned exactly, for two reasons — read them before bumping:
 #
-# 1. The API is still moving between release candidates: rc.10 made `Session::run`
-#    take `&mut self` (why the backend keeps a pool of sessions), rc.12 introduced the
-#    `api-*` features and rc.13 gated execution providers at compile time. A
-#    resolver-chosen rc.14 is a different API.
-# 2. It is part of what produces the stored vectors — the session options it applies
-#    and the ONNX Runtime API level it requests — and the manifest records the backend
-#    as index identity, so the version cannot move implicitly.
+# 1. The API is still moving between release candidates. rc.14 requires an owned
+#    Environment for Session::builder; rc.15 repairs native ownership and undefined
+#    behavior. Neither is a stable 2.x release. The tested pin must not move implicitly.
+# 2. The session options and ONNX Runtime API level help define stored vectors. The
+#    manifest records the backend's wiring contract (not the crate version) as index
+#    identity, so upgrades must prove token/vector/ranking parity before keeping it.
 #
-# `default-features = false, features = ["std", "load-dynamic"]`: the runtime is a
+# `default-features = false, features = ["std", "load-dynamic", "api-17"]`: the runtime is a
 # shared library loaded at run time — from the path the application passes, else
 # `OTZARIA_ONNX_RUNTIME`, else the platform's file name beside the graph — and never
 # linked. The default, `download-binaries`, links pyke's static builds, and each of those
@@ -86,9 +85,12 @@ crc32fast = "1.5"
 #   network cannot reach.
 #
 # Loaded instead, a missing or unusable runtime is `OnnxRuntimeUnavailable` for semantic
-# search and nothing else. No `api-*` feature: the default API level, 17, is all the
-# backend uses, so any runtime from ONNX Runtime 1.17 on loads; the reference is
-# Microsoft's official 1.28.0 release, which dispatches CPU features at run time.
+# search and nothing else. Explicit `api-17` keeps the minimum C API at 17 rather than
+# rc.15's default API 31. The runtime must be 1.17+ and provide that table; the reference
+# remains Microsoft's official 1.28.0 release. No runtime, CPU feature, graph setting,
+# tokenizer version or vector format is changed by this Rust binding upgrade.
+# rc.15 raises the desktop ONNX build-time MSRV from 1.88 to 1.92; CI checks it
+# separately. Do not impose that optional dependency floor on non-ONNX/mobile builds.
 #
 # Declared for desktop targets only — macOS, Linux (glibc) and Windows (MSVC), each on
 # aarch64 and x86_64 — the platforms Microsoft publishes that runtime for. iOS and
@@ -99,9 +101,9 @@ crc32fast = "1.5"
 # `tests/onnx_backend.rs` carry the same condition, and a test in the last holds all
 # the spellings together.
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.ort]
-version = "=2.0.0-rc.13"
+version = "=2.0.0-rc.15"
 default-features = false
-features = ["std", "load-dynamic"]
+features = ["std", "load-dynamic", "api-17"]
 optional = true
 
 # Pinned exactly for the reason `ort` is, with the tokenizer's own twist: token ids are
@@ -123,13 +125,11 @@ default-features = false
 features = ["fancy-regex"]
 optional = true
 
-# Reached directly to open the runtime *before* `ort` does: `ort` 2.0.0-rc.13 cannot
-# recover from refusing a library (a failed load still completes its `OnceLock`, and the
-# next call panics), so the backend loads the file itself, checks that it exports
-# `OrtGetApiBase` and reports a version `ort` accepts, and only then calls
-# `ort::init_from` — which opens the same file again, bumping a reference count. The same
-# open reads `GetVersionString`, which `ort` checks and does not expose; the load log
-# names it. The handle is kept for the life of the process. See
+# Reached directly to open the runtime *before* `ort` caches it. rc.15 fixes rc.13's
+# failed-loader retry bug, but still panics on a null API table. The backend checks the
+# entry point, UTF-8 version and `GetApi(17)` before calling `ort::init_from` — which
+# opens the same file again, bumping a reference count. This also reads the runtime
+# version for the load log. The handle is kept for the life of the process. See
 # `onnx_backend::ensure_runtime`. Unpinned: it decides no vector, and a range lets cargo
 # unify it with `ort`'s own.
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies.libloading]
