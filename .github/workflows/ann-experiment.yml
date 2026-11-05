@@ -1,0 +1,106 @@
+name: ANN experiment checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/ann/**'
+      - '.github/workflows/ann-experiment.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'experiments/ann/**'
+      - '.github/workflows/ann-experiment.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ann-experiment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-smoke:
+    name: Experimental ANN correctness (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: 'experiments/ann -> target'
+          shared-key: ann-experiment-linux
+      - name: Check experiment formatting
+        run: cargo fmt --manifest-path experiments/ann/Cargo.toml -- --check
+      # The correctness fixture has only 200 vectors. The separate observational
+      # matrix below does not gate a PR on latency/RSS from a shared runner.
+      - name: Check native lifecycle and filter contracts
+        run: cargo test --release --locked --manifest-path experiments/ann/Cargo.toml
+      - name: Check recall accounting
+        run: python3 -m unittest discover -s experiments/ann -p 'test_*.py'
+
+  observational-measurements:
+    name: ANN observations (${{ matrix.name }})
+    needs: native-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: i8-clustered
+            codec: i8-sym-vec
+            distribution: clustered
+          - name: i8-uniform
+            codec: i8-sym-vec
+            distribution: uniform
+          - name: rot192-clustered
+            codec: rot192-i8i4
+            distribution: clustered
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: 'experiments/ann -> target'
+          shared-key: ann-experiment-linux
+      - name: Build the measurement executable
+        run: cargo build --release --locked --manifest-path experiments/ann/Cargo.toml
+      # These are observations on shared runners, never latency/RSS/recall gates.
+      # Nonzero exit means a harness/contract failure, not a timing regression.
+      - name: Measure synthetic queries and mutable lifecycle
+        run: |
+          mkdir -p '${{ runner.temp }}/ann-reports'
+          python3 experiments/ann/run.py \
+            --dataset '${{ runner.temp }}/ann-${{ matrix.name }}' \
+            --output '${{ runner.temp }}/ann-reports/${{ matrix.name }}.json' \
+            --raw-dir '${{ runner.temp }}/ann-reports/${{ matrix.name }}-raw' \
+            --vectors 20000 --dim 256 --queries 50 --top-k 10 \
+            --codec '${{ matrix.codec }}' --distribution '${{ matrix.distribution }}' \
+            --threads 1,4,8 --expansions 32,128,512 --repeats 2
+      - name: Observe per-file advisory cold open and first touch
+        run: |
+          python3 experiments/ann/run.py \
+            --dataset '${{ runner.temp }}/ann-${{ matrix.name }}' \
+            --reuse-dataset --skip-lifecycle --cache-policy advisory-cold \
+            --output '${{ runner.temp }}/ann-reports/${{ matrix.name }}-advised.json' \
+            --raw-dir '${{ runner.temp }}/ann-reports/${{ matrix.name }}-advised-raw' \
+            --threads 1,4 --expansions 128 --filters all,1pct --repeats 2
+      - name: Preserve observations and raw query/timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ann-observations-${{ matrix.name }}
+          path: '${{ runner.temp }}/ann-reports/'
+          if-no-files-found: warn
+          retention-days: 14

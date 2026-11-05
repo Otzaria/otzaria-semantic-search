@@ -1,0 +1,20 @@
+[package]
+name = "otzaria-ann-experiment"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Intentionally a separate crate/lockfile. Building the production crate does not
+# compile USearch, a C++ toolchain, or any of this experiment's dependencies.
+[workspace]
+
+[dependencies]
+otzaria-semantic-search = { path = "../..", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Portable scalar baseline: no NumKong, OpenMP, -march=native, or new CPU floor.
+# This is an experiment, NOT a production backend or an index-format migration.
+usearch = { version = "=2.26.6", default-features = false }
+
+[profile.release]
+debug = 1
