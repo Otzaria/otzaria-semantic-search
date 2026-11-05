@@ -1,0 +1,162 @@
+{
+  "schema": 1,
+  "baseline_sha": "7edc614c3746531b21c71ff738162223297831c6",
+  "candidate_sha": "a79901ff1a34bc9d57b994b905de7ec9ad69bb7a",
+  "run_id": 42081611462,
+  "job_id": 127435823597,
+  "runtime": "1.28.0",
+  "max_tokens": 32,
+  "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "fixtures": [
+    {
+      "name": "fixture",
+      "cases": 25,
+      "tokens_identical": true,
+      "ordered_top5_identical": true,
+      "raw_vectors": {
+        "dimensions": 4,
+        "exactly_identical": true,
+        "max_abs_delta": 0,
+        "worst_cosine": 0.9999999999999998
+      },
+      "normalized_vectors": {
+        "dimensions": 4,
+        "exactly_identical": true,
+        "max_abs_delta": 0,
+        "worst_cosine": 0.9999999999999998
+      },
+      "before_measurement": {
+        "iterations": 100,
+        "load_ms": 19.436228,
+        "native_allocations_measured": false,
+        "p50_us": 26.279,
+        "p95_us": 42.659,
+        "p99_us": 197.37699999999998,
+        "rust_allocations": 22232,
+        "rust_requested_bytes": 3042636,
+        "sessions": 1,
+        "threads": 1
+      },
+      "after_measurement": {
+        "iterations": 100,
+        "load_ms": 19.557123999999998,
+        "native_allocations_measured": false,
+        "p50_us": 26.869999999999997,
+        "p95_us": 35.587,
+        "p99_us": 212.325,
+        "rust_allocations": 22232,
+        "rust_requested_bytes": 3045036,
+        "sessions": 1,
+        "threads": 1
+      },
+      "timing_is_a_gate": false
+    },
+    {
+      "name": "int8",
+      "cases": 25,
+      "tokens_identical": true,
+      "ordered_top5_identical": true,
+      "raw_vectors": {
+        "dimensions": 256,
+        "exactly_identical": true,
+        "max_abs_delta": 0,
+        "worst_cosine": 0.9999999999999998
+      },
+      "normalized_vectors": {
+        "dimensions": 256,
+        "exactly_identical": true,
+        "max_abs_delta": 0,
+        "worst_cosine": 0.9999999999999999
+      },
+      "before_measurement": {
+        "iterations": 100,
+        "load_ms": 326.80786,
+        "native_allocations_measured": false,
+        "p50_us": 6688.784,
+        "p95_us": 11289.089,
+        "p99_us": 14953.261,
+        "rust_allocations": 23172,
+        "rust_requested_bytes": 3543492,
+        "sessions": 1,
+        "threads": 1
+      },
+      "after_measurement": {
+        "iterations": 100,
+        "load_ms": 322.006079,
+        "native_allocations_measured": false,
+        "p50_us": 6679.1050000000005,
+        "p95_us": 11338.721,
+        "p99_us": 15502.454,
+        "rust_allocations": 23172,
+        "rust_requested_bytes": 3545892,
+        "sessions": 1,
+        "threads": 1
+      },
+      "timing_is_a_gate": false
+    },
+    {
+      "name": "fp32",
+      "cases": 25,
+      "tokens_identical": true,
+      "ordered_top5_identical": true,
+      "raw_vectors": {
+        "dimensions": 256,
+        "exactly_identical": true,
+        "max_abs_delta": 0,
+        "worst_cosine": 0.9999999999999998
+      },
+      "normalized_vectors": {
+        "dimensions": 256,
+        "exactly_identical": true,
+        "max_abs_delta": 0,
+        "worst_cosine": 0.9999999999999998
+      },
+      "before_measurement": {
+        "iterations": 100,
+        "load_ms": 500.42873099999997,
+        "native_allocations_measured": false,
+        "p50_us": 12681.238,
+        "p95_us": 18722.602000000003,
+        "p99_us": 24083.959,
+        "rust_allocations": 23172,
+        "rust_requested_bytes": 3543492,
+        "sessions": 1,
+        "threads": 1
+      },
+      "after_measurement": {
+        "iterations": 100,
+        "load_ms": 497.110348,
+        "native_allocations_measured": false,
+        "p50_us": 12665.479000000001,
+        "p95_us": 18310.134,
+        "p99_us": 24310.481,
+        "rust_allocations": 23172,
+        "rust_requested_bytes": 3545892,
+        "sessions": 1,
+        "threads": 1
+      },
+      "timing_is_a_gate": false
+    }
+  ],
+  "source_log": "https://github.com/Otzaria/otzaria-semantic-search/actions/runs/42081611462/job/127435823597",
+  "host": {
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 4,
+    "platform": "GitHub Actions ubuntu-latest x86_64 shared runner",
+    "runtime_sha256": "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407"
+  },
+  "artifact": {
+    "id": 13442225785,
+    "zip_sha256": "795afba30bb9608f69becfa383fe1390b589aedec2d21e27f9e4fec778706593",
+    "url": "https://github.com/Otzaria/otzaria-semantic-search/actions/runs/42081611462/artifacts/13442225785",
+    "files": 6,
+    "expires": "2026-11-19"
+  },
+  "limitations": [
+    "25 neutral texts at token cap32 are a regression corpus, not a ranking-quality benchmark; separate existing goldens check41cases and production cap256.",
+    "One release before/after process per graph on one shared host; latency is descriptive, not a statistically established speedup.",
+    "Rust allocator counts cover allocation calls and requested bytes only, not retained or native memory.",
+    "Native floor1.17 was tested on Linux; reference1.28 is covered by desktop matrix.",
+    "Original broad local baseline suite was interrupted due contention and is not counted as a complete pass."
+  ]
+}
