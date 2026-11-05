@@ -4,6 +4,11 @@ This directory is an **experimental, separately built Cargo crate**. The applica
 continues to use its OXV exact scan. No production dependency, feature, index format,
 manifest, migration, worker policy, or default changes when this experiment is merged.
 
+[Measured results](RESULTS.md) cover three independently built 20k × 256 fixtures,
+including recall, filter costs, RAM/disk, advisory-cold observations and lifecycle
+checks. The [durable evidence](results/2026-11-05/manifest.json) retains complete
+raw results and source/binary hashes. The decision is to keep ANN experimental.
+
 ## Questions it can answer
 
 For a fixed reproducible synthetic dataset, how much do an HNSW graph's latency,
@@ -76,7 +81,8 @@ cargo test --locked --manifest-path experiments/ann/Cargo.toml -j 1
 python3 -m unittest discover -s experiments/ann -p 'test_*.py'
 ```
 
-The separate `ANN experiment checks` workflow runs the 200-vector native smoke
+The separate `ANN experiment checks` workflow runs two 200-vector native smoke fixtures
+(int8 and fitted rotated codec)
 and Python recall checks on Linux when this experiment changes. Root Cargo CI
 does not implicitly include this separate workspace. After the smoke passes,
 three observational jobs measure 20k × 256 fixtures (clustered int8, uniform int8,
@@ -198,6 +204,9 @@ and the reference. Production adoption additionally requires all of the followin
   generation and graph parameters; atomic publication with crash recovery; safe
   rejection/rebuild of a stale or corrupt graph. No existing OXV bytes may be
   reinterpreted as an ANN file.
+- A collision-free mapping of full production chunk keys into USearch's u64 key
+  space. The fixture's synthetic IDs deliberately fit in eight bytes; truncating
+  an arbitrary 128-bit key would lose identity and is not an integration strategy.
 - Bounded cancellable native search, graph build and compaction; filtered-candidate
   budgets and an explicit exact fallback; ownership/locking for concurrent readers
   during delta installation and generation replacement.
