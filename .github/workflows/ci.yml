@@ -19,7 +19,7 @@ env:
 
 jobs:
   onnx-msrv:
-    name: ONNX binding MSRV (Rust 1.92)
+    name: ONNX minimum versions (Rust 1.92, Runtime 1.17)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -30,8 +30,25 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: onnx-msrv-1.92
-      # No runtime download or inference: the regular matrix below covers those.
       - run: cargo check --locked --all-targets --features onnx-backend
+      # The regular native matrix tests the shipped 1.28.0 runtime. Also exercise the
+      # oldest accepted API/runtime here: a version string and a successful query do
+      # not prove that session teardown is safe. The hash pins the official Microsoft
+      # asset; this older GitHub release does not publish an asset digest itself.
+      - name: Fetch ONNX Runtime 1.17.0
+        run: |
+          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.17.0.tgz"
+          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-linux-x64-1.17.0.tgz
+          echo "efc344d54d1969446ff5d3e55b54e205c6579c06333ecf1d34a04215eefae7c6  $archive" | sha256sum --check -
+          library="onnxruntime-linux-x64-1.17.0/lib/libonnxruntime.so.1.17.0"
+          tar -xzf "$archive" -C "$RUNNER_TEMP" "$library"
+          test -f "$RUNNER_TEMP/$library"
+          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/$library" >> "$GITHUB_ENV"
+      # Includes fresh child-process load/refusal/retry and two-session
+      # create/infer/drop/reopen tests. A native teardown crash fails the parent test.
+      - name: Native lifecycle and compatibility at the minimum versions
+        run: cargo test --locked --features onnx-backend --test onnx_backend
 
   check-and-test:
     name: Build & Test (${{ matrix.os }})
@@ -89,7 +106,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 -m pip install --quiet pytest
-          python3 -m pytest tools/kaggle/test_queue.py tools/test_onnx_package_checksum.py -q
+          python3 -m pytest tools/kaggle/test_queue.py tools/test_onnx_package_checksum.py tools/test_compare_ort_parity.py -q
 
       # Also the step in this job that compiles the ONNX backend on every platform. That
       # needs no runtime and no network: ONNX Runtime is loaded when a model is, never
@@ -428,6 +445,56 @@ jobs:
         env:
           OTZARIA_TEST_ONNX_MODEL: ${{ steps.model.outputs.int8 }}
         run: cargo test --test artifact_builder --features onnx-backend -- --ignored --nocapture
+
+      # The same probe source, model files, CPU and runtime isolate the binding change
+      # from cross-machine floating-point differences. Keep the baseline immutable.
+      - name: Check out the ort rc.13 baseline
+        id: ort_before
+        if: ${{ !cancelled() && steps.model.outcome == 'success' && steps.runtime.outcome == 'success' }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 7edc614c3746531b21c71ff738162223297831c6
+          path: ort-before
+          persist-credentials: false
+
+      - name: Compare tokens, embeddings and nearest neighbours before and after ort
+        id: ort_compare
+        if: ${{ !cancelled() && steps.ort_before.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ort-parity-target
+          OTZARIA_PARITY_INT8: ${{ steps.model.outputs.int8 }}
+          OTZARIA_PARITY_FP32: ${{ steps.model.outputs.fp32 }}
+        run: |
+          mkdir -p ort-before/examples "$RUNNER_TEMP/ort-parity"
+          cp examples/ort_parity.rs ort-before/examples/ort_parity.rs
+          cargo build --locked --release --manifest-path ort-before/Cargo.toml --features onnx-backend --example ort_parity
+          cp "$CARGO_TARGET_DIR/release/examples/ort_parity" "$RUNNER_TEMP/ort-parity-before"
+          cargo build --locked --release --manifest-path Cargo.toml --features onnx-backend --example ort_parity
+          cp "$CARGO_TARGET_DIR/release/examples/ort_parity" "$RUNNER_TEMP/ort-parity-after"
+          compare_case() {
+            label="$1"
+            model="$2"
+            tokenizer="$3"
+            before="$RUNNER_TEMP/ort-parity/before-$label.json"
+            after="$RUNNER_TEMP/ort-parity/after-$label.json"
+            "$RUNNER_TEMP/ort-parity-before" "$model" "$tokenizer" 32 100 > "$before"
+            "$RUNNER_TEMP/ort-parity-after" "$model" "$tokenizer" 32 100 > "$after"
+            python3 tools/compare_ort_parity.py "$before" "$after"
+          }
+          compare_case fixture "$GITHUB_WORKSPACE/tests/data/onnx_fixture/dynamic.onnx" "$GITHUB_WORKSPACE/tests/data/onnx_fixture/tokenizer.json"
+          compare_case int8 "$OTZARIA_PARITY_INT8" "$GITHUB_WORKSPACE/onnx-model/tokenizer.json"
+          compare_case fp32 "$OTZARIA_PARITY_FP32" "$GITHUB_WORKSPACE/onnx-model/tokenizer.json"
+
+      # Only neutral probe texts, ids, output vectors and measurement summaries. Never
+      # upload onnx-model/, its tokenizer, weights, or a build/cache containing them.
+      - name: Save ort comparison evidence
+        if: ${{ !cancelled() && steps.ort_compare.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ort-parity
+          path: ${{ runner.temp }}/ort-parity/*.json
+          if-no-files-found: error
+          retention-days: 14
 
   # The x86 int8 decision (`X86Int8` in src/semantic/onnx_backend.rs) on CPUs the runners do
   # not have. The backend leaves `session.x64quantprecision` off where ONNX Runtime's U8S8

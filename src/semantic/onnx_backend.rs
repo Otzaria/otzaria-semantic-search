@@ -416,8 +416,9 @@ fn resolve_runtime_path(
 fn ensure_runtime(runtime: &RuntimeLocation) -> Result<(Environment, String), EmbeddingError> {
     let unavailable = |reason: String| EmbeddingError::OnnxRuntimeUnavailable { reason };
 
-    // Held across the load, so two first loads cannot race. Recovered from poisoning:
-    // the slot only ever goes from empty to one complete value.
+    // Held across initialization, so two first loads cannot race. Recover a poisoned
+    // lock: the slot contains either no library or a pinned library with an optional
+    // fully constructed environment, never a partially constructed native owner.
     let mut slot = RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
     match slot.as_ref() {
         Some(loaded) if loaded.location.path == runtime.path => {
@@ -2485,7 +2486,7 @@ mod tests {
             std::ptr::null()
         }
         unsafe extern "system" fn invalid_utf8() -> *const std::ffi::c_char {
-            b"1.28.\xff\0".as_ptr().cast()
+            c"1.28.\xff".as_ptr()
         }
         unsafe extern "system" fn old() -> *const std::ffi::c_char {
             c"1.16.3".as_ptr()

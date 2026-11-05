@@ -469,7 +469,10 @@ API and reduced `Session::run` allocations;
 [rc.15](https://github.com/pykeio/ort/releases/tag/v2.0.0-rc.15) fixes native memory safety
 and ownership bugs. The exact crate and `ort-sys` pins change together. Their Rust MSRV
 moves from 1.88 to **1.92**, enforced by those crates and checked with the locked graph
-in CI. This floor applies to desktop builds enabling `onnx-backend`; the optional
+in CI. The same job runs the native integration suite on Microsoft's 1.17.0 runtime,
+including fresh-process refusal/retry and full session teardown/reopen. A minimum API
+number alone is not evidence that an older runtime safely tears down. This floor applies
+to desktop builds enabling `onnx-backend`; the optional
 dependency does not raise the floor for non-ONNX/mobile builds. This is a build-toolchain
 change; the shipped ONNX Runtime remains Microsoft's 1.28.0.
 
@@ -479,6 +482,22 @@ runtime, changes no deployment CPU instruction floor and still permits a runtime
 API 17. The backend id stays `onnxruntime-sentence-v1`, because tokenization, per-text inputs,
 graph optimization, exact int8 products, output selection and normalization are unchanged.
 No persisted index field or OXV format changes and no migration is required.
+
+The `golden-onnx` job also builds `examples/ort_parity.rs` twice: once against the fixed
+rc.13 baseline `7edc614c3746531b21c71ff738162223297831c6`, once against the proposed code.
+Both binaries run on the same CPU and Microsoft 1.28.0 runtime, using the same fixture,
+int8 graph and fp32 graph. Each run uses 25 neutral inputs, a 32-token cap, one session and
+one inference thread. `tools/compare_ort_parity.py` requires identical tokens and ordered
+nearest-five neighbours, identical vector shapes, finite values and maximum absolute
+component error at most `1e-6` for both raw and normalized vectors. The six JSON outputs
+are saved as the `ort-parity` CI artifact for 14 days; no model or tokenizer files are
+uploaded. These are regression checks on a small, fixed corpus, not a claim about retrieval
+quality across the whole library.
+
+The probe reports load time, p50/p95/p99 latency and Rust allocation counts over 100 warm
+queries. They are observations, not timing gates on shared CI runners; native allocations
+are explicitly not measured. The longer 256-token and real-model Python-reference cases
+remain in the existing golden tests.
 
 The fixture parity gate continues to compare exact token ids and embeddings against the
 checked-in Python reference. The new lifecycle regression uses a fresh process: malformed
