@@ -149,7 +149,7 @@ is not assumed to match the source files on disk.
 The binary does not set affinity or exclude other workloads; scheduling/contention
 must be considered before interpreting a latency improvement. The empty-scope
 probe is a **launch/join proxy**, not a profiler attributing OXV time to spawning.
-OXV already limits workers to useful shares of at least 4,096 slots. No persistent
+OXV already caps workers based on roughly 4,096 slots per share. No persistent
 pool is introduced based on that proxy or on a noisy single-host timing.
 
 ## Lifecycle and ownership checks

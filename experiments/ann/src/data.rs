@@ -68,9 +68,12 @@ impl Config {
         if !matches!(self.distribution.as_str(), "uniform" | "clustered") {
             return Err("distribution must be uniform or clustered".into());
         }
-        CodecSpec::parse(&self.codec, 0.9999)?;
-        if self.codec == "rot192-i8i4" && self.dim < 192 {
-            return Err("rot192-i8i4 requires at least 192 dimensions".into());
+        if self.codec == "rot192-i8i4" {
+            if self.dim < 192 {
+                return Err("rot192-i8i4 requires at least 192 dimensions".into());
+            }
+        } else {
+            CodecSpec::parse(&self.codec, 0.9999)?;
         }
         Ok(())
     }
@@ -130,7 +133,13 @@ impl Config {
             .map(|key| self.vector(key))
             .collect();
         let refs: Vec<&[f32]> = sample.iter().map(Vec::as_slice).collect();
-        Ok(CodecSpec::parse(&self.codec, 0.9999)?.build(self.dim, &refs)?)
+        // The production name parser deliberately rejects rotated codecs: they
+        // need a fitted epoch, not CodecSpec's named/per-dimension calibration.
+        if self.codec == "rot192-i8i4" {
+            Ok(Codec::fit_rot_i8i4(&refs, 128, 64)?)
+        } else {
+            Ok(CodecSpec::parse(&self.codec, 0.9999)?.build(self.dim, &refs)?)
+        }
     }
 
     pub fn ann(&self, expansion: usize) -> Result<Index> {

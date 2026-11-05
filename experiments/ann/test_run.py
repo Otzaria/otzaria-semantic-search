@@ -1,11 +1,23 @@
+import io
+import subprocess
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from run import cache_advice, recall, recall_summary
+from run import cache_advice, execute, recall, recall_summary
 
 
 class RecallTests(unittest.TestCase):
+    def test_child_failure_preserves_exit_status_and_exposes_native_diagnostic(self):
+        failed = subprocess.CompletedProcess(["binary", "build"], 1, "", "native contract failed\n")
+        stderr = io.StringIO()
+        with patch("run.subprocess.run", return_value=failed), redirect_stderr(stderr):
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                execute(Path("binary"), ["build"], None, "build")
+        self.assertEqual(caught.exception.returncode, 1)
+        self.assertIn("native contract failed", stderr.getvalue())
+
     def test_missing_results_are_misses_and_duplicates_do_not_inflate_recall(self):
         self.assertEqual(recall([1, 2, 3, 4], [1, 1, 2]), 0.5)
         self.assertEqual(recall([1, 2, 3, 4], []), 0.0)

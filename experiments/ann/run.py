@@ -24,9 +24,10 @@ ROOT = Path(__file__).resolve().parent
 def execute(binary: Path, arguments: list[str], raw_dir: Path | None, label: str, metadata: dict | None = None) -> dict:
     print(label, file=sys.stderr, flush=True)
     command = [str(binary), *arguments]
-    process = subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
+    process = subprocess.run(command, check=False, capture_output=True, text=True, timeout=1800)
     if process.stderr:
         print(process.stderr, file=sys.stderr, end="")
+    process.check_returncode()
     value = json.loads(process.stdout)
     value.update(metadata or {})
     if raw_dir:

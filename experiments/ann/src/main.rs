@@ -201,19 +201,35 @@ mod tests {
 
     #[test]
     fn real_oxv_and_native_ann_roundtrip_filters_delta_compaction_and_cancel() -> Result<()> {
+        check_roundtrip(Config {
+            vectors: 200,
+            dim: 32,
+            queries: 4,
+            top_k: 10,
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn fitted_rotated_codec_roundtrip_filters_delta_compaction_and_cancel() -> Result<()> {
+        check_roundtrip(Config {
+            vectors: 200,
+            dim: 256,
+            queries: 4,
+            top_k: 10,
+            codec: "rot192-i8i4".to_string(),
+            ..Config::default()
+        })
+    }
+
+    fn check_roundtrip(config: Config) -> Result<()> {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let fixture = Fixture(
             std::env::temp_dir().join(format!("otzaria-ann-test-{}-{unique}", std::process::id())),
         );
-        let config = Config {
-            vectors: 200,
-            dim: 32,
-            queries: 4,
-            top_k: 10,
-            ..Config::default()
-        };
+        config.validate()?;
         build(&fixture.0, &config)?;
         for filter in ["all", "5pct", "1pct", "empty"] {
             let exact = measure::measure(&fixture.0, "oxv", filter, 1, 128, 1)?;
