@@ -134,6 +134,12 @@ mod with_the_backend {
     const ENV_THREADS: &str = "OTZARIA_ONNX_THREADS";
     const ENV_SESSIONS: &str = "OTZARIA_ONNX_SESSIONS";
 
+    #[test]
+    fn the_binding_still_requests_api_17() {
+        assert_eq!(ort::MINOR_VERSION, 17);
+        assert_eq!(ort::sys::ORT_API_VERSION, 17);
+    }
+
     /// `select_backend` reads the tuning variables, and one test here writes them; the
     /// harness runs tests on parallel threads of one process.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -425,11 +431,10 @@ mod with_the_backend {
 
     /// A refused runtime must leave the process able to load a correct one afterwards.
     ///
-    /// `ort` 2.0.0-rc.13 alone cannot: after one failed `init_from` its library slot reads
-    /// as loaded and empty, the next `init_from` "succeeds" without loading anything, and
-    /// the first call after that panics (`dlsym(0x0, OrtGetApiBase)`). The backend checks
-    /// a library itself before `ort` ever sees it. Only a process that has loaded nothing
-    /// can show the difference, so the check runs in a child of this test binary, alone.
+    /// This covers the original rc.13 failed-loader regression as well as later
+    /// upgrades. The backend checks a library before `ort` ever sees it. Only a process
+    /// that has loaded nothing can show a poisoned global, so the check runs in a child
+    /// of this test binary, alone.
     #[test]
     fn a_refused_runtime_leaves_the_process_able_to_load_a_correct_one() {
         if !runtime_configured() {
@@ -492,6 +497,175 @@ mod with_the_backend {
             .expect("a correct runtime loads after a refused one");
         let vectors = backend.embed_batch_raw(&["the fox"]).unwrap();
         assert_eq!(vectors[0].len(), 4);
+    }
+
+    const LIFECYCLE_CHILD_ENV: &str = "OTZARIA_TEST_ONNX_LIFECYCLE_CHILD";
+
+    /// No other test may keep an environment or session alive for this one: a fresh
+    /// process must survive failed graph construction and complete backend teardown.
+    #[test]
+    fn backends_reopen_after_failure_and_after_the_last_session_is_dropped() {
+        if !runtime_configured() {
+            return;
+        }
+        let _guard = lock_env();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "with_the_backend::backend_lifecycle_in_a_fresh_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove(ENV_THREADS)
+            .env_remove(ENV_SESSIONS)
+            .env(LIFECYCLE_CHILD_ENV, "1")
+            .output()
+            .expect("the test binary can run itself");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child process failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by backends_reopen_after_failure_and_after_the_last_session_is_dropped"]
+    fn backend_lifecycle_in_a_fresh_process() {
+        use otzaria_semantic_search::semantic::backend::EmbeddingBackend;
+        use otzaria_semantic_search::semantic::onnx_backend::{OnnxBackend, OnnxBackendConfig};
+
+        if std::env::var_os(LIFECYCLE_CHILD_ENV).is_none() {
+            println!("SKIPPED: only meaningful as the child of the test that spawns it");
+            return;
+        }
+        let tuning = OnnxBackendConfig {
+            intra_threads: 2,
+            sessions: 2,
+        };
+        let open = |graph: &Path| {
+            OnnxBackend::open(
+                graph,
+                &fixture("tokenizer.json"),
+                32,
+                Pooling::InGraph,
+                &tuning,
+                None,
+            )
+        };
+        let invalid = TempDir::new("invalid_graph_after_runtime");
+        let invalid_graph = invalid.0.join("invalid.onnx");
+        std::fs::write(&invalid_graph, b"not an ONNX graph").unwrap();
+        assert!(matches!(
+            open(&invalid_graph),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+        // This graph creates a native session successfully, then fails the output-rank
+        // contract. That partially constructed backend must release the session too.
+        assert!(matches!(
+            open(&fixture("token_level.onnx")),
+            Err(EmbeddingError::InvalidModelFile { .. })
+        ));
+
+        let texts = ["[QUERY] the quick brown fox", "[PASSAGE] the lazy dog"];
+        let mut reference = None;
+        for _ in 0..4 {
+            let backend = open(&fixture("dynamic.onnx")).expect("backend can reopen");
+            let actual = backend.embed_batch_raw(&texts).unwrap();
+            if let Some(expected) = &reference {
+                assert_eq!(&actual, expected, "reopening changes no vector");
+            } else {
+                reference = Some(actual.clone());
+            }
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| backend.embed_batch_raw(&texts).unwrap());
+                let second = scope.spawn(|| backend.embed_batch_raw(&texts).unwrap());
+                assert_eq!(first.join().unwrap(), actual);
+                assert_eq!(second.join().unwrap(), actual);
+            });
+            // No session or backend reference survives this explicit drop. Vectors
+            // above own their data and stay usable independently of the runtime.
+            drop(backend);
+            assert_eq!(actual[0].len(), 4);
+        }
+    }
+
+    /// Linux maps a copied DSO separately. The binding silently keeps the first DSO
+    /// passed to init_from; the sidecar must detect that before claiming the second.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_externally_loaded_runtime_is_not_misidentified_as_the_requested_file() {
+        if !runtime_configured() {
+            return;
+        }
+        let copy_dir = TempDir::new("second_runtime");
+        let original = std::fs::canonicalize(std::env::var_os(RUNTIME_ENV).unwrap()).unwrap();
+        let copy = copy_dir.0.join("libonnxruntime.so");
+        std::fs::copy(&original, &copy).unwrap();
+        let _guard = lock_env();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "with_the_backend::an_external_runtime_is_checked_in_a_fresh_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove(ENV_THREADS)
+            .env_remove(ENV_SESSIONS)
+            .env(RUNTIME_ENV, original)
+            .env("OTZARIA_TEST_SECOND_RUNTIME", copy)
+            .output()
+            .expect("the test binary can run itself");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child process failed:\n{stdout}\n{stderr}"
+        );
+        // The child has exited and released its DSO before copy_dir is removed.
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by an_externally_loaded_runtime_is_not_misidentified_as_the_requested_file"]
+    fn an_external_runtime_is_checked_in_a_fresh_process() {
+        use otzaria_semantic_search::semantic::backend::EmbeddingBackend;
+        use otzaria_semantic_search::semantic::onnx_backend::{OnnxBackend, OnnxBackendConfig};
+
+        let Some(copy) = std::env::var_os("OTZARIA_TEST_SECOND_RUNTIME") else {
+            println!("SKIPPED: only meaningful as the child of the test that spawns it");
+            return;
+        };
+        let original = PathBuf::from(std::env::var_os(RUNTIME_ENV).unwrap());
+        let _ = ort::init_from(&original).expect("an external component loads the runtime");
+        let open = |runtime| {
+            OnnxBackend::open(
+                &fixture("dynamic.onnx"),
+                &fixture("tokenizer.json"),
+                32,
+                Pooling::InGraph,
+                &OnnxBackendConfig {
+                    intra_threads: 1,
+                    sessions: 1,
+                },
+                Some(runtime),
+            )
+        };
+        match open(Path::new(&copy)) {
+            Err(EmbeddingError::OnnxRuntimeUnavailable { reason }) => {
+                assert!(
+                    reason.contains("initialized outside this backend"),
+                    "{reason}"
+                );
+            }
+            other => panic!("the requested copy was not selected: {other:?}"),
+        }
+        // The mismatch did not cache the wrong file or create an environment. Correcting
+        // the path to the actual loaded runtime succeeds in this same process.
+        let backend = open(&original).expect("the originally loaded runtime can be used");
+        assert_eq!(backend.embed_batch_raw(&["the fox"]).unwrap()[0].len(), 4);
     }
 
     /// Set by the parent test for its child: the runtime the child passes as the

@@ -285,7 +285,7 @@ load, because pooling in Rust is not implemented in v1.
 
 | crate | requirement | features | why |
 |---|---|---|---|
-| `ort` | `=2.0.0-rc.13` | `std`, `load-dynamic` | the runtime is loaded at run time, never linked |
+| `ort` | `=2.0.0-rc.15` | `std`, `load-dynamic`, `api-17` | owned environment; C API 17; runtime loaded at run time, never linked |
 | `tokenizers` | `=0.23.2` | `fancy-regex` (no defaults) | no C (`onig`) or C++ (`esaxx`) in the build |
 | `libloading` | `0.9` | — | reads the runtime's version, checks it before `ort` does (§3) |
 
@@ -410,7 +410,8 @@ release from GitHub (`onnxruntime-osx-arm64-1.28.0.tgz`, SHA-256
 `1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8`; the Linux x64 tgz is
 `a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407`). It dispatches CPU
 features at run time, so it has no AVX2 requirement. The backend needs ONNX Runtime 1.17
-or newer — `ort`'s API level with no `api-*` feature enabled.
+or newer in the 1.x series, with the C API 17 table available — explicitly selected
+by `api-17`, independently of rc.15's default API 31.
 
 **One per process.** `ort` holds one runtime and can neither unload nor replace it. The
 same library again is a no-op, from whichever place it comes; a different one is refused,
@@ -418,36 +419,93 @@ naming both and where each came from. The load log names the runtime as `ONNX Ru
 1.28.0 (git-branch=HEAD, git-commit-id=da9b5e364c, fp8-kv-cache=1, build type=Release)
 from <path> (<place>)`.
 
-**`ort` is only handed a library it will accept.** `ort` 2.0.0-rc.13 cannot survive
-refusing one: its library slot is a `OnceLock` whose loader runs under
-`Once::call_once_force`, so a load that *fails* still completes the `Once` and leaves the
-slot marked initialized, with nothing in it. Every later `init_from` then "succeeds"
-without loading, and the first `ort` call after that panics — reproduced with `ort`
-alone:
+**Validate before caching the library.** The preflight opens the file with `libloading`,
+checks `OrtGetApiBase`, copies its UTF-8 version string, and requires `GetApi(17)` to
+return a non-null table. A sufficiently new version string alone is not an ABI guarantee:
+`ort::api()` still panics on a null table after the library is cached. A missing file,
+non-runtime file, bad version or unsupported table is instead `OnnxRuntimeUnavailable`;
+no global state has changed, so a corrected runtime can be retried. After `init_from`,
+the selected C API table must also match the one probed from the requested file. The
+public loader does not report that it silently kept an externally loaded library; this
+check refuses that mismatch before creating an environment or recording the wrong path.
+A corrected path to the actual loaded library can still be retried.
 
-```text
-first init_from(not a runtime): Err("failed to load from `…/expected.json`: dlopen failed")
-second init_from(real runtime): Ok(())
-calling ort::info() ...
-panicked at ort-2.0.0-rc.13/src/lib.rs:239:14:
-`OrtGetApiBase` must be present in ONNX Runtime dylib:
-  DlSym { source: "dlsym(0x0, OrtGetApiBase): invalid handle" }
-```
+rc.15 repairs rc.13's failed-`OnceLock` initialization bug. The old permanent `Unusable`
+state is therefore removed: an `init_from` failure is retryable. Once `init_from` succeeds,
+the path is still pinned even if environment creation subsequently fails, since the
+binding cannot unload the library or honor a different one. Environment creation is retried
+on that same runtime; a failed creation never returns a ready result on the next attempt.
+The refused-runtime test runs in a fresh child process, so another test cannot hide a
+poisoned global.
 
-When that first call is `Environment::current()` — as it is for the backend — the panic
-happens while `ort`'s environment lock is held, so every later ONNX load in the process
-panics too. The backend therefore opens the library itself first, with
-`libloading`: it must load, export `OrtGetApiBase`, and report a version `ort`'s own rule
-accepts. A refusal at that point touches nothing of `ort`'s and can be corrected and
-retried; should `ort` still refuse a library the checks passed, that is remembered and
-every later load is refused with the reason and "restart". A test runs the
-refused-then-correct sequence in a fresh child process — the only kind of process that can
-show it — and fails on exactly that panic when `ort` is handed the bad file (verified by
-mutation). This is an upstream bug worth reporting against `ort`.
+**The environment and session lifetimes are separate.** rc.14/rc.15 require an owned
+`Environment` passed to every `Session::builder`. The backend retains one environment
+alongside the process-wide runtime and passes a clone into each session. This is necessary
+with rc.15: its private `CURRENT_ENV` is a `OnceLock<Weak<_>>`, and `build()` refuses a
+second creation even after the previous environment has been dropped. Keeping only a
+backend-local owner would make close-and-reopen fail after the final backend disappears.
+The retained environment contains no model weights and has no global thread pool; the
+bounded session pool, all weights and per-session threads are released with each backend.
+Outputs are copied before returning a session lease. Partial construction drops all sessions
+already built, including errors during graph inspection or the per-session probe.
 
-The first load also commits `ort`'s environment: the runtime's log goes to the `log`
-facade (target `onnxruntime`) at warning and above — a library linked into a Flutter
-application must not write to the host's stderr — and telemetry is off.
+Initialization is serialized under the runtime mutex. Session creation and inference use
+owned clones after the mutex has been released. The custom log callback is kept alive by
+the environment, forwarded to the `log` facade (target `onnxruntime`) at warning and above,
+and telemetry remains off. No process-wide `ort` mutex guard is carried into inference.
+
+A downstream native library must let this backend own initialization of the selected
+`ort` instance. rc.13 could reuse an externally configured global environment; rc.15 has
+no public way to retrieve it. If another component has already built one, this backend
+returns `OnnxRuntimeUnavailable` instead of panicking or silently adopting settings. The
+current `otzaria_search_engine` dependency graph has no other `ort` consumer. Sharing an
+externally owned environment would require an explicit API contract; it is not inferred.
+
+### Binding upgrade: rc.13 to rc.15
+
+The published candidate checked on 2026-11-05 is **rc.15**, not a stable 2.x release.
+[rc.14](https://github.com/pykeio/ort/releases/tag/v2.0.0-rc.14) changed the environment
+API and reduced `Session::run` allocations;
+[rc.15](https://github.com/pykeio/ort/releases/tag/v2.0.0-rc.15) fixes native memory safety
+and ownership bugs. The exact crate and `ort-sys` pins change together. Their Rust MSRV
+moves from 1.88 to **1.92**, enforced by those crates and checked with the locked graph
+in CI. The same job runs the native integration suite on Microsoft's 1.17.0 runtime,
+including fresh-process refusal/retry and full session teardown/reopen. A minimum API
+number alone is not evidence that an older runtime safely tears down. This floor applies
+to desktop builds enabling `onnx-backend`; the optional
+dependency does not raise the floor for non-ONNX/mobile builds. This is a build-toolchain
+change; the shipped ONNX Runtime remains Microsoft's 1.28.0.
+
+The enabled graph stays `std` + `load-dynamic` + `api-17`; no provider, `download-binaries`,
+`copy-dylibs`, or API 18+ feature is enabled. Consequently this upgrade links no new native
+runtime, changes no deployment CPU instruction floor and still permits a runtime supporting
+API 17. The backend id stays `onnxruntime-sentence-v1`, because tokenization, per-text inputs,
+graph optimization, exact int8 products, output selection and normalization are unchanged.
+No persisted index field or OXV format changes and no migration is required.
+
+The `golden-onnx` job also builds `examples/ort_parity.rs` twice: once against the fixed
+rc.13 baseline `7edc614c3746531b21c71ff738162223297831c6`, once against the proposed code.
+Both binaries run on the same CPU and Microsoft 1.28.0 runtime, using the same fixture,
+int8 graph and fp32 graph. Each run uses 25 neutral inputs, a 32-token cap, one session and
+one inference thread. `tools/compare_ort_parity.py` requires identical tokens and ordered
+nearest-five neighbours, identical vector shapes, finite values and maximum absolute
+component error at most `1e-6` for both raw and normalized vectors. The six JSON outputs
+are saved as the `ort-parity` CI artifact for 14 days; no model or tokenizer files are
+uploaded. These are regression checks on a small, fixed corpus, not a claim about retrieval
+quality across the whole library.
+
+The probe reports load time, p50/p95/p99 latency and Rust allocation counts over 100 warm
+queries. They are observations, not timing gates on shared CI runners; native allocations
+are explicitly not measured. The longer 256-token and real-model Python-reference cases
+remain in the existing golden tests.
+
+The fixture parity gate continues to compare exact token ids and embeddings against the
+checked-in Python reference. The new lifecycle regression uses a fresh process: malformed
+graph refusal, refusal after a native session has been created, then repeated two-session
+open/infer/drop/reopen with concurrent inference and bit-identical vectors. The API guard
+rejects an upgrade accidentally requesting an API newer than 17. Real-model golden gates
+and older-CPU emulation remain necessary before release; a tiny fixture is not evidence
+of full-model ranking parity on every supported CPU.
 
 ---
 
@@ -772,8 +830,8 @@ references' ids for both and vectors for the first.
   Linux, macOS and Windows, all green, but against the fixture package; the production
   graph runs here on Linux x64 only (`golden-onnx`). The plugin's real-model job
   (`otzaria_search_engine`) is what runs it on all three.
-- **Report the `ort` rc.13 `OnceLock` bug upstream** (§3); the pre-check stays needed until
-  a fixed release is pinned.
+- **Keep the runtime preflight** (§3): rc.15 fixes the old failed-load `OnceLock` bug, but
+  a version string still does not prove that `GetApi(17)` returns a usable table.
 - **Mobile.** No runtime ships for iOS or Android in v1; the gating keeps both building.
   Shipping one is future work (iOS cannot load code the app did not ship signed).
 - **Rust-side pooling** for token-level graphs is out of scope for v1 and refused.
