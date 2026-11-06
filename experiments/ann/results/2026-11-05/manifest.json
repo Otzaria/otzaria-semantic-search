@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "date_utc": "2026-11-05",
+  "repository": "Otzaria/otzaria-semantic-search",
+  "pull_request": 30,
+  "workflow_run_id": 42083690818,
+  "functional_head": "e5fbae04ed9fa654512f86cf6e1527c9cb818299",
+  "base_head": "7edc614c3746531b21c71ff738162223297831c6",
+  "measured_merge_head": "c5c588ecd1bc293dc6faab7b06f8c7f0a3026835",
+  "measured_binary_sha256": "02c89348d140901d9968b5741cb0e2252b0f985380481c8e4a890333e41b5d65",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "cases": [
+    {
+      "name": "i8-clustered",
+      "artifact": {
+        "id": 13440499848,
+        "name": "ann-observations-i8-clustered",
+        "size_in_bytes": 368852,
+        "url": "https://api.github.com/repos/Otzaria/otzaria-semantic-search/actions/artifacts/13440499848",
+        "archive_download_url": "https://api.github.com/repos/Otzaria/otzaria-semantic-search/actions/artifacts/13440499848/zip",
+        "expired": false,
+        "created_at": "2026-11-05T18:24:56Z",
+        "expires_at": "2026-11-19T18:24:55Z",
+        "updated_at": "2026-11-05T18:24:56Z",
+        "digest": "sha256:58b7ce609c9bfcc2b25256af8ff2a502ce74efbadf47910b1ea27332a004fb93",
+        "workflow_run": {
+          "id": 42083690818,
+          "repository_id": 1312256058,
+          "head_repository_id": 1312256058,
+          "head_branch": "palmoni5/ann-benchmark-20261105",
+          "head_sha": "e5fbae04ed9fa654512f86cf6e1527c9cb818299"
+        }
+      },
+      "summary": {
+        "file": "i8-clustered-summary.json",
+        "bytes": 121884,
+        "sha256": "55a5f51072cb44ddf6c48c1b0c33f1520f93dfefafc8ff423ce9ba3fbf3a23f4"
+      },
+      "raw": {
+        "file": "i8-clustered-raw.json.gz",
+        "bytes": 147663,
+        "sha256": "f9e248d7781eb84c0cf01a5e14eb354014524794910c1097d0cc717882272ee5",
+        "uncompressed_bytes": 835570,
+        "uncompressed_sha256": "0cc0c77436e6bddd8042c0ee741ddee44212379137f9dda11e7bfc5912fc4fb9",
+        "gzip_mtime": 0,
+        "original_json_files": 51
+      }
+    },
+    {
+      "name": "i8-uniform",
+      "artifact": {
+        "id": 13441957570,
+        "name": "ann-observations-i8-uniform",
+        "size_in_bytes": 375194,
+        "url": "https://api.github.com/repos/Otzaria/otzaria-semantic-search/actions/artifacts/13441957570",
+        "archive_download_url": "https://api.github.com/repos/Otzaria/otzaria-semantic-search/actions/artifacts/13441957570/zip",
+        "expired": false,
+        "created_at": "2026-11-05T18:25:06Z",
+        "expires_at": "2026-11-19T18:25:05Z",
+        "updated_at": "2026-11-05T18:25:06Z",
+        "digest": "sha256:86f68493068892bf169d3943519b744ac68212476c3825ef842a65472794367b",
+        "workflow_run": {
+          "id": 42083690818,
+          "repository_id": 1312256058,
+          "head_repository_id": 1312256058,
+          "head_branch": "palmoni5/ann-benchmark-20261105",
+          "head_sha": "e5fbae04ed9fa654512f86cf6e1527c9cb818299"
+        }
+      },
+      "summary": {
+        "file": "i8-uniform-summary.json",
+        "bytes": 122075,
+        "sha256": "a3bfcff42419d3a81c0fe87214703848d476a124813796bb87a137c0d3e58463"
+      },
+      "raw": {
+        "file": "i8-uniform-raw.json.gz",
+        "bytes": 179232,
+        "sha256": "e74628e93ffb8c74e41b0844987bcc471df33ff58dc736311fbe9acc2fdac3ca",
+        "uncompressed_bytes": 848827,
+        "uncompressed_sha256": "c9bcedb57fa053bb568d5eb3b4d31fc2d3f9e646a86b43ebffad409de682670f",
+        "gzip_mtime": 0,
+        "original_json_files": 51
+      }
+    },
+    {
+      "name": "rot192-clustered",
+      "artifact": {
+        "id": 13442615130,
+        "name": "ann-observations-rot192-clustered",
+        "size_in_bytes": 369484,
+        "url": "https://api.github.com/repos/Otzaria/otzaria-semantic-search/actions/artifacts/13442615130",
+        "archive_download_url": "https://api.github.com/repos/Otzaria/otzaria-semantic-search/actions/artifacts/13442615130/zip",
+        "expired": false,
+        "created_at": "2026-11-05T18:25:26Z",
+        "expires_at": "2026-11-19T18:25:24Z",
+        "updated_at": "2026-11-05T18:25:26Z",
+        "digest": "sha256:28dbfc60c3405d62fa103345b621192e1b8ba869e27c2282cae5fe43ab89191e",
+        "workflow_run": {
+          "id": 42083690818,
+          "repository_id": 1312256058,
+          "head_repository_id": 1312256058,
+          "head_branch": "palmoni5/ann-benchmark-20261105",
+          "head_sha": "e5fbae04ed9fa654512f86cf6e1527c9cb818299"
+        }
+      },
+      "summary": {
+        "file": "rot192-clustered-summary.json",
+        "bytes": 121712,
+        "sha256": "26a06c6077f13045b0ad144b70e36dde1e50fa146edf12527fa7caaab11122f0"
+      },
+      "raw": {
+        "file": "rot192-clustered-raw.json.gz",
+        "bytes": 152143,
+        "sha256": "ae7ff35d2f92c931d66fa60ff09c022fb057267e526e715b17e883c58eae04d7",
+        "uncompressed_bytes": 831656,
+        "uncompressed_sha256": "3fde7b090aa7ea7b02dfddf78d87173edd15f5e1dff492aaa641f9b931a41994",
+        "gzip_mtime": 0,
+        "original_json_files": 51
+      }
+    }
+  ],
+  "previous_run": {
+    "run_id": 42082151278,
+    "functional_head": "2c8f92478d764c50fb389ae9a7fddfc6e5c429ba",
+    "reason_excluded_from_results": "rot192 fixture failed because a fitted codec was sent through the production named-codec parser; corrected and all three fixtures rerun."
+  }
+}
