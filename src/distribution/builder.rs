@@ -1279,10 +1279,9 @@ mod tests {
         // `embedding_text_version` lives in both the configuration and the identity, so
         // moving it alone means moving both — the disagreement between them is its own
         // rejection, tested separately in `recipe`.
-        // Version 2 of the text recipe exists — the role prefixes — so 3 is the first one
-        // nothing implements.
+        // Version 3 adds Pardes role text, so version 4 is the first unsupported one.
         let text_chunking = ChunkerConfig {
-            embedding_text_version: 3,
+            embedding_text_version: 4,
             ..ChunkerConfig::default()
         };
         let cases: [(&str, ChunkerConfig, ModelIdentity, u32, &str); 3] = [
@@ -1290,31 +1289,31 @@ mod tests {
                 "embedding_text_version",
                 text_chunking.clone(),
                 ModelIdentity {
-                    embedding_text_version: 3,
+                    embedding_text_version: 4,
                     chunking_identity: text_chunking.identity(),
                     ..truthful.clone()
                 },
-                3,
-                "1, 2",
+                4,
+                "1, 2, 3",
             ),
             (
                 // Carried in both places, like the text version above, so both move.
                 "normalization_version",
                 ChunkerConfig {
-                    normalization_version: 2,
+                    normalization_version: 3,
                     ..ChunkerConfig::default()
                 },
                 ModelIdentity {
-                    normalization_version: 2,
+                    normalization_version: 3,
                     chunking_identity: ChunkerConfig {
-                        normalization_version: 2,
+                        normalization_version: 3,
                         ..ChunkerConfig::default()
                     }
                     .identity(),
                     ..truthful.clone()
                 },
-                2,
-                "1",
+                3,
+                "1, 2",
             ),
             (
                 // Only the configuration carries this one — the artifact carries the hash
