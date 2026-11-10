@@ -1,0 +1,3926 @@
+{
+  "schema": 1,
+  "artifact_id": 13441957570,
+  "default": {
+    "schema": 1,
+    "purpose": "synthetic ANN feasibility experiment; not production qualification",
+    "environment": {
+      "utc": "2026-11-05T18:24:46.862841+00:00",
+      "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
+      "machine": "x86_64",
+      "cpu_model": "AMD EPYC 7763 64-Core Processor",
+      "logical_cpus": 4,
+      "affinity_cpus": 4,
+      "cgroup_cpu_max": null,
+      "cgroup_memory_max": null,
+      "loadavg": "1.63 0.50 0.17 1/253 2627",
+      "base_git_revision": "c5c588ecd1bc293dc6faab7b06f8c7f0a3026835",
+      "worktree_dirty": false,
+      "experiment_source_sha256": {
+        "Cargo.toml": "d93d29786bb2e9449f9bc115871fef6c5c90e18b73f8568e8d1f38646b65cf5f",
+        "Cargo.lock": "995a52a216b8be59a7d6342750c1638fd395247da3c0b381a6fa26ed5274748c",
+        "run.py": "30939cd7c2f15928cdb8bdb1fd0fefbca5a77744f2ecac5fb47e19b220aaa15c",
+        "src/data.rs": "39e93200752af13a5c6eb380766579612e8248edf5c699fc9d735bf8f7514be7",
+        "src/lifecycle.rs": "154bdf5812cdc5de5b41ffa73ea39ac692721cc44444cf650eb8f50bef467728",
+        "src/main.rs": "0341df6b75050593b8fa4e2c87a86ebf3137cf2b4ebac9df212f78b883475105",
+        "src/measure.rs": "aed0ba4abbf49629302e5007df3411f04dd3f42ee61a6e77ccbaf2b08d0c3830"
+      },
+      "measured_binary_sha256": "02c89348d140901d9968b5741cb0e2252b0f985380481c8e4a890333e41b5d65",
+      "measured_binary_bytes": 27527768
+    },
+    "environment_end": {
+      "loadavg": "1.49 0.52 0.19 3/268 4523"
+    },
+    "build": {
+      "ann_build_ms": 8863.732246,
+      "ann_bytes": 23453068,
+      "ann_hardware_acceleration": "serial",
+      "ann_memory_usage_bytes": 33715136,
+      "calibration_ms": 7.951214,
+      "config": {
+        "codec": "i8-sym-vec",
+        "connectivity": 16,
+        "dim": 256,
+        "distribution": "uniform",
+        "expansion_add": 128,
+        "queries": 50,
+        "schema": 1,
+        "seed": 11068670087429,
+        "top_k": 10,
+        "vectors": 20000
+      },
+      "decoded_bytes": 20893696,
+      "memory": {
+        "anon_bytes": 30654464,
+        "file_bytes": 11317248,
+        "major_faults": 0,
+        "minor_faults": 9869,
+        "peak_rss_bytes": 41971712,
+        "rss_bytes": 41971712,
+        "virtual_bytes": 55259136
+      },
+      "oxv_build_and_install_ms": 69.110508,
+      "oxv_bytes": 5613696,
+      "raw_bytes": 20893696,
+      "schema": 1,
+      "usearch_features": [],
+      "usearch_version": "2.26.6"
+    },
+    "measurements": [
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "raw",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 1137.182,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 26132480,
+          "major_faults": 0,
+          "minor_faults": 202,
+          "peak_rss_bytes": 26492928,
+          "rss_bytes": 26492928,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7335936,
+          "major_faults": 0,
+          "minor_faults": 187,
+          "peak_rss_bytes": 7692288,
+          "rss_bytes": 7692288,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 454656,
+          "file_bytes": 26132480,
+          "major_faults": 0,
+          "minor_faults": 225,
+          "peak_rss_bytes": 26587136,
+          "rss_bytes": 26587136,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4780032,
+          "major_faults": 0,
+          "minor_faults": 171,
+          "peak_rss_bytes": 5111808,
+          "rss_bytes": 5111808,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 77.736,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 769.9259999999999,
+          "min": 693.3539999999999,
+          "n": 100,
+          "p50": 707.8810000000001,
+          "p95": 727.137,
+          "p99": 743.919
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "0354b72aa960e8e5f6b6024e2841b1301526d1df49b31cf161db4a987f5de3ee",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "decoded",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 1156.0069999999998,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 25968640,
+          "major_faults": 0,
+          "minor_faults": 199,
+          "peak_rss_bytes": 26329088,
+          "rss_bytes": 26329088,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7106560,
+          "major_faults": 0,
+          "minor_faults": 183,
+          "peak_rss_bytes": 7462912,
+          "rss_bytes": 7462912,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 454656,
+          "file_bytes": 25968640,
+          "major_faults": 0,
+          "minor_faults": 222,
+          "peak_rss_bytes": 26423296,
+          "rss_bytes": 26423296,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4763648,
+          "major_faults": 0,
+          "minor_faults": 170,
+          "peak_rss_bytes": 5095424,
+          "rss_bytes": 5095424,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 95.418,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 826.101,
+          "min": 695.698,
+          "n": 100,
+          "p50": 710.646,
+          "p95": 731.926,
+          "p99": 795.345
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 337.93,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 10686464,
+          "major_faults": 0,
+          "minor_faults": 192,
+          "peak_rss_bytes": 11051008,
+          "rss_bytes": 11051008,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7102464,
+          "major_faults": 0,
+          "minor_faults": 184,
+          "peak_rss_bytes": 7462912,
+          "rss_bytes": 7462912,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 10686464,
+          "major_faults": 0,
+          "minor_faults": 215,
+          "peak_rss_bytes": 11145216,
+          "rss_bytes": 11145216,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4759552,
+          "major_faults": 0,
+          "minor_faults": 171,
+          "peak_rss_bytes": 5095424,
+          "rss_bytes": 5095424,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 69.20899999999999,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 251.98000000000002,
+          "min": 211.07299999999998,
+          "n": 100,
+          "p50": 215.041,
+          "p95": 235.289,
+          "p99": 242.072
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 358.81,
+        "memory_after_first": {
+          "anon_bytes": 397312,
+          "file_bytes": 10727424,
+          "major_faults": 0,
+          "minor_faults": 203,
+          "peak_rss_bytes": 11124736,
+          "rss_bytes": 11124736,
+          "virtual_bytes": 156094464
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7028736,
+          "major_faults": 0,
+          "minor_faults": 185,
+          "peak_rss_bytes": 7385088,
+          "rss_bytes": 7385088,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 507904,
+          "file_bytes": 10727424,
+          "major_faults": 0,
+          "minor_faults": 230,
+          "peak_rss_bytes": 11235328,
+          "rss_bytes": 11235328,
+          "virtual_bytes": 223338496
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4657152,
+          "major_faults": 0,
+          "minor_faults": 172,
+          "peak_rss_bytes": 4988928,
+          "rss_bytes": 4988928,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 85.42,
+        "oxv_effective_threads": 4,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 4,
+        "warm_us": {
+          "max": 337.399,
+          "min": 190.366,
+          "n": 100,
+          "p50": 202.398,
+          "p95": 234.578,
+          "p99": 288.618
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 349.502,
+        "memory_after_first": {
+          "anon_bytes": 413696,
+          "file_bytes": 11042816,
+          "major_faults": 0,
+          "minor_faults": 211,
+          "peak_rss_bytes": 11456512,
+          "rss_bytes": 11456512,
+          "virtual_bytes": 225304576
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7340032,
+          "major_faults": 0,
+          "minor_faults": 189,
+          "peak_rss_bytes": 7700480,
+          "rss_bytes": 7700480,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 532480,
+          "file_bytes": 11042816,
+          "major_faults": 0,
+          "minor_faults": 239,
+          "peak_rss_bytes": 11575296,
+          "rss_bytes": 11575296,
+          "virtual_bytes": 292548608
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4837376,
+          "major_faults": 0,
+          "minor_faults": 174,
+          "peak_rss_bytes": 5173248,
+          "rss_bytes": 5173248,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 68.608,
+        "oxv_effective_threads": 5,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 8,
+        "warm_us": {
+          "max": 370.321,
+          "min": 242.623,
+          "n": 100,
+          "p50": 256.128,
+          "p95": 288.568,
+          "p99": 316.417
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 32,
+        "filter": "all",
+        "first_query_us": 256.118,
+        "memory_after_first": {
+          "anon_bytes": 25767936,
+          "file_bytes": 5447680,
+          "major_faults": 0,
+          "minor_faults": 6431,
+          "peak_rss_bytes": 31215616,
+          "rss_bytes": 31215616,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_open": {
+          "anon_bytes": 25767936,
+          "file_bytes": 5447680,
+          "major_faults": 0,
+          "minor_faults": 6431,
+          "peak_rss_bytes": 31215616,
+          "rss_bytes": 31215616,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_warm": {
+          "anon_bytes": 25870336,
+          "file_bytes": 5447680,
+          "major_faults": 0,
+          "minor_faults": 6458,
+          "peak_rss_bytes": 31318016,
+          "rss_bytes": 31318016,
+          "virtual_bytes": 44654592
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4816896,
+          "major_faults": 0,
+          "minor_faults": 174,
+          "peak_rss_bytes": 5152768,
+          "rss_bytes": 5152768,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 18718.255999999998,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 209.29100000000003,
+          "min": 89.737,
+          "n": 100,
+          "p50": 113.75200000000001,
+          "p95": 168.614,
+          "p99": 203.279
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "a80fc516133f3cfbacea098e7e1f435c68266329b78d3947d792f679de881f57",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.182,
+          "min": 0.0,
+          "full_recall_queries": 0
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.18400000000000002,
+          "min": 0.0,
+          "full_recall_queries": 0
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.18400000000000002,
+          "min": 0.0,
+          "full_recall_queries": 0
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 641.497,
+        "memory_after_first": {
+          "anon_bytes": 25763840,
+          "file_bytes": 5357568,
+          "major_faults": 0,
+          "minor_faults": 6430,
+          "peak_rss_bytes": 31121408,
+          "rss_bytes": 31121408,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_open": {
+          "anon_bytes": 25763840,
+          "file_bytes": 5357568,
+          "major_faults": 0,
+          "minor_faults": 6430,
+          "peak_rss_bytes": 31121408,
+          "rss_bytes": 31121408,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_warm": {
+          "anon_bytes": 25952256,
+          "file_bytes": 5357568,
+          "major_faults": 0,
+          "minor_faults": 6478,
+          "peak_rss_bytes": 31309824,
+          "rss_bytes": 31309824,
+          "virtual_bytes": 44654592
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4726784,
+          "major_faults": 0,
+          "minor_faults": 174,
+          "peak_rss_bytes": 5062656,
+          "rss_bytes": 5062656,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 18493.493,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 447.89599999999996,
+          "min": 323.56399999999996,
+          "n": 100,
+          "p50": 363.268,
+          "p95": 414.865,
+          "p99": 438.168
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "123d7cd92dcfcf4b43a3a6d8d933c159d18050006c69c16359b1c00ebf167332",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.47,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 512,
+        "filter": "all",
+        "first_query_us": 2028.5759999999998,
+        "memory_after_first": {
+          "anon_bytes": 25866240,
+          "file_bytes": 5341184,
+          "major_faults": 0,
+          "minor_faults": 6454,
+          "peak_rss_bytes": 31207424,
+          "rss_bytes": 31207424,
+          "virtual_bytes": 44679168
+        },
+        "memory_after_open": {
+          "anon_bytes": 25763840,
+          "file_bytes": 5341184,
+          "major_faults": 0,
+          "minor_faults": 6429,
+          "peak_rss_bytes": 31105024,
+          "rss_bytes": 31105024,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_warm": {
+          "anon_bytes": 26169344,
+          "file_bytes": 5341184,
+          "major_faults": 0,
+          "minor_faults": 6530,
+          "peak_rss_bytes": 31510528,
+          "rss_bytes": 31510528,
+          "virtual_bytes": 44883968
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4710400,
+          "major_faults": 0,
+          "minor_faults": 171,
+          "peak_rss_bytes": 5042176,
+          "rss_bytes": 5042176,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 18681.082000000002,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 1382.76,
+          "min": 1189.951,
+          "n": 100,
+          "p50": 1222.512,
+          "p95": 1282.2930000000001,
+          "p99": 1338.909
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "c4f2d72cdc1d62116e355537c63c3f4bced295541a15c1c20f21599d00db8336",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.888,
+          "min": 0.6,
+          "full_recall_queries": 17
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.888,
+          "min": 0.6,
+          "full_recall_queries": 17
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.888,
+          "min": 0.6,
+          "full_recall_queries": 17
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 32,
+        "filter": "all",
+        "first_query_us": 1431.06,
+        "memory_after_first": {
+          "anon_bytes": 1302528,
+          "file_bytes": 28172288,
+          "major_faults": 0,
+          "minor_faults": 844,
+          "peak_rss_bytes": 29474816,
+          "rss_bytes": 29474816,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_open": {
+          "anon_bytes": 1302528,
+          "file_bytes": 8577024,
+          "major_faults": 0,
+          "minor_faults": 545,
+          "peak_rss_bytes": 9879552,
+          "rss_bytes": 9879552,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_warm": {
+          "anon_bytes": 1445888,
+          "file_bytes": 28958720,
+          "major_faults": 0,
+          "minor_faults": 894,
+          "peak_rss_bytes": 30404608,
+          "rss_bytes": 30404608,
+          "virtual_bytes": 34570240
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4808704,
+          "major_faults": 0,
+          "minor_faults": 173,
+          "peak_rss_bytes": 5144576,
+          "rss_bytes": 5144576,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 1376.3790000000001,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 231.06099999999998,
+          "min": 87.35300000000001,
+          "n": 100,
+          "p50": 112.53,
+          "p95": 171.32,
+          "p99": 204.691
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "a80fc516133f3cfbacea098e7e1f435c68266329b78d3947d792f679de881f57",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.182,
+          "min": 0.0,
+          "full_recall_queries": 0
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.18400000000000002,
+          "min": 0.0,
+          "full_recall_queries": 0
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.18400000000000002,
+          "min": 0.0,
+          "full_recall_queries": 0
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 1678.221,
+        "memory_after_first": {
+          "anon_bytes": 1347584,
+          "file_bytes": 28954624,
+          "major_faults": 0,
+          "minor_faults": 868,
+          "peak_rss_bytes": 30302208,
+          "rss_bytes": 30302208,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_open": {
+          "anon_bytes": 1298432,
+          "file_bytes": 8572928,
+          "major_faults": 0,
+          "minor_faults": 545,
+          "peak_rss_bytes": 9871360,
+          "rss_bytes": 9871360,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_warm": {
+          "anon_bytes": 1527808,
+          "file_bytes": 28954624,
+          "major_faults": 0,
+          "minor_faults": 914,
+          "peak_rss_bytes": 30482432,
+          "rss_bytes": 30482432,
+          "virtual_bytes": 34582528
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4870144,
+          "major_faults": 0,
+          "minor_faults": 173,
+          "peak_rss_bytes": 5201920,
+          "rss_bytes": 5201920,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 1330.663,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 459.007,
+          "min": 336.047,
+          "n": 100,
+          "p50": 369.9,
+          "p95": 424.141,
+          "p99": 447.04400000000004
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "123d7cd92dcfcf4b43a3a6d8d933c159d18050006c69c16359b1c00ebf167332",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.47,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 512,
+        "filter": "all",
+        "first_query_us": 2846.933,
+        "memory_after_first": {
+          "anon_bytes": 1441792,
+          "file_bytes": 28934144,
+          "major_faults": 0,
+          "minor_faults": 891,
+          "peak_rss_bytes": 30375936,
+          "rss_bytes": 30375936,
+          "virtual_bytes": 34566144
+        },
+        "memory_after_open": {
+          "anon_bytes": 1302528,
+          "file_bytes": 8552448,
+          "major_faults": 0,
+          "minor_faults": 546,
+          "peak_rss_bytes": 9854976,
+          "rss_bytes": 9854976,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_warm": {
+          "anon_bytes": 1765376,
+          "file_bytes": 28934144,
+          "major_faults": 0,
+          "minor_faults": 972,
+          "peak_rss_bytes": 30699520,
+          "rss_bytes": 30699520,
+          "virtual_bytes": 34885632
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4849664,
+          "major_faults": 0,
+          "minor_faults": 174,
+          "peak_rss_bytes": 5185536,
+          "rss_bytes": 5185536,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 1271.423,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 1428.776,
+          "min": 1206.1109999999999,
+          "n": 100,
+          "p50": 1244.413,
+          "p95": 1304.4750000000001,
+          "p99": 1360.118
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "c4f2d72cdc1d62116e355537c63c3f4bced295541a15c1c20f21599d00db8336",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.888,
+          "min": 0.6,
+          "full_recall_queries": 17
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.888,
+          "min": 0.6,
+          "full_recall_queries": 17
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.888,
+          "min": 0.6,
+          "full_recall_queries": 17
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "raw",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 136.715,
+        "memory_after_first": {
+          "anon_bytes": 356352,
+          "file_bytes": 15671296,
+          "major_faults": 0,
+          "minor_faults": 193,
+          "peak_rss_bytes": 16027648,
+          "rss_bytes": 16027648,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 352256,
+          "file_bytes": 7122944,
+          "major_faults": 0,
+          "minor_faults": 186,
+          "peak_rss_bytes": 7475200,
+          "rss_bytes": 7475200,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 15671296,
+          "major_faults": 0,
+          "minor_faults": 217,
+          "peak_rss_bytes": 16130048,
+          "rss_bytes": 16130048,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4653056,
+          "major_faults": 0,
+          "minor_faults": 175,
+          "peak_rss_bytes": 4993024,
+          "rss_bytes": 4993024,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 58.91,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 71.483,
+          "min": 44.132,
+          "n": 100,
+          "p50": 45.656,
+          "p95": 56.925999999999995,
+          "p99": 67.396
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "c5d8ae70b21cc8eecba86edad4de7eeca8337c0d07a877a95255dfd0d24aa753",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "decoded",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 73.898,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 15724544,
+          "major_faults": 0,
+          "minor_faults": 195,
+          "peak_rss_bytes": 16089088,
+          "rss_bytes": 16089088,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7335936,
+          "major_faults": 0,
+          "minor_faults": 189,
+          "peak_rss_bytes": 7696384,
+          "rss_bytes": 7696384,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 15724544,
+          "major_faults": 0,
+          "minor_faults": 218,
+          "peak_rss_bytes": 16187392,
+          "rss_bytes": 16187392,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4780032,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5124096,
+          "rss_bytes": 5124096,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 52.929,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 62.01499999999999,
+          "min": 43.672,
+          "n": 100,
+          "p50": 45.054,
+          "p95": 48.741,
+          "p99": 59.691
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "826f1ecfa02cf79080042b9315cf108ec0cd5ac552ebbd0f438be09a9e440119",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.992,
+          "min": 0.9,
+          "full_recall_queries": 46
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 45.964999999999996,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 10596352,
+          "major_faults": 0,
+          "minor_faults": 195,
+          "peak_rss_bytes": 10960896,
+          "rss_bytes": 10960896,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7340032,
+          "major_faults": 0,
+          "minor_faults": 189,
+          "peak_rss_bytes": 7700480,
+          "rss_bytes": 7700480,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 10596352,
+          "major_faults": 0,
+          "minor_faults": 218,
+          "peak_rss_bytes": 11059200,
+          "rss_bytes": 11059200,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4784128,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5128192,
+          "rss_bytes": 5128192,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 52.007,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 34.144,
+          "min": 19.196,
+          "n": 100,
+          "p50": 20.328,
+          "p95": 22.732,
+          "p99": 30.146
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "826f1ecfa02cf79080042b9315cf108ec0cd5ac552ebbd0f438be09a9e440119",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.992,
+          "min": 0.9,
+          "full_recall_queries": 46
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 40.035,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 10502144,
+          "major_faults": 0,
+          "minor_faults": 194,
+          "peak_rss_bytes": 10862592,
+          "rss_bytes": 10862592,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7086080,
+          "major_faults": 0,
+          "minor_faults": 187,
+          "peak_rss_bytes": 7442432,
+          "rss_bytes": 7442432,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 10502144,
+          "major_faults": 0,
+          "minor_faults": 217,
+          "peak_rss_bytes": 10960896,
+          "rss_bytes": 10960896,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4710400,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5054464,
+          "rss_bytes": 5054464,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 47.469,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 4,
+        "warm_us": {
+          "max": 53.83,
+          "min": 19.136000000000003,
+          "n": 100,
+          "p50": 20.018,
+          "p95": 21.591,
+          "p99": 46.988
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "826f1ecfa02cf79080042b9315cf108ec0cd5ac552ebbd0f438be09a9e440119",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.992,
+          "min": 0.9,
+          "full_recall_queries": 46
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 37.129999999999995,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 10592256,
+          "major_faults": 0,
+          "minor_faults": 194,
+          "peak_rss_bytes": 10952704,
+          "rss_bytes": 10952704,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7335936,
+          "major_faults": 0,
+          "minor_faults": 188,
+          "peak_rss_bytes": 7692288,
+          "rss_bytes": 7692288,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 10592256,
+          "major_faults": 0,
+          "minor_faults": 217,
+          "peak_rss_bytes": 11051008,
+          "rss_bytes": 11051008,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4780032,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5120000,
+          "rss_bytes": 5120000,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 52.488,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 8,
+        "warm_us": {
+          "max": 35.596000000000004,
+          "min": 19.225,
+          "n": 100,
+          "p50": 20.278000000000002,
+          "p95": 22.201,
+          "p99": 30.707000000000004
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "826f1ecfa02cf79080042b9315cf108ec0cd5ac552ebbd0f438be09a9e440119",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.992,
+          "min": 0.9,
+          "full_recall_queries": 46
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 32,
+        "filter": "5pct",
+        "first_query_us": 1774.111,
+        "memory_after_first": {
+          "anon_bytes": 25870336,
+          "file_bytes": 5394432,
+          "major_faults": 0,
+          "minor_faults": 6458,
+          "peak_rss_bytes": 31264768,
+          "rss_bytes": 31264768,
+          "virtual_bytes": 44687360
+        },
+        "memory_after_open": {
+          "anon_bytes": 25772032,
+          "file_bytes": 5394432,
+          "major_faults": 0,
+          "minor_faults": 6434,
+          "peak_rss_bytes": 31166464,
+          "rss_bytes": 31166464,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 26529792,
+          "file_bytes": 5394432,
+          "major_faults": 0,
+          "minor_faults": 6619,
+          "peak_rss_bytes": 31924224,
+          "rss_bytes": 31924224,
+          "virtual_bytes": 45342720
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4763648,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5103616,
+          "rss_bytes": 5103616,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 18577.006999999998,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 2095.069,
+          "min": 968.908,
+          "n": 100,
+          "p50": 1349.6779999999999,
+          "p95": 1722.5140000000001,
+          "p99": 2024.348
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "1e1efbd1505a370019e4c815e828fc0c25c275f1c7f0a09a73a0d375d0f44607",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.858,
+          "min": 0.6,
+          "full_recall_queries": 12
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.862,
+          "min": 0.6,
+          "full_recall_queries": 13
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.862,
+          "min": 0.6,
+          "full_recall_queries": 13
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 3957.5060000000003,
+        "memory_after_first": {
+          "anon_bytes": 26001408,
+          "file_bytes": 5353472,
+          "major_faults": 0,
+          "minor_faults": 6490,
+          "peak_rss_bytes": 31354880,
+          "rss_bytes": 31354880,
+          "virtual_bytes": 44687360
+        },
+        "memory_after_open": {
+          "anon_bytes": 25772032,
+          "file_bytes": 5353472,
+          "major_faults": 0,
+          "minor_faults": 6434,
+          "peak_rss_bytes": 31125504,
+          "rss_bytes": 31125504,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 26632192,
+          "file_bytes": 5353472,
+          "major_faults": 0,
+          "minor_faults": 6644,
+          "peak_rss_bytes": 31985664,
+          "rss_bytes": 31985664,
+          "virtual_bytes": 45506560
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4722688,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5062656,
+          "rss_bytes": 5062656,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 18865.126,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 4410.881,
+          "min": 2512.2690000000002,
+          "n": 100,
+          "p50": 2762.6059999999998,
+          "p95": 3318.643,
+          "p99": 4019.732
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "52e937421539181c39c33505ae123e3da566393478bbec54ae8fbc6e04d4741d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.99,
+          "min": 0.9,
+          "full_recall_queries": 45
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 512,
+        "filter": "5pct",
+        "first_query_us": 6282.3949999999995,
+        "memory_after_first": {
+          "anon_bytes": 26439680,
+          "file_bytes": 5472256,
+          "major_faults": 0,
+          "minor_faults": 6597,
+          "peak_rss_bytes": 31911936,
+          "rss_bytes": 31911936,
+          "virtual_bytes": 45150208
+        },
+        "memory_after_open": {
+          "anon_bytes": 25776128,
+          "file_bytes": 5472256,
+          "major_faults": 0,
+          "minor_faults": 6435,
+          "peak_rss_bytes": 31248384,
+          "rss_bytes": 31248384,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 27652096,
+          "file_bytes": 5472256,
+          "major_faults": 0,
+          "minor_faults": 6893,
+          "peak_rss_bytes": 33124352,
+          "rss_bytes": 33124352,
+          "virtual_bytes": 46407680
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4841472,
+          "major_faults": 0,
+          "minor_faults": 178,
+          "peak_rss_bytes": 5185536,
+          "rss_bytes": 5185536,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 18670.231,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 6215.94,
+          "min": 4512.692,
+          "n": 100,
+          "p50": 4745.366,
+          "p95": 5399.517000000001,
+          "p99": 6214.487999999999
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "826f1ecfa02cf79080042b9315cf108ec0cd5ac552ebbd0f438be09a9e440119",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.992,
+          "min": 0.9,
+          "full_recall_queries": 46
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 32,
+        "filter": "5pct",
+        "first_query_us": 3382.1820000000002,
+        "memory_after_first": {
+          "anon_bytes": 1437696,
+          "file_bytes": 28942336,
+          "major_faults": 0,
+          "minor_faults": 892,
+          "peak_rss_bytes": 30380032,
+          "rss_bytes": 30380032,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_open": {
+          "anon_bytes": 1310720,
+          "file_bytes": 8560640,
+          "major_faults": 0,
+          "minor_faults": 550,
+          "peak_rss_bytes": 9871360,
+          "rss_bytes": 9871360,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 2117632,
+          "file_bytes": 28942336,
+          "major_faults": 0,
+          "minor_faults": 1058,
+          "peak_rss_bytes": 31059968,
+          "rss_bytes": 31059968,
+          "virtual_bytes": 35237888
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4837376,
+          "major_faults": 0,
+          "minor_faults": 178,
+          "peak_rss_bytes": 5181440,
+          "rss_bytes": 5181440,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 1503.896,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 1754.5449999999998,
+          "min": 992.6920000000001,
+          "n": 100,
+          "p50": 1336.303,
+          "p95": 1604.6750000000002,
+          "p99": 1692.2079999999999
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "1e1efbd1505a370019e4c815e828fc0c25c275f1c7f0a09a73a0d375d0f44607",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.858,
+          "min": 0.6,
+          "full_recall_queries": 12
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.862,
+          "min": 0.6,
+          "full_recall_queries": 13
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.862,
+          "min": 0.6,
+          "full_recall_queries": 13
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 128,
+        "filter": "5pct",
+        "first_query_us": 5013.356,
+        "memory_after_first": {
+          "anon_bytes": 1630208,
+          "file_bytes": 28868608,
+          "major_faults": 0,
+          "minor_faults": 939,
+          "peak_rss_bytes": 30498816,
+          "rss_bytes": 30498816,
+          "virtual_bytes": 34779136
+        },
+        "memory_after_open": {
+          "anon_bytes": 1310720,
+          "file_bytes": 8486912,
+          "major_faults": 0,
+          "minor_faults": 550,
+          "peak_rss_bytes": 9797632,
+          "rss_bytes": 9797632,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 2269184,
+          "file_bytes": 28868608,
+          "major_faults": 0,
+          "minor_faults": 1095,
+          "peak_rss_bytes": 31137792,
+          "rss_bytes": 31137792,
+          "virtual_bytes": 35434496
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4784128,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5124096,
+          "rss_bytes": 5124096,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 1345.7810000000002,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 3481.698,
+          "min": 2486.32,
+          "n": 100,
+          "p50": 2828.108,
+          "p95": 3220.79,
+          "p99": 3293.266
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "52e937421539181c39c33505ae123e3da566393478bbec54ae8fbc6e04d4741d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.99,
+          "min": 0.9,
+          "full_recall_queries": 45
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 1000,
+        "expansion_search": 512,
+        "filter": "5pct",
+        "first_query_us": 7335.119000000001,
+        "memory_after_first": {
+          "anon_bytes": 1900544,
+          "file_bytes": 28676096,
+          "major_faults": 0,
+          "minor_faults": 1005,
+          "peak_rss_bytes": 30576640,
+          "rss_bytes": 30576640,
+          "virtual_bytes": 35053568
+        },
+        "memory_after_open": {
+          "anon_bytes": 1306624,
+          "file_bytes": 8294400,
+          "major_faults": 0,
+          "minor_faults": 549,
+          "peak_rss_bytes": 9601024,
+          "rss_bytes": 9601024,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 3104768,
+          "file_bytes": 28676096,
+          "major_faults": 0,
+          "minor_faults": 1299,
+          "peak_rss_bytes": 31780864,
+          "rss_bytes": 31780864,
+          "virtual_bytes": 36311040
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4591616,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 4931584,
+          "rss_bytes": 4931584,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 1273.927,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 5499.974,
+          "min": 4448.171,
+          "n": 100,
+          "p50": 4614.662,
+          "p95": 5204.142,
+          "p99": 5319.317
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "826f1ecfa02cf79080042b9315cf108ec0cd5ac552ebbd0f438be09a9e440119",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.992,
+          "min": 0.9,
+          "full_recall_queries": 46
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "raw",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 33.242,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 7233536,
+          "major_faults": 0,
+          "minor_faults": 188,
+          "peak_rss_bytes": 7593984,
+          "rss_bytes": 7593984,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7184384,
+          "major_faults": 0,
+          "minor_faults": 185,
+          "peak_rss_bytes": 7540736,
+          "rss_bytes": 7540736,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 7233536,
+          "major_faults": 0,
+          "minor_faults": 212,
+          "peak_rss_bytes": 7696384,
+          "rss_bytes": 7696384,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4820992,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5165056,
+          "rss_bytes": 5165056,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 78.166,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 64.881,
+          "min": 13.325000000000001,
+          "n": 100,
+          "p50": 14.257,
+          "p95": 14.988,
+          "p99": 15.719
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "1fed25fa03a0ac77fd6fe45aea55d6e86123361b926e2a3bb41718b1be031c03",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "decoded",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 22.282,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 7319552,
+          "major_faults": 0,
+          "minor_faults": 192,
+          "peak_rss_bytes": 7684096,
+          "rss_bytes": 7684096,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7319552,
+          "major_faults": 0,
+          "minor_faults": 190,
+          "peak_rss_bytes": 7680000,
+          "rss_bytes": 7680000,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 7319552,
+          "major_faults": 0,
+          "minor_faults": 215,
+          "peak_rss_bytes": 7782400,
+          "rss_bytes": 7782400,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4870144,
+          "major_faults": 0,
+          "minor_faults": 178,
+          "peak_rss_bytes": 5214208,
+          "rss_bytes": 5214208,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 53.37,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 33.542,
+          "min": 13.405,
+          "n": 100,
+          "p50": 14.176,
+          "p95": 14.897,
+          "p99": 15.46
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 23.955000000000002,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 7348224,
+          "major_faults": 0,
+          "minor_faults": 192,
+          "peak_rss_bytes": 7712768,
+          "rss_bytes": 7712768,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7122944,
+          "major_faults": 0,
+          "minor_faults": 188,
+          "peak_rss_bytes": 7483392,
+          "rss_bytes": 7483392,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 7348224,
+          "major_faults": 0,
+          "minor_faults": 215,
+          "peak_rss_bytes": 7811072,
+          "rss_bytes": 7811072,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4710400,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5054464,
+          "rss_bytes": 5054464,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 55.183,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 29.604999999999997,
+          "min": 9.978,
+          "n": 100,
+          "p50": 10.82,
+          "p95": 11.722000000000001,
+          "p99": 13.184
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 18.564,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 7163904,
+          "major_faults": 0,
+          "minor_faults": 189,
+          "peak_rss_bytes": 7524352,
+          "rss_bytes": 7524352,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 7098368,
+          "major_faults": 0,
+          "minor_faults": 186,
+          "peak_rss_bytes": 7454720,
+          "rss_bytes": 7454720,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 7163904,
+          "major_faults": 0,
+          "minor_faults": 212,
+          "peak_rss_bytes": 7622656,
+          "rss_bytes": 7622656,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4743168,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5083136,
+          "rss_bytes": 5083136,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 45.896,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 4,
+        "warm_us": {
+          "max": 68.438,
+          "min": 10.009,
+          "n": 100,
+          "p50": 10.811,
+          "p95": 11.722000000000001,
+          "p99": 13.545
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 18.424,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 7389184,
+          "major_faults": 0,
+          "minor_faults": 192,
+          "peak_rss_bytes": 7753728,
+          "rss_bytes": 7753728,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 7323648,
+          "major_faults": 0,
+          "minor_faults": 189,
+          "peak_rss_bytes": 7684096,
+          "rss_bytes": 7684096,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 7389184,
+          "major_faults": 0,
+          "minor_faults": 215,
+          "peak_rss_bytes": 7852032,
+          "rss_bytes": 7852032,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4767744,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5111808,
+          "rss_bytes": 5111808,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 51.286,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 8,
+        "warm_us": {
+          "max": 51.556,
+          "min": 9.867999999999999,
+          "n": 100,
+          "p50": 10.84,
+          "p95": 11.681999999999999,
+          "p99": 12.664
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 32,
+        "filter": "1pct",
+        "first_query_us": 4089.9530000000004,
+        "memory_after_first": {
+          "anon_bytes": 26005504,
+          "file_bytes": 5459968,
+          "major_faults": 0,
+          "minor_faults": 6491,
+          "peak_rss_bytes": 31465472,
+          "rss_bytes": 31465472,
+          "virtual_bytes": 44687360
+        },
+        "memory_after_open": {
+          "anon_bytes": 25772032,
+          "file_bytes": 5459968,
+          "major_faults": 0,
+          "minor_faults": 6434,
+          "peak_rss_bytes": 31232000,
+          "rss_bytes": 31232000,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 27213824,
+          "file_bytes": 5459968,
+          "major_faults": 0,
+          "minor_faults": 6850,
+          "peak_rss_bytes": 32673792,
+          "rss_bytes": 32673792,
+          "virtual_bytes": 45912064
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4763648,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5103616,
+          "rss_bytes": 5103616,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 19192.426,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 3674.5469999999996,
+          "min": 2500.937,
+          "n": 100,
+          "p50": 2985.7019999999998,
+          "p95": 3277.477,
+          "p99": 3511.974
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 7133.0109999999995,
+        "memory_after_first": {
+          "anon_bytes": 26447872,
+          "file_bytes": 5378048,
+          "major_faults": 0,
+          "minor_faults": 6599,
+          "peak_rss_bytes": 31825920,
+          "rss_bytes": 31825920,
+          "virtual_bytes": 45150208
+        },
+        "memory_after_open": {
+          "anon_bytes": 25772032,
+          "file_bytes": 5378048,
+          "major_faults": 0,
+          "minor_faults": 6434,
+          "peak_rss_bytes": 31150080,
+          "rss_bytes": 31150080,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 27680768,
+          "file_bytes": 5378048,
+          "major_faults": 0,
+          "minor_faults": 6900,
+          "peak_rss_bytes": 33058816,
+          "rss_bytes": 33058816,
+          "virtual_bytes": 46407680
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4681728,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5025792,
+          "rss_bytes": 5025792,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 18603.548000000003,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 7048.6849999999995,
+          "min": 4667.039000000001,
+          "n": 100,
+          "p50": 5099.366,
+          "p95": 5718.973,
+          "p99": 6648.538
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 512,
+        "filter": "1pct",
+        "first_query_us": 8064.099,
+        "memory_after_first": {
+          "anon_bytes": 26468352,
+          "file_bytes": 5378048,
+          "major_faults": 0,
+          "minor_faults": 6604,
+          "peak_rss_bytes": 31846400,
+          "rss_bytes": 31846400,
+          "virtual_bytes": 45150208
+        },
+        "memory_after_open": {
+          "anon_bytes": 25772032,
+          "file_bytes": 5378048,
+          "major_faults": 0,
+          "minor_faults": 6434,
+          "peak_rss_bytes": 31150080,
+          "rss_bytes": 31150080,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 27725824,
+          "file_bytes": 5378048,
+          "major_faults": 0,
+          "minor_faults": 6911,
+          "peak_rss_bytes": 33103872,
+          "rss_bytes": 33103872,
+          "virtual_bytes": 46407680
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4747264,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5091328,
+          "rss_bytes": 5091328,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 18629.777000000002,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 10050.886999999999,
+          "min": 5980.12,
+          "n": 100,
+          "p50": 6218.063999999999,
+          "p95": 7350.918,
+          "p99": 8181.218000000001
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 32,
+        "filter": "1pct",
+        "first_query_us": 5395.118,
+        "memory_after_first": {
+          "anon_bytes": 1630208,
+          "file_bytes": 28782592,
+          "major_faults": 0,
+          "minor_faults": 939,
+          "peak_rss_bytes": 30412800,
+          "rss_bytes": 30412800,
+          "virtual_bytes": 34779136
+        },
+        "memory_after_open": {
+          "anon_bytes": 1310720,
+          "file_bytes": 8400896,
+          "major_faults": 0,
+          "minor_faults": 550,
+          "peak_rss_bytes": 9711616,
+          "rss_bytes": 9711616,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 2945024,
+          "file_bytes": 28782592,
+          "major_faults": 0,
+          "minor_faults": 1260,
+          "peak_rss_bytes": 31727616,
+          "rss_bytes": 31727616,
+          "virtual_bytes": 35966976
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4698112,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5038080,
+          "rss_bytes": 5038080,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 1393.661,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 4050.329,
+          "min": 2453.849,
+          "n": 100,
+          "p50": 2943.663,
+          "p95": 3348.338,
+          "p99": 3892.925
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 7370.565,
+        "memory_after_first": {
+          "anon_bytes": 1904640,
+          "file_bytes": 28938240,
+          "major_faults": 0,
+          "minor_faults": 1005,
+          "peak_rss_bytes": 30842880,
+          "rss_bytes": 30842880,
+          "virtual_bytes": 35045376
+        },
+        "memory_after_open": {
+          "anon_bytes": 1310720,
+          "file_bytes": 8556544,
+          "major_faults": 0,
+          "minor_faults": 549,
+          "peak_rss_bytes": 9867264,
+          "rss_bytes": 9867264,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 3051520,
+          "file_bytes": 28938240,
+          "major_faults": 0,
+          "minor_faults": 1285,
+          "peak_rss_bytes": 31989760,
+          "rss_bytes": 31989760,
+          "virtual_bytes": 36106240
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4853760,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5193728,
+          "rss_bytes": 5193728,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 1307.189,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 6915.3009999999995,
+          "min": 4711.001,
+          "n": 100,
+          "p50": 5218.347,
+          "p95": 6160.713,
+          "p99": 6852.037
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 512,
+        "filter": "1pct",
+        "first_query_us": 8992.848,
+        "memory_after_first": {
+          "anon_bytes": 1933312,
+          "file_bytes": 28917760,
+          "major_faults": 0,
+          "minor_faults": 1014,
+          "peak_rss_bytes": 30851072,
+          "rss_bytes": 30851072,
+          "virtual_bytes": 35053568
+        },
+        "memory_after_open": {
+          "anon_bytes": 1314816,
+          "file_bytes": 8536064,
+          "major_faults": 0,
+          "minor_faults": 552,
+          "peak_rss_bytes": 9850880,
+          "rss_bytes": 9850880,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 3190784,
+          "file_bytes": 28917760,
+          "major_faults": 0,
+          "minor_faults": 1321,
+          "peak_rss_bytes": 32108544,
+          "rss_bytes": 32108544,
+          "virtual_bytes": 36311040
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4833280,
+          "major_faults": 0,
+          "minor_faults": 179,
+          "peak_rss_bytes": 5177344,
+          "rss_bytes": 5177344,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 1382.817,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 7583.447999999999,
+          "min": 5933.788,
+          "n": 100,
+          "p50": 6279.0650000000005,
+          "p95": 7310.043,
+          "p99": 7507.69
+        },
+        "cache_advice": {
+          "policy": "uncontrolled",
+          "eviction_verified": false,
+          "result": "not_requested"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      }
+    ],
+    "lifecycle": {
+      "added": 1200,
+      "ann_all_key_membership_after_load_and_view": true,
+      "ann_bytes_after_compact": 24390460,
+      "ann_cancellation_predicate_calls_after_request": 20799,
+      "ann_cancellation_request_to_native_return_us": 9814.777,
+      "ann_compact_us": 171985.84100000001,
+      "ann_exact_compaction_and_restore_parity": true,
+      "ann_mutation_us": 721222.038,
+      "cancelled_result_discarded": true,
+      "corrupt_ann_refused_exact_fallback_available": true,
+      "deleted": 400,
+      "exact_oxv_compaction_score_and_order_parity": true,
+      "live_after": 20800,
+      "native_ann_abort_supported": false,
+      "oxv_bytes_after_compact": 5833984,
+      "oxv_bytes_after_delta": 5962560,
+      "oxv_compact_us": 28527.638000000003,
+      "oxv_generation_before": 1,
+      "oxv_generation_compacted": 3,
+      "oxv_generation_delta": 2,
+      "oxv_install_us": 7219.594,
+      "pre_cancelled_ann_wrapper": true,
+      "pre_cancelled_oxv": true,
+      "recall_after_delta": [
+        {
+          "filter": "All",
+          "mean_recall_vs_oxv": 0.6649999999999999,
+          "queries": 20
+        },
+        {
+          "filter": "FivePercent",
+          "mean_recall_vs_oxv": 1.0,
+          "queries": 20
+        },
+        {
+          "filter": "OnePercent",
+          "mean_recall_vs_oxv": 1.0,
+          "queries": 20
+        },
+        {
+          "filter": "Empty",
+          "mean_recall_vs_oxv": null,
+          "queries": 0
+        }
+      ],
+      "retained_oxv_snapshot_parity": true,
+      "status": "passed",
+      "uncovered_production_contracts": [
+        "window/alias penalties before top-k",
+        "foreign links and moved-text resolver",
+        "crash-safe ANN generation publication",
+        "cancellable native ANN search/build/compaction",
+        "real corpus and multi-platform CPU coverage"
+      ],
+      "vectors_before": 20000
+    },
+    "thread_launch_proxy": {
+      "kind": "empty-scope launch/join proxy, not an attributed OXV CPU profile",
+      "timings": [
+        {
+          "empty_scope_us": {
+            "max": 3.236,
+            "min": 0.04,
+            "n": 100,
+            "p50": 0.049999999999999996,
+            "p95": 0.051,
+            "p99": 0.06
+          },
+          "threads_including_caller": 1
+        },
+        {
+          "empty_scope_us": {
+            "max": 126.64800000000001,
+            "min": 34.815,
+            "n": 100,
+            "p50": 38.762,
+            "p95": 53.1,
+            "p99": 82.685
+          },
+          "threads_including_caller": 2
+        },
+        {
+          "empty_scope_us": {
+            "max": 158.889,
+            "min": 77.40599999999999,
+            "n": 100,
+            "p50": 86.55199999999999,
+            "p95": 115.196,
+            "p99": 133.381
+          },
+          "threads_including_caller": 4
+        },
+        {
+          "empty_scope_us": {
+            "max": 329.97,
+            "min": 159.79000000000002,
+            "n": 100,
+            "p50": 182.633,
+            "p95": 258.161,
+            "p99": 292.79
+          },
+          "threads_including_caller": 8
+        }
+      ]
+    },
+    "limitations": [
+      "Fresh process/open is measured; per-file advisory cache policy is recorded and eviction is never guaranteed.",
+      "Synthetic independent queries are not a real embedding corpus or semantic-quality test.",
+      "USearch is pinned 2.26.6, scalar F32/IP over OXV-decoded vectors; graph memory is extra disk/RAM.",
+      "OXV codec scan includes quantized-query arithmetic; decoded-f32 separates its metric difference from ANN recall.",
+      "Production alias/window penalties, foreign links, moved-text resolution, atomic ANN generation publication, and bounded native cancellation are not implemented.",
+      "One Linux host cannot qualify mobile, Windows, macOS, old CPUs, or full-library scale.",
+      "Empty-scope timings are a launch/join proxy, not a CPU profile attributing OXV time to spawning."
+    ]
+  },
+  "advised": {
+    "schema": 1,
+    "purpose": "synthetic ANN feasibility experiment; not production qualification",
+    "environment": {
+      "utc": "2026-11-05T18:25:03.542940+00:00",
+      "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
+      "machine": "x86_64",
+      "cpu_model": "AMD EPYC 7763 64-Core Processor",
+      "logical_cpus": 4,
+      "affinity_cpus": 4,
+      "cgroup_cpu_max": null,
+      "cgroup_memory_max": null,
+      "loadavg": "1.49 0.52 0.19 1/268 4528",
+      "base_git_revision": "c5c588ecd1bc293dc6faab7b06f8c7f0a3026835",
+      "worktree_dirty": false,
+      "experiment_source_sha256": {
+        "Cargo.toml": "d93d29786bb2e9449f9bc115871fef6c5c90e18b73f8568e8d1f38646b65cf5f",
+        "Cargo.lock": "995a52a216b8be59a7d6342750c1638fd395247da3c0b381a6fa26ed5274748c",
+        "run.py": "30939cd7c2f15928cdb8bdb1fd0fefbca5a77744f2ecac5fb47e19b220aaa15c",
+        "src/data.rs": "39e93200752af13a5c6eb380766579612e8248edf5c699fc9d735bf8f7514be7",
+        "src/lifecycle.rs": "154bdf5812cdc5de5b41ffa73ea39ac692721cc44444cf650eb8f50bef467728",
+        "src/main.rs": "0341df6b75050593b8fa4e2c87a86ebf3137cf2b4ebac9df212f78b883475105",
+        "src/measure.rs": "aed0ba4abbf49629302e5007df3411f04dd3f42ee61a6e77ccbaf2b08d0c3830"
+      },
+      "measured_binary_sha256": "02c89348d140901d9968b5741cb0e2252b0f985380481c8e4a890333e41b5d65",
+      "measured_binary_bytes": 27527768
+    },
+    "environment_end": {
+      "loadavg": "1.49 0.52 0.19 4/269 5954"
+    },
+    "build": {
+      "ann_build_ms": 8863.732246,
+      "ann_bytes": 23453068,
+      "ann_hardware_acceleration": "serial",
+      "ann_memory_usage_bytes": 33715136,
+      "calibration_ms": 7.951214,
+      "config": {
+        "codec": "i8-sym-vec",
+        "connectivity": 16,
+        "dim": 256,
+        "distribution": "uniform",
+        "expansion_add": 128,
+        "queries": 50,
+        "schema": 1,
+        "seed": 11068670087429,
+        "top_k": 10,
+        "vectors": 20000
+      },
+      "decoded_bytes": 20893696,
+      "memory": {
+        "anon_bytes": 30654464,
+        "file_bytes": 11317248,
+        "major_faults": 0,
+        "minor_faults": 9869,
+        "peak_rss_bytes": 41971712,
+        "rss_bytes": 41971712,
+        "virtual_bytes": 55259136
+      },
+      "oxv_build_and_install_ms": 69.110508,
+      "oxv_bytes": 5613696,
+      "raw_bytes": 20893696,
+      "schema": 1,
+      "usearch_features": [],
+      "usearch_version": "2.26.6"
+    },
+    "measurements": [
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "raw",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 17985.529,
+        "memory_after_first": {
+          "anon_bytes": 364544,
+          "file_bytes": 26116096,
+          "major_faults": 5,
+          "minor_faults": 361,
+          "peak_rss_bytes": 26480640,
+          "rss_bytes": 26480640,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 5251072,
+          "major_faults": 1,
+          "minor_faults": 186,
+          "peak_rss_bytes": 5611520,
+          "rss_bytes": 5611520,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 26136576,
+          "major_faults": 6,
+          "minor_faults": 385,
+          "peak_rss_bytes": 26595328,
+          "rss_bytes": 26595328,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4784128,
+          "major_faults": 0,
+          "minor_faults": 173,
+          "peak_rss_bytes": 5120000,
+          "rss_bytes": 5120000,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 457.56,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 997.7339999999999,
+          "min": 698.192,
+          "n": 100,
+          "p50": 713.3299999999999,
+          "p95": 799.522,
+          "p99": 963.029
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "raw.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "0354b72aa960e8e5f6b6024e2841b1301526d1df49b31cf161db4a987f5de3ee",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "decoded",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 17202.872,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 26062848,
+          "major_faults": 5,
+          "minor_faults": 361,
+          "peak_rss_bytes": 26423296,
+          "rss_bytes": 26423296,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 5189632,
+          "major_faults": 1,
+          "minor_faults": 186,
+          "peak_rss_bytes": 5545984,
+          "rss_bytes": 5545984,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 454656,
+          "file_bytes": 26083328,
+          "major_faults": 6,
+          "minor_faults": 385,
+          "peak_rss_bytes": 26537984,
+          "rss_bytes": 26537984,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4861952,
+          "major_faults": 0,
+          "minor_faults": 173,
+          "peak_rss_bytes": 5193728,
+          "rss_bytes": 5193728,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 383.79,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 931.39,
+          "min": 699.0930000000001,
+          "n": 100,
+          "p50": 732.747,
+          "p95": 816.163,
+          "p99": 901.954
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "decoded.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 6161.704,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 10665984,
+          "major_faults": 8,
+          "minor_faults": 252,
+          "peak_rss_bytes": 11026432,
+          "rss_bytes": 11026432,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 5070848,
+          "major_faults": 1,
+          "minor_faults": 186,
+          "peak_rss_bytes": 5427200,
+          "rss_bytes": 5427200,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 454656,
+          "file_bytes": 10686464,
+          "major_faults": 9,
+          "minor_faults": 276,
+          "peak_rss_bytes": 11141120,
+          "rss_bytes": 11141120,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4677632,
+          "major_faults": 0,
+          "minor_faults": 172,
+          "peak_rss_bytes": 5009408,
+          "rss_bytes": 5009408,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 347.252,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 268.10400000000004,
+          "min": 205.91699999999997,
+          "n": 100,
+          "p50": 210.70600000000002,
+          "p95": 234.391,
+          "p99": 242.02499999999998
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "encoded.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 3090.7259999999997,
+        "memory_after_first": {
+          "anon_bytes": 405504,
+          "file_bytes": 11010048,
+          "major_faults": 26,
+          "minor_faults": 292,
+          "peak_rss_bytes": 11415552,
+          "rss_bytes": 11415552,
+          "virtual_bytes": 223203328
+        },
+        "memory_after_open": {
+          "anon_bytes": 360448,
+          "file_bytes": 5271552,
+          "major_faults": 1,
+          "minor_faults": 188,
+          "peak_rss_bytes": 5632000,
+          "rss_bytes": 5632000,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 512000,
+          "file_bytes": 11010048,
+          "major_faults": 26,
+          "minor_faults": 318,
+          "peak_rss_bytes": 11522048,
+          "rss_bytes": 11522048,
+          "virtual_bytes": 223338496
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4747264,
+          "major_faults": 0,
+          "minor_faults": 174,
+          "peak_rss_bytes": 5083136,
+          "rss_bytes": 5083136,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 315.092,
+        "oxv_effective_threads": 4,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 4,
+        "warm_us": {
+          "max": 419.268,
+          "min": 188.67499999999998,
+          "n": 100,
+          "p50": 202.821,
+          "p95": 262.774,
+          "p99": 281.609
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "encoded.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "269c16c11545d7df1febfbe498372045f91d467fcd200812c1f9137c89a849fb",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.996,
+          "min": 0.9,
+          "full_recall_queries": 48
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 721.956,
+        "memory_after_first": {
+          "anon_bytes": 25763840,
+          "file_bytes": 5373952,
+          "major_faults": 0,
+          "minor_faults": 6429,
+          "peak_rss_bytes": 31137792,
+          "rss_bytes": 31137792,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_open": {
+          "anon_bytes": 25763840,
+          "file_bytes": 5373952,
+          "major_faults": 0,
+          "minor_faults": 6429,
+          "peak_rss_bytes": 31137792,
+          "rss_bytes": 31137792,
+          "virtual_bytes": 44511232
+        },
+        "memory_after_warm": {
+          "anon_bytes": 25952256,
+          "file_bytes": 5373952,
+          "major_faults": 0,
+          "minor_faults": 6477,
+          "peak_rss_bytes": 31326208,
+          "rss_bytes": 31326208,
+          "virtual_bytes": 44654592
+        },
+        "memory_before_open": {
+          "anon_bytes": 335872,
+          "file_bytes": 4743168,
+          "major_faults": 0,
+          "minor_faults": 173,
+          "peak_rss_bytes": 5079040,
+          "rss_bytes": 5079040,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 35254.906,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 506.14099999999996,
+          "min": 332.144,
+          "n": 100,
+          "p50": 373.812,
+          "p95": 452.029,
+          "p99": 496.192
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "index.usearch",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "123d7cd92dcfcf4b43a3a6d8d933c159d18050006c69c16359b1c00ebf167332",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.47,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 20000,
+        "expansion_search": 128,
+        "filter": "all",
+        "first_query_us": 47901.548,
+        "memory_after_first": {
+          "anon_bytes": 1347584,
+          "file_bytes": 28422144,
+          "major_faults": 213,
+          "minor_faults": 783,
+          "peak_rss_bytes": 29769728,
+          "rss_bytes": 29769728,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_open": {
+          "anon_bytes": 1298432,
+          "file_bytes": 8470528,
+          "major_faults": 2,
+          "minor_faults": 524,
+          "peak_rss_bytes": 9768960,
+          "rss_bytes": 9768960,
+          "virtual_bytes": 34426880
+        },
+        "memory_after_warm": {
+          "anon_bytes": 1527808,
+          "file_bytes": 28852224,
+          "major_faults": 215,
+          "minor_faults": 913,
+          "peak_rss_bytes": 30380032,
+          "rss_bytes": 30380032,
+          "virtual_bytes": 34582528
+        },
+        "memory_before_open": {
+          "anon_bytes": 331776,
+          "file_bytes": 4767744,
+          "major_faults": 0,
+          "minor_faults": 171,
+          "peak_rss_bytes": 5099520,
+          "rss_bytes": 5099520,
+          "virtual_bytes": 9949184
+        },
+        "open_us": 4769.429,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 519.576,
+          "min": 323.928,
+          "n": 100,
+          "p50": 369.62399999999997,
+          "p95": 443.45300000000003,
+          "p99": 509.48699999999997
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "index.usearch",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "123d7cd92dcfcf4b43a3a6d8d933c159d18050006c69c16359b1c00ebf167332",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.47,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 0.47200000000000003,
+          "min": 0.1,
+          "full_recall_queries": 0
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "raw",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 455.235,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 5693440,
+          "major_faults": 2,
+          "minor_faults": 197,
+          "peak_rss_bytes": 6053888,
+          "rss_bytes": 6053888,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 5316608,
+          "major_faults": 1,
+          "minor_faults": 187,
+          "peak_rss_bytes": 5672960,
+          "rss_bytes": 5672960,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 5693440,
+          "major_faults": 2,
+          "minor_faults": 221,
+          "peak_rss_bytes": 6156288,
+          "rss_bytes": 6156288,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4845568,
+          "major_faults": 0,
+          "minor_faults": 178,
+          "peak_rss_bytes": 5189632,
+          "rss_bytes": 5189632,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 321.314,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 37.31,
+          "min": 13.465,
+          "n": 100,
+          "p50": 14.376,
+          "p95": 15.438999999999998,
+          "p99": 36.699000000000005
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "raw.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "1fed25fa03a0ac77fd6fe45aea55d6e86123361b926e2a3bb41718b1be031c03",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "decoded",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 514.336,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 5656576,
+          "major_faults": 2,
+          "minor_faults": 194,
+          "peak_rss_bytes": 6017024,
+          "rss_bytes": 6017024,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 5275648,
+          "major_faults": 1,
+          "minor_faults": 184,
+          "peak_rss_bytes": 5632000,
+          "rss_bytes": 5632000,
+          "virtual_bytes": 30851072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 462848,
+          "file_bytes": 5656576,
+          "major_faults": 2,
+          "minor_faults": 218,
+          "peak_rss_bytes": 6119424,
+          "rss_bytes": 6119424,
+          "virtual_bytes": 30986240
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4808704,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5152768,
+          "rss_bytes": 5152768,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 312.737,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 37.571000000000005,
+          "min": 13.594999999999999,
+          "n": 100,
+          "p50": 14.427,
+          "p95": 15.219,
+          "p99": 20.058
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "decoded.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 499.458,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 5505024,
+          "major_faults": 3,
+          "minor_faults": 193,
+          "peak_rss_bytes": 5865472,
+          "rss_bytes": 5865472,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 5238784,
+          "major_faults": 1,
+          "minor_faults": 187,
+          "peak_rss_bytes": 5595136,
+          "rss_bytes": 5595136,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 5505024,
+          "major_faults": 3,
+          "minor_faults": 216,
+          "peak_rss_bytes": 5963776,
+          "rss_bytes": 5963776,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4771840,
+          "major_faults": 0,
+          "minor_faults": 178,
+          "peak_rss_bytes": 5111808,
+          "rss_bytes": 5111808,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 342.15299999999996,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 30.067,
+          "min": 9.889,
+          "n": 100,
+          "p50": 10.731,
+          "p95": 11.762,
+          "p99": 17.914
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "encoded.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": null,
+        "backend": "oxv",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 496.653,
+        "memory_after_first": {
+          "anon_bytes": 360448,
+          "file_bytes": 5373952,
+          "major_faults": 3,
+          "minor_faults": 191,
+          "peak_rss_bytes": 5734400,
+          "rss_bytes": 5734400,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_open": {
+          "anon_bytes": 356352,
+          "file_bytes": 5115904,
+          "major_faults": 1,
+          "minor_faults": 185,
+          "peak_rss_bytes": 5472256,
+          "rss_bytes": 5472256,
+          "virtual_bytes": 15572992
+        },
+        "memory_after_warm": {
+          "anon_bytes": 458752,
+          "file_bytes": 5373952,
+          "major_faults": 3,
+          "minor_faults": 214,
+          "peak_rss_bytes": 5832704,
+          "rss_bytes": 5832704,
+          "virtual_bytes": 15708160
+        },
+        "memory_before_open": {
+          "anon_bytes": 339968,
+          "file_bytes": 4780032,
+          "major_faults": 0,
+          "minor_faults": 177,
+          "peak_rss_bytes": 5120000,
+          "rss_bytes": 5120000,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 271.85,
+        "oxv_effective_threads": 1,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 4,
+        "warm_us": {
+          "max": 30.427,
+          "min": 10.078999999999999,
+          "n": 100,
+          "p50": 10.991,
+          "p95": 12.634,
+          "p99": 15.88
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "encoded.oxv",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 33715136,
+        "backend": "usearch-load",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 7055.493,
+        "memory_after_first": {
+          "anon_bytes": 26451968,
+          "file_bytes": 5304320,
+          "major_faults": 0,
+          "minor_faults": 6598,
+          "peak_rss_bytes": 31756288,
+          "rss_bytes": 31756288,
+          "virtual_bytes": 45150208
+        },
+        "memory_after_open": {
+          "anon_bytes": 25776128,
+          "file_bytes": 5304320,
+          "major_faults": 0,
+          "minor_faults": 6433,
+          "peak_rss_bytes": 31080448,
+          "rss_bytes": 31080448,
+          "virtual_bytes": 44519424
+        },
+        "memory_after_warm": {
+          "anon_bytes": 27680768,
+          "file_bytes": 5304320,
+          "major_faults": 0,
+          "minor_faults": 6898,
+          "peak_rss_bytes": 32985088,
+          "rss_bytes": 32985088,
+          "virtual_bytes": 46407680
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4624384,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 4968448,
+          "rss_bytes": 4968448,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 29305.69,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 5976.938,
+          "min": 4708.285000000001,
+          "n": 100,
+          "p50": 5117.853999999999,
+          "p95": 5557.961,
+          "p99": 5918.598
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "index.usearch",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      },
+      {
+        "ann_memory_usage_bytes": 160768,
+        "backend": "usearch-view",
+        "cold_definition": "fresh process and freshly opened handle; standalone invocation does not evict file caches; see runner cache_advice when present",
+        "eligible_vectors": 200,
+        "expansion_search": 128,
+        "filter": "1pct",
+        "first_query_us": 52109.447,
+        "memory_after_first": {
+          "anon_bytes": 1904640,
+          "file_bytes": 28864512,
+          "major_faults": 214,
+          "minor_faults": 1008,
+          "peak_rss_bytes": 30769152,
+          "rss_bytes": 30769152,
+          "virtual_bytes": 35045376
+        },
+        "memory_after_open": {
+          "anon_bytes": 1310720,
+          "file_bytes": 8482816,
+          "major_faults": 2,
+          "minor_faults": 529,
+          "peak_rss_bytes": 9793536,
+          "rss_bytes": 9793536,
+          "virtual_bytes": 34435072
+        },
+        "memory_after_warm": {
+          "anon_bytes": 3051520,
+          "file_bytes": 28864512,
+          "major_faults": 214,
+          "minor_faults": 1288,
+          "peak_rss_bytes": 31916032,
+          "rss_bytes": 31916032,
+          "virtual_bytes": 36106240
+        },
+        "memory_before_open": {
+          "anon_bytes": 344064,
+          "file_bytes": 4718592,
+          "major_faults": 0,
+          "minor_faults": 176,
+          "peak_rss_bytes": 5062656,
+          "rss_bytes": 5062656,
+          "virtual_bytes": 9957376
+        },
+        "open_us": 4492.92,
+        "oxv_effective_threads": null,
+        "repeats": 2,
+        "schema": 1,
+        "threads": 1,
+        "warm_us": {
+          "max": 6924.257,
+          "min": 4621.061,
+          "n": 100,
+          "p50": 5075.6849999999995,
+          "p95": 6024.617,
+          "p99": 6862.661
+        },
+        "cache_advice": {
+          "policy": "advisory-cold",
+          "eviction_verified": false,
+          "fixture_file": "index.usearch",
+          "result": "accepted_advisory_no_guarantee"
+        },
+        "ordered_query_keys_sha256": "6364b7f0be7adac88549a23196f2cdb4791e2b16dc8ac79901514e28b92c4d2d",
+        "recall_vs_raw": {
+          "queries": 50,
+          "mean": 0.998,
+          "min": 0.9,
+          "full_recall_queries": 49
+        },
+        "recall_vs_decoded": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        },
+        "recall_vs_oxv": {
+          "queries": 50,
+          "mean": 1.0,
+          "min": 1.0,
+          "full_recall_queries": 50
+        }
+      }
+    ],
+    "lifecycle": null,
+    "thread_launch_proxy": {
+      "kind": "empty-scope launch/join proxy, not an attributed OXV CPU profile",
+      "timings": [
+        {
+          "empty_scope_us": {
+            "max": 3.416,
+            "min": 0.04,
+            "n": 100,
+            "p50": 0.049999999999999996,
+            "p95": 0.051,
+            "p99": 0.06
+          },
+          "threads_including_caller": 1
+        },
+        {
+          "empty_scope_us": {
+            "max": 113.863,
+            "min": 33.924,
+            "n": 100,
+            "p50": 49.163,
+            "p95": 62.306999999999995,
+            "p99": 79.41900000000001
+          },
+          "threads_including_caller": 2
+        },
+        {
+          "empty_scope_us": {
+            "max": 956.637,
+            "min": 73.31800000000001,
+            "n": 100,
+            "p50": 99.056,
+            "p95": 156.9,
+            "p99": 315.784
+          },
+          "threads_including_caller": 4
+        },
+        {
+          "empty_scope_us": {
+            "max": 1153.4869999999999,
+            "min": 155.622,
+            "n": 100,
+            "p50": 224.953,
+            "p95": 349.212,
+            "p99": 858.092
+          },
+          "threads_including_caller": 8
+        }
+      ]
+    },
+    "limitations": [
+      "Fresh process/open is measured; per-file advisory cache policy is recorded and eviction is never guaranteed.",
+      "Synthetic independent queries are not a real embedding corpus or semantic-quality test.",
+      "USearch is pinned 2.26.6, scalar F32/IP over OXV-decoded vectors; graph memory is extra disk/RAM.",
+      "OXV codec scan includes quantized-query arithmetic; decoded-f32 separates its metric difference from ANN recall.",
+      "Production alias/window penalties, foreign links, moved-text resolution, atomic ANN generation publication, and bounded native cancellation are not implemented.",
+      "One Linux host cannot qualify mobile, Windows, macOS, old CPUs, or full-library scale.",
+      "Empty-scope timings are a launch/join proxy, not a CPU profile attributing OXV time to spawning."
+    ]
+  }
+}
