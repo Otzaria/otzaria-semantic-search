@@ -100,6 +100,7 @@ fn qa491_lazy_fp32_passages_use_the_production_official_index() {
         text: TextIdentity::with_line_text_version(1),
         model: LocalModel::of_family(temp.join("query.int8.onnx"), &model, "int8"),
         deployment: EmbeddingDeployment {
+            disable_kleidiai: false,
             onnx_runtime: Some(PathBuf::from(
                 std::env::var("OTZARIA_ONNX_RUNTIME").unwrap(),
             )),
@@ -224,6 +225,7 @@ fn qa491_lazy_fp32_passages_use_the_production_official_index() {
         text: TextIdentity::with_line_text_version(1),
         model: LocalModel::of_family(temp.join("document.fp32.onnx"), &model, "fp32"),
         deployment: EmbeddingDeployment {
+            disable_kleidiai: false,
             onnx_runtime: Some(PathBuf::from(
                 std::env::var("OTZARIA_ONNX_RUNTIME").unwrap(),
             )),

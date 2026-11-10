@@ -148,6 +148,18 @@ pub struct EmbeddingDeployment {
     /// than ignored, because ONNX Runtime cannot be unloaded or replaced. Ignored by the
     /// stand-in, which runs nothing. `docs/ONNX_BACKEND.md` §3 has the whole lookup.
     pub onnx_runtime: Option<PathBuf>,
+    /// Pardes INT8 uses global-text dynamic quantization on every CPU. ARM's
+    /// KleidiAI per-token kernel changes the embedding function and cannot share
+    /// an index with x86. False by default, preserving legacy Meivin semantics.
+    pub disable_kleidiai: bool,
+}
+
+impl EmbeddingDeployment {
+    /// The versioned Pardes recipe has one cross-architecture kernel policy.
+    pub fn for_text_recipe(mut self, version: u32) -> Self {
+        self.disable_kleidiai = version == 3;
+        self
+    }
 }
 
 /// Local embedding runtime: owns the *policy* around a backend, while the backend
@@ -894,6 +906,23 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_pardes_recipe_enables_the_cross_cpu_int8_policy() {
+        assert!(!super::EmbeddingDeployment::default().disable_kleidiai);
+        for version in [1, 2] {
+            assert!(
+                !super::EmbeddingDeployment::default()
+                    .for_text_recipe(version)
+                    .disable_kleidiai
+            );
+        }
+        assert!(
+            super::EmbeddingDeployment::default()
+                .for_text_recipe(3)
+                .disable_kleidiai
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

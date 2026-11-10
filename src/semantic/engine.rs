@@ -360,7 +360,10 @@ impl SemanticEngine {
                 max_tokens: self.config.embedding_max_tokens,
                 batch_size: self.config.embedding_batch_size,
             },
-            self.config.deployment.clone(),
+            self.config
+                .deployment
+                .clone()
+                .for_text_recipe(self.config.chunking.embedding_text_version),
         );
 
         if let Err(e) = runtime.load() {

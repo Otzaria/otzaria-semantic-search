@@ -19,7 +19,9 @@ use otzaria_semantic_search::distribution::package::utc_timestamp;
 use otzaria_semantic_search::hybrid::coordinator::HybridCoordinator;
 use otzaria_semantic_search::semantic::backend::Pooling;
 use otzaria_semantic_search::semantic::chunker::ChunkerConfig;
-use otzaria_semantic_search::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use otzaria_semantic_search::semantic::embedding::{
+    EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime,
+};
 use otzaria_semantic_search::semantic::engine::{SemanticConfig, SemanticEngine};
 use otzaria_semantic_search::semantic::model_package::validate_model;
 use otzaria_semantic_search::semantic::types::{BookForIndexing, BookLine, SearchMode};
@@ -655,17 +657,20 @@ fn run_embed_shard(args: &[String]) {
     if let Some(threads) = parse_arg(args, "--threads") {
         env::set_var("OTZARIA_ONNX_THREADS", threads);
     }
-    let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-        model_path: PathBuf::from(require_arg(args, "--model-file")),
-        embedding_dim: plan.model.embedding_dim,
-        max_tokens: plan.model.max_tokens,
-        batch_size: parse_arg(args, "--batch")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(32),
-        pooling: Pooling::parse(&plan.model.pooling).unwrap_or_else(|error| {
-            exit_with("The family declares a pooling nothing performs", error)
-        }),
-    });
+    let mut runtime = EmbeddingRuntime::with_deployment(
+        EmbeddingConfig {
+            model_path: PathBuf::from(require_arg(args, "--model-file")),
+            embedding_dim: plan.model.embedding_dim,
+            max_tokens: plan.model.max_tokens,
+            batch_size: parse_arg(args, "--batch")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32),
+            pooling: Pooling::parse(&plan.model.pooling).unwrap_or_else(|error| {
+                exit_with("The family declares a pooling nothing performs", error)
+            }),
+        },
+        EmbeddingDeployment::default().for_text_recipe(plan.model.embedding_text_version),
+    );
     runtime
         .load()
         .unwrap_or_else(|error| exit_with("Could not load the model", error));

@@ -321,6 +321,7 @@ impl OfficialSemanticIndex {
         // agreed with by a set that declares the same number.
         let text_recipe = EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
         let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
+        let deployment = deployment.for_text_recipe(model.embedding_text_version);
 
         // Meivin uses a separate verified FP32 passage graph. Pardes has one
         // shared graph for both roles, while retaining the smaller query cap.
@@ -1006,6 +1007,7 @@ mod tests {
             OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
         let index = OfficialSemanticIndex::open(OfficialIndexConfig {
             deployment: EmbeddingDeployment {
+                disable_kleidiai: false,
                 onnx_runtime: Some(dir.join("bundled").join("onnxruntime.dll")),
             },
             ..config(&vectors, &model_path, &model, "int8")

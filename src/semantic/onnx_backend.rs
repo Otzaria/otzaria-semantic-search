@@ -967,25 +967,45 @@ fn inspect_graph(session: &Session, graph: &Path) -> Result<Wiring, EmbeddingErr
 /// Returns `ort::Result` so that `?` converts the builder's `Error<SessionBuilder>` —
 /// which is neither `Send` nor `Sync` — into a plain `ort::Error` here, before it can
 /// reach an error type that must be.
-fn build_session(
-    environment: &Environment,
-    graph: &Path,
-    intra_threads: usize,
-) -> ort::Result<Session> {
-    build_session_as(environment, graph, intra_threads, x86_int8().sets_entry())
-}
-
-/// [`build_session`], with [`X64_QUANT_PRECISION`] on or off whatever the CPU. The backend
-/// asks for what [`x86_int8`] decides; both are for the golden tests, which report what the
-/// entry changes on the CPU they run on, and need every other setting to be the backend's
-/// for that to mean anything.
+#[cfg(test)]
 fn build_session_as(
     environment: &Environment,
     graph: &Path,
     intra_threads: usize,
     exact_x86_int8: bool,
 ) -> ort::Result<Session> {
-    Session::builder(environment)?
+    build_session_as_with_kernel_policy(environment, graph, intra_threads, exact_x86_int8, false)
+}
+
+fn build_session_with_kernel_policy(
+    environment: &Environment,
+    graph: &Path,
+    intra_threads: usize,
+    disable_kleidiai: bool,
+) -> ort::Result<Session> {
+    build_session_as_with_kernel_policy(
+        environment,
+        graph,
+        intra_threads,
+        x86_int8().sets_entry(),
+        disable_kleidiai,
+    )
+}
+
+fn build_session_as_with_kernel_policy(
+    environment: &Environment,
+    graph: &Path,
+    intra_threads: usize,
+    exact_x86_int8: bool,
+    disable_kleidiai: bool,
+) -> ort::Result<Session> {
+    let builder = Session::builder(environment)?;
+    let builder = if disable_kleidiai {
+        builder.with_config_entry("mlas.disable_kleidiai", "1")?
+    } else {
+        builder
+    };
+    builder
         .with_optimization_level(GRAPH_OPTIMIZATION)?
         .with_config_entry(X64_QUANT_PRECISION, if exact_x86_int8 { "1" } else { "0" })?
         .with_intra_threads(intra_threads)?
@@ -1276,6 +1296,28 @@ impl OnnxBackend {
         tuning: &OnnxBackendConfig,
         runtime_library: Option<&Path>,
     ) -> Result<Self, EmbeddingError> {
+        Self::open_with_kernel_policy(
+            graph,
+            tokenizer,
+            max_tokens,
+            pooling,
+            tuning,
+            runtime_library,
+            false,
+        )
+    }
+
+    /// Open with the versioned Pardes cross-CPU INT8 policy; legacy callers keep
+    /// platform defaults through `open`.
+    pub fn open_with_kernel_policy(
+        graph: &Path,
+        tokenizer: &Path,
+        max_tokens: usize,
+        pooling: Pooling,
+        tuning: &OnnxBackendConfig,
+        runtime_library: Option<&Path>,
+        disable_kleidiai: bool,
+    ) -> Result<Self, EmbeddingError> {
         let started = std::time::Instant::now();
 
         if pooling != Pooling::InGraph {
@@ -1345,7 +1387,13 @@ impl OnnxBackend {
             path: graph.display().to_string(),
             reason,
         };
-        let first = build_session(&environment, graph, tuning.intra_threads).map_err(|e| {
+        let first = build_session_with_kernel_policy(
+            &environment,
+            graph,
+            tuning.intra_threads,
+            disable_kleidiai,
+        )
+        .map_err(|e| {
             invalid(format!(
                 "ONNX Runtime could not load the graph ({:?}): {}",
                 e.code(),
@@ -1361,19 +1409,22 @@ impl OnnxBackend {
         workers.push(Worker::new(first, &wiring).map_err(worker_failed)?);
         for index in 1..tuning.sessions {
             // The file is evidently valid by now, so a failure here is a resource one.
-            let session =
-                build_session(&environment, graph, tuning.intra_threads).map_err(|e| {
-                    EmbeddingError::LoadFailed {
-                        reason: format!(
-                        "session {} of {} for {} could not be created: {e} (each session holds \
+            let session = build_session_with_kernel_policy(
+                &environment,
+                graph,
+                tuning.intra_threads,
+                disable_kleidiai,
+            )
+            .map_err(|e| EmbeddingError::LoadFailed {
+                reason: format!(
+                    "session {} of {} for {} could not be created: {e} (each session holds \
                          its own copy of the weights; lower {})",
-                        index + 1,
-                        tuning.sessions,
-                        graph.display(),
-                        OnnxBackendConfig::ENV_SESSIONS
-                    ),
-                    }
-                })?;
+                    index + 1,
+                    tuning.sessions,
+                    graph.display(),
+                    OnnxBackendConfig::ENV_SESSIONS
+                ),
+            })?;
             workers.push(Worker::new(session, &wiring).map_err(worker_failed)?);
         }
 

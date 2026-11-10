@@ -75,7 +75,7 @@ use crate::errors::PackError;
 use crate::semantic::backend::Pooling;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
-use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
 use crate::semantic::official_index::readable_store_identity;
 use crate::semantic::oxv::codec::CodecSpec;
 use crate::semantic::oxv::reader::Segment;
@@ -400,13 +400,16 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
 /// What it is, and the backend that ran it, become the artifact's provenance.
 fn load_model(request: &BuildRequest) -> Result<(EmbeddingRuntime, VectorProvenance), PackError> {
     let declared = &request.model;
-    let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-        model_path: request.model_path.clone(),
-        embedding_dim: declared.embedding_dim,
-        max_tokens: declared.max_tokens,
-        batch_size: request.batch_size,
-        pooling: Pooling::parse(&declared.pooling)?,
-    });
+    let mut runtime = EmbeddingRuntime::with_deployment(
+        EmbeddingConfig {
+            model_path: request.model_path.clone(),
+            embedding_dim: declared.embedding_dim,
+            max_tokens: declared.max_tokens,
+            batch_size: request.batch_size,
+            pooling: Pooling::parse(&declared.pooling)?,
+        },
+        EmbeddingDeployment::default().for_text_recipe(declared.embedding_text_version),
+    );
     runtime.load()?;
 
     for (field, declared, loaded) in [
