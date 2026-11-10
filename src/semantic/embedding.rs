@@ -116,13 +116,12 @@ impl EmbeddingConfig {
 /// Where this machine keeps what a backend loads besides the model — today, the ONNX
 /// Runtime shared library.
 ///
-/// Deployment, not identity. [`EmbeddingConfig`] says what the vectors are, and is persisted
-/// as an index's identity; this says where the code that computes them lives, which differs
-/// between the build machine and every device while their vectors stay comparable. So
-/// nothing here reaches a manifest, an artifact's identity, a chunking identity or a backend
-/// id, and changing it invalidates nothing. A type of its own, held beside the configuration
-/// rather than inside it, so that no code deriving an identity from an [`EmbeddingConfig`]
-/// can pick it up.
+/// The runtime library path is deployment, not identity: it can differ between
+/// machines without changing the model's vectors. The numeric kernel policy is
+/// instead derived from the versioned text recipe and public model family; it
+/// must agree between index generation, queries and highlighting.
+/// `for_text_recipe` fixes that policy for Pardes and preserves all legacy
+/// Meivin defaults. It is not a user performance preference.
 ///
 /// A host passes it through
 /// [`SemanticConfig::deployment`](crate::semantic::engine::SemanticConfig::deployment) or
