@@ -1,5 +1,5 @@
 {
-  "family_id": "otzaria/Pardes-QA491-TorahPairs107-fp32-384",
+  "family_id": "otzaria/Pardes-QA491-int8-384",
   "tokenizer_checksum": "d491690794a1abea341790598b8d55d581c2d33b1e3e282d2666641f1b4e35ac",
   "embedding_dim": 384,
   "pooling": "in-graph",
@@ -10,8 +10,8 @@
   "chunking_identity": 13334152532150206612,
   "query_packages": [
     {
-      "checksum": "dd3acb51f6ab735cae17815f4e996591c8af89ecbb42504f74a32d396a22f991",
-      "quantization": "fp32"
+      "checksum": "edb0b74909ef0ae63ddaa1f47e909c18dc1584908a926471636f759e2de43365",
+      "quantization": "int8"
     }
   ]
 }

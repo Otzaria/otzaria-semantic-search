@@ -322,7 +322,11 @@ impl OfficialSemanticIndex {
         let text_recipe = EmbeddingTextRecipe::from_version(model.embedding_text_version)?;
         let normalization = TextNormalizationRecipe::from_version(model.normalization_version)?;
 
-        let passage = if model.query_max_tokens.is_some() {
+        // Meivin uses a separate verified FP32 passage graph. Pardes has one
+        // shared graph for both roles, while retaining the smaller query cap.
+        let separate_passage = model.query_max_tokens.is_some()
+            && text_recipe != EmbeddingTextRecipe::PardesLineOrNeighbourContext;
+        let passage = if separate_passage {
             let package = model
                 .passage_package
                 .as_ref()
@@ -359,11 +363,7 @@ impl OfficialSemanticIndex {
             None
         };
         let set = SegmentSet::open(&vectors_dir)?;
-        if let Some(package) = model
-            .passage_package
-            .as_ref()
-            .filter(|_| model.query_max_tokens.is_some())
-        {
+        if let Some(package) = model.passage_package.as_ref().filter(|_| separate_passage) {
             verify_passage_membership(&set, package)?;
         }
 
@@ -568,7 +568,9 @@ impl OfficialSemanticIndex {
         }
         let set = SegmentSet::open(&dir)?;
         set.identity().verify_matches(&self.expected)?;
-        if self.expected.model.query_max_tokens.is_some() {
+        if self.expected.model.query_max_tokens.is_some()
+            && self.text_recipe != EmbeddingTextRecipe::PardesLineOrNeighbourContext
+        {
             let passage_package = self
                 .passage
                 .as_ref()
@@ -772,6 +774,7 @@ mod tests {
                 model: model.clone(),
                 chunking: ChunkerConfig {
                     embedding_text_version: model.embedding_text_version,
+                    normalization_version: model.normalization_version,
                     ..ChunkerConfig::default()
                 },
                 created_at: "2026-10-01T00:00:00Z".to_string(),
@@ -1158,5 +1161,50 @@ mod tests {
         let local = LocalModel::of_family(PathBuf::from("query.int8.onnx"), &identity, "int8");
         assert_eq!(local.max_tokens, 256);
         assert_eq!(local.query_max_tokens, Some(128));
+    }
+
+    #[test]
+    fn pardes_shared_graph_search_highlighting_and_reload() {
+        let dir = TempDir::new("official_pardes_shared_graph");
+        let model_path = mock::write_stub_onnx_package(&dir.join("model"));
+        let mut model = family(vec![package(&model_path, "int8")], 3);
+        // The hash-only backend has no tokenizer and cannot apply a distinct
+        // query cap; the real 128/512 policy is covered by the ONNX parity run.
+        model.query_max_tokens = Some(512);
+        model.normalization_version = 2;
+        model.chunking_identity = ChunkerConfig {
+            embedding_text_version: 3,
+            normalization_version: 2,
+            ..ChunkerConfig::default()
+        }
+        .identity();
+        let vectors = dir.join("vectors");
+        install(&dir, "pardes30", &vectors, &model_path, &model, 30);
+        let mut index =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
+        let raw = "<b>מִצְוַת</b>  תפילין";
+        let clean = crate::semantic::pardes_clean::clean(raw);
+        let expected = |text: &str| {
+            let mut vector = mock::hash_embedding(text, DIM);
+            crate::semantic::embedding::normalize_validated(&mut vector, DIM).unwrap();
+            vector
+        };
+        assert_eq!(
+            index.embed_query(raw).unwrap(),
+            expected(&format!("query: {clean}"))
+        );
+        assert_eq!(
+            index
+                .embed_passages(&[raw], &CancellationToken::new())
+                .unwrap(),
+            vec![expected(&clean)]
+        );
+        assert!(
+            index.passage.is_none(),
+            "Pardes must not load a second graph"
+        );
+        install(&dir, "pardes31", &vectors, &model_path, &model, 31);
+        index.reload_vectors().unwrap();
+        assert_eq!(index.set_info().library_version, 31);
     }
 }
