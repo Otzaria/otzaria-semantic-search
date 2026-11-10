@@ -116,13 +116,12 @@ impl EmbeddingConfig {
 /// Where this machine keeps what a backend loads besides the model — today, the ONNX
 /// Runtime shared library.
 ///
-/// Deployment, not identity. [`EmbeddingConfig`] says what the vectors are, and is persisted
-/// as an index's identity; this says where the code that computes them lives, which differs
-/// between the build machine and every device while their vectors stay comparable. So
-/// nothing here reaches a manifest, an artifact's identity, a chunking identity or a backend
-/// id, and changing it invalidates nothing. A type of its own, held beside the configuration
-/// rather than inside it, so that no code deriving an identity from an [`EmbeddingConfig`]
-/// can pick it up.
+/// The runtime library path is deployment, not identity: it can differ between
+/// machines without changing the model's vectors. The numeric kernel policy is
+/// instead derived from the versioned text recipe and public model family; it
+/// must agree between index generation, queries and highlighting.
+/// `for_text_recipe` fixes that policy for Pardes and preserves all legacy
+/// Meivin defaults. It is not a user performance preference.
 ///
 /// A host passes it through
 /// [`SemanticConfig::deployment`](crate::semantic::engine::SemanticConfig::deployment) or
@@ -148,6 +147,18 @@ pub struct EmbeddingDeployment {
     /// than ignored, because ONNX Runtime cannot be unloaded or replaced. Ignored by the
     /// stand-in, which runs nothing. `docs/ONNX_BACKEND.md` §3 has the whole lookup.
     pub onnx_runtime: Option<PathBuf>,
+    /// Pardes INT8 uses global-text dynamic quantization on every CPU. ARM's
+    /// KleidiAI per-token kernel changes the embedding function and cannot share
+    /// an index with x86. False by default, preserving legacy Meivin semantics.
+    pub disable_kleidiai: bool,
+}
+
+impl EmbeddingDeployment {
+    /// The versioned Pardes recipe has one cross-architecture kernel policy.
+    pub fn for_text_recipe(mut self, version: u32) -> Self {
+        self.disable_kleidiai = version == 3;
+        self
+    }
 }
 
 /// Local embedding runtime: owns the *policy* around a backend, while the backend
@@ -894,6 +905,23 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_pardes_recipe_enables_the_cross_cpu_int8_policy() {
+        assert!(!super::EmbeddingDeployment::default().disable_kleidiai);
+        for version in [1, 2] {
+            assert!(
+                !super::EmbeddingDeployment::default()
+                    .for_text_recipe(version)
+                    .disable_kleidiai
+            );
+        }
+        assert!(
+            super::EmbeddingDeployment::default()
+                .for_text_recipe(3)
+                .disable_kleidiai
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

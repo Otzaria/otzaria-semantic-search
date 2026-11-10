@@ -465,13 +465,14 @@ fn onnx_backend(config: &EmbeddingConfig, deployment: &EmbeddingDeployment) -> C
     // The table passes no tuning, so the runtime's own knobs come from the environment;
     // typed callers use `OnnxBackend::open`.
     Some(OnnxBackendConfig::from_env_for(config).and_then(|tuning| {
-        OnnxBackend::open(
+        OnnxBackend::open_with_kernel_policy(
             &config.model_path,
             &onnx_tokenizer_path(&config.model_path),
             config.max_tokens,
             config.pooling,
             &tuning,
             deployment.onnx_runtime.as_deref(),
+            deployment.disable_kleidiai,
         )
         .map(|backend| Box::new(backend) as Box<dyn EmbeddingBackend>)
     }))

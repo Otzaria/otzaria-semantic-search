@@ -447,7 +447,8 @@ impl Chunker {
     ) -> Cow<'a, str> {
         match self.text_recipe {
             EmbeddingTextRecipe::LineOrNeighbourContext
-            | EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext => {
+            | EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext
+            | EmbeddingTextRecipe::PardesLineOrNeighbourContext => {
                 if char_count < self.config.min_meaningful_chars {
                     Cow::Owned(self.build_context_text(lines, index))
                 } else {

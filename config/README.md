@@ -7,6 +7,7 @@ handed one pair, never a mix of two.
 
 | Directory | Model | Status |
 |---|---|---|
+| `config/models/pardesqa491-windows-onnx/` | Pardes student2 INT8 backbone with trained QA491 shared projection, 384 dimensions; `query: ` /128 and unprefixed passages /512, Pardes cleaner | selected compact family; requires its own matching index; legacy Meivin families remain available |
 | `config/models/meivin-round2-onnx/` | Meivin Round 2 through ONNX Runtime, 256 dimensions: its int8 and fp32 packages | **the production identity**: the application ships the int8 package and embeds queries with it; the library's passages are embedded with fp32 |
 | `config/models/meivin-round2-windows-onnx/` | the same model and packages; `chunking_version` 2, which also embeds windows of 512 characters, overlapping by 128, of a line longer than 512 (at most 6 per line) | published beside the production identity; every line's first window is the production identity's text and key |
 

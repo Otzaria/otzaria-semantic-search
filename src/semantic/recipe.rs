@@ -92,6 +92,8 @@ pub enum EmbeddingTextRecipe {
     /// passages it should find, and nothing about either vector says so. That is why the
     /// query side is part of the recipe and not a detail of the caller.
     RolePrefixedLineOrNeighbourContext,
+    /// Pardes: no passage prefix; `query: ` on cleaned queries.
+    PardesLineOrNeighbourContext,
 }
 
 /// What [`EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext`] puts before every
@@ -116,7 +118,9 @@ impl EmbeddingTextRecipe {
     /// would give that space a `▁` token of its own before `[SEP]`.
     pub fn passage_text(self, text: &str) -> Cow<'_, str> {
         match self {
-            Self::LineOrNeighbourContext => Cow::Borrowed(text),
+            Self::LineOrNeighbourContext | Self::PardesLineOrNeighbourContext => {
+                Cow::Borrowed(text)
+            }
             Self::RolePrefixedLineOrNeighbourContext => {
                 Cow::Owned(format!("{PASSAGE_PREFIX}{}", text.trim()))
             }
@@ -135,6 +139,7 @@ impl EmbeddingTextRecipe {
     pub fn query_text(self, normalized_query: &str) -> Cow<'_, str> {
         match self {
             Self::LineOrNeighbourContext => Cow::Borrowed(normalized_query),
+            Self::PardesLineOrNeighbourContext => Cow::Owned(format!("query: {normalized_query}")),
             Self::RolePrefixedLineOrNeighbourContext => {
                 Cow::Owned(format!("{QUERY_PREFIX}{}", normalized_query.trim()))
             }
@@ -184,6 +189,8 @@ pub enum TextNormalizationRecipe {
     /// removing punctuation helps retrieval is S1's measurement, and the answer becomes a
     /// second variant here.
     AsSuppliedByCorpus,
+    /// Exact pardes-clean-1, before role prefixes on both sides.
+    PardesClean1,
 }
 
 impl TextNormalizationRecipe {
@@ -194,6 +201,7 @@ impl TextNormalizationRecipe {
     pub fn apply<'a>(self, text: &'a str) -> std::borrow::Cow<'a, str> {
         match self {
             Self::AsSuppliedByCorpus => std::borrow::Cow::Borrowed(text),
+            Self::PardesClean1 => std::borrow::Cow::Owned(super::pardes_clean::clean(text)),
         }
     }
 }
@@ -249,9 +257,11 @@ recipe_versions!(ChunkingAlgorithm, "chunking_version", {
 recipe_versions!(EmbeddingTextRecipe, "embedding_text_version", {
     LineOrNeighbourContext => 1,
     RolePrefixedLineOrNeighbourContext => 2,
+    PardesLineOrNeighbourContext => 3,
 });
 recipe_versions!(TextNormalizationRecipe, "normalization_version", {
     AsSuppliedByCorpus => 1,
+    PardesClean1 => 2,
 });
 
 /// The three versions resolved together, once, before any of them is acted on.
@@ -344,15 +354,15 @@ mod tests {
             ),
             (
                 "embedding_text_version",
-                EmbeddingTextRecipe::from_version(3).unwrap_err(),
-                3,
-                "1, 2",
+                EmbeddingTextRecipe::from_version(4).unwrap_err(),
+                4,
+                "1, 2, 3",
             ),
             (
                 "normalization_version",
-                TextNormalizationRecipe::from_version(2).unwrap_err(),
-                2,
-                "1",
+                TextNormalizationRecipe::from_version(3).unwrap_err(),
+                3,
+                "1, 2",
             ),
         ] {
             match error {

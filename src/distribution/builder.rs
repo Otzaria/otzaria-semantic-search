@@ -75,7 +75,7 @@ use crate::errors::PackError;
 use crate::semantic::backend::Pooling;
 use crate::semantic::chunk_key::ChunkKey;
 use crate::semantic::chunker::{Chunker, ChunkerConfig};
-use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+use crate::semantic::embedding::{EmbeddingConfig, EmbeddingDeployment, EmbeddingRuntime};
 use crate::semantic::official_index::readable_store_identity;
 use crate::semantic::oxv::codec::CodecSpec;
 use crate::semantic::oxv::reader::Segment;
@@ -400,13 +400,16 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
 /// What it is, and the backend that ran it, become the artifact's provenance.
 fn load_model(request: &BuildRequest) -> Result<(EmbeddingRuntime, VectorProvenance), PackError> {
     let declared = &request.model;
-    let mut runtime = EmbeddingRuntime::new(EmbeddingConfig {
-        model_path: request.model_path.clone(),
-        embedding_dim: declared.embedding_dim,
-        max_tokens: declared.max_tokens,
-        batch_size: request.batch_size,
-        pooling: Pooling::parse(&declared.pooling)?,
-    });
+    let mut runtime = EmbeddingRuntime::with_deployment(
+        EmbeddingConfig {
+            model_path: request.model_path.clone(),
+            embedding_dim: declared.embedding_dim,
+            max_tokens: declared.max_tokens,
+            batch_size: request.batch_size,
+            pooling: Pooling::parse(&declared.pooling)?,
+        },
+        EmbeddingDeployment::default().for_text_recipe(declared.embedding_text_version),
+    );
     runtime.load()?;
 
     for (field, declared, loaded) in [
@@ -1279,10 +1282,9 @@ mod tests {
         // `embedding_text_version` lives in both the configuration and the identity, so
         // moving it alone means moving both — the disagreement between them is its own
         // rejection, tested separately in `recipe`.
-        // Version 2 of the text recipe exists — the role prefixes — so 3 is the first one
-        // nothing implements.
+        // Version 3 adds Pardes role text, so version 4 is the first unsupported one.
         let text_chunking = ChunkerConfig {
-            embedding_text_version: 3,
+            embedding_text_version: 4,
             ..ChunkerConfig::default()
         };
         let cases: [(&str, ChunkerConfig, ModelIdentity, u32, &str); 3] = [
@@ -1290,31 +1292,31 @@ mod tests {
                 "embedding_text_version",
                 text_chunking.clone(),
                 ModelIdentity {
-                    embedding_text_version: 3,
+                    embedding_text_version: 4,
                     chunking_identity: text_chunking.identity(),
                     ..truthful.clone()
                 },
-                3,
-                "1, 2",
+                4,
+                "1, 2, 3",
             ),
             (
                 // Carried in both places, like the text version above, so both move.
                 "normalization_version",
                 ChunkerConfig {
-                    normalization_version: 2,
+                    normalization_version: 3,
                     ..ChunkerConfig::default()
                 },
                 ModelIdentity {
-                    normalization_version: 2,
+                    normalization_version: 3,
                     chunking_identity: ChunkerConfig {
-                        normalization_version: 2,
+                        normalization_version: 3,
                         ..ChunkerConfig::default()
                     }
                     .identity(),
                     ..truthful.clone()
                 },
-                2,
-                "1",
+                3,
+                "1, 2",
             ),
             (
                 // Only the configuration carries this one — the artifact carries the hash

@@ -726,6 +726,7 @@ mod with_the_backend {
         );
         let application_runtime = PathBuf::from(application_runtime);
         let deployment = EmbeddingDeployment {
+            disable_kleidiai: false,
             onnx_runtime: Some(application_runtime.clone()),
         };
         let dir = TempDir::new("application_runtime");
@@ -782,6 +783,7 @@ mod with_the_backend {
         let refused = EmbeddingRuntime::with_deployment(
             config_for(model),
             EmbeddingDeployment {
+                disable_kleidiai: false,
                 onnx_runtime: Some(other.clone()),
             },
         )
@@ -808,6 +810,7 @@ mod with_the_backend {
         let model = package(&dir, "dynamic.onnx");
         let absent = dir.0.join("not-installed").join("onnxruntime-library");
         let deployment = EmbeddingDeployment {
+            disable_kleidiai: false,
             onnx_runtime: Some(absent.clone()),
         };
         let is_the_refusal = |error: &EmbeddingError| {

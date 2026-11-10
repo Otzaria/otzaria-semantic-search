@@ -34,6 +34,10 @@ mock-embedding = []
 # every other target the feature is on with no backend behind it.
 onnx-backend = ["dep:ort", "dep:tokenizers", "dep:libloading"]
 
+[[example]]
+name = "pardes_parity"
+required-features = ["onnx-backend"]
+
 [[bench]]
 name = "vector_search"
 harness = false
