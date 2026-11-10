@@ -2,6 +2,7 @@
 mod data;
 mod lifecycle;
 mod measure;
+mod native_checks;
 
 use data::Config;
 use otzaria_semantic_search::distribution::package::PackageKind;
@@ -190,8 +191,24 @@ fn path_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otzaria_semantic_search::semantic::segment_set::SegmentSet;
 
     struct Fixture(PathBuf);
+    impl Fixture {
+        fn build(config: &Config) -> Result<Self> {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let fixture = Self(
+                std::env::temp_dir()
+                    .join(format!("otzaria-ann-test-{}-{unique}", std::process::id())),
+            );
+            config.validate()?;
+            build(&fixture.0, config)?;
+            Ok(fixture)
+        }
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             // Only the unique directory this test created, never a CLI path.
@@ -222,15 +239,101 @@ mod tests {
         })
     }
 
+    #[test]
+    fn tied_f32_scores_survive_delta_compaction_and_restore() -> Result<()> {
+        check_roundtrip(Config {
+            vectors: 200,
+            dim: 1,
+            queries: 4,
+            top_k: 10,
+            codec: "f32".to_string(),
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn native_contents_detects_corruption_with_unchanged_size_and_membership() -> Result<()> {
+        let config = Config {
+            vectors: 200,
+            dim: 32,
+            queries: 4,
+            codec: "f32".to_string(),
+            ..Config::default()
+        };
+        let fixture = Fixture::build(&config)?;
+        let source = SegmentSet::open(&fixture.0.join("lifecycle-set"))?;
+        let ann = config.ann(128)?;
+        ann.load(path_str(&fixture.0.join("index.usearch"))?)?;
+        native_checks::verify_contents(&ann, &source)?;
+        let mut first = vec![0f32; config.dim];
+        let mut second = vec![0f32; config.dim];
+        assert_eq!(ann.get(1, &mut first)?, 1);
+        assert_eq!(ann.get(2, &mut second)?, 1);
+        assert_ne!(first, second);
+
+        // A one-bit payload change must fail even when every ID is still present.
+        let mut changed = first.clone();
+        changed[0] = f32::from_bits(changed[0].to_bits() ^ 1);
+        ann.remove(1)?;
+        ann.add(1, &changed)?;
+        assert_eq!(ann.size(), config.vectors);
+        assert!((1..=config.vectors as u64).all(|key| ann.contains(key)));
+        let error = native_checks::verify_contents(&ann, &source).unwrap_err();
+        assert!(error.to_string().contains("vector content"));
+
+        // Swapping two intact vectors also preserves size and membership.
+        ann.remove(1)?;
+        ann.remove(2)?;
+        ann.add(1, &second)?;
+        ann.add(2, &first)?;
+        assert!(native_checks::verify_contents(&ann, &source).is_err());
+        ann.remove(1)?;
+        ann.remove(2)?;
+        ann.add(1, &first)?;
+        ann.add(2, &second)?;
+        native_checks::verify_contents(&ann, &source)?;
+
+        ann.remove(1)?;
+        assert!(native_checks::verify_contents(&ann, &source).is_err());
+        ann.add(config.vectors as u64 + 1, &first)?;
+        assert_eq!(ann.size(), config.vectors);
+        assert!(native_checks::verify_contents(&ann, &source).is_err());
+        ann.remove(config.vectors as u64 + 1)?;
+        ann.add(1, &first)?;
+        ann.change_metric_kind(usearch::MetricKind::Cos)?;
+        assert!(native_checks::verify_contents(&ann, &source).is_err());
+        ann.change_metric_kind(usearch::MetricKind::IP)?;
+        native_checks::verify_contents(&ann, &source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_contents_detects_resurrected_tombstones() -> Result<()> {
+        let config = Config {
+            vectors: 200,
+            dim: 1,
+            queries: 4,
+            codec: "f32".to_string(),
+            ..Config::default()
+        };
+        let fixture = Fixture::build(&config)?;
+        lifecycle::run(&fixture.0)?;
+        let source = SegmentSet::open(&fixture.0.join("lifecycle-set"))?;
+        let ann = config.ann(128)?;
+        ann.load(path_str(&fixture.0.join("lifecycle-compacted.usearch"))?)?;
+        native_checks::verify_contents(&ann, &source)?;
+        assert!(!ann.contains(50));
+        let mut vector = vec![0f32; config.dim];
+        assert_eq!(ann.get(1, &mut vector)?, 1);
+        ann.remove(1)?;
+        ann.add(50, &vector)?;
+        assert_eq!(ann.size() as u64, source.info().slots_live);
+        assert!(native_checks::verify_contents(&ann, &source).is_err());
+        Ok(())
+    }
+
     fn check_roundtrip(config: Config) -> Result<()> {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let fixture = Fixture(
-            std::env::temp_dir().join(format!("otzaria-ann-test-{}-{unique}", std::process::id())),
-        );
-        config.validate()?;
-        build(&fixture.0, &config)?;
+        let fixture = Fixture::build(&config)?;
         for filter in ["all", "5pct", "1pct", "empty"] {
             let exact = measure::measure(&fixture.0, "oxv", filter, 1, 128, 1)?;
             let parallel = measure::measure(&fixture.0, "oxv", filter, 8, 128, 1)?;
@@ -256,6 +359,7 @@ mod tests {
         assert_eq!(lifecycle["status"], "passed");
         assert_eq!(lifecycle["live_after"], 208);
         assert_eq!(lifecycle["native_ann_abort_supported"], false);
+        assert_eq!(lifecycle["ann_all_live_vectors_match_oxv"], true);
         assert!(
             lifecycle::run(&fixture.0).is_err(),
             "a second lifecycle must not overwrite its own generation history"

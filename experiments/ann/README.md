@@ -81,9 +81,10 @@ cargo test --locked --manifest-path experiments/ann/Cargo.toml -j 1
 python3 -m unittest discover -s experiments/ann -p 'test_*.py'
 ```
 
-The separate `ANN experiment checks` workflow runs two 200-vector native smoke fixtures
-(int8 and fitted rotated codec)
-and Python recall checks on Linux when this experiment changes. Root Cargo CI
+The separate `ANN experiment checks` workflow runs 200-vector roundtrip fixtures
+for int8, fitted rotated codec and tie-heavy one-dimensional F32 data, focused
+corruption and exact-result validation tests, and Python recall checks on Linux
+when this experiment changes. Root Cargo CI
 does not implicitly include this separate workspace. After the smoke passes,
 three observational jobs measure 20k × 256 fixtures (clustered int8, uniform int8,
 clustered rotated codec), preserve JSON/raw results as Actions artifacts, and
@@ -164,9 +165,24 @@ The lifecycle command installs a real OXV delta with 2% tombstones and 6% new ke
 then compacts it using the existing installer and compactor. It verifies exact
 keys/scores/order before and after compaction and that readers retaining earlier
 generations continue answering their original snapshots. In the separate native
-graph it removes/adds the same keys, compacts, saves, loads and mmap-views the file,
-checks every key's membership, and compares native exact results across compaction
-and both reopen modes. Approximate recall after delta is reported separately.
+graph it removes/adds the same keys, compacts, saves, loads and mmap-views the file.
+Native exact comparisons preserve ranked distances and every key/distance pair
+strictly better than the top-k cutoff. Equal-distance keys may reorder, and keys
+tied at the cutoff may substitute for one another; no floating-point tolerance
+is used. Result counts, uniqueness, live membership and finite sorted distances
+are checked independently. OXV's strict key/score/order checks are unchanged.
+
+After mutation, after native compaction, and after each load/view restoration,
+every live native key's F32 vector is checked bit for bit against the decoded
+vector in the retained OXV generation. Together with the live count, this detects
+missing, unexpected, tombstoned, swapped or modified vectors even if their query
+scores happen to tie. Validation streams through OXV with O(dim) vector scratch
+space and is outside the mutation/compaction timing intervals. If a cutoff key
+changes, a temporary native index with at most k vectors verifies that the new
+key really has the cutoff distance using the same F32/IP arithmetic. New lifecycle
+reports record the tie policy and full-content checks explicitly; the retained
+2026-11-05 reports predate these stronger checks. Approximate recall after delta
+is reported separately and its accounting is unchanged.
 
 The Rust wrapper owns USearch's index handle. `add` copies each temporary input;
 we use owned file mappings, not `view_from_buffer`, and install no custom metric

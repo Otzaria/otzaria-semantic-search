@@ -2,7 +2,7 @@
 //! graph is a disposable derivative; no production generation contains it.
 use crate::data::{self, Config, Filter, key_id};
 use crate::measure::{Backend, Hits};
-use crate::{Result, path_str};
+use crate::{Result, native_checks, path_str};
 use otzaria_semantic_search::cancellation::CancellationToken;
 use otzaria_semantic_search::distribution::package::PackageKind;
 use otzaria_semantic_search::errors::VectorStoreError;
@@ -108,9 +108,8 @@ pub fn run(dir: &Path) -> Result<Value> {
         ann.add(key, &decoded)?;
     }
     let ann_mutation_us = started.elapsed().as_secs_f64() * 1e6;
-    if ann.size() != live_count {
-        return Err("ANN mutation did not produce the expected live size".into());
-    }
+    native_checks::verify_contents(&ann, &current)
+        .map_err(|error| format!("ANN after delta: {error}"))?;
 
     let mut after_delta = Vec::new();
     let mut recall_by_filter = Vec::new();
@@ -143,19 +142,29 @@ pub fn run(dir: &Path) -> Result<Value> {
         after_delta.push(expected);
     }
 
-    // Compare full native search results before and after graph compaction;
-    // graph traversal may change approximate candidates, exact keys must survive.
+    // Exact distances and strictly better neighbors must survive compaction.
+    // USearch may reorder ties or select different keys tied at the top-k cutoff;
+    // full key-to-vector validation above and below guards the underlying content.
     let native_exact_before: Vec<_> = (0..config.queries.min(20))
         .map(|id| ann.exact_search(&config.query(id), config.top_k))
         .collect::<std::result::Result<_, _>>()?;
     let started = Instant::now();
     ann.compact()?;
     let ann_compact_us = started.elapsed().as_secs_f64() * 1e6;
+    native_checks::verify_contents(&ann, &current)
+        .map_err(|error| format!("ANN after compaction: {error}"))?;
     for (id, expected) in native_exact_before.iter().enumerate() {
-        let actual = ann.exact_search(&config.query(id), config.top_k)?;
-        if expected.keys != actual.keys || expected.distances != actual.distances {
-            return Err("ANN compaction changed exact keys or distances".into());
-        }
+        let query = config.query(id);
+        let actual = ann.exact_search(&query, config.top_k)?;
+        native_checks::verify_exact_parity(
+            &ann,
+            &query,
+            expected,
+            &actual,
+            config.top_k.min(live_count),
+            &is_live,
+        )
+        .map_err(|error| format!("ANN compaction query {id}: {error}"))?;
     }
     let started = Instant::now();
     let compacted = compact(
@@ -190,19 +199,25 @@ pub fn run(dir: &Path) -> Result<Value> {
         } else {
             restored.load(path_str(&compacted_path)?)?;
         }
-        if restored.size() != live_count {
-            return Err("ANN restore lost vectors".into());
-        }
+        native_checks::verify_contents(&restored, &current)
+            .map_err(|error| format!("ANN restore (view={viewed}): {error}"))?;
         for key in 1..=config.vectors as u64 + added_count as u64 {
             if restored.contains(key) != is_live(key) {
                 return Err("ANN key mapping changed on compact/save/restore".into());
             }
         }
         for (id, expected) in native_exact_before.iter().enumerate() {
-            let actual = restored.exact_search(&config.query(id), config.top_k)?;
-            if expected.keys != actual.keys || expected.distances != actual.distances {
-                return Err("ANN restore changed exact keys or distances".into());
-            }
+            let query = config.query(id);
+            let actual = restored.exact_search(&query, config.top_k)?;
+            native_checks::verify_exact_parity(
+                &restored,
+                &query,
+                expected,
+                &actual,
+                config.top_k.min(live_count),
+                &is_live,
+            )
+            .map_err(|error| format!("ANN restore (view={viewed}) query {id}: {error}"))?;
         }
     }
 
@@ -276,6 +291,9 @@ pub fn run(dir: &Path) -> Result<Value> {
         "recall_after_delta": recall_by_filter,
         "exact_oxv_compaction_score_and_order_parity": true, "retained_oxv_snapshot_parity": true,
         "ann_exact_compaction_and_restore_parity": true, "ann_all_key_membership_after_load_and_view": true,
+        "ann_exact_tie_policy": "equal_distance_permutations_and_verified_cutoff_substitutions",
+        "ann_all_live_vectors_match_oxv": true,
+        "ann_vector_validation_stages": ["after_delta", "after_compact", "load", "view"],
         "pre_cancelled_oxv": oxv_pre_cancelled, "pre_cancelled_ann_wrapper": ann_pre_cancelled,
         "native_ann_abort_supported": false,
         "ann_cancellation_predicate_calls_after_request": predicate_calls.get().saturating_sub(1),

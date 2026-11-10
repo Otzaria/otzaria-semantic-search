@@ -6,6 +6,11 @@ The functional head, generated merge ref, executable hash, original GitHub ZIP
 digests and hashes of the retained files are in [manifest.json](manifest.json).
 The analysis and measurement limits are in [RESULTS.md](../../RESULTS.md).
 
+These archives predate the native tie-handling correction and full key-to-vector
+content checks. Their source hashes identify the historical producer recorded in
+the manifest and are not expected to match later source revisions. The archives,
+summaries and manifest are preserved unchanged.
+
 | Fixture | Compact summary | Complete raw archive |
 | --- | --- | --- |
 | Clustered int8 | [i8-clustered-summary.json](i8-clustered-summary.json) | [i8-clustered-raw.json.gz](i8-clustered-raw.json.gz) |
