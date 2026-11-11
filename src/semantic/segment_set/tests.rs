@@ -2416,11 +2416,13 @@ fn held_without_delete_sharing(path: &Path, share: u32) -> std::fs::File {
         .unwrap_or_else(|error| panic!("holding {}: {error}", path.display()))
 }
 
-/// `file`, closed on another thread after 300 ms.
+/// `file`, closed on another thread once an operation on `refused` is refused: a timer raced
+/// the work before that operation, which a slow runner outlasted.
 #[cfg(windows)]
-fn released_soon(file: std::fs::File) -> std::thread::JoinHandle<()> {
+fn released_once_refused(file: std::fs::File, refused: &Path) -> std::thread::JoinHandle<()> {
+    let refused = refused.to_path_buf();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        retry::wait_for_refusal(&refused, std::time::Duration::from_secs(10));
         drop(file);
     })
 }
@@ -2475,8 +2477,9 @@ fn windows_current_held_open_briefly_is_flipped_once_released() {
         forget_refusals();
         let report = at_step(
             move |step| {
-                (step == Step::PreviousWritten)
-                    .then(|| released_soon(held_without_delete_sharing(&held, share)))
+                (step == Step::PreviousWritten).then(|| {
+                    released_once_refused(held_without_delete_sharing(&held, share), &held)
+                })
             },
             || install(&dir, &delta),
         )
@@ -2518,10 +2521,10 @@ fn windows_a_segment_held_open_briefly_is_placed_once_released() {
         let report = at_step(
             move |step| {
                 (step == Step::Staged).then(|| {
-                    released_soon(held_without_delete_sharing(
+                    released_once_refused(
+                        held_without_delete_sharing(&held, FILE_SHARE_READ | FILE_SHARE_WRITE),
                         &held,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    ))
+                    )
                 })
             },
             || install(&dir, &source),
@@ -2758,10 +2761,13 @@ fn windows_staging_held_open_briefly_is_recovered_once_released() {
     std::fs::write(staging.join("left.oxv"), b"half").unwrap();
 
     forget_refusals();
-    let released = released_soon(held_without_delete_sharing(
-        &staging.join("left.oxv"),
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-    ));
+    let released = released_once_refused(
+        held_without_delete_sharing(
+            &staging.join("left.oxv"),
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        ),
+        &staging,
+    );
     let set = SegmentSet::open(&dir).unwrap();
     released.join().unwrap();
     assert!(refusals_on(&staging) > 0, "recovery never met the handle");
@@ -2813,10 +2819,10 @@ fn windows_a_verdict_held_open_briefly_is_withdrawn_once_released() {
     let report = at_step(
         move |step| {
             (step == Step::Staged).then(|| {
-                released_soon(held_without_delete_sharing(
+                released_once_refused(
+                    held_without_delete_sharing(&held, FILE_SHARE_READ | FILE_SHARE_WRITE),
                     &held,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ))
+                )
             })
         },
         || install(&dir, &base),

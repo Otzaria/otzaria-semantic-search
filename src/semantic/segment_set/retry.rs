@@ -35,6 +35,25 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Every path refused on any thread, for the thread that holds it to wait on.
+#[cfg(all(windows, test))]
+static REFUSED_ANYWHERE: (
+    std::sync::Mutex<Vec<std::path::PathBuf>>,
+    std::sync::Condvar,
+) = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Block until an operation on `path` is refused, or `timeout` passes.
+#[cfg(all(windows, test))]
+pub(crate) fn wait_for_refusal(path: &Path, timeout: Duration) {
+    let (refused, signal) = &REFUSED_ANYWHERE;
+    let refused = refused
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = signal.wait_timeout_while(refused, timeout, |refused| {
+        !refused.iter().any(|seen| seen == path)
+    });
+}
+
 /// `fs::rename`.
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     retried("moving", &[from, to], || fs::rename(from, to))
@@ -67,6 +86,14 @@ fn retried(
             let attempt = operation();
             if attempt.as_ref().is_err_and(is_transient) {
                 refused += 1;
+                #[cfg(test)]
+                {
+                    let (seen, signal) = &REFUSED_ANYWHERE;
+                    seen.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend(paths.iter().map(|path| path.to_path_buf()));
+                    signal.notify_all();
+                }
             }
             attempt
         },
