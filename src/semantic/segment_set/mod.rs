@@ -800,7 +800,7 @@ pub struct RetireReport {
 /// For a host that has opened the set without falling back
 /// ([`SetInfo::recovered_from_previous`] `false`). Under the set's lock: `CURRENT`'s
 /// generation is opened as [`SegmentSet::open`] opens it, without falling back; `PREVIOUS`
-/// is removed and the removal flushed; then garbage is collected. A crash at any point
+/// is removed and, on Unix, the removal flushed; then garbage is collected. A crash at any point
 /// leaves `CURRENT` as it was, so the set opens: before the removal is durable `PREVIOUS`
 /// may still be there, and after it whatever was not yet collected goes at the next open or
 /// flip. `PREVIOUS` that does not read is no fallback and is removed alike. Without

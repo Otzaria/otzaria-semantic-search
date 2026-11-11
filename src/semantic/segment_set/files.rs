@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! <vectors>/
-//!   .lock                        held for install, compaction and recovery
+//!   .lock                        held for install, compaction, recovery and retirement
 //!   CURRENT                      {"generation":7,"set":"gen-000007/set.json","set_sha256":"…"}
 //!   PREVIOUS                     the generation CURRENT pointed to before the last flip
 //!   segments/<sid>.oxv           immutable segments: a name never takes other bytes
@@ -119,7 +119,8 @@ pub(crate) fn write_pointer(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<
 }
 
 /// Remove `PREVIOUS` — the file, or an empty directory in its place, never recursively —
-/// and flush the set's directory, so no collection runs before the removal is durable.
+/// and flush the set's directory where that is possible (Unix), so no collection runs
+/// before the removal is durable.
 pub(crate) fn remove_previous(dir: &Path) -> io::Result<()> {
     let path = dir.join(PREVIOUS);
     if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
