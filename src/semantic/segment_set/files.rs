@@ -118,6 +118,18 @@ pub(crate) fn write_pointer(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<
     write_atomically(&path, bytes)
 }
 
+/// Remove `PREVIOUS` — the file, or an empty directory in its place, never recursively —
+/// and flush the set's directory, so no collection runs before the removal is durable.
+pub(crate) fn remove_previous(dir: &Path) -> io::Result<()> {
+    let path = dir.join(PREVIOUS);
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        retry::remove_dir(&path)?;
+    } else {
+        retry::remove_file(&path)?;
+    }
+    sync_set_dir(dir)
+}
+
 pub(crate) fn segment_file(id: &str) -> String {
     format!("{SEGMENTS_DIR}/{id}.oxv")
 }

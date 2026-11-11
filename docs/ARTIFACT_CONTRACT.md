@@ -443,7 +443,7 @@ SHA-256 מעל `"otzaria-vector-identity-v1\n"` ושורת `path=value\n` לכל
 <vectors>/
 ├── .lock                        נלקח להתקנה, לדחיסה ולשחזור
 ├── CURRENT                      {"generation":7,"set":"gen-000007/set.json","set_sha256":"…"}
-├── PREVIOUS                     הדור ש־CURRENT הצביע עליו לפני ההחלפה האחרונה
+├── PREVIOUS                     הדור ש־CURRENT הצביע עליו לפני ההחלפה האחרונה, עד ש־retire_previous מוותר עליו
 ├── segments/<sid>.oxv           segments, בלתי משתנים: שם שאינו נכתב על בתים אחרים
 ├── segments/<sid>.package.json  ה־manifest שה־segment הותקן ממנו
 ├── segments/<sid>.corrupt       פסק דין: ה־SHA-256 של מה שהקובץ מחזיק, והסיבה; דור שמונה בתים אחרים אינו נפתח
@@ -547,6 +547,24 @@ base מחליף את הסט כולו.
 ב־fallback, וזו שנכשלת — נדחית, מבוטלת או נקטעת בכל שלב — אינה מוחקת ואינה כותבת על אף דור
 קיים: המצביעים נשארים על מה שמנו, וכש־`CURRENT` אינו נקרא ה־fallback ל־`PREVIOUS` נשאר
 כשהיה.
+
+**ויתור על `PREVIOUS`.** `PREVIOUS` שומר את הדור הקודם, וכל segment שרק הוא משתמש בו, עד
+ההחלפה הבאה — אחרי base זה סט שלם שני על הדיסק. מארח שפתח את הדור של `CURRENT` בלי fallback
+מוותר עליו ב־`retire_previous(dir)`, עם ה־lock: הדור של `CURRENT` נפתח כמו בפתיחה, בלי
+fallback; `PREVIOUS` מוסר (קובץ, או תיקייה ריקה במקומו, בלי מחיקה רקורסיבית) וההסרה נשטפת
+לדיסק; ואז איסוף אשפה. כש־`CURRENT` אינו נפתח — `PREVIOUS` הוא ה־fallback היחיד — הוויתור
+נדחה בסיבה, ושום דבר אינו משתנה; בלי `PREVIOUS` אין מה לעשות, ושום דבר אינו נכתב; `PREVIOUS`
+שאינו נקרא אינו fallback ומוסר כמו אחר. ה־lock תפוס בידי התקנה או דחיסה — `Io` מסוג
+`WouldBlock`, כמו ביניהן.
+
+| קריסה אחרי | מה נשאר | מה הפתיחה הבאה עושה |
+|---|---|---|
+| (לפני ההסרה) | הכול כשהיה | הדור של `CURRENT` נפתח |
+| PreviousRetired | אין `PREVIOUS`; הדור שמנה עוד על הדיסק | הדור של `CURRENT` נפתח; האשפה נאספת |
+
+`CURRENT` אינו משתנה בשום שלב, ולכן הסט נפתח אחרי קריסה בכל נקודה; הסרה שלא נשטפה לפני
+נפילת חשמל משאירה את `PREVIOUS` כשהיה, כי האיסוף רץ רק אחריה. קורא שמיפה את הדור הקודם ממשיך
+לענות ממנו, כמו אחרי כל החלפה (§5.5).
 
 ### 5.5 איסוף אשפה ו־Windows
 
@@ -660,14 +678,14 @@ slots מושווים למקורם; דור חדש מוחלף פנימה. כל blo
 
 | שגיאה | איפה | למארח |
 |---|---|---|
-| `ArtifactError::MetadataUnusable` — אין `CURRENT` ואין `PREVIOUS` | פתיחה | אין סט מותקן |
+| `ArtifactError::MetadataUnusable` — אין `CURRENT` ואין `PREVIOUS` | פתיחה, `retire_previous` | אין סט מותקן |
 | `ArtifactError::IdentityMismatch { mismatches }` | פתיחה, התקנה, טעינה מחדש | הסט הלא נכון; כל שדה שלא הסכים, בשמו. תיקייה של גרסה 1 נוקבת ב־`store.backend_id` |
 | `ArtifactError::DeltaDoesNotApply { field, reason }` | התקנה | `delta.from_library_version` (פער, חפיפה, אין base), `delta.codec_params` (epoch אחר) |
 | `ArtifactError::SegmentIdTaken { id, installed_sha256, offered_sha256 }` | התקנה | מהדורה מותקנת שפורסמה שוב בבתים אחרים, והבתים המותקנים חיים; הסט והשחרור תקינים — §2.4 |
 | `ArtifactError::UnexpectedArtifactDigest` | התקנה | ה־manifest אינו המפורסם |
 | `ArtifactError::PayloadChecksumFailed`, `ManifestDisagreesWithPayload` | התקנה | ה־segment או ה־manifest פגומים |
 | `ArtifactError::InsufficientSpace { needed, available }` | התקנה, דחיסה | אין מקום — המצב היחיד שהמשתמש יכול לפעול בו בלי הורדה |
-| `VectorStoreError::Corrupted { reason }` | פתיחה, `info`, התקנה, scrub | segment או קובץ נגזר פגומים, ושני הדורות אינם נפתחים |
+| `VectorStoreError::Corrupted { reason }` | פתיחה, `info`, התקנה, scrub, `retire_previous` | segment או קובץ נגזר פגומים, ושני הדורות אינם נפתחים; ב־`retire_previous` — הדור של `CURRENT` אינו נפתח, ו־`PREVIOUS` נשמר |
 | `VectorStoreError::OpenFailed { reason }` | פתיחה | segment תקין — magic ו־CRC של ה־header — בגרסת פורמט או ב־codec שה־build אינו קורא: חדש ממנו, לא פגום, ושום דבר אינו מוחק אותו |
 | `EmbeddingError` | פתיחה | המודל חסר או אינו מתאים לתצורה — מתוקן בהשגת המודל, לא הווקטורים |
 | `SemanticSearchError::Resolution { reason }` | חיפוש | האינדקס של המארח לא ענה; החיפוש נשאר עם התוצאות הלקסיקליות ו־`fallback_reason` |
@@ -739,7 +757,8 @@ Apple M4, וקטורים סינתטיים בצורה של ספריית v30
 - חבילת שאילתה בשייכות: int8 ו־fp32 פותחים סט שנבנה ב־fp32 ומקבל את שתיהן; חבילה מחוץ
   לרשימה, tokenizer אחר, משפחה אחרת, מתכון אחר ומתכון שורות אחר נדחים בשם השדה.
 - כל אחת מחמש נקודות הקריסה של ההתקנה מחזירה את הדור הישן או החדש, וההתקנה החוזרת
-  מצליחה; `CURRENT` פגום נופל ל־`PREVIOUS`; delta כפול או ישן אינו משנה דבר; פער, epoch
+  מצליחה; קריסה באמצע `retire_previous` משאירה את `CURRENT`, והוויתור נדחה כש־`CURRENT`
+  אינו נפתח; `CURRENT` פגום נופל ל־`PREVIOUS`; delta כפול או ישן אינו משנה דבר; פער, epoch
   אחר ו־base חסר נדחים.
 - section קריטי לא מוכר נדחה ו־ancillary מדולג; בית הפוך בכל section נתפס — בפתיחה או
   ב־scrub.

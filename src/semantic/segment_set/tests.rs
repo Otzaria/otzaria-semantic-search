@@ -3509,3 +3509,254 @@ fn a_cross_model_base_survives_a_previous_that_cannot_be_removed() {
     assert_eq!(std::fs::read(&held).unwrap(), b"untouched");
     assert_eq!(generations_and_segments(&dir).0.len(), 2);
 }
+
+/// Two bases, `PREVIOUS` naming the first: the second set on disk a retirement frees.
+fn two_bases(work: &TempDir) -> PathBuf {
+    let dir = work.join("vectors");
+    install(&dir, &release(work, &v29(), None)).unwrap();
+    install(&dir, &release(work, &v31(), None)).unwrap();
+    assert_eq!(previous_generation(&dir), 1);
+    dir
+}
+
+#[test]
+fn retiring_previous_after_a_base_frees_the_old_set_and_the_live_one_still_opens() {
+    let work = TempDir::new("set_retire_base");
+    let dir = two_bases(&work);
+    let set = SegmentSet::open(&dir).unwrap();
+    let answers = everything(&set, 5);
+    let live = set.info().segments[0].id.clone();
+    drop(set);
+    let (_, segments) = generations_and_segments(&dir);
+    assert_eq!(segments.len(), 2, "both bases are kept before retiring");
+
+    let report = retire_previous(&dir).unwrap();
+    assert_eq!(
+        (report.generation, report.retired, report.retired_generation),
+        (2, true, Some(1))
+    );
+    assert!(report.bytes_freed > 0);
+    assert!(!dir.join(PREVIOUS).exists());
+    let (generations, segments) = generations_and_segments(&dir);
+    assert_eq!(generations, BTreeSet::from([files::generation_dir(2)]));
+    assert_eq!(segments, BTreeSet::from([live]));
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    assert!(!set.info().recovered_from_previous);
+    assert_eq!(everything(&set, 5), answers);
+    drop(set);
+    // Retired already: nothing is left to do.
+    let again = retire_previous(&dir).unwrap();
+    assert_eq!(
+        (
+            again.generation,
+            again.retired,
+            again.retired_generation,
+            again.bytes_freed
+        ),
+        (2, false, None, 0)
+    );
+}
+
+/// After a delta, `PREVIOUS`'s generation shares the base with `CURRENT`'s: its own files go,
+/// the base stays.
+#[test]
+fn retiring_previous_after_a_delta_keeps_the_segments_current_uses() {
+    let work = TempDir::new("set_retire_delta");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let (_, before) = generations_and_segments(&dir);
+
+    let report = retire_previous(&dir).unwrap();
+    assert_eq!((report.retired, report.retired_generation), (true, Some(1)));
+    let (generations, segments) = generations_and_segments(&dir);
+    assert_eq!(generations, BTreeSet::from([files::generation_dir(2)]));
+    assert_eq!(segments, before);
+    assert_eq!(SegmentSet::open(&dir).unwrap().info().library_version, 30);
+}
+
+#[test]
+fn retiring_without_previous_changes_nothing() {
+    let work = TempDir::new("set_retire_none");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    let before = (on_disk(&dir), generations_and_segments(&dir));
+    let report = retire_previous(&dir).unwrap();
+    assert_eq!(
+        (
+            report.generation,
+            report.retired,
+            report.retired_generation,
+            report.bytes_freed
+        ),
+        (1, false, None, 0)
+    );
+    assert_eq!((on_disk(&dir), generations_and_segments(&dir)), before);
+}
+
+/// `PREVIOUS` is the only generation that opens: retiring it is refused, and the set keeps
+/// serving it.
+#[test]
+fn retiring_is_refused_while_current_does_not_open() {
+    fn damage_a_bitmap(dir: &Path) {
+        let current = files::read_pointer(dir, CURRENT).unwrap().unwrap();
+        let generation = dir.join(files::generation_dir(current.generation));
+        let del = std::fs::read_dir(&generation)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".del"))
+            .unwrap()
+            .path();
+        let mut bytes = std::fs::read(&del).unwrap();
+        bytes[20] ^= 1;
+        std::fs::write(&del, bytes).unwrap();
+    }
+    type Damage = fn(&Path);
+    let damages: [(&str, Damage); 4] = [
+        ("bitmap", damage_a_bitmap),
+        ("garbage", |dir| break_current(dir, Broken::Garbage)),
+        ("directory", |dir| break_current(dir, Broken::Directory)),
+        ("missing", |dir| {
+            std::fs::remove_file(dir.join(CURRENT)).unwrap()
+        }),
+    ];
+    for (name, damage) in damages {
+        let work = TempDir::new("set_retire_refused");
+        let dir = two_bases(&work);
+        damage(&dir);
+        let before = (on_disk(&dir), generations_and_segments(&dir));
+        let refused = retire_previous(&dir);
+        assert!(
+            matches!(
+                refused,
+                Err(SemanticSearchError::VectorStore(
+                    VectorStoreError::Corrupted { .. }
+                ))
+            ),
+            "{name}: {refused:?}"
+        );
+        assert_eq!(
+            (on_disk(&dir), generations_and_segments(&dir)),
+            before,
+            "{name}"
+        );
+        let set = SegmentSet::open(&dir).unwrap();
+        assert_eq!(set.generation(), 1, "{name}");
+        assert!(set.info().recovered_from_previous, "{name}");
+    }
+}
+
+#[test]
+fn retiring_where_nothing_is_installed_is_refused_and_creates_nothing() {
+    let work = TempDir::new("set_retire_missing");
+    let dir = work.join("vectors");
+    let nothing_installed = |dir: &Path| {
+        matches!(
+            retire_previous(dir),
+            Err(SemanticSearchError::Artifact(
+                ArtifactError::MetadataUnusable { .. }
+            ))
+        )
+    };
+    assert!(nothing_installed(&dir));
+    assert!(!dir.exists(), "the lock would have created it");
+    std::fs::create_dir(&dir).unwrap();
+    assert!(nothing_installed(&dir));
+}
+
+/// While an install or a compaction holds the lock, a retirement is refused as they refuse
+/// one another, and changes nothing.
+#[test]
+fn retiring_never_waits_behind_an_install() {
+    let work = TempDir::new("set_retire_busy");
+    let dir = two_bases(&work);
+    let before = (on_disk(&dir), generations_and_segments(&dir));
+    let held = files::SetLock::take(&dir).unwrap();
+    match retire_previous(&dir) {
+        Err(SemanticSearchError::Artifact(ArtifactError::Io { source, .. })) => {
+            assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock)
+        }
+        other => panic!("a locked set must refuse a retirement, got {other:?}"),
+    }
+    assert_eq!((on_disk(&dir), generations_and_segments(&dir)), before);
+    drop(held);
+    assert!(retire_previous(&dir).unwrap().retired);
+}
+
+/// A crash after `PREVIOUS` is gone and before anything is collected leaves `CURRENT` as it
+/// was: the next open serves it and collects what the retirement did not.
+#[test]
+fn a_crash_while_retiring_leaves_a_set_that_opens() {
+    let work = TempDir::new("set_retire_crash");
+    let dir = two_bases(&work);
+    let answers = everything(&SegmentSet::open(&dir).unwrap(), 9);
+
+    CRASH_AT.with(|crash| crash.set(Some(Step::PreviousRetired)));
+    let crashed = retire_previous(&dir);
+    CRASH_AT.with(|crash| crash.set(None));
+    assert!(
+        matches!(
+            crashed,
+            Err(SemanticSearchError::Artifact(
+                ArtifactError::InterruptedInstall { .. }
+            ))
+        ),
+        "{crashed:?}"
+    );
+    assert!(!dir.join(PREVIOUS).exists());
+    assert!(dir.join(files::generation_dir(1)).exists(), "not collected");
+
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    assert!(!set.info().recovered_from_previous);
+    assert_eq!(everything(&set, 9), answers);
+    drop(set);
+    let (generations, segments) = generations_and_segments(&dir);
+    assert_eq!(generations, BTreeSet::from([files::generation_dir(2)]));
+    assert_eq!(segments.len(), 1);
+}
+
+/// A `PREVIOUS` that does not read is no fallback: it goes like one that does.
+#[test]
+fn an_unreadable_previous_is_retired_too() {
+    for how in [Broken::Garbage, Broken::Directory] {
+        let work = TempDir::new("set_retire_unreadable");
+        let dir = two_bases(&work);
+        let previous = dir.join(PREVIOUS);
+        std::fs::remove_file(&previous).unwrap();
+        match how {
+            Broken::Garbage => std::fs::write(&previous, b"damaged").unwrap(),
+            Broken::Directory => std::fs::create_dir(&previous).unwrap(),
+        }
+        let report = retire_previous(&dir).unwrap();
+        assert_eq!(
+            (report.retired, report.retired_generation),
+            (true, None),
+            "{how:?}"
+        );
+        assert!(!previous.exists(), "{how:?}");
+        assert_eq!(
+            generations_and_segments(&dir).0,
+            BTreeSet::from([files::generation_dir(2)]),
+            "{how:?}"
+        );
+    }
+}
+
+/// A reader of the generation `PREVIOUS` named keeps answering from what it mapped.
+#[test]
+fn a_reader_of_the_retired_generation_keeps_answering() {
+    let work = TempDir::new("set_retire_reader");
+    let dir = two_bases(&work);
+    let current = std::fs::read(dir.join(CURRENT)).unwrap();
+    std::fs::remove_file(dir.join(CURRENT)).unwrap();
+    let reader = SegmentSet::open_without_recovery(&dir).unwrap();
+    assert_eq!(reader.generation(), 1);
+    let answers = everything(&reader, 4);
+    files::write_pointer(&dir, CURRENT, &current).unwrap();
+
+    assert!(retire_previous(&dir).unwrap().retired);
+    assert_eq!(everything(&reader, 4), answers);
+}
