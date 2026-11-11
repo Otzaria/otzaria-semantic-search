@@ -16,6 +16,7 @@
 //! | [`SegmentSet::open`] | the directory | nothing, unless it can clean up after a crash |
 //! | [`install_package`] | a segment and its release manifest | a new generation |
 //! | [`compact()`] | the set, optionally the live index's keys | a new generation of one segment |
+//! | [`retire_previous`] | the directory | drops `PREVIOUS`, and its garbage with it |
 //! | [`info()`] | the directory | nothing |
 //! | [`scrub`] | the directory | marks a damaged segment |
 //!
@@ -26,6 +27,10 @@
 //! removed after every flip and at every open that can take the lock. A file that cannot be
 //! removed — mapped by a reader on a filesystem without POSIX delete (FAT/exFAT) — stays until
 //! a later open or install finds it free; nothing depends on it being gone.
+//!
+//! `PREVIOUS` keeps the generation before the live one, and every segment only it uses, as a
+//! fallback until the next flip — after a base, a whole second set. A host that has opened
+//! `CURRENT`'s generation without falling back may give it up with [`retire_previous`].
 
 mod compact;
 mod files;
@@ -212,11 +217,7 @@ impl SegmentSet {
         let previous = read_pointer(dir, PREVIOUS);
         if matches!((&current, &previous), (Ok(None), Ok(None))) {
             refuse_a_v1_artifact(dir)?;
-            return Err(ArtifactError::MetadataUnusable {
-                path: dir.join(CURRENT).display().to_string(),
-                reason: "no vector set is installed here".to_string(),
-            }
-            .into());
+            return Err(nothing_installed(dir));
         }
         let first = match &current {
             Ok(Some(pointer)) => match Self::open_generation(dir, pointer) {
@@ -576,6 +577,14 @@ impl SegmentSet {
     }
 }
 
+fn nothing_installed(dir: &Path) -> SemanticSearchError {
+    ArtifactError::MetadataUnusable {
+        path: dir.join(CURRENT).display().to_string(),
+        reason: "no vector set is installed here".to_string(),
+    }
+    .into()
+}
+
 /// Why a scrub's verdict condemns `document`, if one does: a verdict on any of its segments.
 /// `open` and `info` both ask, before reading a segment, so they refuse — and fall back —
 /// alike.
@@ -771,6 +780,117 @@ pub fn scrub(dir: &Path, cancel: &CancellationToken) -> Result<ScrubReport, Sema
     Ok(report(bytes, false))
 }
 
+/// What [`retire_previous`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireReport {
+    /// The generation `CURRENT` names, which opened and stays live.
+    pub generation: u64,
+    /// Whether `PREVIOUS` was removed. `false` when there was none: nothing changed.
+    pub retired: bool,
+    /// The generation `PREVIOUS` named; `None` when there was none, or it did not read.
+    pub retired_generation: Option<u64>,
+    /// What the collection after it removed from the set's segments and generations. A file
+    /// left for later — mapped by a reader on FAT/exFAT — is not counted.
+    pub bytes_freed: u64,
+}
+
+/// Give up the fallback: remove `PREVIOUS` once the generation `CURRENT` names opens, and
+/// collect what only it kept — after a base, the whole set before it.
+///
+/// For a host that has opened the set without falling back
+/// ([`SetInfo::recovered_from_previous`] `false`). Under the set's lock: `CURRENT`'s
+/// generation is opened as [`SegmentSet::open`] opens it, without falling back; `PREVIOUS`
+/// is removed and, on Unix, the removal flushed; then garbage is collected. A crash at any point
+/// leaves `CURRENT` as it was, so the set opens: before the removal is durable `PREVIOUS`
+/// may still be there, and after it whatever was not yet collected goes at the next open or
+/// flip. `PREVIOUS` that does not read is no fallback and is removed alike. Without
+/// `PREVIOUS` nothing is written or collected.
+///
+/// A reader that opened `PREVIOUS`'s generation keeps answering from what it mapped, as
+/// after any flip; one opening without recovery while it goes fails, and opens again.
+///
+/// # Errors
+///
+/// The lock held by an install, a compaction or another retirement:
+/// [`ArtifactError::Io`] of kind [`std::io::ErrorKind::WouldBlock`], and nothing is read.
+/// [`ArtifactError::MetadataUnusable`] when no set is installed, and
+/// [`ArtifactError::IdentityMismatch`] for a v1 artifact, as [`SegmentSet::open`].
+/// `CURRENT`'s generation not opening — the set serves `PREVIOUS`, its only fallback —
+/// refuses with the reason, [`VectorStoreError::Corrupted`] as a rule, and changes nothing.
+/// [`ArtifactError::Io`] when `PREVIOUS` cannot be removed, or its removal flushed; nothing
+/// is collected then, and `CURRENT` is as it was.
+pub fn retire_previous(dir: &Path) -> Result<RetireReport, SemanticSearchError> {
+    if !dir.is_dir() {
+        // The lock would create the directory.
+        return Err(nothing_installed(dir));
+    }
+    let _lock = SetLock::take(dir)?;
+    let current = read_pointer(dir, CURRENT);
+    let previous = read_pointer(dir, PREVIOUS);
+    let current = match (current, &previous) {
+        (Ok(Some(pointer)), _) => pointer,
+        (Ok(None), Ok(None)) => {
+            refuse_a_v1_artifact(dir)?;
+            return Err(nothing_installed(dir));
+        }
+        (Ok(None), _) => {
+            return Err(corrupted(format!(
+                "{}: there is a PREVIOUS and no CURRENT, which is kept as the fallback",
+                dir.display()
+            ))
+            .into())
+        }
+        (Err(reason), _) => return Err(corrupted(format!("{}: {reason}", dir.display())).into()),
+    };
+    drop(SegmentSet::open_generation(dir, &current)?);
+    let report = |retired, retired_generation, bytes_freed| RetireReport {
+        generation: current.generation,
+        retired,
+        retired_generation,
+        bytes_freed,
+    };
+    let retired_generation = match previous {
+        Ok(None) => return Ok(report(false, None, 0)),
+        Ok(pointer) => pointer.map(|pointer| pointer.generation),
+        Err(_) => None,
+    };
+    let before = set_bytes(dir);
+    files::remove_previous(dir).map_err(io_error(format!(
+        "removing {}",
+        dir.join(PREVIOUS).display()
+    )))?;
+    install::reached(install::Step::PreviousRetired)?;
+    collect_garbage(dir);
+    let freed = before.saturating_sub(set_bytes(dir));
+    log::info!(
+        "Retired the previous generation of {} ({retired_generation:?}): {freed} byte(s) freed",
+        dir.display()
+    );
+    Ok(report(true, retired_generation, freed))
+}
+
+/// The bytes of the set's segments and generations: what a collection can free.
+fn set_bytes(dir: &Path) -> u64 {
+    let files = |path: PathBuf| {
+        fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum::<u64>()
+    };
+    let generations: u64 = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("gen-"))
+        .map(|entry| files(entry.path()))
+        .sum();
+    generations + files(dir.join(SEGMENTS_DIR))
+}
+
 /// A directory holding a v1 artifact is a store this build does not read, and says so by
 /// the identity field that names the store.
 fn refuse_a_v1_artifact(dir: &Path) -> Result<(), ArtifactError> {
@@ -832,7 +952,8 @@ pub(crate) fn recover(dir: &Path) -> Result<(), ArtifactError> {
     Ok(())
 }
 
-/// Remove generations neither pointer names and segments only they used. Best effort: a
+/// Remove generations neither pointer names and segments only they used — after a flip, at
+/// an open that takes the lock, and after [`retire_previous`]. Best effort: a
 /// file that cannot be removed — mapped by a reader on FAT/exFAT, say — is left for the next
 /// call, and a pointer that cannot be read stops the collection altogether, since what it
 /// names cannot be known. So does `PREVIOUS` without `CURRENT`, which no flip leaves: what
