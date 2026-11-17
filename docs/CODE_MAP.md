@@ -82,7 +82,7 @@ otzaria-semantic-search/
     │   ├── official_index.rs               # מסלול האפליקציה: סט מותקן + מודל, read-only; מחזיר hits
     │   ├── resolve.rs                      # VectorHit ו-CandidateResolver: הפורט אל השורות החיות של המארח
     │   ├── oxv/                            # פורמט ה-segment: format, codec, writer, reader, kernel, scan
-    │   ├── segment_set/                    # הסט על המכשיר: install, compact, recover, GC, scrub
+    │   ├── segment_set/                    # הסט על המכשיר: install, compact, recover, GC, scrub, retire
     │   ├── manifest.rs                     # מעקב גירסאות קבצים אטומי (JSON)
     │   ├── store.rs                        # Vector DB בזיכרון למסלול הפיתוח (Pre-normalized + Heap)
     │   ├── store_backend.rs                # שני חוזים למסלול הפיתוח: חיפוש, ומוטציות של אינדוקס
@@ -468,6 +468,8 @@ otzaria-semantic-search/
     `ApplyReport` מדווח, ו-`already_applied` הוא delta שהסט כבר בלע.
   - `compact` — `CompactionPolicy` מחליטה, `LiveKeySource` מעגן מחדש; `CompactionReport`.
   - `info(dir)` ו-`scrub(dir)` — בלי מודל: מה מותקן, וקריאת כל block.
+  - `retire_previous(dir)` — מוותר על `PREVIOUS` אחרי שהדור של `CURRENT` נפתח, ואוסף את מה
+    שרק הוא שמר; `RetireReport`.
   - `ReleaseManifest` — ה-manifest שמתפרסם לצד segment, ו-`package()` — החבילה שהוא מתאר.
   - `space` — כמה מקום נשאר: `statvfs` ו-`GetDiskFreeSpaceExW`, שלוש קריאות `unsafe`
     קטנות במקום תלות.

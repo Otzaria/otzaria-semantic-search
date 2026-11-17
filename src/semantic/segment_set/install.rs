@@ -226,7 +226,8 @@ pub struct ApplyReport {
     pub already_applied: bool,
 }
 
-/// The points an install can be cut off at, for the tests that prove each one recoverable.
+/// The points an install — or a retirement of `PREVIOUS` — can be cut off at, for the tests
+/// that prove each one recoverable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Staged,
@@ -234,6 +235,8 @@ pub(crate) enum Step {
     GenerationWritten,
     PreviousWritten,
     CurrentFlipped,
+    /// [`retire_previous`](super::retire_previous): `PREVIOUS` removed, nothing collected.
+    PreviousRetired,
 }
 
 #[cfg(test)]
@@ -248,7 +251,7 @@ thread_local! {
 }
 
 /// Stop here, as a crash would, when a test asked for it; nothing outside a test build.
-fn reached(step: Step) -> Result<(), ArtifactError> {
+pub(super) fn reached(step: Step) -> Result<(), ArtifactError> {
     #[cfg(test)]
     AT_STEP.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -986,16 +989,10 @@ impl NewGeneration {
             Err(_) => true,
         };
         if discard_previous {
-            let path = dir.join(PREVIOUS);
-            let removed = if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-                retry::remove_dir(&path)
-            } else {
-                retry::remove_file(&path)
-            };
-            if let Err(error) = removed.and_then(|()| sync_set_dir(dir)) {
+            if let Err(error) = super::files::remove_previous(dir) {
                 log::warn!(
                     "Cleanup of {} is incomplete until the next install: {error}",
-                    path.display()
+                    dir.join(PREVIOUS).display()
                 );
                 // Do not collect generations before the pointer's removal is durable.
                 return Ok(document);
