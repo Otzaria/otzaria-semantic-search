@@ -4,6 +4,7 @@
 //! cargo bench
 //! cargo bench -- --vectors 1000000 --dim 256
 //! cargo bench -- --store oxv --vectors 1000000 --dim 256 --threads 8
+//! cargo bench -- --store oxv --vectors 4000000 --dim 256 --batch 12
 //! ```
 //!
 //! Measures [`VectorStore`] directly, or with `--store oxv` the vector store's int8
@@ -48,6 +49,8 @@ struct Options {
     /// For `--store oxv`: `i8-sym-vec` (the default), `i8-sym-dim` or `f32`.
     codec: String,
     threads: usize,
+    /// For `--store oxv`: also scan this many queries at once, against one at a time.
+    batch: usize,
     dir: Option<std::path::PathBuf>,
 }
 
@@ -63,6 +66,7 @@ impl Default for Options {
             store: "memory".to_string(),
             codec: "i8-sym-vec".to_string(),
             threads: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+            batch: 8,
             dir: None,
         }
     }
@@ -86,6 +90,7 @@ fn parse_options() -> Options {
             "--top-k" => options.top_k = parsed("--top-k"),
             "--queries" => options.queries = parsed("--queries"),
             "--threads" => options.threads = parsed("--threads"),
+            "--batch" => options.batch = parsed("--batch"),
             "--store" => options.store = value.cloned().unwrap_or_default(),
             "--codec" => options.codec = value.cloned().unwrap_or_default(),
             "--dir" => options.dir = value.map(std::path::PathBuf::from),
@@ -182,7 +187,9 @@ fn oxv(options: Options) {
     use otzaria_semantic_search::distribution::package::PackageKind;
     use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
     use otzaria_semantic_search::semantic::oxv::reader::Segment;
-    use otzaria_semantic_search::semantic::oxv::scan::{scan_segments, ScanRequest};
+    use otzaria_semantic_search::semantic::oxv::scan::{
+        scan_segments, scan_segments_many, ScanRequest,
+    };
     use otzaria_semantic_search::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
     use otzaria_semantic_search::semantic::resolve::BookSet;
 
@@ -192,6 +199,7 @@ fn oxv(options: Options) {
         top_k,
         queries,
         threads,
+        batch,
         dir,
         codec,
         ..
@@ -289,6 +297,40 @@ fn oxv(options: Options) {
         .collect();
     let filtered = run(threads, Some(&filter));
     println!("scan, 5% of the books: {filtered}");
+
+    // Several queries: one pass for all of them, against one pass each.
+    let request = ScanRequest {
+        top_k,
+        books: None,
+        threads,
+        window_penalty: 0.0,
+    };
+    for m in [2, batch.max(2)] {
+        let rounds = queries.div_ceil(m).max(3);
+        let (mut alone, mut together) = (Vec::new(), Vec::new());
+        for round in 0..rounds {
+            let batch: Vec<Vec<f32>> = (0..m).map(|i| unit(1_000 + round * m + i)).collect();
+            let views: Vec<&[f32]> = batch.iter().map(Vec::as_slice).collect();
+            let started = Instant::now();
+            let one_by_one: Vec<_> = views
+                .iter()
+                .map(|query| scan_segments(&[&segment], query, &request, &cancel).expect("scan"))
+                .collect();
+            alone.push(started.elapsed());
+            let started = Instant::now();
+            let at_once =
+                scan_segments_many(&[&segment], &views, &request, &cancel).expect("scan many");
+            together.push(started.elapsed());
+            assert_eq!(at_once, one_by_one);
+        }
+        let (alone, together) = (summarize(alone), summarize(together));
+        println!("{m} queries, one by one, {threads} threads: {alone}");
+        println!("{m} queries, one pass,   {threads} threads: {together}");
+        println!(
+            "  → {:.2}× faster",
+            alone.min.as_secs_f64() / together.min.as_secs_f64()
+        );
+    }
 
     drop(segment);
     let _ = std::fs::remove_dir_all(&dir);

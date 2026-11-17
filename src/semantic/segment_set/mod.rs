@@ -384,8 +384,59 @@ impl SegmentSet {
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, VectorStoreError> {
         let prepared = PreparedQuery::new(query, self.codec())?;
-        let views: Vec<ScanSegment<'_>> = self
-            .segments
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::scan_with_penalties(&set, &prepared, request, also, penalties, cancel)
+    }
+
+    /// [`Self::scan`] for several queries in one pass over the vectors: for each query,
+    /// exactly the hits [`Self::scan`] returns for it alone, in the same order. The scan is
+    /// bound by memory bandwidth, so `m` queries cost little more than one — where `m`
+    /// separate scans read every vector `m` times. For a host that searches several texts
+    /// at once: the windows of a long passage, a query and its passage form.
+    pub fn scan_many(
+        &self,
+        queries: &[&[f32]],
+        request: &ScanRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
+        self.scan_many_with_penalties(
+            queries,
+            request,
+            ScanPenalties {
+                window: request.window_penalty,
+                alias: request.window_penalty,
+            },
+            cancel,
+        )
+    }
+
+    /// [`Self::scan_many`] with an independent alias penalty used during top-k selection.
+    pub(crate) fn scan_many_with_penalties(
+        &self,
+        queries: &[&[f32]],
+        request: &ScanRequest<'_>,
+        penalties: ScanPenalties,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
+        let prepared = queries
+            .iter()
+            .map(|query| PreparedQuery::new(query, self.codec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::scan_many(&set, &prepared, request, penalties, cancel)
+    }
+
+    /// The set's segments as the scan sees them.
+    fn scan_views(&self) -> Vec<ScanSegment<'_>> {
+        self.segments
             .iter()
             .zip(&self.deleted)
             .zip(&self.links)
@@ -394,12 +445,7 @@ impl SegmentSet {
                 deleted: &deleted.words,
                 links,
             })
-            .collect();
-        let set = ScanSet {
-            segments: &views,
-            reverse_links: &self.reverse,
-        };
-        scan::scan_with_penalties(&set, &prepared, request, also, penalties, cancel)
+            .collect()
     }
 
     /// The newest entry for a book is authoritative, including an unknown hash.

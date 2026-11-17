@@ -5,8 +5,8 @@ use super::codec::Codec;
 use super::kernel::{dot_f32, nibbles_scalar, select, PreparedQuery};
 use super::reader::Segment;
 use super::scan::{
-    scan, scan_reporting, scan_with, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet,
-    LINK_UNRESOLVED,
+    scan, scan_many, scan_reporting, scan_with, scan_with_penalties, Link, ReverseLink,
+    ScanPenalties, ScanRequest, ScanSegment, ScanSet, LINK_UNRESOLVED,
 };
 use super::testing::{key, random_books, spec, write_segment, Random, TempDir, TestBook};
 use crate::cancellation::{probe, CancellationToken, SCAN_CHECK_INTERVAL};
@@ -1250,4 +1250,184 @@ fn a_full_width_224_32_rotation_round_trips_and_scans_every_dimension() {
             hits[0].score
         );
     }
+}
+
+/// `m` queries scanned at once are `m` scans, bit for bit: every codec, with and without a
+/// filter, for every `k`, at every thread count, one query or many.
+#[test]
+fn many_queries_in_one_pass_are_each_query_scanned_alone_bit_for_bit() {
+    for (seed, codec) in [
+        (81u64, int8 as fn(&[&[f32]]) -> Codec),
+        (82, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+        (83, per_vector),
+        (84, rotated),
+    ] {
+        let fixture = Fixture::new(60, 40, seed, codec);
+        let segments = fixture.scan_segments();
+        let set = ScanSet {
+            segments: &segments,
+            reverse_links: &fixture.reverse,
+        };
+        let mut random = Random(seed + 11);
+        let queries: Vec<PreparedQuery> = (0..8)
+            .map(|_| PreparedQuery::new(&random.unit(DIM), fixture.segments[0].codec()).unwrap())
+            .collect();
+        let one: BookSet = ["id:00001"].into_iter().collect();
+        let several: BookSet = ["id:00000", "id:00007", "id:99999"].into_iter().collect();
+        for books in [None, Some(&one), Some(&several)] {
+            for top_k in [0, 1, 10, 500] {
+                for threads in [1, 3, 8] {
+                    let request = ScanRequest {
+                        top_k,
+                        books,
+                        threads,
+                        window_penalty: 0.0,
+                    };
+                    for m in [1, 3, 8] {
+                        let many = scan_many(
+                            &set,
+                            &queries[..m],
+                            &request,
+                            ScanPenalties {
+                                window: 0.0,
+                                alias: 0.0,
+                            },
+                            &CancellationToken::new(),
+                        )
+                        .unwrap();
+                        assert_eq!(many.len(), m);
+                        for (query, hits) in queries.iter().zip(&many) {
+                            let alone =
+                                scan(&set, query, &request, &CancellationToken::new()).unwrap();
+                            assert_eq!(
+                                bits(hits),
+                                bits(&alone),
+                                "{books:?}, k {top_k}, {threads} threads, {m} queries"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// With windows and aliases penalized — the alias apart from the window — each query of a
+/// batch is ranked as its own scan ranks it.
+#[test]
+fn many_queries_are_penalized_as_each_scan_penalizes() {
+    let dir = TempDir::new("scan_many_penalty");
+    for (seed, codec) in [
+        (91u64, int8 as fn(&[&[f32]]) -> Codec),
+        (92, per_vector),
+        (93, rotated),
+    ] {
+        let [windowed, plain] = windowed_pair(&dir, seed, codec);
+        let views = [ScanSegment {
+            segment: &windowed,
+            deleted: &[],
+            links: &[],
+        }];
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &[],
+        };
+        let mut random = Random(seed * 5);
+        let queries: Vec<PreparedQuery> = (0..4)
+            .map(|_| PreparedQuery::new(&random.unit(DIM), plain.codec()).unwrap())
+            .collect();
+        for penalties in [
+            ScanPenalties {
+                window: 0.04,
+                alias: 0.04,
+            },
+            ScanPenalties {
+                window: 0.04,
+                alias: 0.01,
+            },
+        ] {
+            for (top_k, threads) in [(10, 1), (100, 3), (1200, 8)] {
+                let request = ScanRequest {
+                    top_k,
+                    books: None,
+                    threads,
+                    window_penalty: penalties.window,
+                };
+                let many = scan_many(
+                    &set,
+                    &queries,
+                    &request,
+                    penalties,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+                for (query, hits) in queries.iter().zip(&many) {
+                    let alone = scan_with_penalties(
+                        &set,
+                        query,
+                        &request,
+                        &[],
+                        penalties,
+                        &CancellationToken::new(),
+                    )
+                    .unwrap();
+                    assert_eq!(bits(hits), bits(&alone), "k {top_k}, {threads} threads");
+                }
+            }
+        }
+    }
+}
+
+/// No queries, no hits; `k` 0, an empty list per query; queries of two codecs, or of
+/// another width, or a cancelled token, an error.
+#[test]
+fn a_batch_of_queries_is_checked_as_one_query_is() {
+    let fixture = Fixture::new(20, 20, 95, int8);
+    let segments = fixture.scan_segments();
+    let set = ScanSet {
+        segments: &segments,
+        reverse_links: &fixture.reverse,
+    };
+    let codec = fixture.segments[0].codec();
+    let mut random = Random(96);
+    let query = PreparedQuery::new(&random.unit(DIM), codec).unwrap();
+    let request = |top_k| ScanRequest {
+        top_k,
+        books: None,
+        threads: 2,
+        window_penalty: 0.0,
+    };
+    let none = ScanPenalties {
+        window: 0.0,
+        alias: 0.0,
+    };
+    let go = |queries: &[PreparedQuery], top_k, cancel: &CancellationToken| {
+        scan_many(&set, queries, &request(top_k), none, cancel)
+    };
+    assert!(go(&[], 10, &CancellationToken::new()).unwrap().is_empty());
+    let empty = go(
+        &[query.clone(), query.clone()],
+        0,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(empty, vec![Vec::<VectorHit>::new(); 2]);
+
+    let float = Codec::f32(DIM).unwrap();
+    let other = PreparedQuery::new(&random.unit(DIM), &float).unwrap();
+    assert!(matches!(
+        go(&[query.clone(), other], 10, &CancellationToken::new()),
+        Err(VectorStoreError::SearchFailed { .. })
+    ));
+
+    let narrow = Codec::calibrate_i8_sym_dim(&[&random.unit(DIM / 2)[..]], 1.0).unwrap();
+    let narrow = PreparedQuery::new(&random.unit(DIM / 2), &narrow).unwrap();
+    assert!(matches!(
+        go(&[query.clone(), narrow], 10, &CancellationToken::new()),
+        Err(VectorStoreError::DimensionMismatch { .. })
+    ));
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(go(&[query], 10, &cancel).is_err());
 }

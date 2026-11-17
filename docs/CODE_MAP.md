@@ -457,11 +457,15 @@ otzaria-semantic-search/
     מהליבות, עד שמונה. `scan_with` — אותה סריקה, ולצדה slots שהמארח נוקב בהם
     (`SlotRef`): כל אחד שחי ומחזיק את המפתח שלו מנוקד כמו בסריקה, ו-`k` הטובים מבין אלה
     שהסריקה לא החזירה ממוזגים בסדר שלה — לצד הפגיעות שלה, אף פעם לא במקומן.
+    `scan_many` / `scan_segments_many` — כמה שאילתות במעבר אחד על הווקטורים: כל וקטור נקרא
+    מהזיכרון פעם אחת ומנוקד מול כל שאילתה, ולכל שאילתה `k` טובים משלה — בדיוק מה שסריקה
+    שלה לבדה מחזירה, ביט בביט. הסריקה חסומה ברוחב הפס של הזיכרון, כך ש-`m` שאילתות עולות
+    מעט יותר משאילתה אחת.
 
 * [`src/semantic/segment_set/`](../src/semantic/segment_set/mod.rs) — **הסט על המכשיר.**
   - `SegmentSet::open` — שחזור כשה-lock פנוי, ואז הדור ש-`CURRENT` מונה, או `PREVIOUS`;
     `open_without_recovery` — אותה פתיחה בלי ה-lock ובלי שחזור ואיסוף אשפה, לקורא לצד
-    session פתוח (§5.5 של החוזה); `scan`, `scan_with`, `info`, `generation`, `identity`;
+    session פתוח (§5.5 של החוזה); `scan`, `scan_with`, `scan_many`, `info`, `generation`, `identity`;
     `segments()` לקריאה בלבד, ו-`is_live(seg, slot)` — האם slot חי בדור הזה.
   - `install_package` — segment ו-manifest של שחרור, לפי §5.3 של החוזה: אימות, staging,
     העברה, delta שנפתר במעבר אחד על המפתחות הישנים, דור חדש, החלפת מצביעים, אשפה.
@@ -580,6 +584,7 @@ otzaria-semantic-search/
     `otzaria-oxv` 2 `i8-sym-vec`, ו-`otzaria-oxv` 3 `rot192-i8i4`).
   - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
     `search_hits_with(vector, …, also, …)` — ולצדם הווקטורים של `also` (`scan_with`);
+    `search_hits_many(vectors, …)` — כמה וקטורים במעבר אחד (`scan_many`);
     `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
     `book_count`.
   - `status` מדווח `vectors_persisted = true` ו-`needs_full_reindex = None`, ולא כטענה
