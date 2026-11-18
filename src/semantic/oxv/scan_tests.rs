@@ -5,8 +5,9 @@ use super::codec::Codec;
 use super::kernel::{dot_f32, nibbles_scalar, select, PreparedQuery};
 use super::reader::Segment;
 use super::scan::{
-    scan, scan_reporting, scan_with, Link, ReverseLink, ScanRequest, ScanSegment, ScanSet,
-    LINK_UNRESOLVED,
+    queries_per_pass, scan, scan_many, scan_reporting, scan_with, scan_with_penalties, Link,
+    ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet, LINK_UNRESOLVED,
+    MIN_SLOTS_PER_THREAD, QUERIES_PER_PASS,
 };
 use super::testing::{key, random_books, spec, write_segment, Random, TempDir, TestBook};
 use crate::cancellation::{probe, CancellationToken, SCAN_CHECK_INTERVAL};
@@ -1215,7 +1216,16 @@ fn a_full_width_224_32_rotation_round_trips_and_scans_every_dimension() {
         segments: &segments,
         reverse_links: &[],
     };
-    for (dimension, vector) in vectors.iter().enumerate() {
+    let request = ScanRequest {
+        top_k: 1,
+        books: None,
+        threads: 1,
+        window_penalty: 0.0,
+    };
+    let cancel = CancellationToken::new();
+    let batch = super::scan::scan_segments_many(&[&segment], &refs, &request, &cancel).unwrap();
+    assert_eq!(batch.len(), vectors.len());
+    for (dimension, (vector, batched)) in vectors.iter().zip(batch).enumerate() {
         let query = PreparedQuery::new(vector, segment.codec()).unwrap();
         let PreparedQuery::Rotated {
             head,
@@ -1227,18 +1237,8 @@ fn a_full_width_224_32_rotation_round_trips_and_scans_every_dimension() {
             panic!("rotated query");
         };
         assert_eq!((head.len(), tail_lo.len(), tail_hi.len()), (224, 16, 16));
-        let hits = scan(
-            &set,
-            &query,
-            &ScanRequest {
-                top_k: 1,
-                books: None,
-                threads: 1,
-                window_penalty: 0.0,
-            },
-            &CancellationToken::new(),
-        )
-        .unwrap();
+        let hits = scan(&set, &query, &request, &cancel).unwrap();
+        assert_eq!(bits(&batched), bits(&hits));
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].key.same_text(key(dimension as u64)),
@@ -1250,4 +1250,229 @@ fn a_full_width_224_32_rotation_round_trips_and_scans_every_dimension() {
             hits[0].score
         );
     }
+}
+
+/// Use enough work to exercise the actual worker/merge path, including with a book filter.
+/// Each query keeps its own ordering, even when one query ties every slot.
+#[test]
+fn parallel_batches_match_separate_scans_bit_for_bit() {
+    for (seed, codec) in [
+        (81u64, int8 as fn(&[&[f32]]) -> Codec),
+        (82, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+        (83, per_vector),
+        (84, rotated),
+    ] {
+        let fixture = Fixture::new(60, 300, seed, codec);
+        let segments = fixture.scan_segments();
+        let set = ScanSet {
+            segments: &segments,
+            reverse_links: &fixture.reverse,
+        };
+        let mut random = Random(seed + 11);
+        let raw = std::iter::once(vec![0.0; DIM]).chain((1..12).map(|_| random.unit(DIM)));
+        let queries: Vec<_> = raw
+            .map(|query| PreparedQuery::new(&query, fixture.segments[0].codec()).unwrap())
+            .collect();
+        let books: BookSet = (0..32).map(|book| format!("id:{book:05}")).collect();
+        let penalties = ScanPenalties {
+            window: 0.0,
+            alias: 0.0,
+        };
+        for books in [None, Some(&books)] {
+            for top_k in [1, 40, 5000] {
+                let request = ScanRequest {
+                    top_k,
+                    books,
+                    threads: 8,
+                    window_penalty: 0.0,
+                };
+                let token = CancellationToken::new();
+                let (batch, checkpoints) = probe::checkpoints_of(|| {
+                    scan_many(&set, &queries, &request, penalties, &token)
+                });
+                // The calling thread only scans its share. Both filters select more
+                // than two full shares, and each share is below this threshold.
+                assert!((1024..MIN_SLOTS_PER_THREAD).contains(checkpoints.last().unwrap()));
+                let batch = batch.unwrap();
+                assert_eq!(batch.len(), queries.len());
+                for (query, hits) in queries.iter().zip(&batch) {
+                    let alone = scan(&set, query, &request, &token).unwrap();
+                    assert_eq!(
+                        bits(hits),
+                        bits(&alone),
+                        "seed {seed}, {books:?}, k {top_k}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn large_top_k_reduces_queries_per_pass() {
+    assert_eq!(queries_per_pass(40 * 8), QUERIES_PER_PASS);
+    assert_eq!(queries_per_pass(100_000 * 8), 1);
+    assert_eq!(queries_per_pass(usize::MAX), 1);
+}
+
+#[test]
+fn large_batches_preserve_input_order_across_groups_and_cancel_mid_scan() {
+    let fixture = Fixture::new(60, 100, 85, per_vector);
+    let segments = fixture.scan_segments();
+    let set = ScanSet {
+        segments: &segments,
+        reverse_links: &fixture.reverse,
+    };
+    let mut random = Random(86);
+    let queries: Vec<_> = (0..QUERIES_PER_PASS * 2 + 1)
+        .map(|_| PreparedQuery::new(&random.unit(DIM), fixture.segments[0].codec()).unwrap())
+        .collect();
+    let request = ScanRequest {
+        top_k: 10,
+        books: None,
+        threads: 1,
+        window_penalty: 0.0,
+    };
+    let penalties = ScanPenalties {
+        window: 0.0,
+        alias: 0.0,
+    };
+    let token = CancellationToken::new();
+    let batch = scan_many(&set, &queries, &request, penalties, &token).unwrap();
+    assert_eq!(batch.len(), queries.len());
+    for (query, hits) in queries.iter().zip(&batch) {
+        let alone = scan(&set, query, &request, &token).unwrap();
+        assert_eq!(bits(hits), bits(&alone));
+    }
+
+    let at = SCAN_CHECK_INTERVAL / QUERIES_PER_PASS;
+    let (cancelled, checkpoints) = probe::cancelling_at(&token, at, || {
+        scan_many(&set, &queries, &request, penalties, &token)
+    });
+    assert!(matches!(cancelled, Err(VectorStoreError::Cancelled)));
+    assert_eq!(checkpoints, [0, 0, at]);
+}
+
+#[test]
+fn many_queries_apply_the_same_window_penalty_as_separate_scans() {
+    let dir = TempDir::new("scan_many_penalty");
+    for (seed, codec) in [
+        (91u64, int8 as fn(&[&[f32]]) -> Codec),
+        (92, per_vector),
+        (93, rotated),
+        (94, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+    ] {
+        let [windowed, plain] = windowed_pair(&dir, seed, codec);
+        let views = [ScanSegment {
+            segment: &windowed,
+            deleted: &[],
+            links: &[],
+        }];
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &[],
+        };
+        let mut random = Random(seed * 5);
+        let queries: Vec<_> = (0..4)
+            .map(|_| PreparedQuery::new(&random.unit(DIM), plain.codec()).unwrap())
+            .collect();
+        let token = CancellationToken::new();
+        let penalties = ScanPenalties {
+            window: 0.04,
+            alias: 0.04,
+        };
+        for top_k in [10, 100, 1200] {
+            let request = ScanRequest {
+                top_k,
+                books: None,
+                threads: 1,
+                window_penalty: penalties.window,
+            };
+            let many = scan_many(&set, &queries, &request, penalties, &token).unwrap();
+            assert_eq!(many.len(), queries.len());
+            for (query, hits) in queries.iter().zip(&many) {
+                let alone =
+                    scan_with_penalties(&set, query, &request, &[], penalties, &token).unwrap();
+                assert_eq!(bits(hits), bits(&alone), "k {top_k}");
+            }
+        }
+    }
+}
+
+/// No queries, no hits; `k` 0, an empty list per query; queries of two codecs, or of
+/// another width, or a cancelled token, an error.
+#[test]
+fn a_batch_of_queries_is_checked_as_one_query_is() {
+    let fixture = Fixture::new(20, 20, 95, int8);
+    let segments = fixture.scan_segments();
+    let set = ScanSet {
+        segments: &segments,
+        reverse_links: &fixture.reverse,
+    };
+    let codec = fixture.segments[0].codec();
+    let mut random = Random(96);
+    let query = PreparedQuery::new(&random.unit(DIM), codec).unwrap();
+    let request = |top_k| ScanRequest {
+        top_k,
+        books: None,
+        threads: 2,
+        window_penalty: 0.0,
+    };
+    let none = ScanPenalties {
+        window: 0.0,
+        alias: 0.0,
+    };
+    let go = |queries: &[PreparedQuery], top_k, cancel: &CancellationToken| {
+        scan_many(&set, queries, &request(top_k), none, cancel)
+    };
+    assert!(go(&[], 10, &CancellationToken::new()).unwrap().is_empty());
+    let empty = go(
+        &[query.clone(), query.clone()],
+        0,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(empty, vec![Vec::<VectorHit>::new(); 2]);
+
+    let float = Codec::f32(DIM).unwrap();
+    let other = PreparedQuery::new(&random.unit(DIM), &float).unwrap();
+    assert!(matches!(
+        go(&[query.clone(), other], 10, &CancellationToken::new()),
+        Err(VectorStoreError::SearchFailed { .. })
+    ));
+
+    let narrow = Codec::calibrate_i8_sym_dim(&[&random.unit(DIM / 2)[..]], 1.0).unwrap();
+    let narrow = PreparedQuery::new(&random.unit(DIM / 2), &narrow).unwrap();
+    assert!(matches!(
+        go(&[query.clone(), narrow], 10, &CancellationToken::new()),
+        Err(VectorStoreError::DimensionMismatch { .. })
+    ));
+
+    assert_eq!(
+        go(std::slice::from_ref(&query), 10, &CancellationToken::new()).unwrap(),
+        vec![scan(&set, &query, &request(10), &CancellationToken::new()).unwrap()],
+    );
+
+    let missing: BookSet = ["unknown"].into_iter().collect();
+    let request = ScanRequest {
+        books: Some(&missing),
+        ..request(10)
+    };
+    let queries = [query.clone(), query];
+    assert_eq!(
+        scan_many(&set, &queries, &request, none, &CancellationToken::new()).unwrap(),
+        vec![Vec::<VectorHit>::new(); 2],
+    );
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        go(&queries, 10, &cancel),
+        Err(VectorStoreError::Cancelled)
+    ));
+    // A pre-cancelled request is stopped before preparing even its first query.
+    assert!(matches!(
+        super::scan::scan_segments_many(&[&fixture.segments[0]], &[&[]], &request, &cancel),
+        Err(VectorStoreError::Cancelled),
+    ));
 }

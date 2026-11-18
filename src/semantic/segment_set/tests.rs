@@ -1075,6 +1075,43 @@ fn a_filtered_scan_of_a_set_reaches_foreign_records() {
     assert!(hits.iter().all(|hit| &*hit.records[0].book == "id:4"));
 }
 
+/// A set scanned for several queries at once gives each query the hits a scan of its own
+/// gives it — across a base and a delta, foreign records and tombstones, with and without a
+/// filter.
+#[test]
+fn a_set_scans_several_queries_in_one_pass_as_one_by_one() {
+    let work = TempDir::new("set_scan_many");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+    let queries: Vec<Vec<f32>> = (0..5).map(|seed| Random(40 + seed).unit(DIM)).collect();
+    let views: Vec<&[f32]> = queries.iter().map(Vec::as_slice).collect();
+    let books: BookSet = ["id:4", "id:1"].into_iter().collect();
+    for books in [None, Some(&books)] {
+        for (top_k, threads) in [(3, 1), (100, 2)] {
+            let request = ScanRequest {
+                top_k,
+                books,
+                threads,
+                window_penalty: 0.0,
+            };
+            let many = set
+                .scan_many(&views, &request, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(many.len(), queries.len());
+            for (query, hits) in views.iter().zip(&many) {
+                assert_eq!(
+                    hits,
+                    &set.scan(query, &request, &CancellationToken::new())
+                        .unwrap(),
+                    "{books:?}, k {top_k}"
+                );
+            }
+        }
+    }
+}
+
 /// Which slots of a generation are live is the set's to say: a tombstoned one is not, nor
 /// one past a segment's end or in no segment. A scan weighs, besides the books it admits,
 /// the live slots it is handed — at the score a full scan gives them — and passes over the

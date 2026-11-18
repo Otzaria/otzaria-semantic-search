@@ -384,8 +384,54 @@ impl SegmentSet {
         cancel: &CancellationToken,
     ) -> Result<Vec<VectorHit>, VectorStoreError> {
         let prepared = PreparedQuery::new(query, self.codec())?;
-        let views: Vec<ScanSegment<'_>> = self
-            .segments
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::scan_with_penalties(&set, &prepared, request, also, penalties, cancel)
+    }
+
+    /// The same ordered hits as [`Self::scan`] for each query. Scanning the vectors
+    /// together can save memory traffic when searching several windows of a long passage.
+    /// Large batches are split to bound working memory.
+    pub fn scan_many(
+        &self,
+        queries: &[&[f32]],
+        request: &ScanRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
+        self.scan_many_with_penalties(
+            queries,
+            request,
+            ScanPenalties {
+                window: request.window_penalty,
+                alias: request.window_penalty,
+            },
+            cancel,
+        )
+    }
+
+    /// [`Self::scan_many`] with an independent alias penalty used during top-k selection.
+    pub(crate) fn scan_many_with_penalties(
+        &self,
+        queries: &[&[f32]],
+        request: &ScanRequest<'_>,
+        penalties: ScanPenalties,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
+        let prepared = scan::prepare_queries(queries, self.codec(), cancel)?;
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::scan_many(&set, &prepared, request, penalties, cancel)
+    }
+
+    /// The set's segments as the scan sees them.
+    fn scan_views(&self) -> Vec<ScanSegment<'_>> {
+        self.segments
             .iter()
             .zip(&self.deleted)
             .zip(&self.links)
@@ -394,12 +440,7 @@ impl SegmentSet {
                 deleted: &deleted.words,
                 links,
             })
-            .collect();
-        let set = ScanSet {
-            segments: &views,
-            reverse_links: &self.reverse,
-        };
-        scan::scan_with_penalties(&set, &prepared, request, also, penalties, cancel)
+            .collect()
     }
 
     /// The newest entry for a book is authoritative, including an unknown hash.

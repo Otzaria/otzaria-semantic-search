@@ -4,6 +4,7 @@
 //! cargo bench
 //! cargo bench -- --vectors 1000000 --dim 256
 //! cargo bench -- --store oxv --vectors 1000000 --dim 256 --threads 8
+//! cargo bench -- --store oxv --vectors 4000000 --dim 256 --batch 12
 //! ```
 //!
 //! Measures [`VectorStore`] directly, or with `--store oxv` the vector store's int8
@@ -48,6 +49,8 @@ struct Options {
     /// For `--store oxv`: `i8-sym-vec` (the default), `i8-sym-dim` or `f32`.
     codec: String,
     threads: usize,
+    /// For `--store oxv`: also scan this many queries at once, against one at a time.
+    batch: Option<usize>,
     dir: Option<std::path::PathBuf>,
 }
 
@@ -63,6 +66,7 @@ impl Default for Options {
             store: "memory".to_string(),
             codec: "i8-sym-vec".to_string(),
             threads: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+            batch: None,
             dir: None,
         }
     }
@@ -86,6 +90,11 @@ fn parse_options() -> Options {
             "--top-k" => options.top_k = parsed("--top-k"),
             "--queries" => options.queries = parsed("--queries"),
             "--threads" => options.threads = parsed("--threads"),
+            "--batch" => {
+                let size = parsed("--batch");
+                assert!(size > 0, "--batch needs a positive integer");
+                options.batch = Some(size);
+            }
             "--store" => options.store = value.cloned().unwrap_or_default(),
             "--codec" => options.codec = value.cloned().unwrap_or_default(),
             "--dir" => options.dir = value.map(std::path::PathBuf::from),
@@ -182,7 +191,9 @@ fn oxv(options: Options) {
     use otzaria_semantic_search::distribution::package::PackageKind;
     use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
     use otzaria_semantic_search::semantic::oxv::reader::Segment;
-    use otzaria_semantic_search::semantic::oxv::scan::{scan_segments, ScanRequest};
+    use otzaria_semantic_search::semantic::oxv::scan::{
+        scan_segments, scan_segments_many, ScanRequest,
+    };
     use otzaria_semantic_search::semantic::oxv::writer::{SegmentBuilder, SegmentSpec};
     use otzaria_semantic_search::semantic::resolve::BookSet;
 
@@ -192,6 +203,7 @@ fn oxv(options: Options) {
         top_k,
         queries,
         threads,
+        batch,
         dir,
         codec,
         ..
@@ -289,6 +301,64 @@ fn oxv(options: Options) {
         .collect();
     let filtered = run(threads, Some(&filter));
     println!("scan, 5% of the books: {filtered}");
+
+    if let Some(size) = batch {
+        for (label, books) in [("all books", None), ("5% of the books", Some(&filter))] {
+            let request = ScanRequest {
+                top_k,
+                books,
+                threads,
+                window_penalty: 0.0,
+            };
+            let rounds = queries.div_ceil(size).max(8);
+            let mut separate_times = Vec::with_capacity(rounds);
+            let mut batch_times = Vec::with_capacity(rounds);
+            for round in 0..=rounds {
+                let batch: Vec<_> = (0..size).map(|i| unit(1_000 + round * size + i)).collect();
+                let views: Vec<_> = batch.iter().map(Vec::as_slice).collect();
+                let separate = || {
+                    let start = Instant::now();
+                    let hits = views
+                        .iter()
+                        .map(|query| {
+                            scan_segments(&[&segment], query, &request, &cancel).expect("scan")
+                        })
+                        .collect::<Vec<_>>();
+                    (start.elapsed(), hits)
+                };
+                let batched = || {
+                    let start = Instant::now();
+                    let hits = scan_segments_many(&[&segment], &views, &request, &cancel)
+                        .expect("scan many");
+                    (start.elapsed(), hits)
+                };
+
+                // Alternate the order to reduce the effect of which path warmed the cache.
+                let ((separate_time, separate_hits), (batch_time, batch_hits)) = if round % 2 == 0 {
+                    let separate = separate();
+                    (separate, batched())
+                } else {
+                    let batched = batched();
+                    (separate(), batched)
+                };
+                assert_eq!(separate_hits, batch_hits);
+                if round != 0 {
+                    separate_times.push(separate_time);
+                    batch_times.push(batch_time);
+                }
+            }
+
+            let separate = summarize(separate_times);
+            let batched = summarize(batch_times);
+            println!("{size} queries, {label}, {threads} threads");
+            println!("  separate: {separate}");
+            println!("  batched:  {batched}");
+            println!(
+                "  median speedup: {:.2}×",
+                separate.median.as_secs_f64() / batched.median.as_secs_f64()
+            );
+        }
+    }
 
     drop(segment);
     let _ = std::fs::remove_dir_all(&dir);

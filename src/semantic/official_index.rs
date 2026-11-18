@@ -506,6 +506,32 @@ impl OfficialSemanticIndex {
         )?)
     }
 
+    /// The same hits as [`Self::search_hits_with`] with no additional slots, for each query
+    /// vector in input order. See [`SegmentSet::scan_many`].
+    pub fn search_hits_many(
+        &self,
+        query_vectors: &[&[f32]],
+        top_k: usize,
+        books: Option<&BookSet>,
+        window_penalty: f32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<VectorHit>>, SemanticSearchError> {
+        Ok(self.set.scan_many_with_penalties(
+            query_vectors,
+            &ScanRequest {
+                top_k,
+                books,
+                threads: self.scan_threads,
+                window_penalty,
+            },
+            ScanPenalties {
+                window: window_penalty,
+                alias: window_penalty,
+            },
+            cancel,
+        )?)
+    }
+
     /// Embed a query separately, so the coordinator can cache the vector.
     pub(crate) fn embed_query(&self, query: &str) -> Result<Vec<f32>, SemanticSearchError> {
         // The same recipe the stored vectors were built under. A query embedded from raw
