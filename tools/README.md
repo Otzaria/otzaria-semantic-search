@@ -165,3 +165,17 @@ backend has to agree:
   for every case on each run: 36 of the 37 role-prefixed cases tokenize alike either way —
   those beginning with a digit, a quote, a parenthesis and a Latin letter among them — and
   `query_leading_whitespace` does not.
+
+## CI native runtime artifacts
+
+`fetch_onnx_runtime.py` extracts native libraries from Microsoft's official PyPI wheels
+(reference 1.28.0) or NuGet package (minimum 1.17.0). Immutable URLs, SHA-256 digests
+and exact members are pinned in `onnx_runtime_artifacts.json`. This replaces unavailable
+GitHub release downloads without upgrading runtime versions. Python bindings are neither
+installed nor imported. Failed checksums or missing libraries fail the job; `GITHUB_ENV`
+receives `OTZARIA_ONNX_RUNTIME` only after verification and extraction.
+
+```sh
+python tools/fetch_onnx_runtime.py --version 1.28.0 --platform linux-x64 --out /tmp/ort
+python -m unittest discover -s tools -p test_fetch_onnx_runtime.py -v
+```

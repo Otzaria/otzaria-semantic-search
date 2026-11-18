@@ -35,18 +35,12 @@ jobs:
       # oldest accepted API/runtime here: a version string and a successful query do
       # not prove that session teardown is safe. The hash pins the official Microsoft
       # asset; this older GitHub release does not publish an asset digest itself.
-      - name: Fetch ONNX Runtime 1.17.0
+      - name: Fetch pinned ONNX Runtime 1.17.0
+        shell: bash
         run: |
-          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.17.0.tgz"
-          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-linux-x64-1.17.0.tgz
-          echo "efc344d54d1969446ff5d3e55b54e205c6579c06333ecf1d34a04215eefae7c6  $archive" | sha256sum --check -
-          library="onnxruntime-linux-x64-1.17.0/lib/libonnxruntime.so.1.17.0"
-          tar -xzf "$archive" -C "$RUNNER_TEMP" "$library"
-          test -f "$RUNNER_TEMP/$library"
-          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/$library" >> "$GITHUB_ENV"
-      # Includes fresh child-process load/refusal/retry and two-session
-      # create/infer/drop/reopen tests. A native teardown crash fails the parent test.
+          python tools/fetch_onnx_runtime.py \
+            --version 1.17.0 --platform "linux-x64" --out "$RUNNER_TEMP/ort-1.17.0"
+
       - name: Native lifecycle and compatibility at the minimum versions
         run: cargo test --locked --features onnx-backend --test onnx_backend
 
@@ -106,7 +100,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 -m pip install --quiet pytest
-          python3 -m pytest tools/kaggle/test_queue.py tools/test_onnx_package_checksum.py tools/test_compare_ort_parity.py -q
+          python3 -m pytest tools/kaggle/test_queue.py tools/test_onnx_package_checksum.py tools/test_compare_ort_parity.py tools/test_fetch_onnx_runtime.py -q
 
       # Also the step in this job that compiles the ONNX backend on every platform. That
       # needs no runtime and no network: ONNX Runtime is loaded when a model is, never
@@ -128,9 +122,9 @@ jobs:
   # `OTZARIA_ONNX_RUNTIME`, so the runtime is fetched first, or this job would be green
   # having run none of them.
   #
-  # The runtime is Microsoft's official 1.28.0 release, the backend's reference: it
+  # The runtime is Microsoft's official 1.28.0 wheel, the backend's reference: it
   # needs glibc >= 2.27 and dispatches CPU features at run time. Asset names and SHA-256
-  # digests are from the v1.28.0 release page, pinned for the reason the actions are
+  # digests are pinned in tools/onnx_runtime_artifacts.json, for the reason actions are
   # pinned: a re-uploaded asset is a different runtime. Not cached — 9 to 79 MB, and a
   # verified download is as good as a cache hit.
   onnx-backend:
@@ -141,18 +135,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            ort_archive: onnxruntime-linux-x64-1.28.0.tgz
-            ort_sha256: a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407
-            ort_library: onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
+            ort_platform: linux-x64
           # arm64: there is no macOS x86_64 build of 1.28.0.
           - os: macos-latest
-            ort_archive: onnxruntime-osx-arm64-1.28.0.tgz
-            ort_sha256: 1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8
-            ort_library: onnxruntime-osx-arm64-1.28.0/lib/libonnxruntime.1.28.0.dylib
+            ort_platform: macos-arm64
           - os: windows-latest
-            ort_archive: onnxruntime-win-x64-1.28.0.zip
-            ort_sha256: abef733dacbe2f571547a7150b479b5cb9cc0df22f96c24983a42cadb1b4f8bc
-            ort_library: onnxruntime-win-x64-1.28.0/lib/onnxruntime.dll
+            ort_platform: windows-x64
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -168,55 +156,11 @@ jobs:
           key: onnx-backend
 
       # Only the library is extracted from the archive.
-      - name: Fetch ONNX Runtime 1.28.0
-        if: runner.os != 'Windows'
+      - name: Fetch pinned ONNX Runtime 1.28.0
+        shell: bash
         run: |
-          archive="$RUNNER_TEMP/${{ matrix.ort_archive }}"
-          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
-            "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/${{ matrix.ort_archive }}"
-          echo "${{ matrix.ort_sha256 }}  $archive" | shasum -a 256 -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" "${{ matrix.ort_library }}"
-          test -f "$RUNNER_TEMP/${{ matrix.ort_library }}"
-          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/${{ matrix.ort_library }}" >> "$GITHUB_ENV"
-
-      # PowerShell and .NET's zip reader rather than bash: the Windows runner's bash has
-      # no dependable zip tool, and the archive also holds a 408 MB PDB that extracting
-      # everything would write out. The path handed on is a native Windows one, which
-      # the loader needs; an MSYS-style `/d/a/...` is not.
-      - name: Fetch ONNX Runtime 1.28.0 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $archive = Join-Path $env:RUNNER_TEMP '${{ matrix.ort_archive }}'
-          curl.exe -fSL --retry 5 --retry-all-errors --output $archive `
-            'https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/${{ matrix.ort_archive }}'
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-          if ($actual -ne '${{ matrix.ort_sha256 }}') {
-            Write-Output "::error::${{ matrix.ort_archive }}: SHA-256 $actual, expected ${{ matrix.ort_sha256 }}"
-            exit 1
-          }
-          $member = '${{ matrix.ort_library }}'
-          $folder = $member.Substring(0, $member.LastIndexOf('/'))
-          $target = Join-Path $env:RUNNER_TEMP ($folder -replace '/', '\')
-          New-Item -ItemType Directory -Force -Path $target | Out-Null
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
-          try {
-            foreach ($entry in $zip.Entries) {
-              if ($entry.FullName -like "$folder/*.dll") {
-                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $target $entry.Name), $true)
-              }
-            }
-          } finally {
-            $zip.Dispose()
-          }
-          $library = Join-Path $env:RUNNER_TEMP ($member -replace '/', '\')
-          if (-not (Test-Path -LiteralPath $library)) {
-            Write-Output "::error::$member is not in ${{ matrix.ort_archive }}"
-            exit 1
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "OTZARIA_ONNX_RUNTIME=$library"
+          python tools/fetch_onnx_runtime.py \
+            --version 1.28.0 --platform "${{ matrix.ort_platform }}" --out "$RUNNER_TEMP/ort-1.28.0"
 
       - name: Clippy (onnx-backend)
         run: cargo clippy --all-targets --features onnx-backend -- -D warnings
@@ -374,21 +318,13 @@ jobs:
           echo "fp32=$(pwd)/onnx-model/seforim-embed-round2-fp32.onnx" >> "$GITHUB_OUTPUT"
 
       # The linux-x64 row of the `onnx-backend` matrix; bump the two together.
-      - name: Fetch ONNX Runtime 1.28.0
+      - name: Fetch pinned ONNX Runtime 1.28.0
         id: runtime
+        shell: bash
         run: |
-          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
-          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
-          echo "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407  $archive" | shasum -a 256 -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
-          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
+          python tools/fetch_onnx_runtime.py \
+            --version 1.28.0 --platform "linux-x64" --out "$RUNNER_TEMP/ort-1.28.0"
 
-      # A package checksum is what the family's identity lists among its `query_packages`,
-      # and it has two implementations: the crate's and tools/onnx_package_checksum.py. For
-      # each graph both must reach the value its golden file records — from the real
-      # package; the unit tests only reach it from a 241-byte one — and the family must
-      # declare that value for the package of that quantization.
       - name: The package checksums, by both implementations
         run: |
           check() {
@@ -577,18 +513,12 @@ jobs:
 
       # The linux-x64 row of the `onnx-backend` matrix, as in `golden-onnx`; bump all three
       # together.
-      - name: Fetch ONNX Runtime 1.28.0
+      - name: Fetch pinned ONNX Runtime 1.28.0
+        shell: bash
         run: |
-          archive="$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0.tgz"
-          curl -fSL --retry 5 --retry-all-errors --output "$archive" \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
-          echo "a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407  $archive" | shasum -a 256 -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP" onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0
-          echo "OTZARIA_ONNX_RUNTIME=$RUNNER_TEMP/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so.1.28.0" >> "$GITHUB_ENV"
+          python tools/fetch_onnx_runtime.py \
+            --version 1.28.0 --platform "linux-x64" --out "$RUNNER_TEMP/ort-1.28.0"
 
-      # Intel SDE 10.13.1 (2026-07-28), Linux. Its installation notes: "On Ubuntu systems,
-      # you must disable yama" — it injects itself by a ptrace attach to its parent, which
-      # Ubuntu's default ptrace scope forbids.
       - name: Fetch Intel SDE 10.13.1
         run: |
           archive="$RUNNER_TEMP/sde-external-10.13.1-2026-07-28-lin.tar.xz"
