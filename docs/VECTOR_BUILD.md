@@ -361,7 +361,7 @@ release that was already assembled.
 |------|--------|
 | G1 | The identity is complete and the segment's own; the codec is the declared one; every scale is finite and > 0; for `i8-sym-dim`, at most 1e-4 of the components are clipped, and for `rot192-i8i4` at most 1e-4 of the tail's |
 | G5 | Every slot holds its key's warehouse vector, encoded; every alias's two vectors are in the warehouse and at least the release ledger's threshold apart in cosine, and the detail reports the count and the least cosine. On a 20,000-slot sample (`--samples`), the decoded vectors' cosine with their f32 originals is finite, with a mean ≥ 0.9995 and a 0.1st percentile ≥ 0.998 — for `rot192-i8i4`, which drops 64 components, ≥ 0.997 and ≥ 0.99 (measured on v31: 0.9975 and 0.9938). Not applicable to a delta with no slot; any other empty sample fails |
-| G7 | A base is ≤ 3.5 × 10⁹ bytes (room for a set with long-line windows, about 2.73 × 10⁹); a delta is ≤ 0.15 × its base, otherwise publish a base |
+| G7 | A base is ≤ 4 × 10⁹ bytes (4 GB, decimal; enough for the complete-coverage notes recipe in i8-sym-vec); a delta is ≤ 0.15 × its base, otherwise publish a base |
 | G8 | Assembling again into `<out>.g8` gives the same segment, package, release manifest and ledger, byte for byte |
 | G9 | `verify_for_install` passes, reading every payload byte, under the manifest's `packageDigest`; the segment is the manifest's |
 | G10 | Reported, not enforced: the base plus its deltas as a multiple of the base, with a note past 1.3 |

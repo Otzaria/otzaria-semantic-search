@@ -53,7 +53,7 @@ pub const G5_ROT_MIN_P001_COSINE: f64 = 0.99;
 pub const G6_ROT_MIN_RECALL_AT_10: f64 = 0.98;
 pub const G6_ROT_MIN_RECALL_AT_50: f64 = 0.98;
 /// G7: the largest base, in bytes.
-pub const G7_MAX_BASE_BYTES: u64 = 3_500_000_000;
+pub const G7_MAX_BASE_BYTES: u64 = 4_000_000_000;
 /// G7: the largest delta, as a fraction of its base; a larger one is published as a base.
 pub const G7_MAX_DELTA_RATIO: f64 = 0.15;
 /// G10: the most a base and its deltas should be, as a multiple of the base; past it the
@@ -876,6 +876,56 @@ pub fn recall(found: &[ChunkKey], exact: &[ChunkKey]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn g7_base_budget_includes_four_decimal_gigabytes_and_rejects_one_byte_more() {
+        use crate::distribution::package::PackageCounts;
+        use crate::semantic::oxv::writer::{SegmentSpec, WrittenSegment};
+        use crate::semantic::versioning::{test_identity, test_provenance};
+        let identity = test_identity();
+        for kind in [PackageKind::Base, PackageKind::Compacted] {
+            for (size, expected) in [
+                (3_500_000_001, true),
+                (3_889_391_688, true),
+                (3_999_999_999, true),
+                (4_000_000_000, true),
+                (4_000_000_001, false),
+                (u64::from(u32::MAX), false),
+            ] {
+                let written = WrittenSegment {
+                    path: PathBuf::new(),
+                    size,
+                    sha256: [0; 32],
+                    segment_id: [0; 16],
+                    spec: SegmentSpec {
+                        kind,
+                        identity_digest: identity.identity_digest(),
+                        from_library_version: 0,
+                        to_library_version: 38,
+                        library_release_tag: "v38-size-boundary".to_string(),
+                    },
+                    counts: PackageCounts::default(),
+                    clipped_components: 0,
+                };
+                let manifest = ReleaseManifest::for_segment(
+                    &written,
+                    &identity,
+                    [0; 32],
+                    test_provenance(),
+                    String::new(),
+                );
+                let verdict = g7(&manifest, None);
+                assert_eq!(
+                    verdict.passed(),
+                    expected,
+                    "{kind:?}, {size}: {}",
+                    verdict.detail
+                );
+                assert!(verdict.detail.contains("at most 4000000000"));
+            }
+        }
+        assert_eq!(G7_MAX_DELTA_RATIO, 0.15);
+    }
 
     /// G5 at the int8 floors.
     fn g5(content: &Content, kind: PackageKind) -> Gate {
