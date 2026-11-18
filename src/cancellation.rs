@@ -104,15 +104,20 @@ impl CancellationToken {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) fn check_scan_cancelled(&self) -> Result<(), VectorStoreError> {
+        if self.is_cancelled() {
+            return Err(VectorStoreError::Cancelled);
+        }
+        Ok(())
+    }
+
     /// A checkpoint inside a vector scan, `scanned` records in. The scan calls it before
     /// its first record and then every [`SCAN_CHECK_INTERVAL`] records.
     #[inline]
     pub(crate) fn scan_checkpoint(&self, scanned: usize) -> Result<(), VectorStoreError> {
         probe::observe(scanned);
-        if self.is_cancelled() {
-            return Err(VectorStoreError::Cancelled);
-        }
-        Ok(())
+        self.check_scan_cancelled()
     }
 }
 

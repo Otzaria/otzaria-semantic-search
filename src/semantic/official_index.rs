@@ -506,9 +506,8 @@ impl OfficialSemanticIndex {
         )?)
     }
 
-    /// [`Self::search_hits_with`] for several query vectors in one pass over the set (see
-    /// [`SegmentSet::scan_many`]): for each, exactly the hits `search_hits_with` returns for
-    /// it alone, with nothing weighed besides. Vectors this index's runtime produced.
+    /// The same hits as [`Self::search_hits_with`] with no additional slots, for each query
+    /// vector in input order. See [`SegmentSet::scan_many`].
     pub fn search_hits_many(
         &self,
         query_vectors: &[&[f32]],

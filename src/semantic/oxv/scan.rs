@@ -24,6 +24,7 @@
 use crate::cancellation::{CancellationToken, SCAN_CHECK_INTERVAL};
 use crate::errors::VectorStoreError;
 use crate::semantic::chunk_key::ChunkKey;
+use crate::semantic::oxv::codec::Codec;
 use crate::semantic::oxv::kernel::{
     dot_f32, ordered, select, select_nibbles, unordered, DotKernel, NibbleKernel, PreparedQuery,
 };
@@ -35,7 +36,22 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::AtomicUsize;
 
 /// Below this many slots a share is not worth a thread of its own.
-const MIN_SLOTS_PER_THREAD: usize = 4096;
+pub(super) const MIN_SLOTS_PER_THREAD: usize = 4096;
+
+/// Keep the per-worker heaps bounded as the number of queries grows. The common
+/// passage search (up to twelve windows) fits in one pass.
+pub(super) const QUERIES_PER_PASS: usize = 16;
+
+/// Soft budget for the per-worker heaps and one query's merge buffer. A request
+/// whose single-query heaps exceed it still gets the top-k it asked for.
+const BATCH_CANDIDATE_BUDGET: usize = 32 * 1024 * 1024;
+
+pub(super) fn queries_per_pass(candidates_per_query: usize) -> usize {
+    let bytes = candidates_per_query.saturating_mul(size_of::<Candidate>());
+    (BATCH_CANDIDATE_BUDGET / bytes.max(1))
+        .saturating_sub(1)
+        .clamp(1, QUERIES_PER_PASS)
+}
 
 /// A foreign record whose key no older segment of the set holds live.
 pub(crate) const LINK_UNRESOLVED: u16 = 1;
@@ -169,8 +185,8 @@ pub fn scan_segments(
     scan(&set, &prepared, request, cancel)
 }
 
-/// [`scan_segments`] for several queries in one pass over the vectors: for each, the hits
-/// [`scan_segments`] returns for it alone (see [`scan_many`]).
+/// The same hits as [`scan_segments`] for each query, in input order. Large batches are
+/// processed in groups to bound the working memory.
 pub fn scan_segments_many(
     segments: &[&Segment],
     queries: &[&[f32]],
@@ -192,10 +208,7 @@ pub fn scan_segments_many(
             ),
         });
     }
-    let prepared = queries
-        .iter()
-        .map(|query| PreparedQuery::new(query, first.codec()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let prepared = prepare_queries(queries, first.codec(), cancel)?;
     let views: Vec<ScanSegment<'_>> = segments
         .iter()
         .map(|segment| ScanSegment {
@@ -411,14 +424,25 @@ fn check_dim(set: &ScanSet<'_>, query: &PreparedQuery) -> Result<(), VectorStore
     Ok(())
 }
 
-/// Several queries in one pass over the vectors: for each, exactly what [`scan_all`] with
-/// nothing besides returns for it alone — the same hits, bit for bit, in the same order.
-///
-/// The scan is bound by memory bandwidth, not arithmetic: each vector is read from memory
-/// once and scored against every query while it is in cache, so `m` queries cost little more
-/// than one instead of `m` passes over the set. Each query keeps its own best `k` (and its own
-/// early rejection); a slot's role under the filter is resolved at most once, for the first
-/// query it contends for.
+/// Prepare a batch for one codec, checking cancellation between queries.
+pub(crate) fn prepare_queries(
+    queries: &[&[f32]],
+    codec: &Codec,
+    cancel: &CancellationToken,
+) -> Result<Vec<PreparedQuery>, VectorStoreError> {
+    cancel.check_scan_cancelled()?;
+    queries
+        .iter()
+        .map(|query| {
+            cancel.check_scan_cancelled()?;
+            PreparedQuery::new(query, codec)
+        })
+        .collect()
+}
+
+/// The same ordered hits as [`scan_all`] for each query, without additional slots.
+/// Queries in a group share the scan plan and reuse each vector while it is in cache.
+/// Each query keeps its own ranking, and a slot's role is resolved on demand once per group.
 pub(crate) fn scan_many(
     set: &ScanSet<'_>,
     queries: &[PreparedQuery],
@@ -426,20 +450,30 @@ pub(crate) fn scan_many(
     penalties: ScanPenalties,
     cancel: &CancellationToken,
 ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
+    if let [query] = queries {
+        return scan_all(set, query, request, &[], penalties, cancel, None).map(|hits| vec![hits]);
+    }
+
     cancel.scan_checkpoint(0)?;
     check_penalties(request, penalties)?;
-    for query in queries {
-        check_dim(set, query)?;
-    }
     if request.top_k == 0 || queries.is_empty() {
         return Ok(vec![Vec::new(); queries.len()]);
     }
+    for query in queries {
+        check_dim(set, query)?;
+    }
     let work = Work::plan(set, request.books);
-    let top_k = request.top_k.min(work.total.max(1));
+    cancel.check_scan_cancelled()?;
+    if work.total == 0 {
+        return Ok(vec![Vec::new(); queries.len()]);
+    }
+    let top_k = request.top_k.min(work.total);
     let threads = request
         .threads
         .max(1)
         .min(work.total.div_ceil(MIN_SLOTS_PER_THREAD).max(1));
+    // Work shares have equal sizes to within one slot. Each holds at most top_k.
+    let group_size = queries_per_pass(top_k.saturating_mul(threads).min(work.total));
     let shares = work.split(threads);
     let config = ScanConfig { request, penalties };
     let mixed = || VectorStoreError::SearchFailed {
@@ -451,15 +485,41 @@ pub(crate) fn scan_many(
         scorers: &[S],
         config: ScanConfig<'_, '_>,
         top_k: usize,
+        group_size: usize,
         shares: &[Vec<Piece>],
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
-        let found = run_shares_many(set, scorers, config, top_k, shares, cancel)?;
-        Ok(found
-            .into_iter()
-            .zip(scorers)
-            .map(|(found, scorer)| hits(set, found, config.request, config.penalties, scorer))
-            .collect())
+        let mut hits_by_query = Vec::with_capacity(scorers.len());
+        for group in scorers.chunks(group_size) {
+            cancel.check_scan_cancelled()?;
+            let mut workers = run_shares_many(set, group, config, top_k, shares, cancel)?;
+            for scorer in group {
+                cancel.check_scan_cancelled()?;
+                let heap_len: usize = workers
+                    .iter()
+                    .map(|worker| worker.as_slice()[0].top.heap.len())
+                    .sum();
+                let mut heaps = workers.iter_mut().map(|worker| {
+                    worker
+                        .next()
+                        .expect("each worker has a heap per query")
+                        .top
+                        .heap
+                });
+                // Reuse the first heap's backing storage. Materialize one query at a time
+                // so the other heaps need no duplicate candidate storage.
+                let mut found = heaps.next().expect("at least one worker").into_vec();
+                found.reserve_exact(heap_len - found.len());
+                for heap in heaps {
+                    found.extend(heap.into_vec());
+                }
+                let found = best_of(found, top_k);
+                cancel.check_scan_cancelled()?;
+                hits_by_query.push(hits(set, found, config.request, config.penalties, scorer));
+            }
+        }
+        cancel.check_scan_cancelled()?;
+        Ok(hits_by_query)
     }
 
     match &queries[0] {
@@ -476,7 +536,7 @@ pub(crate) fn scan_many(
                     _ => Err(mixed()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            finish(set, &scorers, config, top_k, &shares, cancel)
+            finish(set, &scorers, config, top_k, group_size, &shares, cancel)
         }
         PreparedQuery::Int8PerVector { .. } => {
             let (kernel, _) = select();
@@ -491,7 +551,7 @@ pub(crate) fn scan_many(
                     _ => Err(mixed()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            finish(set, &scorers, config, top_k, &shares, cancel)
+            finish(set, &scorers, config, top_k, group_size, &shares, cancel)
         }
         PreparedQuery::Rotated { .. } => {
             let (dot, nibbles) = (select().0, select_nibbles().0);
@@ -519,7 +579,7 @@ pub(crate) fn scan_many(
                     _ => Err(mixed()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            finish(set, &scorers, config, top_k, &shares, cancel)
+            finish(set, &scorers, config, top_k, group_size, &shares, cancel)
         }
         PreparedQuery::Float { .. } => {
             let scorers = queries
@@ -529,7 +589,7 @@ pub(crate) fn scan_many(
                     _ => Err(mixed()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            finish(set, &scorers, config, top_k, &shares, cancel)
+            finish(set, &scorers, config, top_k, group_size, &shares, cancel)
         }
     }
 }
@@ -823,8 +883,8 @@ fn run_shares_many<S: Scorer>(
     k: usize,
     shares: &[Vec<Piece>],
     cancel: &CancellationToken,
-) -> Result<Vec<Vec<Candidate>>, VectorStoreError> {
-    let results: Vec<Result<Vec<TopK>, VectorStoreError>> = std::thread::scope(|scope| {
+) -> Result<Vec<std::vec::IntoIter<BatchTop>>, VectorStoreError> {
+    std::thread::scope(|scope| {
         let handles: Vec<_> = shares
             .iter()
             .skip(1)
@@ -839,16 +899,10 @@ fn run_shares_many<S: Scorer>(
                 .map(|handle| handle.join().expect("a scan thread must not panic")),
         );
         results
-    });
-    let mut all: Vec<Vec<Candidate>> = (0..scorers.len())
-        .map(|_| Vec::with_capacity(k * shares.len()))
-        .collect();
-    for result in results {
-        for (query, top) in result?.into_iter().enumerate() {
-            all[query].extend(top.heap.into_vec());
-        }
-    }
-    Ok(all.into_iter().map(|found| best_of(found, k)).collect())
+            .into_iter()
+            .map(|result| result.map(Vec::into_iter))
+            .collect()
+    })
 }
 
 /// `found` — the scan's winners, best first — with the slots of `also` it did not return
@@ -966,7 +1020,7 @@ fn scan_share(
     Ok(top)
 }
 
-/// [`scan_share`] for several queries: each vector read once, scored against each.
+/// [`scan_share`] for several queries that reuse the vectors in cache.
 fn scan_share_many<S: Scorer>(
     set: &ScanSet<'_>,
     scorers: &[S],
@@ -974,8 +1028,24 @@ fn scan_share_many<S: Scorer>(
     k: usize,
     share: &[Piece],
     cancel: &CancellationToken,
-) -> Result<Vec<TopK>, VectorStoreError> {
-    let mut tops: Vec<TopK> = scorers.iter().map(|_| TopK::new(k)).collect();
+) -> Result<Vec<BatchTop>, VectorStoreError> {
+    cancel.check_scan_cancelled()?;
+    let share_slots: usize = share
+        .iter()
+        .map(|piece| (piece.end - piece.start) as usize)
+        .sum();
+    let mut tops: Vec<_> = scorers
+        .iter()
+        .map(|_| BatchTop {
+            top: TopK::new(k.min(share_slots)),
+            cutoff: i32::MIN,
+        })
+        .collect();
+    // Keep the interval proportional to scoring work as the group grows.
+    let checkpoint_mask = SCAN_CHECK_INTERVAL
+        .div_ceil(scorers.len())
+        .next_power_of_two()
+        - 1;
     let mut visited = 0usize;
     for piece in share {
         let segment = &set.segments[piece.seg as usize];
@@ -990,6 +1060,7 @@ fn scan_share_many<S: Scorer>(
             piece,
             penalties: config.penalties,
             cancel,
+            checkpoint_mask,
         };
         match segment.segment.vector_scale_bytes() {
             Some(scales) => {
@@ -1011,6 +1082,12 @@ fn scan_share_many<S: Scorer>(
     Ok(tops)
 }
 
+/// Cache the cutoff so a rejected candidate needs no heap lookup.
+struct BatchTop {
+    top: TopK,
+    cutoff: i32,
+}
+
 /// One piece of a share, scanned for several queries.
 struct PassMany<'p, 's, S> {
     set: &'p ScanSet<'s>,
@@ -1020,6 +1097,7 @@ struct PassMany<'p, 's, S> {
     piece: &'p Piece,
     penalties: ScanPenalties,
     cancel: &'p CancellationToken,
+    checkpoint_mask: usize,
 }
 
 impl<S: Scorer> PassMany<'_, '_, S> {
@@ -1028,11 +1106,11 @@ impl<S: Scorer> PassMany<'_, '_, S> {
         &self,
         vectors: impl Iterator<Item = &'v [u8]>,
         scales: impl Iterator<Item = f32>,
-        tops: &mut [TopK],
+        tops: &mut [BatchTop],
         visited: &mut usize,
     ) -> Result<(), VectorStoreError> {
         for (offset, (vector, scale)) in vectors.zip(scales).enumerate() {
-            if visited.is_multiple_of(SCAN_CHECK_INTERVAL) {
+            if *visited & self.checkpoint_mask == 0 {
                 self.cancel.scan_checkpoint(*visited)?;
             }
             *visited += 1;
@@ -1044,10 +1122,8 @@ impl<S: Scorer> PassMany<'_, '_, S> {
             let mut role: Option<Option<u8>> = None;
             for (scorer, top) in self.scorers.iter().zip(tops.iter_mut()) {
                 let mut rank = scorer.rank(vector, scale);
-                // as `Pass::run`: a nonnegative penalty cannot promote a raw score below
-                // this query's worst
-                if top.heap.len() == top.k && top.heap.peek().is_some_and(|worst| rank < worst.rank)
-                {
+                // A nonnegative penalty cannot promote this rank past the cutoff.
+                if rank < top.cutoff {
                     continue;
                 }
                 let window = *role.get_or_insert_with(|| {
@@ -1060,9 +1136,12 @@ impl<S: Scorer> PassMany<'_, '_, S> {
                 if applied_penalty != 0.0 {
                     rank = scorer.penalize(rank, applied_penalty);
                 }
-                top.offer(rank, self.piece.seg, slot, window, || {
+                top.top.offer(rank, self.piece.seg, slot, window, || {
                     self.segment.segment.key(slot)
                 });
+                if top.top.heap.len() == top.top.k {
+                    top.cutoff = top.top.heap.peek().expect("the heap is full").rank;
+                }
             }
         }
         Ok(())

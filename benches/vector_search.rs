@@ -50,7 +50,7 @@ struct Options {
     codec: String,
     threads: usize,
     /// For `--store oxv`: also scan this many queries at once, against one at a time.
-    batch: usize,
+    batch: Option<usize>,
     dir: Option<std::path::PathBuf>,
 }
 
@@ -66,7 +66,7 @@ impl Default for Options {
             store: "memory".to_string(),
             codec: "i8-sym-vec".to_string(),
             threads: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
-            batch: 8,
+            batch: None,
             dir: None,
         }
     }
@@ -90,7 +90,11 @@ fn parse_options() -> Options {
             "--top-k" => options.top_k = parsed("--top-k"),
             "--queries" => options.queries = parsed("--queries"),
             "--threads" => options.threads = parsed("--threads"),
-            "--batch" => options.batch = parsed("--batch"),
+            "--batch" => {
+                let size = parsed("--batch");
+                assert!(size > 0, "--batch needs a positive integer");
+                options.batch = Some(size);
+            }
             "--store" => options.store = value.cloned().unwrap_or_default(),
             "--codec" => options.codec = value.cloned().unwrap_or_default(),
             "--dir" => options.dir = value.map(std::path::PathBuf::from),
@@ -298,38 +302,62 @@ fn oxv(options: Options) {
     let filtered = run(threads, Some(&filter));
     println!("scan, 5% of the books: {filtered}");
 
-    // Several queries: one pass for all of them, against one pass each.
-    let request = ScanRequest {
-        top_k,
-        books: None,
-        threads,
-        window_penalty: 0.0,
-    };
-    for m in [2, batch.max(2)] {
-        let rounds = queries.div_ceil(m).max(3);
-        let (mut alone, mut together) = (Vec::new(), Vec::new());
-        for round in 0..rounds {
-            let batch: Vec<Vec<f32>> = (0..m).map(|i| unit(1_000 + round * m + i)).collect();
-            let views: Vec<&[f32]> = batch.iter().map(Vec::as_slice).collect();
-            let started = Instant::now();
-            let one_by_one: Vec<_> = views
-                .iter()
-                .map(|query| scan_segments(&[&segment], query, &request, &cancel).expect("scan"))
-                .collect();
-            alone.push(started.elapsed());
-            let started = Instant::now();
-            let at_once =
-                scan_segments_many(&[&segment], &views, &request, &cancel).expect("scan many");
-            together.push(started.elapsed());
-            assert_eq!(at_once, one_by_one);
+    if let Some(size) = batch {
+        for (label, books) in [("all books", None), ("5% of the books", Some(&filter))] {
+            let request = ScanRequest {
+                top_k,
+                books,
+                threads,
+                window_penalty: 0.0,
+            };
+            let rounds = queries.div_ceil(size).max(8);
+            let mut separate_times = Vec::with_capacity(rounds);
+            let mut batch_times = Vec::with_capacity(rounds);
+            for round in 0..=rounds {
+                let batch: Vec<_> = (0..size).map(|i| unit(1_000 + round * size + i)).collect();
+                let views: Vec<_> = batch.iter().map(Vec::as_slice).collect();
+                let separate = || {
+                    let start = Instant::now();
+                    let hits = views
+                        .iter()
+                        .map(|query| {
+                            scan_segments(&[&segment], query, &request, &cancel).expect("scan")
+                        })
+                        .collect::<Vec<_>>();
+                    (start.elapsed(), hits)
+                };
+                let batched = || {
+                    let start = Instant::now();
+                    let hits = scan_segments_many(&[&segment], &views, &request, &cancel)
+                        .expect("scan many");
+                    (start.elapsed(), hits)
+                };
+
+                // Alternate the order to reduce the effect of which path warmed the cache.
+                let ((separate_time, separate_hits), (batch_time, batch_hits)) = if round % 2 == 0 {
+                    let separate = separate();
+                    (separate, batched())
+                } else {
+                    let batched = batched();
+                    (separate(), batched)
+                };
+                assert_eq!(separate_hits, batch_hits);
+                if round != 0 {
+                    separate_times.push(separate_time);
+                    batch_times.push(batch_time);
+                }
+            }
+
+            let separate = summarize(separate_times);
+            let batched = summarize(batch_times);
+            println!("{size} queries, {label}, {threads} threads");
+            println!("  separate: {separate}");
+            println!("  batched:  {batched}");
+            println!(
+                "  median speedup: {:.2}×",
+                separate.median.as_secs_f64() / batched.median.as_secs_f64()
+            );
         }
-        let (alone, together) = (summarize(alone), summarize(together));
-        println!("{m} queries, one by one, {threads} threads: {alone}");
-        println!("{m} queries, one pass,   {threads} threads: {together}");
-        println!(
-            "  → {:.2}× faster",
-            alone.min.as_secs_f64() / together.min.as_secs_f64()
-        );
     }
 
     drop(segment);

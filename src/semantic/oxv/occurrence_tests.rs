@@ -207,6 +207,25 @@ fn alias_penalty_selects_top_k_role_before_the_heap_and_restores_the_actual_pena
     assert_eq!(alias_costlier[0].window, 0);
     assert_eq!(alias_costlier[0].applied_penalty, 0.0);
 
+    let queries = [
+        query.clone(),
+        PreparedQuery::new(&[0.0, 1.0], segment.codec()).unwrap(),
+    ];
+    let cancel = CancellationToken::new();
+    for (request, alias) in [(request, 0.01), (costlier_request, 0.2)] {
+        let penalties = ScanPenalties {
+            window: request.window_penalty,
+            alias,
+        };
+        let batch = super::scan::scan_many(&set, &queries, &request, penalties, &cancel).unwrap();
+        assert_eq!(batch.len(), queries.len());
+        for (query, batched) in queries.iter().zip(batch) {
+            let alone =
+                scan_with_penalties(&set, query, &request, &[], penalties, &cancel).unwrap();
+            assert_eq!(batched, alone);
+        }
+    }
+
     let unfiltered_request = ScanRequest {
         books: None,
         top_k: 2,

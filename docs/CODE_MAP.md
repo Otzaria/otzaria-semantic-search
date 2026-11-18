@@ -457,10 +457,9 @@ otzaria-semantic-search/
     מהליבות, עד שמונה. `scan_with` — אותה סריקה, ולצדה slots שהמארח נוקב בהם
     (`SlotRef`): כל אחד שחי ומחזיק את המפתח שלו מנוקד כמו בסריקה, ו-`k` הטובים מבין אלה
     שהסריקה לא החזירה ממוזגים בסדר שלה — לצד הפגיעות שלה, אף פעם לא במקומן.
-    `scan_many` / `scan_segments_many` — כמה שאילתות במעבר אחד על הווקטורים: כל וקטור נקרא
-    מהזיכרון פעם אחת ומנוקד מול כל שאילתה, ולכל שאילתה `k` טובים משלה — בדיוק מה שסריקה
-    שלה לבדה מחזירה, ביט בביט. הסריקה חסומה ברוחב הפס של הזיכרון, כך ש-`m` שאילתות עולות
-    מעט יותר משאילתה אחת.
+    `scan_many` / `scan_segments_many` מנקדות כל וקטור מול כמה שאילתות בעודו במטמון המעבד,
+    כדי לחסוך קריאות מהזיכרון. כל שאילתה מקבלת את אותן תוצאות שהייתה מקבלת בסריקה נפרדת.
+    אצוות גדולות מתחלקות לקבוצות כדי להגביל את הזיכרון הדרוש למועמדים.
 
 * [`src/semantic/segment_set/`](../src/semantic/segment_set/mod.rs) — **הסט על המכשיר.**
   - `SegmentSet::open` — שחזור כשה-lock פנוי, ואז הדור ש-`CURRENT` מונה, או `PREVIOUS`;
@@ -584,7 +583,7 @@ otzaria-semantic-search/
     `otzaria-oxv` 2 `i8-sym-vec`, ו-`otzaria-oxv` 3 `rot192-i8i4`).
   - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
     `search_hits_with(vector, …, also, …)` — ולצדם הווקטורים של `also` (`scan_with`);
-    `search_hits_many(vectors, …)` — כמה וקטורים במעבר אחד (`scan_many`);
+    `search_hits_many(vectors, …)` — כמה וקטורי שאילתה בסריקה משותפת (`scan_many`);
     `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
     `book_count`.
   - `status` מדווח `vectors_persisted = true` ו-`needs_full_reindex = None`, ולא כטענה

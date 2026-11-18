@@ -392,11 +392,9 @@ impl SegmentSet {
         scan::scan_with_penalties(&set, &prepared, request, also, penalties, cancel)
     }
 
-    /// [`Self::scan`] for several queries in one pass over the vectors: for each query,
-    /// exactly the hits [`Self::scan`] returns for it alone, in the same order. The scan is
-    /// bound by memory bandwidth, so `m` queries cost little more than one — where `m`
-    /// separate scans read every vector `m` times. For a host that searches several texts
-    /// at once: the windows of a long passage, a query and its passage form.
+    /// The same ordered hits as [`Self::scan`] for each query. Scanning the vectors
+    /// together can save memory traffic when searching several windows of a long passage.
+    /// Large batches are split to bound working memory.
     pub fn scan_many(
         &self,
         queries: &[&[f32]],
@@ -422,10 +420,7 @@ impl SegmentSet {
         penalties: ScanPenalties,
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<VectorHit>>, VectorStoreError> {
-        let prepared = queries
-            .iter()
-            .map(|query| PreparedQuery::new(query, self.codec()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let prepared = scan::prepare_queries(queries, self.codec(), cancel)?;
         let views = self.scan_views();
         let set = ScanSet {
             segments: &views,
