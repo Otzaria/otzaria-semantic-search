@@ -1156,3 +1156,98 @@ fn public_scan_rejects_a_negative_or_nonfinite_window_penalty() {
         );
     }
 }
+
+/// Fit and persist the full model width. Tail-only queries catch an accidental
+/// historical 192-row assumption in query rotation, decoding or the scan kernel.
+#[test]
+fn a_full_width_224_32_rotation_round_trips_and_scans_every_dimension() {
+    use super::codec::{CODEC_ROT_I8I4, ROT_I8I4_NAME};
+    let dim = 256;
+    let vectors: Vec<Vec<f32>> = (0..dim)
+        .map(|at| {
+            let mut vector = vec![0.0; dim];
+            vector[at] = 1.0;
+            vector
+        })
+        .collect();
+    let refs: Vec<_> = vectors.iter().map(Vec::as_slice).collect();
+    let fitted = Codec::fit_rot_i8i4(&refs, 224, 32).unwrap();
+    assert_eq!(
+        (fitted.dim(), fitted.name(), fitted.bytes_per_vector()),
+        (256, ROT_I8I4_NAME, 240)
+    );
+    let codec = Codec::from_params(CODEC_ROT_I8I4, dim, fitted.params()).unwrap();
+    assert_eq!(codec.params_sha256(), fitted.params_sha256());
+    let layout = codec.rotated().unwrap();
+    assert_eq!(
+        (
+            layout.head,
+            layout.tail,
+            layout.out_dim(),
+            layout.rotation.len()
+        ),
+        (224, 32, 256, 256 * 256)
+    );
+    let dir = TempDir::new("full_width_rotated_scan");
+    let path = dir.join("full.oxv");
+    let mut book = TestBook::named("id:1");
+    book.primary = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (key(i as u64), i as u32, v.clone()))
+        .collect();
+    write_segment(
+        &path,
+        spec(PackageKind::Base, 0, 38),
+        codec.clone(),
+        &[book],
+        &[],
+    );
+    let segment = Segment::open(&path).unwrap();
+    assert_eq!(segment.codec(), &codec);
+    assert_eq!(segment.key_len(), 8);
+    let segments = [ScanSegment {
+        segment: &segment,
+        deleted: &[],
+        links: &[],
+    }];
+    let set = ScanSet {
+        segments: &segments,
+        reverse_links: &[],
+    };
+    for (dimension, vector) in vectors.iter().enumerate() {
+        let query = PreparedQuery::new(vector, segment.codec()).unwrap();
+        let PreparedQuery::Rotated {
+            head,
+            tail_lo,
+            tail_hi,
+            ..
+        } = &query
+        else {
+            panic!("rotated query");
+        };
+        assert_eq!((head.len(), tail_lo.len(), tail_hi.len()), (224, 16, 16));
+        let hits = scan(
+            &set,
+            &query,
+            &ScanRequest {
+                top_k: 1,
+                books: None,
+                threads: 1,
+                window_penalty: 0.0,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].key.same_text(key(dimension as u64)),
+            "dimension {dimension}"
+        );
+        assert!(
+            (hits[0].score - 1.0).abs() < 1e-5,
+            "dimension {dimension}: {}",
+            hits[0].score
+        );
+    }
+}

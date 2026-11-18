@@ -275,7 +275,7 @@ assembly. The plan must have been split against that ledger.
   base, and the file is the epoch:
 
   ```sh
-  otzaria-semantic-search fit-rotation --warehouse $W [--sample 200000] --out $F
+  otzaria-semantic-search fit-rotation --warehouse $W [--sample 200000] [--head 128 --tail 64] --out $F
   ```
 
   It reads `--sample` vectors evenly spaced over the warehouse, takes the 192 leading
@@ -290,6 +290,20 @@ assembly. The plan must have been split against that ledger.
   one in which two distinct keys of the plan — or, for a delta, of the plan and the
   previous ledger — share them, naming both. The anchor family keeps `i8-sym-vec` and
   format 2, byte for byte.
+  The fitted codec already supports other layouts through the same parameters and runtime
+  reader. `fit-rotation --warehouse $W --head 224 --tail 32 --out $F` keeps all 256 model
+  dimensions: 224 components in int8 and 32 in 4 bits, or 240 code bytes plus a scale per
+  vector. The query rotates through all 256 rows too. The `rot192-i8i4` registry name stays
+  unchanged; the serialized layout and its epoch SHA-256 identify the actual dimensions.
+  Defaults remain 128 + 64. A layout requires a positive head, an even tail and a sum no
+  larger than the warehouse width. Keeping every dimension removes projection loss; it
+  does **not** remove quantization error or establish recall. Run the existing G1/G5/G7/G8/G9
+  gates and the engine's G3/G4/G6 validator before publishing. A family requiring recall
+  floors of 0.98 / 0.99 must pass explicit `--min-recall-10 0.98 --min-recall-50 0.99`, since
+  the validator's historical rotated-codec defaults are 0.98 / 0.98. This layout requires
+  no embedding rerun: fit and reassemble from the verified fp32 warehouse, without aliases
+  unless that family separately enables and validates them.
+
 * **Short lines sharing a vector** (`--alias-threshold 0.99`, format 3 only, off by
   default): a record the plan flags short, whose first-window neighbour at −1, +1, −2 or +2
   in its book is not short and has a warehouse vector at least that cosine from its own

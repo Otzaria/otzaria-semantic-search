@@ -158,6 +158,9 @@ Options for 'warehouse-verify':
 Options for 'fit-rotation':
   --warehouse <dir>          The warehouse to fit on
   --sample <N>               Vectors to fit on, evenly spaced (default: 200000)
+  --head <N>                 Components stored in int8 (default: 128, positive)
+  --tail <N>                 Components stored in 4 bits (default: 64, even). Head + tail
+                             must fit the model width; e.g. 224 + 32 keeps all 256 dimensions
   --out <path>               Receives the codec's parameters; its SHA-256 is printed. The
                              same warehouse and sample write the same bytes
 
@@ -918,8 +921,29 @@ fn run_fit_rotation(args: &[String]) {
             .parse()
             .unwrap_or_else(|_| exit_with("--sample", "not a number"))
     });
+    let head = parse_arg(args, "--head").map_or(ROT_HEAD, |value| {
+        value
+            .parse::<usize>()
+            .unwrap_or_else(|_| exit_with("--head", "not a nonnegative integer"))
+    });
+    let tail = parse_arg(args, "--tail").map_or(ROT_TAIL, |value| {
+        value
+            .parse::<usize>()
+            .unwrap_or_else(|_| exit_with("--tail", "not a nonnegative integer"))
+    });
+    if head == 0
+        || !tail.is_multiple_of(2)
+        || head
+            .checked_add(tail)
+            .is_none_or(|width| width > warehouse.dim())
+    {
+        exit_with("Invalid rotation layout", format!(
+            "head {head} must be positive, tail {tail} must be even, and their sum must fit width {}",
+            warehouse.dim()
+        ));
+    }
     let out = PathBuf::from(require_arg(args, "--out"));
-    let codec = fit_rot_i8i4(&warehouse, sample, ROT_HEAD, ROT_TAIL)
+    let codec = fit_rot_i8i4(&warehouse, sample, head, tail)
         .unwrap_or_else(|error| exit_with("The rotation could not be fitted", error));
     std::fs::write(&out, codec.params())
         .unwrap_or_else(|error| exit_with(&format!("Writing {}", out.display()), error));
@@ -937,6 +961,10 @@ fn run_fit_rotation(args: &[String]) {
         "Parameters:      {} bytes in {}",
         codec.params().len(),
         out.display()
+    );
+    println!(
+        "Layout:          {head} int8 + {tail} 4-bit of {} input dimensions",
+        warehouse.dim()
     );
     println!("Epoch SHA-256:   {digest}");
 }

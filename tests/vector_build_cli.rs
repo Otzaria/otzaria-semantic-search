@@ -602,3 +602,53 @@ fn a_corrupt_warehouse_fails_assembly_and_only_its_index_is_repaired() {
         segment
     );
 }
+
+#[test]
+fn fit_rotation_cli_accepts_custom_full_width_layout_and_rejects_invalid_layouts() {
+    use otzaria_semantic_search::distribution::assemble::read_rotation;
+    let build = Build::new("cli-custom-rotation");
+    build.step(1, &[("id:1", &[0, 1, 2, 3])], None);
+    let rotation = build.work.path("rotation.bin");
+    let args = [
+        "fit-rotation",
+        "--warehouse",
+        build.warehouse.as_str(),
+        "--head",
+        "40",
+        "--tail",
+        "24",
+        "--sample",
+        "4",
+        "--out",
+        rotation.as_str(),
+    ];
+    let output = ok(&args);
+    assert!(output.contains("40 int8 + 24 4-bit of 64 input dimensions"));
+    let codec = read_rotation(Path::new(&rotation)).unwrap();
+    assert_eq!((codec.dim(), codec.bytes_per_vector()), (64, 52));
+    let params = codec.params();
+    assert_eq!(u32::from_le_bytes(params[8..12].try_into().unwrap()), 64);
+    assert_eq!(u32::from_le_bytes(params[12..16].try_into().unwrap()), 40);
+    assert_eq!(u32::from_le_bytes(params[16..20].try_into().unwrap()), 24);
+    for (head, tail) in [
+        ("0", "24"),
+        ("40", "25"),
+        ("64", "2"),
+        ("18446744073709551615", "2"),
+    ] {
+        let invalid = build.work.path(&format!("invalid-{head}-{tail}.bin"));
+        let (status, output) = run(&[
+            "fit-rotation",
+            "--warehouse",
+            &build.warehouse,
+            "--head",
+            head,
+            "--tail",
+            tail,
+            "--out",
+            &invalid,
+        ]);
+        assert_ne!(status, 0, "{output}");
+        assert!(!Path::new(&invalid).exists());
+    }
+}
