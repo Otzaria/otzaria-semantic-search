@@ -28,7 +28,7 @@ One directory, written by `export_semantic_plan` over the release index (in
 
 | File | Layout |
 |---|---|
-| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, flags u8, pad [2], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first. `flags` bit 0, **short**: a first window whose line is shorter than `min_meaningful_chars` and so embedded with its neighbours' context (`Chunker::borrows_context`); only it may share a neighbour's vector. A plan written before the flag has 0 there and shares nothing |
+| `records.bin` | `b"OXVREC1\n"` (8 bytes), `u64` count, then per embedded line `{book u32, ordinal u32, sha256 [32]}` (40 bytes), strictly ascending by (book, ordinal); under `chunking_version` 2 or 3, `b"OXVREC2\n"`, `u64` count, then per embedded window `{book u32, ordinal u32, window u8, flags u8, pad [2], sha256 [32]}` (44 bytes), strictly ascending by (book, ordinal, window), window 0 being the line's first. `flags` bit 0, **short**: a first window whose line is shorter than `min_meaningful_chars` and so embedded with its neighbours' context (`Chunker::borrows_context`); only it may share a neighbour's vector. A plan written before the flag has 0 there and shares nothing |
 | `books.json` | JSON array of the books' stable keys, strictly ascending by bytes; a record's `book` is an index into it |
 | `embed.jsonl` | the texts to embed — §2 |
 | `embed-manifest.json` | what `embed.jsonl` is — §2 |
@@ -376,3 +376,22 @@ compares the plan's keys at that width. Compare a computed key with one by
 
 On empty input, `coverage` of a plan with no record is complete, and `recall` of an empty
 `exact` is 1.0: a validator must refuse empty input itself rather than rely on them.
+
+
+## Complete main text and separate notes
+
+The candidate profile in `config/models/meivin-qa491-complete-notes-onnx/` uses
+chunking version 3 and embedding text version 4. It consumes an explicit semantic
+projection alongside unchanged lexical text. Use the matching engine producer and
+rebuilt index; changing the identity of an existing package cannot convert its vectors.
+See [the measured audit and rollout requirements](ISSUE34_AUDIT_HE.md) and
+[portable conformance fixtures](SEMANTIC_RECIPE_FIXTURES.md).
+
+ONNX builds and CPU shard workers write `token-audit.json` before their completion
+manifest. It counts actual inferred passages, over-budget passages, discarded tokens,
+the configured passage cap and the longest uncapped input. This is an operational
+report, outside the vector identity and package manifest; a backend without uncapped
+counting emits no report. Counting includes role prefixes and special tokens, disables
+padding/truncation, and adds no extra tokenization to search queries. External workers
+should run the `audit_plan_tokens` example against their pending plan and tokenizer;
+its default exit status 2 rejects truncation until explicitly accepted.

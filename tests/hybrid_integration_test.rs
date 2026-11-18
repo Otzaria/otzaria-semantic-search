@@ -102,6 +102,8 @@ fn genesis_book() -> BookForIndexing {
         ],
         lines: vec![
             BookLine {
+                semantic_text: None,
+                semantic_notes: Vec::new(),
                 line_id: 1,
                 section_id: 100,
                 text: LINE_ONE.to_string(),
@@ -110,6 +112,8 @@ fn genesis_book() -> BookForIndexing {
                 segment: 1,
             },
             BookLine {
+                semantic_text: None,
+                semantic_notes: Vec::new(),
                 line_id: 2,
                 section_id: 100,
                 text: LINE_TWO.to_string(),
@@ -118,6 +122,8 @@ fn genesis_book() -> BookForIndexing {
                 segment: 2,
             },
             BookLine {
+                semantic_text: None,
+                semantic_notes: Vec::new(),
                 line_id: 3,
                 section_id: 101,
                 text: LINE_THREE.to_string(),
@@ -160,6 +166,8 @@ fn berachot_without_fingerprint() -> BookForIndexing {
         topics: "/תלמוד/משנה/ברכות".to_string(),
         extra_facets: vec!["/era/תנאים".to_string()],
         lines: vec![BookLine {
+            semantic_text: None,
+            semantic_notes: Vec::new(),
             line_id: 501,
             section_id: 900,
             text: BERACHOT_LINE.to_string(),

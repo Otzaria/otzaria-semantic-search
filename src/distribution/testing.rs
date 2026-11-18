@@ -40,6 +40,8 @@ pub(crate) fn corpus(
             serde_json::to_string(&CorpusLineRecord {
                 line_id: *line_id,
                 line: CorpusLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     source_book_key: book.to_string(),
                     title: String::new(),
                     reference: String::new(),
@@ -263,4 +265,64 @@ pub(crate) mod heap {
     pub(crate) fn peak() -> isize {
         PEAK.with(Cell::get)
     }
+}
+
+/// Inference stand-in with an explicit uncapped tokenizer, for build diagnostics tests.
+/// This fixture constructor exists only in the crate's unit-test build.
+pub(crate) fn counting_runtime(
+    model_path: &Path,
+    max_tokens: usize,
+) -> crate::semantic::embedding::EmbeddingRuntime {
+    use crate::errors::EmbeddingError;
+    use crate::semantic::backend::{EmbeddingBackend, Pooling};
+    use crate::semantic::embedding::{EmbeddingConfig, EmbeddingRuntime};
+    struct Counted {
+        cap: usize,
+    }
+    impl EmbeddingBackend for Counted {
+        fn id(&self) -> &'static str {
+            "counted-build-test"
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn dim(&self) -> u32 {
+            DIM
+        }
+        fn max_tokens(&self) -> usize {
+            self.cap
+        }
+        fn pooling(&self) -> Pooling {
+            Pooling::InGraph
+        }
+        fn tokenize(&self, text: &str) -> Result<Vec<u32>, EmbeddingError> {
+            Ok(vec![1; (text.split_whitespace().count() + 2).min(self.cap)])
+        }
+        fn untruncated_token_count(&self, text: &str) -> Result<Option<usize>, EmbeddingError> {
+            Ok(Some(text.split_whitespace().count() + 2))
+        }
+        fn embed_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(texts
+                .iter()
+                .map(|_| {
+                    let mut v = vec![0.0; DIM as usize];
+                    v[0] = 1.0;
+                    v
+                })
+                .collect())
+        }
+    }
+    EmbeddingRuntime::with_test_counting_backend(
+        EmbeddingConfig {
+            model_path: model_path.to_path_buf(),
+            embedding_dim: DIM,
+            max_tokens,
+            batch_size: 2,
+            pooling: Pooling::InGraph,
+        },
+        Box::new(Counted { cap: max_tokens }),
+        passage_package(model_path).checksum,
+        mock::stub_tokenizer_checksum(),
+    )
+    .unwrap()
 }

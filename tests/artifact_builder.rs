@@ -102,6 +102,8 @@ fn corpus_identity() -> CorpusIdentity {
 
 fn corpus_line(book: &str, text: &str, section_id: u64) -> CorpusLine {
     CorpusLine {
+        semantic_text: None,
+        semantic_notes: Vec::new(),
         source_book_key: book.to_string(),
         title: if book == GENESIS {
             "בראשית"

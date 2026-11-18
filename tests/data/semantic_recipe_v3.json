@@ -1,0 +1,339 @@
+{
+  "book": {
+    "content_fingerprint": 1,
+    "extra_facets": [],
+    "is_pdf": false,
+    "lines": [
+      {
+        "line_hash": 0,
+        "line_id": 1,
+        "reference": "fixture 1",
+        "section_id": 1,
+        "segment": 0,
+        "semantic_text": "טקסט מהסעיף הקודם אינו משמש הקשר לסעיף הבא",
+        "text": "טקסט מהסעיף הקודם אינו משמש הקשר לסעיף הבא"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 2,
+        "reference": "fixture 2",
+        "section_id": 2,
+        "segment": 1,
+        "semantic_text": "הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה  סמוך לפני",
+        "text": "הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה  סמוך לפני"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 3,
+        "reference": "fixture 3",
+        "section_id": 2,
+        "segment": 2,
+        "semantic_text": "שורת עוגן",
+        "text": "שורת עוגן"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 4,
+        "reference": "fixture 4",
+        "section_id": 2,
+        "segment": 3,
+        "semantic_text": "סמוך אחרי המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך ",
+        "text": "סמוך אחרי המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך "
+      },
+      {
+        "line_hash": 0,
+        "line_id": 5,
+        "reference": "fixture 5",
+        "section_id": 2,
+        "segment": 4,
+        "semantic_text": "  \t   ",
+        "text": "  \t   "
+      },
+      {
+        "line_hash": 0,
+        "line_id": 6,
+        "reference": "fixture 6",
+        "section_id": 3,
+        "segment": 5,
+        "semantic_text": "מילה00\tמילה01\tמילה02\tמילה03\tמילה04\tמילה05\tמילה06\tמילה07\tמילה08\tמילה09\tמילה10\tמילה11\tמילה12\tמילה13\tמילה14\tמילה15\tמילה16\tמילה17\tמילה18\tמילה19\tמילה20\tמילה21\tמילה22\tמילה23\tמילה24\tמילה25\tמילה26\tמילה27\tמילה28\tמילה29\tמילה30\tמילה31\tמילה32\tמילה33\tמילה34\tמילה35\tמילה36\tמילה37\tמילה38\tמילה39",
+        "text": "מילה00\tמילה01\tמילה02\tמילה03\tמילה04\tמילה05\tמילה06\tמילה07\tמילה08\tמילה09\tמילה10\tמילה11\tמילה12\tמילה13\tמילה14\tמילה15\tמילה16\tמילה17\tמילה18\tמילה19\tמילה20\tמילה21\tמילה22\tמילה23\tמילה24\tמילה25\tמילה26\tמילה27\tמילה28\tמילה29\tמילה30\tמילה31\tמילה32\tמילה33\tמילה34\tמילה35\tמילה36\tמילה37\tמילה38\tמילה39"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 7,
+        "reference": "fixture 7",
+        "section_id": 3,
+        "segment": 6,
+        "semantic_notes": [
+          "הערת שוליים בנושא עצמאי שצריכה לקבל חלון משלה",
+          "רמבם פסק אחרת",
+          "א"
+        ],
+        "semantic_text": "גוף הטקסט עם חזרה אל הטענה העיקרית",
+        "text": "גוף הטקסט 12 עם הערת שוליים בנושא אחר וחזרה אל הטענה"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 8,
+        "reference": "fixture 8",
+        "section_id": 4,
+        "segment": 7,
+        "semantic_notes": [
+          "הערה עצמאית משמשת חלון ראשון כאשר גוף השורה ריק"
+        ],
+        "semantic_text": "",
+        "text": "12 הערה ללא טקסט ראשי"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 9,
+        "reference": "fixture 9",
+        "section_id": 5,
+        "segment": 8,
+        "semantic_text": "אאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאא",
+        "text": "אאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאא"
+      },
+      {
+        "line_hash": 0,
+        "line_id": 10,
+        "reference": "fixture 10",
+        "section_id": 6,
+        "segment": 9,
+        "semantic_text": "אב",
+        "text": "אב"
+      }
+    ],
+    "source_book_key": "semantic-recipe-fixture.txt",
+    "title": "דוגמאות התאמה למתכון",
+    "topics": ""
+  },
+  "character_offsets": "Unicode scalar values within trimmed main text or the individual note; context windows retain the short line's anchor range.",
+  "chunking": {
+    "chunking_version": 3,
+    "context_window_lines": 2,
+    "embedding_text_version": 4,
+    "max_chunk_chars": 64,
+    "max_windows_per_line": 255,
+    "min_embeddable_chars": 5,
+    "min_meaningful_chars": 20,
+    "normalization_version": 1,
+    "window_chars": 64,
+    "window_overlap_chars": 16
+  },
+  "chunking_identity": 10355723254304759364,
+  "expected": [
+    {
+      "line_id": 1,
+      "windows": [
+        {
+          "chars": [
+            0,
+            42
+          ],
+          "embedding_text": "[PASSAGE] טקסט מהסעיף הקודם אינו משמש הקשר לסעיף הבא",
+          "key": "d226148d97203a0f5995b96dd6691e0a",
+          "ordinal": 0
+        }
+      ]
+    },
+    {
+      "line_id": 2,
+      "windows": [
+        {
+          "chars": [
+            0,
+            59
+          ],
+          "embedding_text": "[PASSAGE] הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה",
+          "key": "32f7955af5d644f199bfa4b5f44ad6f5",
+          "ordinal": 0
+        },
+        {
+          "chars": [
+            48,
+            100
+          ],
+          "embedding_text": "[PASSAGE] הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה הקדמה  סמוך לפני",
+          "key": "8c79dff78dd14e86834e014036e7cc8f",
+          "ordinal": 1
+        }
+      ]
+    },
+    {
+      "line_id": 3,
+      "windows": [
+        {
+          "chars": [
+            0,
+            9
+          ],
+          "embedding_text": "[PASSAGE] הקדמה הקדמה  סמוך לפני שורת עוגן סמוך אחרי המשך המשך המשך המשך",
+          "key": "fd7b01fc533b54b37b2d1ba04bf3de1a",
+          "ordinal": 0
+        }
+      ]
+    },
+    {
+      "line_id": 4,
+      "windows": [
+        {
+          "chars": [
+            0,
+            64
+          ],
+          "embedding_text": "[PASSAGE] סמוך אחרי המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך המשך",
+          "key": "2fed7e664945598c20b94f198c4b485f",
+          "ordinal": 0
+        },
+        {
+          "chars": [
+            50,
+            84
+          ],
+          "embedding_text": "[PASSAGE] המשך המשך המשך המשך המשך המשך המשך",
+          "key": "be365130e6b0054fcc1c3b85f301f08c",
+          "ordinal": 1
+        }
+      ]
+    },
+    {
+      "line_id": 5,
+      "windows": []
+    },
+    {
+      "line_id": 6,
+      "windows": [
+        {
+          "chars": [
+            0,
+            62
+          ],
+          "embedding_text": "[PASSAGE] מילה00\tמילה01\tמילה02\tמילה03\tמילה04\tמילה05\tמילה06\tמילה07\tמילה08",
+          "key": "a0018b11700ab24d9909f89a6cd7e280",
+          "ordinal": 0
+        },
+        {
+          "chars": [
+            49,
+            111
+          ],
+          "embedding_text": "[PASSAGE] מילה07\tמילה08\tמילה09\tמילה10\tמילה11\tמילה12\tמילה13\tמילה14\tמילה15",
+          "key": "51d022bf8d9d4962800cfb731123bd49",
+          "ordinal": 1
+        },
+        {
+          "chars": [
+            98,
+            160
+          ],
+          "embedding_text": "[PASSAGE] מילה14\tמילה15\tמילה16\tמילה17\tמילה18\tמילה19\tמילה20\tמילה21\tמילה22",
+          "key": "ce55db60c939696f3a48d44cc0d62f86",
+          "ordinal": 2
+        },
+        {
+          "chars": [
+            147,
+            209
+          ],
+          "embedding_text": "[PASSAGE] מילה21\tמילה22\tמילה23\tמילה24\tמילה25\tמילה26\tמילה27\tמילה28\tמילה29",
+          "key": "f39911317f1bd9a346ec5874651b2995",
+          "ordinal": 3
+        },
+        {
+          "chars": [
+            196,
+            258
+          ],
+          "embedding_text": "[PASSAGE] מילה28\tמילה29\tמילה30\tמילה31\tמילה32\tמילה33\tמילה34\tמילה35\tמילה36",
+          "key": "a4fe3e3083eeb5c408d3edd2c291d63c",
+          "ordinal": 4
+        },
+        {
+          "chars": [
+            245,
+            279
+          ],
+          "embedding_text": "[PASSAGE] מילה35\tמילה36\tמילה37\tמילה38\tמילה39",
+          "key": "cdebd4e6d3d40cfe5cbe31cad3839654",
+          "ordinal": 5
+        }
+      ]
+    },
+    {
+      "line_id": 7,
+      "windows": [
+        {
+          "chars": [
+            0,
+            34
+          ],
+          "embedding_text": "[PASSAGE] גוף הטקסט עם חזרה אל הטענה העיקרית",
+          "key": "c1780dc9fa5f754acaa86a7658e2a32f",
+          "ordinal": 0
+        },
+        {
+          "chars": [
+            0,
+            45
+          ],
+          "embedding_text": "[PASSAGE] הערת שוליים בנושא עצמאי שצריכה לקבל חלון משלה",
+          "key": "161d3196ccde290c84ef58e61b18c7c7",
+          "ordinal": 1
+        },
+        {
+          "chars": [
+            0,
+            13
+          ],
+          "embedding_text": "[PASSAGE] רמבם פסק אחרת",
+          "key": "6c3e583fbc739867d5cc2373ab7a64e2",
+          "ordinal": 2
+        }
+      ]
+    },
+    {
+      "line_id": 8,
+      "windows": [
+        {
+          "chars": [
+            0,
+            47
+          ],
+          "embedding_text": "[PASSAGE] הערה עצמאית משמשת חלון ראשון כאשר גוף השורה ריק",
+          "key": "0e87bf0ddc0f6a75e1010ff81755e2da",
+          "ordinal": 0
+        }
+      ]
+    },
+    {
+      "line_id": 9,
+      "windows": [
+        {
+          "chars": [
+            0,
+            64
+          ],
+          "embedding_text": "[PASSAGE] אאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאא",
+          "key": "a477fef8c7d9340e2e3b1af232991021",
+          "ordinal": 0
+        },
+        {
+          "chars": [
+            96,
+            150
+          ],
+          "embedding_text": "[PASSAGE] אאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאאא",
+          "key": "288097b8f16ee95873b981771f6ecb1d",
+          "ordinal": 1
+        }
+      ]
+    },
+    {
+      "line_id": 10,
+      "windows": []
+    }
+  ],
+  "format": "otzaria-semantic-recipe-conformance",
+  "format_version": 1,
+  "scope": "Prepared corpus text to semantic windows and keys; HTML/line normalization is upstream."
+}

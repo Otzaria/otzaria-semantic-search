@@ -240,6 +240,10 @@ pub struct BookLine {
     pub line_id: u64,
     pub section_id: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_notes: Vec<String>,
     pub line_hash: u64,
     pub reference: String,
     pub segment: u64,
@@ -346,6 +350,18 @@ impl BookForIndexing {
             // `line_hash` is 0 for lines the lexical engine considers too short
             // to deduplicate, so it cannot stand in for the text on its own.
             fnv.feed_field(line.text.as_bytes());
+            // Preserve legacy fingerprints when no semantic projection exists.
+            if line.semantic_text.is_some() || !line.semantic_notes.is_empty() {
+                fnv.feed_field(b"semantic-main-and-notes-v4");
+                fnv.feed_field(&[u8::from(line.semantic_text.is_some())]);
+                if let Some(text) = &line.semantic_text {
+                    fnv.feed_field(text.as_bytes());
+                }
+                fnv.feed_field(&(line.semantic_notes.len() as u64).to_le_bytes());
+                for note in &line.semantic_notes {
+                    fnv.feed_field(note.as_bytes());
+                }
+            }
         }
         fnv.finish()
     }
@@ -373,6 +389,9 @@ pub struct SemanticChunk {
     pub section_id: u64,
     pub line_hash: u64,
     pub anchor_text: String,
+    /// True only for window zero built from a short semantic main line.
+    #[serde(default)]
+    pub borrows_context: bool,
     pub embedding_text: String,
     pub chunk_hash: String,
     pub content_hash: u64,
@@ -1168,6 +1187,8 @@ mod tests {
             lines: lines
                 .iter()
                 .map(|&(line_id, section_id, text, line_hash)| BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id,
                     section_id,
                     text: text.to_string(),

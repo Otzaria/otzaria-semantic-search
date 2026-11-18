@@ -328,3 +328,41 @@ fn copy_dir(from: &Path, to: &Path) {
         std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
     }
 }
+
+#[test]
+fn shards_automatically_persist_token_counts_for_their_actual_window() {
+    use crate::distribution::token_audit::{BuildTokenAudit, BUILD_TOKEN_AUDIT_FILE};
+    let (dir, plan_dir, mut plan, runtime) = fixture("automatic_token_audit");
+    plan.model.max_tokens = 5;
+    let counted = super::testing::counting_runtime(&stub_model(dir.path()), 5);
+    let out = dir.join("counted-shard");
+    let manifest = embed_shard(&plan_dir, &plan, 1, 2, &counted, 2, worker(), &out).unwrap();
+    let report: BuildTokenAudit =
+        serde_json::from_slice(&std::fs::read(out.join(BUILD_TOKEN_AUDIT_FILE)).unwrap()).unwrap();
+    assert_eq!(report.passages, manifest.records);
+    let counts: Vec<_> = TEXTS[1..3]
+        .iter()
+        .map(|text| text.split_whitespace().count() + 2)
+        .collect();
+    assert_eq!(
+        report.over_budget_passages,
+        counts.iter().filter(|&&n| n > 5).count() as u64
+    );
+    assert_eq!(
+        report.discarded_tokens,
+        counts
+            .iter()
+            .map(|n| n.saturating_sub(5) as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(report.max_observed, *counts.iter().max().unwrap());
+    assert_eq!(report.max_tokens, 5);
+    assert!(!std::fs::read_to_string(out.join(SHARD_MANIFEST_FILE))
+        .unwrap()
+        .contains("token-audit"));
+    // A stand-in without a tokenizer emits no fabricated diagnostics.
+    let mock_out = dir.join("mock-shard");
+    plan.model.max_tokens = 512;
+    embed_shard(&plan_dir, &plan, 0, 1, &runtime, 2, worker(), &mock_out).unwrap();
+    assert!(!mock_out.join(BUILD_TOKEN_AUDIT_FILE).exists());
+}

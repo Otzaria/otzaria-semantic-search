@@ -485,6 +485,7 @@ impl SemanticEngine {
     ) -> Result<IndexOutcome, SemanticSearchError> {
         self.ensure_index_usable()?;
 
+        self.chunker.validate_book_coverage(book)?;
         let chunks = self.chunker.chunk_book(book);
         let line_fingerprint = book.line_fingerprint();
 
@@ -986,6 +987,8 @@ mod tests {
             lines: lines
                 .iter()
                 .map(|&(line_id, section_id, text)| BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id,
                     section_id,
                     text: text.to_string(),
@@ -1511,6 +1514,8 @@ mod tests {
         let mut rescanned = scan.clone();
         rescanned.lines[1].text = "עמוד שני לאחר סריקה מחדש באיכות טובה יותר".to_string();
         rescanned.lines.push(BookLine {
+            semantic_text: None,
+            semantic_notes: Vec::new(),
             line_id: 3,
             section_id: 1,
             text: "עמוד שלישי שלא זוהה בסריקה הראשונה".to_string(),

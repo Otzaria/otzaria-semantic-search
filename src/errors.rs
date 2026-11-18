@@ -293,6 +293,10 @@ pub enum ManifestError {
 /// matching artifact, `corrupt` by downloading this one again.
 #[derive(Error, Debug)]
 pub enum ArtifactError {
+    /// A complete-coverage recipe cannot represent this line within its window budget.
+    #[error("Semantic line coverage is incomplete: {reason}")]
+    IncompleteLineCoverage { reason: String },
+
     /// `manifest.json` or `payloads.json` is missing, unreadable or not the JSON it
     /// claims to be.
     #[error("Artifact metadata is unusable ({path}): {reason}")]

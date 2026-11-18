@@ -128,9 +128,12 @@ impl ChunkerConfig {
         u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 yields 32 bytes"))
     }
 
-    /// The same recipe without its windows: what every line's first window — the key an
-    /// index's `chunkKey` column holds — is computed under.
+    /// The legacy recipe without its windows. Version 3 keeps its identity because its
+    /// first window and short-line context deliberately differ from versions 1 and 2.
     pub fn anchor(&self) -> Self {
+        if self.chunking_version == ChunkingAlgorithm::CompleteAnchoredLineWindows.version() {
+            return self.clone();
+        }
         Self {
             chunking_version: ChunkingAlgorithm::AnchoredLine.version(),
             window_chars: 0,
@@ -160,15 +163,25 @@ impl ChunkerConfig {
                     return refuse(field, found, "0 under chunking_version 1");
                 }
             }
-            ChunkingAlgorithm::AnchoredLineWindows => {
+            ChunkingAlgorithm::AnchoredLineWindows
+            | ChunkingAlgorithm::CompleteAnchoredLineWindows => {
                 if let Some((field, found)) = fields.into_iter().find(|(_, value)| *value == 0) {
                     return refuse(field, found, "a positive value under chunking_version 2");
                 }
-                if self.window_overlap_chars * 2 >= self.window_chars {
+                if self.window_overlap_chars >= self.window_chars.div_ceil(2) {
                     return refuse(
                         "window_overlap_chars",
                         self.window_overlap_chars,
                         "less than half of window_chars",
+                    );
+                }
+                if algorithm == ChunkingAlgorithm::CompleteAnchoredLineWindows
+                    && self.max_chunk_chars == 0
+                {
+                    return refuse(
+                        "max_chunk_chars",
+                        0,
+                        "a positive value under chunking_version 3",
                     );
                 }
                 // Window 255 is no window: it is what an alias occurrence reads as.
@@ -222,6 +235,15 @@ impl Chunker {
     pub fn new(config: ChunkerConfig) -> Result<Self, ArtifactError> {
         let algorithm = ChunkingAlgorithm::from_version(config.chunking_version)?;
         config.check_windows(algorithm)?;
+        if config.embedding_text_version == EmbeddingTextRecipe::RolePrefixedMainAndNotes.version()
+            && algorithm != ChunkingAlgorithm::CompleteAnchoredLineWindows
+        {
+            return Err(ArtifactError::UnsupportedRecipeVersion {
+                field: "chunking_version",
+                found: config.chunking_version,
+                supported: "3 for embedding_text_version 4".to_string(),
+            });
+        }
         Ok(Self {
             algorithm,
             text_recipe: EmbeddingTextRecipe::from_version(config.embedding_text_version)?,
@@ -232,6 +254,11 @@ impl Chunker {
 
     /// What this chunker resolved to. Reported so a builder can record what it is about to
     /// run rather than what it was asked for.
+    /// The exact configuration this chunker applies, including its identity fields.
+    pub fn config(&self) -> &ChunkerConfig {
+        &self.config
+    }
+
     pub fn recipe(
         &self,
     ) -> (
@@ -242,13 +269,15 @@ impl Chunker {
         (self.algorithm, self.text_recipe, self.normalization)
     }
 
+    /// Build a book's bounded chunks. An authoritative version 3 build first calls
+    /// [`Self::validate_book_coverage`] to refuse a line exceeding the window budget.
     pub fn chunk_book(&self, book: &BookForIndexing) -> Vec<SemanticChunk> {
         // Exhaustive on purpose: a second algorithm has to be written here before its
         // version number can be accepted anywhere.
         match self.algorithm {
-            ChunkingAlgorithm::AnchoredLine | ChunkingAlgorithm::AnchoredLineWindows => {
-                self.chunk_book_anchored(book)
-            }
+            ChunkingAlgorithm::AnchoredLine
+            | ChunkingAlgorithm::AnchoredLineWindows
+            | ChunkingAlgorithm::CompleteAnchoredLineWindows => self.chunk_book_anchored(book),
         }
     }
 
@@ -268,16 +297,70 @@ impl Chunker {
     /// Under version 2 as well: the first window, the key an index's column holds.
     pub fn embedded_text(&self, lines: &[LineRef<'_>], index: usize) -> Option<String> {
         match self.algorithm {
-            ChunkingAlgorithm::AnchoredLine | ChunkingAlgorithm::AnchoredLineWindows => {
-                self.anchored_text(lines, index)
-            }
+            ChunkingAlgorithm::AnchoredLine
+            | ChunkingAlgorithm::AnchoredLineWindows
+            | ChunkingAlgorithm::CompleteAnchoredLineWindows => self.anchored_text(lines, index),
         }
     }
 
-    /// Every window `lines[index]` is embedded as, [`Self::embedded_text`] first; empty when
-    /// the line is not embedded. Takes, and panics on, the same `lines` as that.
+    /// Main-text windows `lines[index]` is embedded as, [`Self::embedded_text`] first;
+    /// empty when the line is not embedded. Takes, and panics on, the same `lines` as
+    /// that. Version 3 callers must validate the configured budget through
+    /// [`Self::validate_line_coverage`] before accepting these as complete. Version 4
+    /// callers with separate notes use [`Self::embedded_windows_with_notes`].
     pub fn embedded_windows(&self, lines: &[LineRef<'_>], index: usize) -> Vec<EmbeddedWindow> {
         self.windows_of(lines, index)
+    }
+
+    /// Main-text windows followed by independent notes anchored to the same line.
+    /// Notes shorter than `min_embeddable_chars` are skipped; each longer note is
+    /// windowed on its own, so its subject never enters the main passage's context.
+    /// Only embedding text version 4 enables notes. Ordinals are contiguous there,
+    /// including when the main text is empty and the first note supplies window 0.
+    /// Call `validate_line_coverage` at a fallible indexing boundary before accepting
+    /// these bounded windows as complete.
+    pub fn embedded_windows_with_notes(
+        &self,
+        lines: &[LineRef<'_>],
+        index: usize,
+        notes: &[String],
+    ) -> Vec<EmbeddedWindow> {
+        let mut windows = self.windows_of(lines, index);
+        if self.text_recipe != EmbeddingTextRecipe::RolePrefixedMainAndNotes {
+            return windows;
+        }
+        for note in notes {
+            if note.trim().chars().count() < self.config.min_embeddable_chars {
+                continue;
+            }
+            let note_lines = [LineRef {
+                text: note,
+                section: 0,
+            }];
+            windows.extend(self.windows_of(note_lines.as_slice(), 0));
+        }
+        // Keep body boundaries: runtime note keys may be reconstructed without
+        // main-line neighbours. Cross-body dedup would change note ordinals.
+        // The store deduplicates identical vectors globally by ChunkKey.
+        windows.truncate(self.config.max_windows_per_line);
+        for (ordinal, window) in windows.iter_mut().enumerate() {
+            window.ordinal = ordinal as u8;
+        }
+        windows
+    }
+
+    fn book_line_refs<'a>(&self, book: &'a BookForIndexing) -> Vec<LineRef<'a>> {
+        book.lines
+            .iter()
+            .map(|line| LineRef {
+                text: if self.text_recipe == EmbeddingTextRecipe::RolePrefixedMainAndNotes {
+                    line.semantic_text.as_deref().unwrap_or(&line.text)
+                } else {
+                    &line.text
+                },
+                section: line.section_id,
+            })
+            .collect()
     }
 
     /// Whether a line of this text is embedded with its neighbours' context: one the recipe
@@ -308,8 +391,9 @@ impl Chunker {
         let facets = book.all_facets();
         let chunking_identity = self.config.identity();
 
+        let refs = self.book_line_refs(book);
         for (i, line) in book.lines.iter().enumerate() {
-            for window in self.windows_of(book.lines.as_slice(), i) {
+            for window in self.embedded_windows_with_notes(&refs, i, &line.semantic_notes) {
                 let embedded_text = window.text;
                 let chunk_hash = compute_chunk_hash(&embedded_text);
                 let semantic_id = compute_window_semantic_id(
@@ -327,6 +411,7 @@ impl Chunker {
                     section_id: line.section_id,
                     line_hash: line.line_hash,
                     anchor_text: line.text.clone(),
+                    borrows_context: window.ordinal == 0 && self.borrows_context(refs[i].text),
                     embedding_text: embedded_text,
                     chunk_hash,
                     content_hash: book.content_fingerprint,
@@ -353,10 +438,19 @@ impl Chunker {
         let n = text.chars().count();
         let mut out = vec![EmbeddedWindow {
             ordinal: 0,
-            chars: 0..n.min(self.config.max_chunk_chars) as u32,
+            chars: 0..if self.algorithm == ChunkingAlgorithm::CompleteAnchoredLineWindows
+                && n >= self.config.min_meaningful_chars
+            {
+                word_prefix_end(
+                    &text.chars().collect::<Vec<_>>(),
+                    self.config.max_chunk_chars,
+                ) as u32
+            } else {
+                n.min(self.config.max_chunk_chars) as u32
+            },
             text: first,
         }];
-        if self.algorithm != ChunkingAlgorithm::AnchoredLineWindows
+        if self.algorithm == ChunkingAlgorithm::AnchoredLine
             || n < self.config.min_meaningful_chars
             || n <= self.config.max_chunk_chars
         {
@@ -364,7 +458,12 @@ impl Chunker {
         }
         let chars: Vec<char> = text.chars().collect();
         let mut keys = vec![ChunkKey::of(&out[0].text)];
-        let spans = window_spans(
+        let spans_fn = if self.algorithm == ChunkingAlgorithm::CompleteAnchoredLineWindows {
+            complete_window_spans
+        } else {
+            window_spans
+        };
+        let spans = spans_fn(
             &chars,
             self.config.max_chunk_chars,
             self.config.window_chars,
@@ -411,7 +510,14 @@ impl Chunker {
 
         let embedding_text = self.embedding_text_for(lines, index, char_count);
 
-        let truncated_text = truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars);
+        let truncated_text = if self.algorithm == ChunkingAlgorithm::CompleteAnchoredLineWindows {
+            let chars: Vec<char> = embedding_text.trim().chars().collect();
+            chars[..word_prefix_end(&chars, self.config.max_chunk_chars)]
+                .iter()
+                .collect()
+        } else {
+            truncate_to_chars(embedding_text.trim(), self.config.max_chunk_chars)
+        };
         // Normalized *before* the digest, because the digest has to describe the string
         // the model is given. Hashing the pre-normalization text would put a digest of
         // something nothing was built from into every record — the same fault
@@ -448,7 +554,8 @@ impl Chunker {
         match self.text_recipe {
             EmbeddingTextRecipe::LineOrNeighbourContext
             | EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext
-            | EmbeddingTextRecipe::PardesLineOrNeighbourContext => {
+            | EmbeddingTextRecipe::PardesLineOrNeighbourContext
+            | EmbeddingTextRecipe::RolePrefixedMainAndNotes => {
                 if char_count < self.config.min_meaningful_chars {
                     Cow::Owned(self.build_context_text(lines, index))
                 } else {
@@ -488,7 +595,91 @@ impl Chunker {
             context_lines.push(lines.text(i));
         }
 
+        if self.algorithm == ChunkingAlgorithm::CompleteAnchoredLineWindows {
+            return balanced_context_text(
+                &context_lines,
+                index - start_idx,
+                self.config.max_chunk_chars,
+            );
+        }
         context_lines.join(" ")
+    }
+
+    /// Refuse a version 3 book whose text cannot fit in the configured window budget.
+    /// Call this at a fallible corpus/build boundary before publishing `chunk_book`'s
+    /// chunks. Legacy versions intentionally retain their historical bounded coverage.
+    pub fn validate_book_coverage(&self, book: &BookForIndexing) -> Result<(), ArtifactError> {
+        let refs = self.book_line_refs(book);
+        for (index, line) in book.lines.iter().enumerate() {
+            if self.text_recipe == EmbeddingTextRecipe::RolePrefixedMainAndNotes
+                && !book.is_pdf
+                && line.semantic_text.is_none()
+            {
+                return Err(ArtifactError::IncompleteLineCoverage {
+                    reason: format!("book {} line {}: embedding_text_version 4 requires an explicit prepared semantic_text projection", book.source_book_key, line.line_id),
+                });
+            }
+            self.validate_line_coverage(&refs, index, &line.semantic_notes)
+                .map_err(|error| ArtifactError::IncompleteLineCoverage {
+                    reason: format!(
+                        "book {} line {}: {error}",
+                        book.source_book_key, line.line_id
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Check main text and separate notes against the complete recipe's window
+    /// budget. Exposed for an index that has a line and its neighbour slice rather
+    /// than a whole `BookForIndexing`.
+    pub fn validate_line_coverage(
+        &self,
+        lines: &[LineRef<'_>],
+        index: usize,
+        notes: &[String],
+    ) -> Result<(), ArtifactError> {
+        if self.algorithm != ChunkingAlgorithm::CompleteAnchoredLineWindows {
+            return Ok(());
+        }
+        let mut count = 0;
+        let inputs = std::iter::once(lines[index].text).chain(
+            notes
+                .iter()
+                .filter(|note| {
+                    self.text_recipe == EmbeddingTextRecipe::RolePrefixedMainAndNotes
+                        && note.trim().chars().count() >= self.config.min_embeddable_chars
+                })
+                .map(String::as_str),
+        );
+        for text in inputs {
+            let chars: Vec<char> = text.trim().chars().collect();
+            if chars.len() < self.config.min_embeddable_chars {
+                continue;
+            }
+            let spans = if chars.len() < self.config.min_meaningful_chars {
+                vec![(0, chars.len().min(self.config.max_chunk_chars))]
+            } else {
+                complete_window_spans(
+                    &chars,
+                    self.config.max_chunk_chars,
+                    self.config.window_chars,
+                    self.config.window_overlap_chars,
+                    self.config.max_windows_per_line,
+                )
+            };
+            count += spans.len();
+            let covered = spans.last().map_or(0, |(_, end)| *end);
+            if covered < chars.len() || count > self.config.max_windows_per_line {
+                return Err(ArtifactError::IncompleteLineCoverage {
+                    reason: format!(
+                        "requires more than {} windows for the main text and notes: {} of {} characters covered; split the source line or increase the window budget (at most 255)",
+                        self.config.max_windows_per_line, covered, chars.len(),
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -565,6 +756,155 @@ pub fn compute_window_semantic_id(
     hex
 }
 
+/// Keep the full anchor, spending the remaining character budget on the nearest
+/// text on either side. Reading order is preserved; preceding context is kept from
+/// its end, following context from its beginning.
+fn balanced_context_text(lines: &[&str], anchor: usize, cap: usize) -> String {
+    let center = lines[anchor].trim();
+    let center_len = center.chars().count();
+    if center_len >= cap {
+        let chars: Vec<char> = center.chars().collect();
+        return chars[..word_prefix_end(&chars, cap)].iter().collect();
+    }
+    let before: Vec<char> = lines[..anchor].join(" ").trim().chars().collect();
+    let after: Vec<char> = lines[anchor + 1..].join(" ").trim().chars().collect();
+    let remaining = cap - center_len;
+    let preceding = |budget: usize| -> String {
+        if budget <= 1 || before.is_empty() {
+            return String::new();
+        }
+        let mut start = before.len().saturating_sub(budget - 1);
+        if start > 0 && !before[start - 1].is_whitespace() {
+            if let Some(space) = (start..before.len()).find(|&i| before[i].is_whitespace()) {
+                start = space + 1;
+            }
+        }
+        before[start..]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let following = |budget: usize| -> String {
+        if budget <= 1 || after.is_empty() {
+            return String::new();
+        }
+        after[..word_prefix_end(&after, budget - 1)]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
+    let cost = |text: &str| text.chars().count() + usize::from(!text.is_empty());
+    let mut left = preceding(remaining / 2);
+    let mut right = following(remaining - cost(&left));
+    left = preceding(remaining - cost(&right));
+    right = following(remaining - cost(&left));
+    [left.as_str(), center, right.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// End a prefix at whitespace when a word fits. An individual word longer than
+/// the cap must still be split to guarantee progress and bound every model input.
+fn word_prefix_end(chars: &[char], cap: usize) -> usize {
+    if chars.len() <= cap {
+        return chars.len();
+    }
+    if cap == 0 {
+        return 0;
+    }
+    if chars[cap].is_whitespace() || chars[cap - 1].is_whitespace() {
+        return cap;
+    }
+    (1..cap)
+        .rev()
+        .find(|&at| chars[at].is_whitespace())
+        .unwrap_or(cap)
+}
+
+/// Version 3's sequential, gap-free windows. Their configured bound is checked
+/// by `validate_book_coverage` before an authoritative build is accepted.
+pub(crate) fn complete_window_spans(
+    chars: &[char],
+    first: usize,
+    length: usize,
+    overlap: usize,
+    max_windows: usize,
+) -> Vec<(usize, usize)> {
+    let initial = complete_spans_with_overlap(chars, first, length, overlap, max_windows);
+    if initial.last().is_some_and(|(_, end)| *end >= chars.len()) || max_windows <= 1 {
+        return initial;
+    }
+    let first_end = word_prefix_end(chars, first);
+    let capacity = first_end.saturating_add(length.saturating_mul(max_windows - 1));
+    if chars.len() > capacity {
+        return initial;
+    }
+    // Spend overlap only when the whole line still fits. The first attempt preserves
+    // the measured overlap; very long lines reduce it instead of dropping their tail.
+    let reduced = overlap.min((capacity - chars.len()) / (max_windows - 1));
+    let adapted = complete_spans_with_overlap(chars, first, length, reduced, max_windows);
+    if adapted.last().is_some_and(|(_, end)| *end >= chars.len()) {
+        return adapted;
+    }
+    // Word-boundary snapping can consume the remaining slack. Keep a boundary when
+    // possible, but spend the available cap when necessary to fit the remaining text.
+    let mut out = vec![(0, first_end)];
+    while let Some(&(_, start)) = out.last() {
+        if start >= chars.len() || out.len() >= max_windows {
+            break;
+        }
+        let remaining = max_windows - out.len();
+        let minimum_end = chars
+            .len()
+            .saturating_sub(length.saturating_mul(remaining - 1));
+        let natural_end = start + word_prefix_end(&chars[start..], length);
+        let end = if natural_end >= minimum_end && natural_end > start {
+            natural_end
+        } else {
+            start.saturating_add(length).min(chars.len())
+        };
+        out.push((start, end));
+    }
+    out
+}
+
+fn complete_spans_with_overlap(
+    chars: &[char],
+    first: usize,
+    length: usize,
+    overlap: usize,
+    max_windows: usize,
+) -> Vec<(usize, usize)> {
+    let mut out = vec![(0, word_prefix_end(chars, first))];
+    while let Some(&(previous_start, previous_end)) = out.last() {
+        if previous_end >= chars.len() || out.len() >= max_windows {
+            break;
+        }
+        let mut start = previous_end.saturating_sub(overlap).max(previous_start + 1);
+        if start > 0 && !chars[start - 1].is_whitespace() {
+            if let Some(space) = (start..previous_end).find(|&at| chars[at].is_whitespace()) {
+                start = space + 1;
+            }
+        }
+        // A very long word following a short prefix must move beyond the previous
+        // endpoint even when its nearest whitespace lies in the overlap itself.
+        let mut end = start + word_prefix_end(&chars[start..], length);
+        if end <= previous_end {
+            start = previous_end;
+            end = start + word_prefix_end(&chars[start..], length);
+        }
+        if end <= previous_end {
+            break;
+        }
+        out.push((start, end));
+    }
+    out
+}
+
 /// A long line's window spans in characters: `[0, first)`, then `length` each overlapping by
 /// `overlap`, snapped to word boundaries — exactly as the quality measurement computed them.
 pub(crate) fn window_spans(
@@ -636,6 +976,8 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, (sec, txt))| BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: i as u64 + 1,
                     section_id: sec,
                     text: txt.to_string(),
@@ -1085,6 +1427,8 @@ mod tests {
                 section += 1 + random.below(3);
             }
             book.lines.push(BookLine {
+                semantic_text: None,
+                semantic_notes: Vec::new(),
                 line_id: i as u64 + 1,
                 section_id: section,
                 text: random_line(random),
@@ -1480,6 +1824,268 @@ mod tests {
             .map(|window| ChunkKey::of(&window.text))
             .collect();
         assert_eq!(keys.len(), windows.len());
+    }
+
+    fn complete_config() -> ChunkerConfig {
+        ChunkerConfig {
+            chunking_version: 3,
+            max_windows_per_line: 255,
+            ..windows_config()
+        }
+    }
+
+    #[test]
+    fn complete_context_keeps_anchor_and_nearest_neighbours() {
+        let before = format!("{} סמוך לפני", "רחוק ".repeat(100));
+        let after = format!("סמוך אחרי {}", "רחוק ".repeat(100));
+        let book = dummy_book(vec![
+            (0, "מחוץ לסעיף"),
+            (1, &before),
+            (1, "שורת עוגן"),
+            (1, &after),
+            (2, "מחוץ לסעיף"),
+        ]);
+        let text = chunker(complete_config())
+            .embedded_text(&line_refs(&book), 2)
+            .unwrap();
+        assert!(text.contains("סמוך לפני שורת עוגן סמוך אחרי"), "{text}");
+        assert!(!text.contains("מחוץ לסעיף"));
+        assert!(text.strip_prefix("[PASSAGE] ").unwrap().chars().count() <= 512);
+        let long = "מילים קרובות ".repeat(100);
+        for (left, right) in [("", long.as_str()), (long.as_str(), "")] {
+            let book = dummy_book(vec![(1, left), (1, "שורת עוגן"), (1, right)]);
+            let text = chunker(complete_config())
+                .embedded_text(&line_refs(&book), 1)
+                .unwrap();
+            let content = text.strip_prefix("[PASSAGE] ").unwrap();
+            assert!(content.contains("שורת עוגן"));
+            assert!((480..=512).contains(&content.chars().count()));
+        }
+    }
+
+    #[test]
+    fn complete_windows_cover_tail_and_keep_word_boundaries() {
+        let text = (0..3000)
+            .map(|i| format!("word{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let book = dummy_book(vec![(1, &text)]);
+        let c = chunker(complete_config());
+        c.validate_book_coverage(&book).unwrap();
+        let windows = c.embedded_windows(&line_refs(&book), 0);
+        assert!(windows.len() > 6);
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(windows.last().unwrap().chars.end as usize, chars.len());
+        let mut covered = vec![false; chars.len()];
+        for w in &windows {
+            let (start, end) = (w.chars.start as usize, w.chars.end as usize);
+            assert!(end - start <= 512);
+            assert!(start == 0 || chars[start - 1].is_whitespace());
+            assert!(end == chars.len() || chars[end].is_whitespace());
+            covered[start..end].fill(true);
+            assert_eq!(
+                w.text,
+                format!(
+                    "[PASSAGE] {}",
+                    chars[start..end].iter().collect::<String>().trim()
+                )
+            );
+        }
+        assert!(chars
+            .iter()
+            .zip(covered)
+            .all(|(ch, yes)| ch.is_whitespace() || yes));
+    }
+
+    #[test]
+    fn complete_coverage_refuses_an_exhausted_budget() {
+        let long = "אבג ".repeat(3000);
+        let book = dummy_book(vec![(1, &long)]);
+        let c = chunker(ChunkerConfig {
+            max_windows_per_line: 6,
+            ..complete_config()
+        });
+        let e = c.validate_book_coverage(&book).unwrap_err().to_string();
+        assert!(
+            e.contains("book1.txt") && e.contains("line 1") && e.contains("6 windows"),
+            "{e}"
+        );
+        chunker(windows_config())
+            .validate_book_coverage(&book)
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_spans_reduce_overlap_for_real_library_sized_lines() {
+        for n in [103_605, 130_000] {
+            let chars: Vec<char> = (0..n).map(|i| if i % 7 == 6 { ' ' } else { 'א' }).collect();
+            let spans = complete_window_spans(&chars, 512, 512, 128, 255);
+            assert_eq!(spans.last().unwrap().1, n);
+            assert!(spans.len() <= 255);
+            assert!(spans.iter().all(|(start, end)| end - start <= 512));
+            assert!(spans.windows(2).all(|pair| pair[1].0 <= pair[0].1));
+        }
+        let chars = vec!['א'; 131_000];
+        assert!(
+            complete_window_spans(&chars, 512, 512, 128, 255)
+                .last()
+                .unwrap()
+                .1
+                < chars.len()
+        );
+    }
+
+    #[test]
+    fn complete_spans_progress_with_long_words_and_unicode_whitespace() {
+        for text in [
+            "א".repeat(5000),
+            format!("קצר {} סוף", "א".repeat(1000)),
+            "מילה\tמילה\u{00a0}מילה\n".repeat(300),
+        ] {
+            let chars: Vec<char> = text.chars().collect();
+            let spans = complete_window_spans(&chars, 31, 29, 7, 255);
+            assert_eq!(spans.last().unwrap().1, chars.len());
+            assert!(spans
+                .windows(2)
+                .all(|p| p[1].0 <= p[0].1 && p[1].1 > p[0].1));
+            assert!(spans.iter().skip(1).all(|(s, e)| e - s <= 29));
+        }
+    }
+
+    #[test]
+    fn complete_entrypoints_agree_on_random_books_and_neighbour_slices() {
+        let mut random = Random(0x00c0_de34);
+        let config = complete_config();
+        let c = chunker(config.clone());
+        for _ in 0..300 {
+            let book = random_book(&mut random);
+            c.validate_book_coverage(&book).unwrap();
+            let refs = line_refs(&book);
+            let chunks = c.chunk_book(&book);
+            for (i, line) in book.lines.iter().enumerate() {
+                let windows = c.embedded_windows(&refs, i);
+                let actual: Vec<_> = chunks
+                    .iter()
+                    .filter(|ch| ch.line_id == line.line_id)
+                    .collect();
+                assert_eq!(actual.len(), windows.len());
+                for (chunk, w) in actual.iter().zip(&windows) {
+                    assert_eq!(chunk.embedding_text, w.text);
+                    assert_eq!(chunk.window, w.ordinal);
+                    assert_eq!(chunk.chunk_hash, ChunkKey::of(&w.text).to_hex());
+                }
+                assert_eq!(
+                    c.embedded_text(&refs, i),
+                    windows.first().map(|w| w.text.clone())
+                );
+                let low = i.saturating_sub(config.context_window_lines);
+                let high = (i + config.context_window_lines + 1).min(refs.len());
+                assert_eq!(c.embedded_windows(&refs[low..high], i - low), windows);
+            }
+        }
+    }
+
+    #[test]
+    fn note_windows_are_separate_and_keep_the_lexical_anchor() {
+        let mut book = dummy_book(vec![(1, "גוף הטקסט עם הערה שהוחזרה לאינדקס")]);
+        book.lines[0].semantic_text = Some("גוף הטקסט ללא ערבוב נושאי ההערה".to_string());
+        book.lines[0].semantic_notes = vec!["הערה בנושא אחר ובה הסבר עצמאי ארוך מספיק".to_string()];
+        let c = chunker(ChunkerConfig {
+            embedding_text_version: 4,
+            ..complete_config()
+        });
+        c.validate_book_coverage(&book).unwrap();
+        let chunks = c.chunk_book(&book);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].embedding_text.contains("ללא ערבוב"));
+        assert!(!chunks[0].embedding_text.contains("בנושא אחר"));
+        assert!(chunks[1].embedding_text.contains("בנושא אחר"));
+        assert_eq!(chunks[0].anchor_text, book.lines[0].text);
+        assert_eq!(chunks[1].anchor_text, book.lines[0].text);
+        assert_eq!((chunks[0].window, chunks[1].window), (0, 1));
+        let refs = c.book_line_refs(&book);
+        assert_eq!(
+            c.embedded_windows_with_notes(&refs, 0, &book.lines[0].semantic_notes)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn note_ordinals_are_independent_of_main_context_duplicates() {
+        let c = chunker(ChunkerConfig {
+            embedding_text_version: 4,
+            ..complete_config()
+        });
+        let refs = [
+            LineRef {
+                text: "ראשית הטקסט",
+                section: 1,
+            },
+            LineRef {
+                text: "עוגן קצר",
+                section: 1,
+            },
+            LineRef {
+                text: "סוף הטקסט",
+                section: 1,
+            },
+        ];
+        let notes = vec![
+            "ראשית הטקסט עוגן קצר סוף הטקסט".to_string(),
+            "הערה נוספת בנושא שונה".to_string(),
+        ];
+        let contextual = c.embedded_windows_with_notes(&refs, 1, &notes);
+        let alone = c.embedded_windows_with_notes(&refs[1..2], 0, &notes);
+        assert_eq!(contextual.len(), 3);
+        assert_eq!(contextual[0].text, contextual[1].text);
+        assert_eq!(contextual[1..], alone[1..]);
+    }
+
+    #[test]
+    fn version_four_refuses_unprepared_non_pdf_book_lines() {
+        let mut book = dummy_book(vec![(1, "תוכן רגיל שהקורא עדיין לא הכין להטמעה")]);
+        let c = chunker(ChunkerConfig {
+            embedding_text_version: 4,
+            ..complete_config()
+        });
+        assert!(c
+            .validate_book_coverage(&book)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit prepared semantic_text"));
+        book.lines[0].semantic_text = Some(book.lines[0].text.clone());
+        c.validate_book_coverage(&book).unwrap();
+        book.lines[0].semantic_text = None;
+        book.is_pdf = true;
+        c.validate_book_coverage(&book).unwrap();
+    }
+
+    #[test]
+    fn notes_can_supply_first_window_and_share_the_line_budget() {
+        let refs = [LineRef {
+            text: "",
+            section: 0,
+        }];
+        let notes = vec!["רמבם פסק אחרת".to_string()];
+        let c = chunker(ChunkerConfig {
+            embedding_text_version: 4,
+            ..complete_config()
+        });
+        let windows = c.embedded_windows_with_notes(&refs, 0, &notes);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].ordinal, 0);
+        assert_eq!(windows[0].text, "[PASSAGE] רמבם פסק אחרת");
+        let limited = chunker(ChunkerConfig {
+            embedding_text_version: 4,
+            max_windows_per_line: 1,
+            ..complete_config()
+        });
+        let refs = [LineRef {
+            text: "גוף הטקסט הראשי עם מספיק תווים",
+            section: 0,
+        }];
+        assert!(limited.validate_line_coverage(&refs, 0, &notes).is_err());
     }
 
     #[derive(serde::Deserialize)]

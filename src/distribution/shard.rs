@@ -29,6 +29,7 @@
 
 use crate::distribution::files::{hex, io_error, malformed, partial_path, read_json, write_json};
 use crate::distribution::plan::{read_embed_plan, EmbedManifest};
+use crate::distribution::token_audit::{write_build_token_audit, BuildTokenAuditAccumulator};
 use crate::errors::PackError;
 use crate::semantic::embedding::EmbeddingRuntime;
 use crate::semantic::versioning::{ModelIdentity, ModelPackage};
@@ -295,14 +296,18 @@ pub fn embed_shard(
     let mut keys = HashingWriter::create(&out.join(KEYS_FILE))?;
     let mut batch: Vec<(u64, [u8; 32], String)> = Vec::with_capacity(batch_size.max(1));
     let mut records = 0u64;
-    let flush = |batch: &mut Vec<(u64, [u8; 32], String)>,
-                 vectors: &mut HashingWriter,
-                 keys: &mut HashingWriter|
+    let mut token_audit = BuildTokenAuditAccumulator::default();
+    let mut flush = |batch: &mut Vec<(u64, [u8; 32], String)>,
+                     vectors: &mut HashingWriter,
+                     keys: &mut HashingWriter|
      -> Result<(), PackError> {
         if batch.is_empty() {
             return Ok(());
         }
         let texts: Vec<&str> = batch.iter().map(|(_, _, text)| text.as_str()).collect();
+        for text in &texts {
+            token_audit.observe(runtime, text)?;
+        }
         let embedded = runtime.embed_batch(&texts)?;
         if embedded.len() != batch.len() || embedded.iter().any(|vector| vector.len() != dim) {
             return Err(malformed(format!(
@@ -353,6 +358,7 @@ pub fn embed_shard(
         worker,
         parity: None,
     };
+    write_build_token_audit(out, token_audit.finish().as_ref())?;
     write_json(&out.join(SHARD_MANIFEST_FILE), &manifest)?;
     Ok(manifest)
 }

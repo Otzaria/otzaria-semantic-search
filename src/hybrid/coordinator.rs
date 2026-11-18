@@ -1769,6 +1769,8 @@ mod tests {
             extra_facets: vec!["/author/משה רבנו".to_string(), "/era/תנך".to_string()],
             lines: vec![
                 BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: 1,
                     section_id: 100,
                     text: LINE_ONE.to_string(),
@@ -1777,6 +1779,8 @@ mod tests {
                     segment: 1,
                 },
                 BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: 2,
                     section_id: 100,
                     text: LINE_TWO.to_string(),
@@ -1785,6 +1789,8 @@ mod tests {
                     segment: 2,
                 },
                 BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: 3,
                     section_id: 101,
                     text: LINE_THREE.to_string(),
@@ -3979,6 +3985,8 @@ mod tests {
             extra_facets: Vec::new(),
             lines: vec![
                 BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: 1,
                     section_id: 1,
                     text: BASE_LINE.to_string(),
@@ -3987,6 +3995,8 @@ mod tests {
                     segment: 1,
                 },
                 BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: 2,
                     section_id: 1,
                     text: "וארעא הות צדיא וריקניא וחשוכא על אפי תהומא".to_string(),

@@ -71,6 +71,9 @@
 
 use crate::distribution::corpus::{CorpusBooks, CorpusLine};
 use crate::distribution::package::{IndexPackage, PackageKind};
+use crate::distribution::token_audit::{
+    write_build_token_audit, BuildTokenAudit, BuildTokenAuditAccumulator,
+};
 use crate::errors::PackError;
 use crate::semantic::backend::Pooling;
 use crate::semantic::chunk_key::ChunkKey;
@@ -355,6 +358,7 @@ pub fn build(request: BuildRequest, corpus: &dyn CorpusBooks) -> Result<BuildRep
     // What the package's own check cannot see: the tables inside the segment.
     Segment::open(&segment_path)?;
 
+    write_build_token_audit(root, assembled.token_audit.as_ref())?;
     let json = manifest.to_json();
     let manifest_path = root.join(RELEASE_MANIFEST_FILENAME);
     let partial = root.join(format!("{RELEASE_MANIFEST_FILENAME}.partial"));
@@ -532,6 +536,8 @@ pub(crate) fn chunk_book_lines(
             content_hash,
             facets,
             text,
+            semantic_text,
+            semantic_notes,
         } = line;
 
         // The two halves of the port describing one line differently is a corpus that
@@ -557,6 +563,8 @@ pub(crate) fn chunk_book_lines(
             line_id,
             section_id,
             text,
+            semantic_text,
+            semantic_notes,
             line_hash,
             reference,
             segment,
@@ -569,7 +577,7 @@ pub(crate) fn chunk_book_lines(
         });
     };
 
-    let chunks = chunker.chunk_book(&BookForIndexing {
+    let book = BookForIndexing {
         source_book_key: book_key.to_string(),
         title: book.title,
         content_fingerprint: book.content_hash,
@@ -577,7 +585,9 @@ pub(crate) fn chunk_book_lines(
         topics: String::new(),
         extra_facets: book.facets,
         lines,
-    });
+    };
+    chunker.validate_book_coverage(&book)?;
+    let chunks = chunker.chunk_book(&book);
     Ok((line_ids, chunks))
 }
 
@@ -599,6 +609,7 @@ struct Assembled {
     vectors: Vec<f32>,
     /// Each slot's window: the least of its key's records'.
     windows: Vec<u8>,
+    token_audit: Option<BuildTokenAudit>,
 }
 
 /// Apply the recipe to every book and embed what it derives, assigning slots the way a
@@ -635,6 +646,7 @@ fn embed_corpus(
     let mut windows: Vec<u8> = Vec::new();
     let mut books = Vec::with_capacity(book_keys.len());
     let mut chunked = BTreeSet::new();
+    let mut token_audit = BuildTokenAuditAccumulator::default();
     for name in book_keys {
         let (line_ids, chunks) = chunk_book_lines(corpus, &chunker, &name)?;
         if line_ids.len() > crate::semantic::oxv::format::HINT_MASK as usize {
@@ -711,6 +723,9 @@ fn embed_corpus(
 
         for batch in texts.chunks(batch_size) {
             let batch: Vec<&str> = batch.iter().map(String::as_str).collect();
+            for text in &batch {
+                token_audit.observe(runtime, text)?;
+            }
             let embedded = runtime.embed_batch(&batch)?;
             // The runtime already refuses a short batch from a backend; this is the same
             // invariant one layer up, where the slots would silently shift instead.
@@ -748,6 +763,7 @@ fn embed_corpus(
         books,
         vectors,
         windows,
+        token_audit: token_audit.finish(),
     })
 }
 
@@ -856,6 +872,8 @@ mod tests {
 
     fn corpus_line(book: &str, text: &str, section_id: u64) -> CorpusLine {
         CorpusLine {
+            semantic_text: None,
+            semantic_notes: Vec::new(),
             source_book_key: book.to_string(),
             title: if book == GENESIS {
                 "בראשית"
@@ -977,6 +995,45 @@ mod tests {
             }
         }
         records
+    }
+
+    #[test]
+    fn corpus_build_automatically_counts_only_passages_actually_embedded() {
+        use crate::distribution::token_audit::BuildTokenAudit;
+        let dir = TempDir::new("build_token_diagnostics");
+        let (path, checksum) = write_model(&dir);
+        let corpus = super::super::testing::corpus(
+            dir.path(),
+            "tokens",
+            1,
+            &[
+                (1, "otzaria/a.txt", "alpha beta gamma delta epsilon"),
+                (2, "otzaria/a.txt", "alpha beta gamma delta epsilon"),
+                (3, "otzaria/b.txt", "alpha beta gamma delta epsilon"),
+                (4, "otzaria/b.txt", "a single longerword"),
+            ],
+        );
+        let chunking = ChunkerConfig {
+            min_meaningful_chars: 5,
+            ..ChunkerConfig::default()
+        };
+        let mut model = model_for(&checksum, &chunking);
+        model.max_tokens = 5;
+        let request = build_request(&dir, model, chunking);
+        let plan = BuildPlan::compute(&corpus, &request.chunking, &request.model).unwrap();
+        let runtime = super::super::testing::counting_runtime(&path, 5);
+        let assembled = embed_corpus(&corpus, &runtime, &request, &plan).unwrap();
+        assert_eq!(assembled.vectors.len() / DIM as usize, 2);
+        assert_eq!(
+            assembled.token_audit,
+            Some(BuildTokenAudit {
+                passages: 2,
+                over_budget_passages: 1,
+                discarded_tokens: 2,
+                max_tokens: 5,
+                max_observed: 7,
+            })
+        );
     }
 
     /// The recipe decides what gets a vector, and it is not "every line the corpus holds".
@@ -1282,9 +1339,9 @@ mod tests {
         // `embedding_text_version` lives in both the configuration and the identity, so
         // moving it alone means moving both — the disagreement between them is its own
         // rejection, tested separately in `recipe`.
-        // Version 3 adds Pardes role text, so version 4 is the first unsupported one.
+        // Version 4 splits main text and notes; version 5 is unsupported.
         let text_chunking = ChunkerConfig {
-            embedding_text_version: 4,
+            embedding_text_version: 5,
             ..ChunkerConfig::default()
         };
         let cases: [(&str, ChunkerConfig, ModelIdentity, u32, &str); 3] = [
@@ -1292,12 +1349,12 @@ mod tests {
                 "embedding_text_version",
                 text_chunking.clone(),
                 ModelIdentity {
-                    embedding_text_version: 4,
+                    embedding_text_version: 5,
                     chunking_identity: text_chunking.identity(),
                     ..truthful.clone()
                 },
-                4,
-                "1, 2, 3",
+                5,
+                "1, 2, 3, 4",
             ),
             (
                 // Carried in both places, like the text version above, so both move.
@@ -1323,19 +1380,19 @@ mod tests {
                 // of the configuration — so the declared identity moves with it.
                 "chunking_version",
                 ChunkerConfig {
-                    chunking_version: 3,
+                    chunking_version: 4,
                     ..ChunkerConfig::default()
                 },
                 ModelIdentity {
                     chunking_identity: ChunkerConfig {
-                        chunking_version: 3,
+                        chunking_version: 4,
                         ..ChunkerConfig::default()
                     }
                     .identity(),
                     ..truthful.clone()
                 },
-                3,
-                "1, 2",
+                4,
+                "1, 2, 3",
             ),
         ];
 

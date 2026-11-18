@@ -338,6 +338,28 @@ impl EmbeddingRuntime {
         self.tokenizer_checksum.as_deref()
     }
 
+    /// Optional build-time count before the backend's token cap, including all
+    /// special tokens. This never runs on the ordinary inference path.
+    pub fn untruncated_token_count(&self, text: &str) -> Result<Option<usize>, EmbeddingError> {
+        self.backend
+            .as_deref()
+            .ok_or(EmbeddingError::NotLoaded)?
+            .untruncated_token_count(text)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_counting_backend(
+        config: EmbeddingConfig,
+        backend: Box<dyn EmbeddingBackend>,
+        model_checksum: String,
+        tokenizer_checksum: String,
+    ) -> Result<Self, EmbeddingError> {
+        let mut runtime = Self::new(config);
+        runtime.adopt(backend, Some(model_checksum))?;
+        runtime.tokenizer_checksum = Some(tokenizer_checksum);
+        Ok(runtime)
+    }
+
     /// Convenience wrapper over [`Self::embed_batch`]; indexing should call the
     /// batch form directly so the backend sees whole batches.
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
@@ -908,7 +930,7 @@ mod tests {
     #[test]
     fn only_pardes_recipe_enables_the_cross_cpu_int8_policy() {
         assert!(!super::EmbeddingDeployment::default().disable_kleidiai);
-        for version in [1, 2] {
+        for version in [1, 2, 4] {
             assert!(
                 !super::EmbeddingDeployment::default()
                     .for_text_recipe(version)

@@ -1,0 +1,82 @@
+{
+  "date": "2026-11-17",
+  "sidecar_branch": "codex/issue34-semantic-recipe",
+  "engine_branch": "codex/issue34-semantic-source",
+  "sidecar_tests": {
+    "default": {
+      "suites": 17,
+      "passed": 707,
+      "failed": 0,
+      "ignored": 2
+    },
+    "mock": {
+      "suites": 17,
+      "passed": 740,
+      "failed": 0,
+      "ignored": 2
+    },
+    "onnx": {
+      "suites": 17,
+      "passed": 763,
+      "failed": 0,
+      "ignored": 13
+    }
+  },
+  "clippy": "all targets, mock-embedding + onnx-backend, -D warnings: passed",
+  "onnx_runtime": "1.31.1 (installed on host)",
+  "native_smoke": {
+    "model": "released QA491 document.fp32.onnx",
+    "recipe_identity": 12470596585207933847,
+    "vectors": 4,
+    "token_audit": {
+      "passages": 4,
+      "over_budget_passages": 2,
+      "discarded_tokens": 84,
+      "max_tokens": 256,
+      "max_observed": 320
+    }
+  },
+  "preflight_real_examples": {
+    "exit_code": 2,
+    "passages": 2,
+    "over_budget_passages": 2,
+    "discarded_tokens": 84
+  },
+  "limitations": [
+    "Original generation7 OXV set not provided",
+    "No full-library vector rebuild or publication",
+    "S1 retrieval quality experiment not run",
+    "CI not triggered; local changes have not been pushed"
+  ],
+  "nested_notes_qa": {
+    "independent_tests_passed": 5,
+    "coverage": [
+      "three nesting depths",
+      "classless sup/sub markers",
+      "UTF8 astral and niqqud and HTML entities",
+      "no text loss or duplication",
+      "deterministic note ordering",
+      "lexical/display metadata roundtrip unchanged",
+      "nested note across newline",
+      "ordinary note continuation across newline"
+    ]
+  },
+  "engine_tests": {
+    "semantic": {
+      "passed": 165,
+      "failed": 0,
+      "ignored": 1
+    },
+    "notes": {
+      "passed": 45,
+      "failed": 0,
+      "ignored": 0
+    },
+    "e2e": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "engine_clippy": "mock, all targets, -D warnings: passed"
+}

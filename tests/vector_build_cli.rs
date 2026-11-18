@@ -91,6 +91,8 @@ fn corpus(work: &Work, version: u32, books: &[(&str, &[usize])]) -> (String, Str
         for i in *texts {
             line_id += 1;
             let line = CorpusLine {
+                semantic_text: None,
+                semantic_notes: Vec::new(),
                 source_book_key: book.to_string(),
                 title: String::new(),
                 reference: String::new(),

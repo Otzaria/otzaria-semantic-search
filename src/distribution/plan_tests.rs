@@ -451,3 +451,93 @@ fn a_short_first_window_round_trips_in_oxvrec2() {
     writer.finish().unwrap();
     assert!(!PlanRecords::open(&plain).unwrap().get(0).short);
 }
+
+#[test]
+fn separated_notes_plan_preserves_anchors_and_short_main_flags() {
+    use crate::distribution::corpus::{CorpusLineRecord, JsonlCorpus};
+    let dir = TempDir::new("separated_notes_plan");
+    let _legacy = corpus(
+        dir.path(),
+        "v4",
+        1,
+        &[
+            (1, A, "lexical main plus a long inline footnote body"),
+            (2, A, "lexical note-only body"),
+        ],
+    );
+    let path = dir.join("v4-lines.jsonl");
+    let records: Vec<CorpusLineRecord> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(index, text)| {
+            let mut record: CorpusLineRecord = serde_json::from_str(text).unwrap();
+            record.line.semantic_text = Some(if index == 0 {
+                "עוגן קצר".to_string()
+            } else {
+                String::new()
+            });
+            record.line.semantic_notes = vec![if index == 0 {
+                L1.to_string()
+            } else {
+                L2.to_string()
+            }];
+            record
+        })
+        .collect();
+    std::fs::write(
+        &path,
+        records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let prepared = JsonlCorpus::load(&dir.join("v4-identity.json"), &path).unwrap();
+    let chunking = ChunkerConfig {
+        chunking_version: 3,
+        embedding_text_version: 4,
+        window_chars: 512,
+        window_overlap_chars: 128,
+        max_windows_per_line: 255,
+        ..ChunkerConfig::default()
+    };
+    let model_path = stub_model(dir.path());
+    let mut model = family(&model_path);
+    model.embedding_text_version = 4;
+    model.chunking_identity = chunking.identity();
+    let out = dir.join("plan");
+    plan_from_corpus(
+        &prepared,
+        PlanRequest {
+            out_dir: out.clone(),
+            model,
+            chunking,
+            passage_package: passage_package(&model_path),
+            previous: None,
+            warehouse: None,
+            created_at: "2026-11-17T12:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    let plan = Plan::open(&out).unwrap();
+    let rows: Vec<_> = plan.records.iter().collect();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0].short);
+    assert_eq!(
+        (rows[1].ordinal, rows[1].window, rows[1].short),
+        (0, 1, false)
+    );
+    assert_eq!(
+        (rows[2].ordinal, rows[2].window, rows[2].short),
+        (1, 0, false)
+    );
+    assert_eq!(
+        rows[1].key(),
+        crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {L1}"))
+    );
+    assert_eq!(
+        rows[2].key(),
+        crate::semantic::chunk_key::ChunkKey::of(&format!("[PASSAGE] {L2}"))
+    );
+}

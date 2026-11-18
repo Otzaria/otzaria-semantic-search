@@ -30,6 +30,7 @@ pub mod ledger;
 pub mod package;
 pub mod plan;
 pub mod shard;
+pub mod token_audit;
 pub mod warehouse;
 
 #[cfg(test)]

@@ -878,7 +878,7 @@ pub fn plan_from_corpus(
     let chunker = Chunker::new(request.chunking.clone())?;
     let mut records = match chunker.recipe().0 {
         ChunkingAlgorithm::AnchoredLine => RecordsWriter::create(&dir.join(RECORDS_FILE))?,
-        ChunkingAlgorithm::AnchoredLineWindows => {
+        ChunkingAlgorithm::AnchoredLineWindows | ChunkingAlgorithm::CompleteAnchoredLineWindows => {
             RecordsWriter::create_windowed(&dir.join(RECORDS_FILE))?
         }
     };
@@ -896,7 +896,7 @@ pub fn plan_from_corpus(
                 book: index as u32,
                 ordinal: ordinals[&chunk.line_id],
                 window: chunk.window,
-                short: chunk.window == 0 && chunker.borrows_context(&chunk.anchor_text),
+                short: chunk.borrows_context,
                 sha256,
             })?;
             embed.offer(&sha256, &chunk.embedding_text)?;

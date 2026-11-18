@@ -276,6 +276,8 @@ fn build_and_install(
             serde_json::to_string(&CorpusLineRecord {
                 line_id: *line_id,
                 line: CorpusLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     source_book_key: book.to_string(),
                     title: title_of(book),
                     reference: String::new(),

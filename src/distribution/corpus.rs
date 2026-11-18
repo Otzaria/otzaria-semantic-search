@@ -96,6 +96,12 @@ pub struct CorpusLine {
     /// it against what the producer claims is what proves a vector belongs to this line
     /// and not to its neighbour.
     pub text: String,
+    /// Semantic main text from the host, without footnote markers or bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_text: Option<String>,
+    /// Footnote bodies in source order, anchored to this line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_notes: Vec<String>,
 }
 
 /// The corpus a set of vectors claims to describe.
@@ -437,6 +443,8 @@ mod tests {
 
     fn line(book: &str, text: &str) -> CorpusLine {
         CorpusLine {
+            semantic_text: None,
+            semantic_notes: Vec::new(),
             source_book_key: book.to_string(),
             title: "ספר בדיקה".to_string(),
             reference: "פרק א".to_string(),

@@ -1218,6 +1218,7 @@ impl CappedTokenizers {
 pub struct OnnxBackend {
     /// Padding off, truncation at `max_tokens`. `encode(&self)`, so shared unlocked.
     tokenizer: Tokenizer,
+    passage_token_counter: PassageTokenCounter,
     capped_tokenizers: CappedTokenizers,
     pool: Pool<Worker>,
     wiring: Wiring,
@@ -1428,8 +1429,10 @@ impl OnnxBackend {
             workers.push(Worker::new(session, &wiring).map_err(worker_failed)?);
         }
 
+        let passage_token_counter = PassageTokenCounter::from_tokenizer(tokenizer_impl.clone())?;
         let mut backend = Self {
             tokenizer: tokenizer_impl,
+            passage_token_counter,
             capped_tokenizers: CappedTokenizers::default(),
             pool: Pool::new(workers),
             dim: wiring.declared_dim.unwrap_or(0),
@@ -1678,7 +1681,7 @@ impl OnnxBackend {
 ///
 /// A refusal names `graph` as the model file, as every error about an ONNX package does,
 /// and the tokenizer in its reason: the package is the unit that is valid or not.
-fn load_tokenizer(
+pub(crate) fn load_tokenizer(
     graph: &Path,
     path: &Path,
     max_tokens: usize,
@@ -1719,6 +1722,41 @@ fn load_tokenizer(
         }))
         .map_err(|e| invalid(format!("refuses truncation to {max_tokens} tokens: {e}")))?;
     Ok((tokenizer, special_tokens))
+}
+
+/// An uncapped copy of the inference tokenizer, for build-time token-budget audits.
+/// Loading this needs neither a graph nor an ONNX Runtime library. Counts include the
+/// passage prefix supplied by the plan and the tokenizer's post-processor tokens.
+pub struct PassageTokenCounter {
+    tokenizer: Tokenizer,
+}
+
+impl PassageTokenCounter {
+    /// Apply the backend's tokenizer configuration, then disable truncation so an audit
+    /// can see content that inference would otherwise discard.
+    pub fn open(path: &Path, max_tokens: usize) -> Result<Self, EmbeddingError> {
+        let (tokenizer, _) = load_tokenizer(path, path, max_tokens)?;
+        Self::from_tokenizer(tokenizer)
+    }
+
+    fn from_tokenizer(mut tokenizer: Tokenizer) -> Result<Self, EmbeddingError> {
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| EmbeddingError::LoadFailed {
+                reason: format!("disabling truncation for token audit: {error}"),
+            })?;
+        Ok(Self { tokenizer })
+    }
+
+    /// The complete sequence length, including special tokens, with no padding.
+    pub fn count(&self, text: &str) -> Result<usize, EmbeddingError> {
+        self.tokenizer
+            .encode(text, true)
+            .map(|encoding| encoding.len())
+            .map_err(|error| EmbeddingError::InferenceFailed {
+                reason: format!("token audit: {error}"),
+            })
+    }
 }
 
 impl std::fmt::Debug for OnnxBackend {
@@ -1763,6 +1801,10 @@ impl EmbeddingBackend for OnnxBackend {
     /// after truncation.
     fn tokenize(&self, text: &str) -> Result<Vec<u32>, EmbeddingError> {
         self.token_ids(text)
+    }
+
+    fn untruncated_token_count(&self, text: &str) -> Result<Option<usize>, EmbeddingError> {
+        self.passage_token_counter.count(text).map(Some)
     }
 
     /// Embed one batch, raw and unnormalized, one vector per input in input order.
@@ -1817,6 +1859,22 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/onnx_fixture")
             .join(name)
+    }
+
+    #[test]
+    fn passage_audit_counts_uncapped_specials_and_ignores_file_padding() {
+        let counter = PassageTokenCounter::open(&fixture("tokenizer.json"), 8).unwrap();
+        let text = format!("[PASSAGE] {}", "hello ".repeat(30));
+        let count = counter.count(&text).unwrap();
+        let (tokenizer, _) =
+            load_tokenizer(&fixture("dynamic.onnx"), &fixture("tokenizer.json"), 8).unwrap();
+        assert_eq!(tokenizer.encode(text.as_str(), true).unwrap().len(), 8);
+        assert!(count > 8);
+        assert!(counter.count("hello").unwrap() < 16);
+        assert_eq!(
+            counter.count("[PASSAGE] hello").unwrap(),
+            counter.count("hello").unwrap() + 1
+        );
     }
 
     /// Whether a runtime library is configured, saying so loudly when it is not. The
@@ -2088,6 +2146,16 @@ mod tests {
         let backend = open_fixture("dynamic.onnx", 32, &tuning(1, 1)).unwrap();
         let text = "the quick brown fox jumps over the dog ".repeat(20);
         let default_ids = backend.tokenize(&text).unwrap();
+        let uncapped = backend.untruncated_token_count(&text).unwrap().unwrap();
+        assert!(uncapped > backend.max_tokens());
+        assert_eq!(
+            uncapped,
+            PassageTokenCounter::open(&fixture("tokenizer.json"), 32)
+                .unwrap()
+                .count(&text)
+                .unwrap()
+        );
+        assert_eq!(backend.tokenizer.get_truncation().unwrap().max_length, 32);
         assert!(backend.capped_tokenizers.entries.lock().unwrap().is_empty());
         let ids = backend.tokenize_capped(&text, 8).unwrap();
         let first = {
@@ -2397,6 +2465,8 @@ mod tests {
             topics: String::new(),
             extra_facets: vec![],
             lines: vec![BookLine {
+                semantic_text: None,
+                semantic_notes: Vec::new(),
                 line_id: 1,
                 section_id: 1,
                 segment: 1,

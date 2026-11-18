@@ -374,6 +374,8 @@ fn main() {
                 topics: "/מקרא".to_string(),
                 extra_facets: vec![],
                 lines: vec![BookLine {
+                    semantic_text: None,
+                    semantic_notes: Vec::new(),
                     line_id: 1,
                     section_id: 1,
                     segment: 1,

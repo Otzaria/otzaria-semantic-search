@@ -164,6 +164,14 @@ pub trait EmbeddingBackend: Send + Sync {
     /// [`EmbeddingError::TokenizationUnsupported`] rather than inventing ids.
     fn tokenize(&self, text: &str) -> Result<Vec<u32>, EmbeddingError>;
 
+    /// Complete sequence length before truncation, including role/special tokens.
+    /// Build tools use this optional capability for aggregate diagnostics; query
+    /// inference does not pay for a second tokenization. A backend without a
+    /// tokenizer reports `None` rather than inventing a count.
+    fn untruncated_token_count(&self, _text: &str) -> Result<Option<usize>, EmbeddingError> {
+        Ok(None)
+    }
+
     /// Embed one already-sized batch into **raw, unnormalized** vectors:
     ///
     /// * one vector per input, in input order — the runtime pairs them

@@ -38,6 +38,10 @@ onnx-backend = ["dep:ort", "dep:tokenizers", "dep:libloading"]
 name = "pardes_parity"
 required-features = ["onnx-backend"]
 
+[[example]]
+name = "audit_plan_tokens"
+required-features = ["onnx-backend"]
+
 [[bench]]
 name = "vector_search"
 harness = false

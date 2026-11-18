@@ -66,6 +66,11 @@ pub enum ChunkingAlgorithm {
     /// [`Self::AnchoredLine`], and a line that stands alone and is longer than the cap also
     /// embeds further overlapping windows of its text, each a chunk of its own.
     AnchoredLineWindows,
+    /// Version 3: retain a short line inside its balanced neighbour context, snap the
+    /// first window to a word boundary too, and permit enough windows to cover the line.
+    /// Builders must call `Chunker::validate_book_coverage` to refuse text exceeding the
+    /// configured window budget rather than publish an incomplete line.
+    CompleteAnchoredLineWindows,
 }
 
 /// What text a chunk carries to the model, and what text a query does.
@@ -94,6 +99,9 @@ pub enum EmbeddingTextRecipe {
     RolePrefixedLineOrNeighbourContext,
     /// Pardes: no passage prefix; `query: ` on cleaned queries.
     PardesLineOrNeighbourContext,
+    /// Prepared main text plus separately anchored note windows; Meivin role prefixes.
+    /// Raw HTML/note preparation belongs to the versioned corpus/index text layer.
+    RolePrefixedMainAndNotes,
 }
 
 /// What [`EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext`] puts before every
@@ -121,7 +129,7 @@ impl EmbeddingTextRecipe {
             Self::LineOrNeighbourContext | Self::PardesLineOrNeighbourContext => {
                 Cow::Borrowed(text)
             }
-            Self::RolePrefixedLineOrNeighbourContext => {
+            Self::RolePrefixedLineOrNeighbourContext | Self::RolePrefixedMainAndNotes => {
                 Cow::Owned(format!("{PASSAGE_PREFIX}{}", text.trim()))
             }
         }
@@ -140,7 +148,7 @@ impl EmbeddingTextRecipe {
         match self {
             Self::LineOrNeighbourContext => Cow::Borrowed(normalized_query),
             Self::PardesLineOrNeighbourContext => Cow::Owned(format!("query: {normalized_query}")),
-            Self::RolePrefixedLineOrNeighbourContext => {
+            Self::RolePrefixedLineOrNeighbourContext | Self::RolePrefixedMainAndNotes => {
                 Cow::Owned(format!("{QUERY_PREFIX}{}", normalized_query.trim()))
             }
         }
@@ -253,11 +261,13 @@ macro_rules! recipe_versions {
 recipe_versions!(ChunkingAlgorithm, "chunking_version", {
     AnchoredLine => 1,
     AnchoredLineWindows => 2,
+    CompleteAnchoredLineWindows => 3,
 });
 recipe_versions!(EmbeddingTextRecipe, "embedding_text_version", {
     LineOrNeighbourContext => 1,
     RolePrefixedLineOrNeighbourContext => 2,
     PardesLineOrNeighbourContext => 3,
+    RolePrefixedMainAndNotes => 4,
 });
 recipe_versions!(TextNormalizationRecipe, "normalization_version", {
     AsSuppliedByCorpus => 1,
@@ -348,15 +358,15 @@ mod tests {
         for (field, error, unimplemented, supported) in [
             (
                 "chunking_version",
-                ChunkingAlgorithm::from_version(3).unwrap_err(),
-                3,
-                "1, 2",
+                ChunkingAlgorithm::from_version(4).unwrap_err(),
+                4,
+                "1, 2, 3",
             ),
             (
                 "embedding_text_version",
-                EmbeddingTextRecipe::from_version(4).unwrap_err(),
-                4,
-                "1, 2, 3",
+                EmbeddingTextRecipe::from_version(5).unwrap_err(),
+                5,
+                "1, 2, 3, 4",
             ),
             (
                 "normalization_version",
@@ -444,6 +454,16 @@ mod tests {
         assert_eq!(query, format!("[QUERY] {line}"));
         assert_eq!(query.matches("[QUERY]").count(), 1);
         assert!(!query.contains("[PASSAGE]"));
+    }
+
+    #[test]
+    fn version_four_keeps_role_prefixes_for_main_and_separate_notes() {
+        let v4 = EmbeddingTextRecipe::RolePrefixedMainAndNotes;
+        let v2 = EmbeddingTextRecipe::RolePrefixedLineOrNeighbourContext;
+        for text in [" שאלה ", "\tמצות  תפילין\n", "[PASSAGE] תוכן"] {
+            assert_eq!(v4.passage_text(text), v2.passage_text(text));
+            assert_eq!(v4.query_text(text), v2.query_text(text));
+        }
     }
 
     /// Under version 2 a query loses its leading and trailing whitespace before the

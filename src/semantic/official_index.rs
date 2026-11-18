@@ -749,6 +749,8 @@ mod tests {
                 serde_json::to_string(&CorpusLineRecord {
                     line_id: (catalogue << 32) + *ordinal,
                     line: CorpusLine {
+                        semantic_text: None,
+                        semantic_notes: Vec::new(),
                         source_book_key: book.to_string(),
                         title: String::new(),
                         reference: String::new(),
