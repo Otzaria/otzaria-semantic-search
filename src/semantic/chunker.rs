@@ -252,13 +252,12 @@ impl Chunker {
         })
     }
 
-    /// What this chunker resolved to. Reported so a builder can record what it is about to
-    /// run rather than what it was asked for.
     /// The exact configuration this chunker applies, including its identity fields.
     pub fn config(&self) -> &ChunkerConfig {
         &self.config
     }
 
+    /// What this chunker resolved to, so a builder can report the implemented recipe.
     pub fn recipe(
         &self,
     ) -> (
