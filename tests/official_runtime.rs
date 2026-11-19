@@ -1205,3 +1205,166 @@ fn an_embedded_passage_lands_on_the_vector_built_for_its_text() {
         embedded[..1]
     );
 }
+
+/// Several queries embedded together are each embedded as alone, bit for bit, whether the
+/// embedding cache holds them or not.
+#[test]
+fn queries_embedded_together_are_each_embedded_alone() {
+    let dir = TempDir::new("embed_queries");
+    let (model_path, vectors) = install(&dir);
+    let cancel = CancellationToken::new();
+    let queries = [LINES[0].2, LINES[3].2, LINES[0].2, "שמע"];
+
+    let cold = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let together = cold.embed_queries(&queries, &cancel).unwrap();
+    let alone = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    for (vector, query) in together.iter().zip(queries) {
+        assert_eq!(vector, &alone.embed_query_cached(query, &cancel).unwrap());
+    }
+    // Warm: every vector now comes from the cache, and is the same.
+    assert_eq!(cold.embed_queries(&queries, &cancel).unwrap(), together);
+    assert_eq!(alone.embed_queries(&queries, &cancel).unwrap(), together);
+}
+
+/// A coordinator scans several vectors in one pass as the set does, under the window
+/// penalty it is given, and says which generation the hits' slots belong to.
+#[test]
+fn many_vector_hits_are_the_set_s_hits_for_each_vector() {
+    use otzaria_semantic_search::config::profiles::DEFAULT_WINDOW_PENALTY;
+    use otzaria_semantic_search::semantic::oxv::scan::ScanRequest;
+    let dir = TempDir::new("vector_hits_many");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let cancel = CancellationToken::new();
+    let queries: Vec<&str> = LINES.iter().map(|(_, _, text)| *text).collect();
+    let embedded = coordinator.embed_queries(&queries, &cancel).unwrap();
+    let views: Vec<&[f32]> = embedded.iter().map(Vec::as_slice).collect();
+
+    let set = SegmentSet::open(&vectors).unwrap();
+    let genesis: BookSet = [GENESIS].into_iter().collect();
+    for books in [None, Some(&genesis)] {
+        for top_k in [1, 3, 10] {
+            let many = coordinator
+                .vector_hits_many(&views, top_k, books, DEFAULT_WINDOW_PENALTY, &cancel)
+                .unwrap();
+            assert_eq!(many.generation, set.generation());
+            let expected = set
+                .scan_many(
+                    &views,
+                    &ScanRequest {
+                        top_k,
+                        books,
+                        threads: 1,
+                        window_penalty: DEFAULT_WINDOW_PENALTY,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(many.per_query, expected, "{books:?}, k {top_k}");
+        }
+    }
+    // Each line's own text finds its own vector first.
+    let many = coordinator
+        .vector_hits_many(&views, 1, None, DEFAULT_WINDOW_PENALTY, &cancel)
+        .unwrap();
+    for (hits, text) in many.per_query.iter().zip(&queries) {
+        assert_eq!(hits[0].key, ChunkKey::of(text));
+    }
+}
+
+/// A host reads a book's slots, decodes them and scores them through the coordinator: the
+/// decoded vectors rank as the scan does, the scores are the scan's, and slots of a
+/// generation that is no longer open read as nothing rather than as other vectors.
+#[test]
+fn a_book_s_slots_decode_and_score_as_the_scan_reads_them() {
+    use otzaria_semantic_search::config::profiles::DEFAULT_WINDOW_PENALTY;
+    let dir = TempDir::new("book_slots");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let cancel = CancellationToken::new();
+
+    let book = coordinator.book_slots(GENESIS).unwrap();
+    let genesis: Vec<&str> = LINES
+        .iter()
+        .filter(|(_, book, _)| *book == GENESIS)
+        .map(|(_, _, text)| *text)
+        .collect();
+    assert_eq!(
+        book.slots
+            .iter()
+            .map(|stored| stored.slot.key)
+            .collect::<Vec<_>>(),
+        genesis
+            .iter()
+            .map(|text| ChunkKey::of(text))
+            .collect::<Vec<_>>(),
+        "in the book's order"
+    );
+    assert_eq!(
+        book.slots.iter().map(|s| s.hint).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(coordinator
+        .book_slots("no/such/book.txt")
+        .unwrap()
+        .slots
+        .is_empty());
+
+    let slots: Vec<SlotRef> = book.slots.iter().map(|stored| stored.slot).collect();
+    let query = coordinator.embed_queries(&[LINES[1].2], &cancel).unwrap();
+    let query: Vec<&[f32]> = query.iter().map(Vec::as_slice).collect();
+    let hits = coordinator
+        .vector_hits_many(&query, 100, None, DEFAULT_WINDOW_PENALTY, &cancel)
+        .unwrap();
+    let scan_score = |slot: &SlotRef| {
+        hits.per_query[0]
+            .iter()
+            .find(|hit| (hit.seg, hit.slot) == (slot.seg, slot.slot))
+            .map(|hit| hit.score)
+            .unwrap()
+    };
+
+    let decoded = coordinator.decode_slots(&slots, book.generation).unwrap();
+    for (vector, slot) in decoded.iter().zip(&slots) {
+        let vector = vector.as_ref().expect("a live slot decodes");
+        let dot: f32 = vector.iter().zip(query[0]).map(|(a, b)| a * b).sum();
+        assert!((dot - scan_score(slot)).abs() < 1e-4, "{slot:?}");
+    }
+
+    let scored = coordinator
+        .score_slots_many(
+            &query,
+            &slots,
+            book.generation,
+            DEFAULT_WINDOW_PENALTY,
+            &cancel,
+        )
+        .unwrap();
+    for (score, slot) in scored[0].iter().zip(&slots) {
+        assert_eq!(score.map(f32::to_bits), Some(scan_score(slot).to_bits()));
+    }
+
+    let stale = book.generation + 1;
+    assert!(coordinator
+        .decode_slots(&slots, stale)
+        .unwrap()
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(
+        coordinator
+            .score_slots_many(&query, &slots, stale, DEFAULT_WINDOW_PENALTY, &cancel)
+            .unwrap(),
+        vec![vec![None; slots.len()]]
+    );
+
+    // Without a vector set there is nothing to read.
+    let none = HybridCoordinator::new(None);
+    assert!(matches!(
+        none.book_slots(GENESIS),
+        Err(SemanticSearchError::Config(_))
+    ));
+    assert!(matches!(
+        none.vector_hits_many(&query, 1, None, DEFAULT_WINDOW_PENALTY, &cancel),
+        Err(SemanticSearchError::Config(_))
+    ));
+}

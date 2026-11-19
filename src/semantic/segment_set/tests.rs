@@ -1190,6 +1190,207 @@ fn a_set_weighs_the_live_slots_it_is_handed_besides_the_books_it_admits() {
     );
 }
 
+/// A book's slots are its records as `book_occurrences` lists them, each with a live slot
+/// that holds its key — in the base, in a delta, or through a foreign record's link — and
+/// a key the delta tombstoned is in none of them.
+#[test]
+fn a_book_s_slots_are_its_records_each_on_a_live_slot_of_its_key() {
+    let work = TempDir::new("set_book_slots");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+
+    for name in ["id:1", "id:2", "id:3", "id:4", "id:none"] {
+        let slots = set.book_slots(name);
+        let mut records = Vec::new();
+        set.book_occurrences(name, &mut records);
+        assert_eq!(slots.len(), records.len(), "{name}");
+        for (stored, (key, record)) in slots.iter().zip(&records) {
+            assert_eq!(
+                (stored.slot.key, stored.hint, stored.window, stored.anchor),
+                (*key, record.hint, record.window, record.anchor),
+                "{name}"
+            );
+            assert!(set.is_live(stored.slot.seg, stored.slot.slot), "{name}");
+            let segment = &set.segments()[stored.slot.seg as usize];
+            assert!(segment.key(stored.slot.slot).same_text(*key), "{name}");
+        }
+        let keys: BTreeSet<u64> = v30()
+            .books
+            .get(name)
+            .map(|lines| lines.values().copied().collect())
+            .unwrap_or_default();
+        let held: BTreeSet<ChunkKey> = slots.iter().map(|stored| stored.slot.key).collect();
+        assert_eq!(
+            held,
+            keys.into_iter().map(key).collect::<BTreeSet<_>>(),
+            "{name} holds the keys v30 gives it"
+        );
+    }
+
+    // id:4 is new in the delta: key 6 through a foreign record linked into the base, key 8
+    // on a slot the delta ships.
+    let four: Vec<(ChunkKey, u16, u32)> = set
+        .book_slots("id:4")
+        .iter()
+        .map(|stored| (stored.slot.key, stored.slot.seg, stored.hint))
+        .collect();
+    assert_eq!(four, vec![(key(6), 0, 0), (key(8), 1, 1)]);
+}
+
+/// A live slot decodes to the vector its key was built from, within the codec's rounding;
+/// a tombstoned slot, a slot holding another key and a slot past a segment's end decode to
+/// nothing and leave the output as it was.
+#[test]
+fn a_live_slot_decodes_to_its_key_s_vector_and_a_dead_one_to_nothing() {
+    let work = TempDir::new("set_decode");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+
+    let mut out = vec![0.0f32; DIM];
+    for name in ["id:1", "id:2", "id:3", "id:4"] {
+        for stored in set.book_slots(name) {
+            assert!(set.decode_slot(&stored.slot, &mut out));
+            let expected = (0..)
+                .map(key)
+                .take(64)
+                .position(|candidate| candidate == stored.slot.key)
+                .map(|n| vector_of(n as u64))
+                .expect("a key of the fixture");
+            let cosine: f32 = out.iter().zip(&expected).map(|(a, b)| a * b).sum::<f32>()
+                / out.iter().map(|a| a * a).sum::<f32>().sqrt();
+            assert!(cosine > 0.999, "{name}: cosine {cosine}");
+        }
+    }
+
+    let segment = &set.segments()[0];
+    let gone = (0..segment.slot_count())
+        .find(|slot| segment.key(*slot) == key(3))
+        .unwrap();
+    let live = (0..segment.slot_count())
+        .find(|slot| segment.key(*slot) == key(1))
+        .unwrap();
+    let marker = vec![7.0f32; DIM];
+    for slot in [
+        SlotRef {
+            seg: 0,
+            slot: gone,
+            key: key(3),
+        },
+        SlotRef {
+            seg: 0,
+            slot: live,
+            key: key(2),
+        },
+        SlotRef {
+            seg: 0,
+            slot: segment.slot_count(),
+            key: key(1),
+        },
+        SlotRef {
+            seg: 9,
+            slot: 0,
+            key: key(1),
+        },
+    ] {
+        out.clone_from(&marker);
+        assert!(!set.decode_slot(&slot, &mut out), "{slot:?}");
+        assert_eq!(out, marker, "{slot:?}");
+    }
+}
+
+/// Scoring given slots gives each the score a full scan gives it, bit for bit, for every
+/// query, in the order the slots were given; a dead, mislabelled or missing slot scores
+/// nothing, and a slot given twice scores the same both times.
+#[test]
+fn scored_slots_are_scored_as_a_full_scan_scores_them() {
+    let work = TempDir::new("set_score_slots");
+    let dir = work.join("vectors");
+    install(&dir, &release(&work, &v29(), None)).unwrap();
+    install(&dir, &release(&work, &v30(), Some(&v29()))).unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+
+    let queries: Vec<Vec<f32>> = (0..3).map(|seed| Random(60 + seed).unit(DIM)).collect();
+    let views: Vec<&[f32]> = queries.iter().map(Vec::as_slice).collect();
+    let mut slots: Vec<SlotRef> = ["id:2", "id:4", "id:1", "id:3"]
+        .iter()
+        .flat_map(|name| set.book_slots(name))
+        .map(|stored| stored.slot)
+        .collect();
+    // Keys several books hold come once per book; a key is scored once.
+    let mut seen = BTreeSet::new();
+    slots.retain(|slot| seen.insert(slot.key));
+    let live = slots.len();
+    let base = &set.segments()[0];
+    let gone = (0..base.slot_count())
+        .find(|slot| base.key(*slot) == key(3))
+        .unwrap();
+    slots.extend([
+        SlotRef {
+            seg: 0,
+            slot: gone,
+            key: key(3),
+        },
+        SlotRef {
+            seg: slots[0].seg,
+            slot: slots[0].slot,
+            key: key(999),
+        },
+        SlotRef {
+            seg: 5,
+            slot: 0,
+            key: key(1),
+        },
+        slots[1],
+    ]);
+
+    for window_penalty in [0.0, 0.04] {
+        let rows = set
+            .score_slots_many(&views, &slots, window_penalty, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(rows.len(), queries.len());
+        for (query, row) in views.iter().zip(&rows) {
+            assert_eq!(row.len(), slots.len());
+            let full: BTreeMap<(u16, u32), u32> = set
+                .scan(
+                    query,
+                    &ScanRequest {
+                        top_k: 100_000,
+                        books: None,
+                        threads: 2,
+                        window_penalty,
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| ((hit.seg, hit.slot), hit.score.to_bits()))
+                .collect();
+            for (slot, score) in slots[..live].iter().zip(row) {
+                assert_eq!(
+                    score.map(f32::to_bits),
+                    full.get(&(slot.seg, slot.slot)).copied(),
+                    "{slot:?}"
+                );
+                assert!(score.is_some());
+            }
+            assert_eq!(&row[live..live + 3], &[None, None, None]);
+            assert_eq!(row[live + 3].map(f32::to_bits), row[1].map(f32::to_bits));
+            assert!(row[1].is_some());
+        }
+    }
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(matches!(
+        set.score_slots_many(&views, &slots, 0.0, &cancelled),
+        Err(VectorStoreError::Cancelled)
+    ));
+}
+
 /// v30 and one more line, a new key: what installs after v30 in the tests below.
 fn v31() -> Library {
     let mut v31 = v30();
@@ -3005,6 +3206,9 @@ fn compaction_never_upgrades_a_legacy_key_to_a_partial_occurrence_snapshot() {
     set.book_occurrences("b", &mut records);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1.hint, 9);
+    // The snapshot's re-anchored record and the legacy one each reach their key's slot.
+    let hints = |name| -> Vec<u32> { set.book_slots(name).iter().map(|s| s.hint).collect() };
+    assert_eq!((hints("a"), hints("b")), (vec![0], vec![9]));
 }
 
 /// A live short line still needs its shared vector after the neighbour's own text
@@ -3116,10 +3320,22 @@ fn compaction_keeps_alias_backing_slots_without_a_live_neighbour() {
                     (records[0].1.hint, records[0].1.window, records[0].1.anchor),
                     (hint, ALIAS_WINDOW, Some(anchor.narrowed()))
                 );
+                // The alias records reach the one slot that backs them.
+                let slots = set.book_slots(name);
+                assert_eq!(slots.len(), 1);
+                assert_eq!(
+                    (slots[0].slot.seg, slots[0].slot.slot, slots[0].window),
+                    (0, 0, ALIAS_WINDOW)
+                );
+                assert_eq!(
+                    (slots[0].hint, slots[0].anchor),
+                    (hint, Some(anchor.narrowed()))
+                );
             }
             let mut records = Vec::new();
             set.book_occurrences("c", &mut records);
             assert_eq!(records.len(), usize::from(normal_survives));
+            assert_eq!(set.book_slots("c").len(), usize::from(normal_survives));
         }
     }
 }
