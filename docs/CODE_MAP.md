@@ -189,6 +189,13 @@ otzaria-semantic-search/
     המארח קושר לשורות חיות. כל פעולה בונה עוברת ב-accessor שרק `SelfBuilt` מקיים, ולכן סט
     מותקן נדחה בשם (`ReadOnlyIndex`) — ולא ב-`None`, שמשמעותו „אין אינדקס סמנטי בכלל”.
   - `with_official_index()` — הבנייה של מסלול האפליקציה; `new()` נשאר מסלול ה-build.
+  - עבודה ישירה עם הווקטורים, למארח שמחפש בכמה טקסטים יחד או קורא וקטורים של ספר
+    (issue #37): `embed_queries` — כמה שאילתות, כל אחת כמו `embed_query_cached`;
+    `query_token_counts` — אורך כל טקסט כשאילתה, התקרה והתוספת של שאילתה ריקה;
+    `vector_hits_many` → `VectorHitsMany` — `search_hits_many` עם הדור של הסלוטים;
+    `book_slots` → `BookSlots` — רשומות הספר והסלוט החי של כל אחת; `decode_slots` ו-
+    `score_slots_many` — וקטור מפוענח וציון כמו בסריקה, ו-`None` לכולם כשהדור שניתן אינו
+    הפתוח. רק בצד `Official`; `SelfBuilt` נדחה ב-`Config` בשם הפעולה.
   - **שלושת המצבים ממומשים**: `LexicalOnly` אינו נוגע במסלול הסמנטי, `SemanticOnly`
     מזניח את מועמדי BM25 שהועברו, ו-`Hybrid` מתדרדר ל-`LexicalOnly` כשהסמנטי נכשל.
     ה-`alpha` נקבע לפי המצב שרץ בפועל (1.0 / 0.0 / דינמי), כדי שציון ממנוע אחד
@@ -466,6 +473,11 @@ otzaria-semantic-search/
     `open_without_recovery` — אותה פתיחה בלי ה-lock ובלי שחזור ואיסוף אשפה, לקורא לצד
     session פתוח (§5.5 של החוזה); `scan`, `scan_with`, `scan_many`, `info`, `generation`, `identity`;
     `segments()` לקריאה בלבד, ו-`is_live(seg, slot)` — האם slot חי בדור הזה.
+  - `book_slots(name)` → `StoredSlot` — הרשומות של ספר כפי ש-`book_occurrences` מונה אותן,
+    כל אחת עם הסלוט החי שמחזיק את המפתח שלה (סלוט ראשי, extra, או יעד של רשומה זרה).
+    `decode_slot` — הווקטור כפי שה-codec מפענח אותו, בלי נרמול: מכפלה עם שאילתה היא ציון
+    הסריקה לפני קנסות. `score_slots_many` — ציון של סלוטים נתונים מול כמה שאילתות, כמו
+    `scan_with` עם מסנן שאינו מקבל אף ספר: אותו ציון של סריקה מלאה, ביט בביט.
   - `install_package` — segment ו-manifest של שחרור, לפי §5.3 של החוזה: אימות, staging,
     העברה, delta שנפתר במעבר אחד על המפתחות הישנים, דור חדש, החלפת מצביעים, אשפה.
     `ApplyReport` מדווח, ו-`already_applied` הוא delta שהסט כבר בלע.
@@ -584,6 +596,8 @@ otzaria-semantic-search/
   - `search(query, top_k, books, cancel)` / `search_hits(vector, …)` — hits, לא שורות;
     `search_hits_with(vector, …, also, …)` — ולצדם הווקטורים של `also` (`scan_with`);
     `search_hits_many(vectors, …)` — כמה וקטורי שאילתה בסריקה משותפת (`scan_many`);
+    `query_token_counts(texts)` → `QueryTokenCounts`, `query_max_tokens`, `dim`;
+    `book_slots`, `decode_slots`, `score_slots_many` — מעל ה-`SegmentSet`;
     `reload_vectors()` → `ReloadOutcome`; `status`, `set_info`, `identity`, `generation`,
     `book_count`.
   - `status` מדווח `vectors_persisted = true` ו-`needs_full_reindex = None`, ולא כטענה

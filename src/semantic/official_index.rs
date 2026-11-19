@@ -35,7 +35,7 @@ use crate::semantic::oxv::format::{SEGMENT_FORMAT_V3, SEGMENT_FORMAT_VERSION};
 use crate::semantic::oxv::scan::{default_scan_threads, ScanPenalties, ScanRequest};
 use crate::semantic::recipe::{EmbeddingTextRecipe, TextNormalizationRecipe};
 use crate::semantic::resolve::{BookSet, SlotRef, VectorHit};
-use crate::semantic::segment_set::{self, SegmentSet, SetInfo, STORE_BACKEND_ID};
+use crate::semantic::segment_set::{self, SegmentSet, SetInfo, StoredSlot, STORE_BACKEND_ID};
 use crate::semantic::types::SemanticStatus;
 use crate::semantic::versioning::{
     IndexVersion, ModelIdentity, ModelPackage, StoreIdentity, TextIdentity,
@@ -539,13 +539,100 @@ impl OfficialSemanticIndex {
         // its passages were built with — scores nonsense with full confidence.
         let text =
             crate::semantic::recipe::query_input(self.text_recipe, self.normalization, query)?;
-        Ok(self.runtime.embed_one_capped(
-            &text,
-            self.expected
-                .model
-                .query_max_tokens
-                .unwrap_or(self.expected.model.max_tokens),
-        )?)
+        Ok(self
+            .runtime
+            .embed_one_capped(&text, self.query_max_tokens())?)
+    }
+
+    /// The most tokens of a query the model sees: the sequence `embed_query`
+    /// embeds is cut there, special tokens included.
+    pub fn query_max_tokens(&self) -> usize {
+        self.expected
+            .model
+            .query_max_tokens
+            .unwrap_or(self.expected.model.max_tokens)
+    }
+
+    /// How long each of `texts` is as a query: the tokens of the sequence
+    /// `embed_query` would feed the model — normalized and marked as a query under
+    /// this set's recipes, special tokens included — before the cap
+    /// ([`Self::query_max_tokens`]) cuts it. A text with nothing left once normalized
+    /// counts 0; it is not a query at all.
+    ///
+    /// For a host that cuts a long passage into windows that each fit: a text whose count
+    /// is at most the cap is embedded whole.
+    ///
+    /// # Errors
+    ///
+    /// [`EmbeddingError::TokenizationUnsupported`](crate::errors::EmbeddingError) when the
+    /// loaded backend has no tokenizer to count with.
+    pub fn query_token_counts(
+        &self,
+        texts: &[&str],
+    ) -> Result<QueryTokenCounts, SemanticSearchError> {
+        let count = |input: &str| -> Result<u32, SemanticSearchError> {
+            match self.runtime.untruncated_token_count(input)? {
+                Some(count) => Ok(count.min(u32::MAX as usize) as u32),
+                None => Err(crate::errors::EmbeddingError::TokenizationUnsupported {
+                    backend: self.runtime.backend_id().unwrap_or("none").to_string(),
+                    reason: "the loaded backend reports no token counts".to_string(),
+                }
+                .into()),
+            }
+        };
+        let mut counts = Vec::with_capacity(texts.len());
+        for text in texts {
+            if self.normalization.apply(text).trim().is_empty() {
+                counts.push(0);
+                continue;
+            }
+            let input =
+                crate::semantic::recipe::query_input(self.text_recipe, self.normalization, text)?;
+            counts.push(count(&input)?);
+        }
+        Ok(QueryTokenCounts {
+            counts,
+            query_max_tokens: self.query_max_tokens().min(u32::MAX as usize) as u32,
+            overhead_tokens: count(&self.text_recipe.query_text(""))?,
+        })
+    }
+
+    /// The width of the set's vectors.
+    pub fn dim(&self) -> usize {
+        self.set.codec().dim()
+    }
+
+    /// Every record of `book` with the live slot that holds its vector: see
+    /// [`SegmentSet::book_slots`]. Slots of this index's [generation](Self::generation).
+    pub fn book_slots(&self, book: &str) -> Vec<StoredSlot> {
+        self.set.book_slots(book)
+    }
+
+    /// The vector each of `slots` holds, decoded as [`SegmentSet::decode_slot`] decodes
+    /// it; `None` for one that is not live in this index's generation or holds another key.
+    pub fn decode_slots(&self, slots: &[SlotRef]) -> Vec<Option<Vec<f32>>> {
+        let dim = self.dim();
+        slots
+            .iter()
+            .map(|slot| {
+                let mut vector = vec![0.0; dim];
+                self.set.decode_slot(slot, &mut vector).then_some(vector)
+            })
+            .collect()
+    }
+
+    /// The score each of `slots` has for each query vector, as a scan under
+    /// `window_penalty` gives it: see [`SegmentSet::score_slots_many`].
+    pub fn score_slots_many(
+        &self,
+        query_vectors: &[&[f32]],
+        slots: &[SlotRef],
+        window_penalty: f32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, SemanticSearchError> {
+        Ok(self
+            .set
+            .score_slots_many(query_vectors, slots, window_penalty, cancel)?)
     }
 
     /// Each text embedded as a stored passage is, under the recipe these vectors were built
@@ -676,6 +763,21 @@ impl OfficialSemanticIndex {
     pub fn book_count(&self) -> u32 {
         self.book_count
     }
+}
+
+/// Token counts for texts embedded as queries: see
+/// [`OfficialSemanticIndex::query_token_counts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryTokenCounts {
+    /// Each text's count as a query, special tokens and role prefix included; 0 for a
+    /// text with nothing to embed.
+    pub counts: Vec<u32>,
+    /// The cap the query sequence is cut at.
+    pub query_max_tokens: u32,
+    /// What an empty query counts: the role prefix and the special tokens. A text of `n`
+    /// tokens of its own counts about `n + overhead_tokens` — about, since a tokenizer may
+    /// join a prefix's last piece with a text's first.
+    pub overhead_tokens: u32,
 }
 
 fn count_books(set: &SegmentSet) -> u32 {
@@ -1023,6 +1125,44 @@ mod tests {
             .search(query, 1, None, &CancellationToken::new())
             .unwrap();
         assert_eq!(stored[0].key, ChunkKey::of(&format!("[PASSAGE] {query}")));
+    }
+
+    /// A text's length as a query is the length of what `embed_query` embeds: normalized,
+    /// marked with the role prefix, special tokens included. A text with nothing to embed
+    /// counts 0, and an empty query's count is what the prefix and the specials add. A
+    /// backend without a tokenizer refuses to count rather than guess.
+    #[test]
+    fn a_query_s_token_count_is_the_length_of_what_embed_query_embeds() {
+        let dir = TempDir::new("official_token_counts");
+        let model_path = mock::write_stub_onnx_package(&dir.join("model"));
+        let model = family(vec![package(&model_path, "int8")], 2);
+        let vectors = dir.join("vectors");
+        install(&dir, "v2", &vectors, &model_path, &model, 30);
+        let mut index =
+            OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap();
+
+        match index.query_token_counts(&[LINES[0].1]) {
+            Err(SemanticSearchError::EmbeddingRuntime(
+                EmbeddingError::TokenizationUnsupported { .. },
+            )) => {}
+            other => panic!("the stand-in has no tokenizer, got {other:?}"),
+        }
+
+        // A tokenizer that counts words, and 2 specials.
+        index.runtime = crate::distribution::testing::counting_runtime(&model_path, 512);
+        let texts = [LINES[0].1, "   ", "שלש מלים כאן"];
+        let counts = index.query_token_counts(&texts).unwrap();
+        let words = |text: &str| text.split_whitespace().count() as u32;
+        assert_eq!(
+            counts,
+            QueryTokenCounts {
+                // "[QUERY]", the text's words, and the specials.
+                counts: vec![1 + words(LINES[0].1) + 2, 0, 1 + 3 + 2],
+                query_max_tokens: 512,
+                overhead_tokens: 1 + 2,
+            }
+        );
+        assert_eq!(index.query_max_tokens(), 512);
     }
 
     /// Where this machine keeps the runtime is no part of what a set must agree with: the

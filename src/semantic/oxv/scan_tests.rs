@@ -1476,3 +1476,55 @@ fn a_batch_of_queries_is_checked_as_one_query_is() {
         Err(VectorStoreError::Cancelled),
     ));
 }
+
+/// What a host reads of a stored vector is what the scan scores: under every codec, the
+/// decoded vector dotted with the query is the slot's score, to within the rounding the scan
+/// applies to the query — so a host that decodes a book's vectors and compares them with a
+/// query vector ranks as a scan would.
+#[test]
+fn a_decoded_slot_dotted_with_the_query_is_its_score() {
+    for (seed, codec, tolerance) in [
+        (101u64, int8 as fn(&[&[f32]]) -> Codec, 5e-5f32),
+        (102, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap(), 1e-6),
+        (103, per_vector, 5e-5),
+        (104, rotated, 5e-5),
+    ] {
+        let fixture = Fixture::new(30, 40, seed, codec);
+        let segments = fixture.scan_segments();
+        let set = ScanSet {
+            segments: &segments,
+            reverse_links: &fixture.reverse,
+        };
+        let mut random = Random(seed + 7);
+        let mut worst = 0.0f32;
+        for _ in 0..4 {
+            let query_vector = random.unit(DIM);
+            let query = PreparedQuery::new(&query_vector, fixture.segments[0].codec()).unwrap();
+            let hits = scan(
+                &set,
+                &query,
+                &ScanRequest {
+                    top_k: usize::MAX >> 8,
+                    books: None,
+                    threads: 2,
+                    window_penalty: 0.0,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert!(!hits.is_empty());
+            let mut decoded = vec![0.0f32; DIM];
+            for hit in &hits {
+                let segment = &fixture.segments[hit.seg as usize];
+                segment.codec().decode(
+                    segment.vector(hit.slot),
+                    segment.vector_scale(hit.slot),
+                    &mut decoded,
+                );
+                let dot: f32 = decoded.iter().zip(&query_vector).map(|(a, b)| a * b).sum();
+                worst = worst.max((dot - hit.score).abs());
+            }
+        }
+        assert!(worst <= tolerance, "codec {seed}: off by {worst}");
+    }
+}
