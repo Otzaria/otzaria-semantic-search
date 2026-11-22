@@ -1391,6 +1391,91 @@ fn scored_slots_are_scored_as_a_full_scan_scores_them() {
     ));
 }
 
+#[test]
+fn only_the_full_scan_s_winning_copy_of_a_key_scores() {
+    let work = TempDir::new("set_score_duplicate_slots");
+    let dir = work.join("vectors");
+    let path = work.join("base.oxv");
+    let key = key(1);
+    let positive = vector_of(1);
+    let negative: Vec<f32> = positive.iter().map(|value| -*value).collect();
+    let books = [
+        TestBook {
+            name: "a".into(),
+            primary: vec![(key, 0, positive.clone())],
+            windows: vec![1],
+            ..TestBook::default()
+        },
+        TestBook {
+            name: "b".into(),
+            primary: vec![(key, 0, negative.clone())],
+            ..TestBook::default()
+        },
+        TestBook {
+            name: "c".into(),
+            primary: vec![(key, 0, positive.clone())],
+            ..TestBook::default()
+        },
+    ];
+    let mut base = spec(PackageKind::Base, 0, 29);
+    base.identity_digest = identity().identity_digest();
+    let written = write_segment(&path, base, codec(), &books, &[]);
+    let manifest = ReleaseManifest::for_segment(
+        &written,
+        &identity(),
+        codec().params_sha256(),
+        test_provenance(),
+        "2026-10-02T00:00:00Z".into(),
+    );
+    install(&dir, &(path, manifest.to_json())).unwrap();
+    let set = SegmentSet::open(&dir).unwrap();
+    let slots = ["a", "b", "c"].map(|name| set.book_slots(name)[0].slot);
+    let queries = [positive.as_slice(), negative.as_slice()];
+    let cancel = CancellationToken::new();
+
+    for (window_penalty, winners) in [(0.0, [0, 1]), (0.04, [2, 1])] {
+        let full = queries.map(|query| {
+            let hits = set
+                .scan(
+                    query,
+                    &ScanRequest {
+                        top_k: slots.len(),
+                        books: None,
+                        threads: 1,
+                        window_penalty,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            (hits[0].slot, hits[0].score.to_bits())
+        });
+        assert_eq!(full.map(|hit| hit.0), winners);
+        for requested in [
+            &[slots[2]][..],
+            &[slots[0]][..],
+            &[slots[1]][..],
+            &[slots[2], slots[1], slots[0], slots[2]][..],
+        ] {
+            let rows = set
+                .score_slots_many(&queries, requested, window_penalty, &cancel)
+                .unwrap();
+            for ((winner, expected), row) in full.into_iter().zip(rows) {
+                assert_eq!(
+                    row.into_iter()
+                        .map(|score| score.map(f32::to_bits))
+                        .collect::<Vec<_>>(),
+                    requested
+                        .iter()
+                        .map(|slot| (slot.slot == winner).then_some(expected))
+                        .collect::<Vec<_>>(),
+                    "penalty {window_penalty}, winner {winner}, requested {requested:?}"
+                );
+            }
+        }
+    }
+}
+
 /// v30 and one more line, a new key: what installs after v30 in the tests below.
 fn v31() -> Library {
     let mut v31 = v30();

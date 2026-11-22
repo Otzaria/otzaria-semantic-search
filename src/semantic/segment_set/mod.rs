@@ -54,7 +54,7 @@ use crate::semantic::oxv::kernel::PreparedQuery;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::scan;
 use crate::semantic::oxv::scan::{
-    Link, ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet,
+    DuplicateSlots, Link, ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet,
 };
 use crate::semantic::resolve::{SlotRef, VectorHit};
 use crate::semantic::versioning::{
@@ -155,6 +155,7 @@ pub struct SegmentSet {
     deleted: Vec<Deleted>,
     links: Vec<Vec<Link>>,
     reverse: Vec<ReverseLink>,
+    duplicate_slots: DuplicateSlots,
     info: SetInfo,
 }
 
@@ -342,6 +343,7 @@ impl SegmentSet {
             deleted,
             links,
             reverse,
+            duplicate_slots: DuplicateSlots::default(),
             info,
         })
     }
@@ -667,8 +669,8 @@ impl SegmentSet {
     /// generation or holds another key. A slot named twice scores the same both times; of
     /// two live slots that hold one key, only the one a scan would return scores.
     ///
-    /// Reads `slots` alone, not the set: each query weighs them as [`Self::scan_with`]
-    /// weighs its `also` beside a filter that admits no book.
+    /// Scores the requested vectors and any live copies of their keys. The first call
+    /// with a live requested slot indexes duplicate keys for this open generation.
     pub fn score_slots_many(
         &self,
         queries: &[&[f32]],
@@ -676,36 +678,20 @@ impl SegmentSet {
         window_penalty: f32,
         cancel: &CancellationToken,
     ) -> Result<Vec<Vec<Option<f32>>>, VectorStoreError> {
-        use crate::semantic::chunk_key::ChunkKey;
-        use std::collections::HashMap;
-        let nothing = crate::semantic::resolve::BookSet::default();
-        let request = ScanRequest {
-            top_k: slots.len().max(1),
-            books: Some(&nothing),
-            threads: 1,
-            window_penalty,
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
         };
-        let mut rows = Vec::with_capacity(queries.len());
-        for query in queries {
-            cancel.check_scan_cancelled()?;
-            let scores: HashMap<(u16, u32), (ChunkKey, f32)> = self
-                .scan_with(query, &request, slots, cancel)?
-                .into_iter()
-                .map(|hit| ((hit.seg, hit.slot), (hit.key, hit.score)))
-                .collect();
-            rows.push(
-                slots
-                    .iter()
-                    .map(|slot| {
-                        scores
-                            .get(&(slot.seg, slot.slot))
-                            .filter(|(key, _)| key.same_text(slot.key))
-                            .map(|(_, score)| *score)
-                    })
-                    .collect(),
-            );
-        }
-        Ok(rows)
+        scan::score_slots_many(
+            &set,
+            self.codec(),
+            &self.duplicate_slots,
+            queries,
+            slots,
+            window_penalty,
+            cancel,
+        )
     }
 
     pub fn info(&self) -> &SetInfo {

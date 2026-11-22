@@ -855,7 +855,7 @@ impl HybridCoordinator {
 
     /// The score each of `slots` has for each query vector, as a scan under
     /// `window_penalty` gives it, one row per query; `None` as [`Self::decode_slots`]
-    /// gives it, and for a key another of `slots` already holds.
+    /// gives it, and for a duplicate slot that loses to another live copy of its key.
     pub fn score_slots_many(
         &self,
         query_vectors: &[&[f32]],
