@@ -64,6 +64,9 @@ use files::{
     corrupted, decode_links, generation_dir, io_error, read_generation, read_pointer, Deleted,
     Pointer, SetDocument, SetLock, CURRENT, INCOMING_DIR, PREVIOUS, SEGMENTS_DIR, STAGING_DIR,
 };
+/// For tests elsewhere in the crate that play the application beside a reader.
+#[cfg(test)]
+pub(crate) use files::{SetLock as TestSetLock, STAGING_DIR as TEST_STAGING_DIR};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
