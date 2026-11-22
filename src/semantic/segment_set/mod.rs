@@ -54,7 +54,7 @@ use crate::semantic::oxv::kernel::PreparedQuery;
 use crate::semantic::oxv::reader::Segment;
 use crate::semantic::oxv::scan;
 use crate::semantic::oxv::scan::{
-    Link, ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet,
+    DuplicateSlots, Link, ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet,
 };
 use crate::semantic::resolve::{SlotRef, VectorHit};
 use crate::semantic::versioning::{
@@ -128,6 +128,22 @@ pub struct ScrubReport {
     pub superseded: bool,
 }
 
+/// One record of a book and the live slot that holds its key's vector: see
+/// [`SegmentSet::book_slots`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSlot {
+    pub slot: SlotRef,
+    /// The line's ordinal in the book when the vectors were built, as
+    /// [`RecordRef::hint`](crate::semantic::resolve::RecordRef::hint).
+    pub hint: u32,
+    /// The record's role: the window of its line,
+    /// [`ALIAS_WINDOW`](crate::semantic::oxv::occurrence::ALIAS_WINDOW) for a short line that
+    /// shares a neighbour's vector.
+    pub window: u8,
+    /// The first-window key of the record's line, when the producer recorded it.
+    pub anchor: Option<crate::semantic::chunk_key::ChunkKey>,
+}
+
 /// One generation of a set, open for scans: its segments mapped, their derived files in
 /// memory.
 pub struct SegmentSet {
@@ -139,6 +155,7 @@ pub struct SegmentSet {
     deleted: Vec<Deleted>,
     links: Vec<Vec<Link>>,
     reverse: Vec<ReverseLink>,
+    duplicate_slots: DuplicateSlots,
     info: SetInfo,
 }
 
@@ -326,6 +343,7 @@ impl SegmentSet {
             deleted,
             links,
             reverse,
+            duplicate_slots: DuplicateSlots::default(),
             info,
         })
     }
@@ -561,6 +579,119 @@ impl SegmentSet {
                 .then(a.anchor.cmp(&b.anchor))
         });
         out.dedup();
+    }
+
+    /// Every record of book `name` in this generation, as [`Self::book_occurrences`] lists
+    /// them, each with the live slot that holds its key's vector: what a host reads to know
+    /// a book's vectors without scanning for them. In the order of `book_occurrences` —
+    /// hint, then key, window and anchor.
+    ///
+    /// A key's slot is the one this book's own entries reach in some segment: a primary
+    /// slot, an extra record's slot, or the target of a foreign record's link. A record
+    /// whose key none of them reaches live — which a sound generation does not hold — is
+    /// left out.
+    pub fn book_slots(&self, name: &str) -> Vec<StoredSlot> {
+        use crate::semantic::chunk_key::ChunkKey;
+        use std::collections::HashMap;
+        let mut located: HashMap<ChunkKey, SlotRef> = HashMap::new();
+        for (seg, segment) in self.segments.iter().enumerate() {
+            let seg = seg as u16;
+            let Ok(index) = segment
+                .books()
+                .binary_search_by(|book| book.name.as_ref().cmp(name))
+            else {
+                continue;
+            };
+            let book = &segment.books()[index];
+            let mut locate = |key, seg, slot| {
+                if self.is_live(seg, slot) {
+                    located.insert(key, SlotRef { seg, slot, key });
+                }
+            };
+            for slot in book.slots.clone() {
+                locate(segment.key(slot), seg, slot);
+            }
+            for extra in book.extras.clone() {
+                let (slot, _) = segment.extra(extra);
+                locate(segment.key(slot), seg, slot);
+            }
+            for foreign in book.foreign.clone() {
+                let (key, _, _) = segment.foreign_record(foreign);
+                if let Some((target_seg, target_slot)) = self.links[seg as usize]
+                    .get(foreign as usize)
+                    .and_then(|link| link.target())
+                {
+                    locate(key, target_seg, target_slot);
+                }
+            }
+        }
+        let mut records = Vec::new();
+        self.book_occurrences(name, &mut records);
+        records
+            .into_iter()
+            .filter_map(|(key, record)| {
+                located.get(&key).map(|slot| StoredSlot {
+                    slot: *slot,
+                    hint: record.hint,
+                    window: record.window,
+                    anchor: record.anchor,
+                })
+            })
+            .collect()
+    }
+
+    /// The vector `slot` holds, as its segment's codec decodes it ([`Codec::decode`]), into
+    /// `out`, which must be the set's width; `false`, leaving `out` as it was, for a slot
+    /// that is not live in this generation or holds another key.
+    ///
+    /// The reconstruction the scan scores, not a renormalized vector: its dot product with a
+    /// unit query is the score a scan gives the slot before any penalty, to within the
+    /// rounding the scan applies to the query.
+    pub fn decode_slot(&self, slot: &SlotRef, out: &mut [f32]) -> bool {
+        if !self.is_live(slot.seg, slot.slot) {
+            return false;
+        }
+        let segment = &self.segments[slot.seg as usize];
+        if !segment.key(slot.slot).same_text(slot.key) {
+            return false;
+        }
+        segment.codec().decode(
+            segment.vector(slot.slot),
+            segment.vector_scale(slot.slot),
+            out,
+        );
+        true
+    }
+
+    /// The score each of `slots` has for each of `queries`, as a full scan gives it — the
+    /// window and alias penalties under `window_penalty` included — in the order given:
+    /// one row per query, one entry per slot. `None` for a slot that is not live in this
+    /// generation or holds another key. A slot named twice scores the same both times; of
+    /// two live slots that hold one key, only the one a scan would return scores.
+    ///
+    /// Scores the requested vectors and any live copies of their keys. The first call
+    /// with a live requested slot indexes duplicate keys for this open generation.
+    pub fn score_slots_many(
+        &self,
+        queries: &[&[f32]],
+        slots: &[SlotRef],
+        window_penalty: f32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, VectorStoreError> {
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::score_slots_many(
+            &set,
+            self.codec(),
+            &self.duplicate_slots,
+            queries,
+            slots,
+            window_penalty,
+            cancel,
+        )
     }
 
     pub fn info(&self) -> &SetInfo {

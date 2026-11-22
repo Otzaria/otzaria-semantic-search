@@ -5,9 +5,9 @@ use super::codec::Codec;
 use super::kernel::{dot_f32, nibbles_scalar, select, PreparedQuery};
 use super::reader::Segment;
 use super::scan::{
-    queries_per_pass, scan, scan_many, scan_reporting, scan_with, scan_with_penalties, Link,
-    ReverseLink, ScanPenalties, ScanRequest, ScanSegment, ScanSet, LINK_UNRESOLVED,
-    MIN_SLOTS_PER_THREAD, QUERIES_PER_PASS,
+    queries_per_pass, scan, scan_many, scan_reporting, scan_with, scan_with_penalties,
+    score_slots_many, DuplicateSlots, Link, ReverseLink, ScanPenalties, ScanRequest, ScanSegment,
+    ScanSet, LINK_UNRESOLVED, MIN_SLOTS_PER_THREAD, QUERIES_PER_PASS,
 };
 use super::testing::{key, random_books, spec, write_segment, Random, TempDir, TestBook};
 use crate::cancellation::{probe, CancellationToken, SCAN_CHECK_INTERVAL};
@@ -1475,4 +1475,127 @@ fn a_batch_of_queries_is_checked_as_one_query_is() {
         super::scan::scan_segments_many(&[&fixture.segments[0]], &[&[]], &request, &cancel),
         Err(VectorStoreError::Cancelled),
     ));
+}
+
+#[test]
+fn direct_slot_scores_match_the_full_scan_across_codecs_and_segments() {
+    let dir = TempDir::new("direct_slot_scores");
+    let cancel = CancellationToken::new();
+    for (seed, codec) in [
+        (111u64, int8 as fn(&[&[f32]]) -> Codec),
+        (112, per_vector),
+        (113, rotated),
+        (114, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap()),
+    ] {
+        let [windowed, plain] = windowed_pair(&dir, seed, codec);
+        let views = [
+            ScanSegment {
+                segment: &windowed,
+                deleted: &[1 << 1],
+                links: &[],
+            },
+            ScanSegment {
+                segment: &plain,
+                deleted: &[1],
+                links: &[],
+            },
+        ];
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &[],
+        };
+        let slots =
+            [(1, 0), (0, 1), (0, 0), (1, 1), (0, 4), (1, 7), (0, 5)].map(|(seg, slot)| SlotRef {
+                seg,
+                slot,
+                key: views[seg as usize].segment.key(slot),
+            });
+        // Key 4 has a windowed copy requested and a better plain copy outside the request.
+        let mut random = Random(seed * 5);
+        let queries = [random.unit(DIM), random.unit(DIM)];
+        let queries = queries.each_ref().map(Vec::as_slice);
+        let codec = windowed.codec();
+        let duplicates = DuplicateSlots::default();
+        for window_penalty in [0.0, 0.04] {
+            let request = ScanRequest {
+                top_k: 2400,
+                books: None,
+                threads: 1,
+                window_penalty,
+            };
+            let rows = score_slots_many(
+                &set,
+                codec,
+                &duplicates,
+                &queries,
+                &slots,
+                window_penalty,
+                &cancel,
+            )
+            .unwrap();
+            for (query, row) in queries.iter().zip(rows) {
+                let query = PreparedQuery::new(query, codec).unwrap();
+                let hits = scan(&set, &query, &request, &cancel).unwrap();
+                for (slot, score) in slots.iter().zip(row) {
+                    let expected = hits
+                        .iter()
+                        .find(|hit| (hit.seg, hit.slot) == (slot.seg, slot.slot))
+                        .map(|hit| hit.score.to_bits());
+                    assert_eq!(score.map(f32::to_bits), expected, "{seed}, {slot:?}");
+                }
+            }
+        }
+    }
+}
+
+/// What a host reads of a stored vector is what the scan scores: under every codec, the
+/// decoded vector dotted with the query is the slot's score, to within the rounding the scan
+/// applies to the query — so a host that decodes a book's vectors and compares them with a
+/// query vector ranks as a scan would.
+#[test]
+fn a_decoded_slot_dotted_with_the_query_is_its_score() {
+    for (seed, codec, tolerance) in [
+        (101u64, int8 as fn(&[&[f32]]) -> Codec, 5e-5f32),
+        (102, |v: &[&[f32]]| Codec::f32(v[0].len()).unwrap(), 1e-6),
+        (103, per_vector, 5e-5),
+        (104, rotated, 5e-5),
+    ] {
+        let fixture = Fixture::new(30, 40, seed, codec);
+        let segments = fixture.scan_segments();
+        let set = ScanSet {
+            segments: &segments,
+            reverse_links: &fixture.reverse,
+        };
+        let mut random = Random(seed + 7);
+        let mut worst = 0.0f32;
+        for _ in 0..4 {
+            let query_vector = random.unit(DIM);
+            let query = PreparedQuery::new(&query_vector, fixture.segments[0].codec()).unwrap();
+            let hits = scan(
+                &set,
+                &query,
+                &ScanRequest {
+                    top_k: usize::MAX >> 8,
+                    books: None,
+                    threads: 2,
+                    window_penalty: 0.0,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert!(!hits.is_empty());
+            let mut decoded = vec![0.0f32; DIM];
+            for hit in &hits {
+                let segment = &fixture.segments[hit.seg as usize];
+                segment.codec().decode(
+                    segment.vector(hit.slot),
+                    segment.vector_scale(hit.slot),
+                    &mut decoded,
+                );
+                let dot: f32 = decoded.iter().zip(&query_vector).map(|(a, b)| a * b).sum();
+                worst = worst.max((dot - hit.score).abs());
+            }
+        }
+        assert!(worst <= tolerance, "codec {seed}: off by {worst}");
+    }
 }

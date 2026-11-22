@@ -34,11 +34,13 @@ use crate::hybrid::ranking::{
     QueryFeatures,
 };
 use crate::semantic::engine::SemanticEngine;
-use crate::semantic::official_index::{OfficialSemanticIndex, ReloadOutcome};
+use crate::semantic::official_index::{OfficialSemanticIndex, QueryTokenCounts, ReloadOutcome};
 use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
 use crate::semantic::oxv::scan::ScanPenalties;
-use crate::semantic::resolve::{CandidateResolver, NoResolver, ResolvedLine, VectorHit};
-use crate::semantic::segment_set::SetInfo;
+use crate::semantic::resolve::{
+    BookSet, CandidateResolver, NoResolver, ResolvedLine, SlotRef, VectorHit,
+};
+use crate::semantic::segment_set::{SetInfo, StoredSlot};
 use crate::semantic::types::{
     is_foundational, BookForIndexing, FusedCandidate, GroupingMode, HybridMergedSibling,
     HybridResultItem, HybridSearchResult, IndexDiff, IndexingSummary, LexicalCandidate,
@@ -117,6 +119,22 @@ impl Default for HybridSearchParams {
             ranking: None,
         }
     }
+}
+
+/// The hits of [`HybridCoordinator::vector_hits_many`]: one list per query vector, in
+/// input order, and the generation of the set their `(seg, slot)` index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorHitsMany {
+    pub generation: u64,
+    pub per_query: Vec<Vec<VectorHit>>,
+}
+
+/// A book's records and their slots, from [`HybridCoordinator::book_slots`], and the
+/// generation the slots belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookSlots {
+    pub generation: u64,
+    pub slots: Vec<StoredSlot>,
 }
 
 /// Which semantic path a coordinator is serving.
@@ -747,6 +765,130 @@ impl HybridCoordinator {
             .as_ref()
             .ok_or_else(no_semantic_index)?
             .embed_passages(texts, cancel)
+    }
+
+    /// Each query's vector as [`Self::embed_query_cached`] gives it, in order: what a host
+    /// that searches with several texts at once — the windows of a long passage — embeds
+    /// before [`Self::vector_hits_many`].
+    pub fn embed_queries(
+        &self,
+        queries: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<f32>>, SemanticSearchError> {
+        queries
+            .iter()
+            .map(|query| self.embed_query_cached(query, cancel))
+            .collect()
+    }
+
+    /// How long each of `texts` is as a query, normalized as [`Self::embed_query_cached`]
+    /// normalizes it: see [`OfficialSemanticIndex::query_token_counts`].
+    pub fn query_token_counts(
+        &self,
+        texts: &[&str],
+    ) -> Result<QueryTokenCounts, SemanticSearchError> {
+        let normalized: Vec<String> = texts
+            .iter()
+            .map(|text| self.normalizer.normalize(text))
+            .collect();
+        let normalized: Vec<&str> = normalized.iter().map(String::as_str).collect();
+        self.with_official("query_token_counts", |index| {
+            index.query_token_counts(&normalized)
+        })
+    }
+
+    /// The `top_k` hits of each query vector in one pass over the official vector set, as
+    /// [`OfficialSemanticIndex::search_hits_many`] finds them under `window_penalty`
+    /// ([`DEFAULT_WINDOW_PENALTY`](crate::config::profiles::DEFAULT_WINDOW_PENALTY) is a
+    /// search's), with the generation their slots belong to.
+    pub fn vector_hits_many(
+        &self,
+        query_vectors: &[&[f32]],
+        top_k: usize,
+        books: Option<&BookSet>,
+        window_penalty: f32,
+        cancel: &CancellationToken,
+    ) -> Result<VectorHitsMany, SemanticSearchError> {
+        cancel.checkpoint()?;
+        self.with_official("vector_hits_many", |index| {
+            Ok(VectorHitsMany {
+                generation: index.generation(),
+                per_query: index.search_hits_many(
+                    query_vectors,
+                    top_k,
+                    books,
+                    window_penalty,
+                    cancel,
+                )?,
+            })
+        })
+    }
+
+    /// Every record of `book` with the live slot that holds its vector, in the open
+    /// generation: see [`SegmentSet::book_slots`](crate::semantic::segment_set::SegmentSet::book_slots).
+    pub fn book_slots(&self, book: &str) -> Result<BookSlots, SemanticSearchError> {
+        self.with_official("book_slots", |index| {
+            Ok(BookSlots {
+                generation: index.generation(),
+                slots: index.book_slots(book),
+            })
+        })
+    }
+
+    /// The vector each of `slots` holds, as the codec decodes it; `None` for a slot that is
+    /// not live, holds another key, or — every one of them — when `generation` is no longer
+    /// the open one, since its slots may now be other vectors' or none. A host that gets
+    /// those reads [`Self::book_slots`] again.
+    pub fn decode_slots(
+        &self,
+        slots: &[SlotRef],
+        generation: u64,
+    ) -> Result<Vec<Option<Vec<f32>>>, SemanticSearchError> {
+        self.with_official("decode_slots", |index| {
+            Ok(if index.generation() == generation {
+                index.decode_slots(slots)
+            } else {
+                vec![None; slots.len()]
+            })
+        })
+    }
+
+    /// The score each of `slots` has for each query vector, as a scan under
+    /// `window_penalty` gives it, one row per query; `None` as [`Self::decode_slots`]
+    /// gives it, and for a duplicate slot that loses to another live copy of its key.
+    pub fn score_slots_many(
+        &self,
+        query_vectors: &[&[f32]],
+        slots: &[SlotRef],
+        generation: u64,
+        window_penalty: f32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, SemanticSearchError> {
+        cancel.checkpoint()?;
+        self.with_official("score_slots_many", |index| {
+            if index.generation() != generation {
+                return Ok(vec![vec![None; slots.len()]; query_vectors.len()]);
+            }
+            index.score_slots_many(query_vectors, slots, window_penalty, cancel)
+        })
+    }
+
+    /// `read` with the official index, under the read lock; a configuration error naming
+    /// `operation` for a self-built index, which has no vector set to read.
+    fn with_official<T>(
+        &self,
+        operation: &str,
+        read: impl FnOnce(&OfficialSemanticIndex) -> Result<T, SemanticSearchError>,
+    ) -> Result<T, SemanticSearchError> {
+        let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            None => Err(no_semantic_index()),
+            Some(SemanticSide::SelfBuilt(_)) => Err(SemanticSearchError::Config(format!(
+                "{operation} reads an official vector set, and this coordinator serves a \
+                 self-built index"
+            ))),
+            Some(SemanticSide::Official(index)) => read(index),
+        }
     }
 
     /// What every search computes before it looks anything up.

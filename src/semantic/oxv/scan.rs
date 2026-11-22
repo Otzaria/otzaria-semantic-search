@@ -35,6 +35,9 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::AtomicUsize;
 
+mod slot_scores;
+pub(crate) use slot_scores::{score_slots_many, DuplicateSlots};
+
 /// Below this many slots a share is not worth a thread of its own.
 pub(super) const MIN_SLOTS_PER_THREAD: usize = 4096;
 
@@ -330,54 +333,23 @@ fn scan_all(
     let shares = work.split(threads);
     let config = ScanConfig { request, penalties };
 
-    match query {
-        PreparedQuery::Int8 { q16, inv_scale } => {
-            let (kernel, _) = select();
-            let scorer = Int8 {
-                q16,
-                inv_scale: *inv_scale,
-                kernel,
-            };
+    match QueryScorer::new(query) {
+        QueryScorer::Int8(scorer) => {
             let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
             let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
             Ok(hits(set, found, request, penalties, &scorer))
         }
-        PreparedQuery::Int8PerVector { q16, inv_scale } => {
-            let (kernel, _) = select();
-            let scorer = Int8PerVector {
-                q16,
-                inv_scale: *inv_scale,
-                kernel,
-            };
+        QueryScorer::Int8PerVector(scorer) => {
             let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
             let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
             Ok(hits(set, found, request, penalties, &scorer))
         }
-        PreparedQuery::Rotated {
-            head,
-            inv_head,
-            tail_lo,
-            tail_hi,
-            inv_tail,
-            constant,
-            ..
-        } => {
-            let scorer = Rotated {
-                head,
-                inv_head: *inv_head,
-                tail_lo,
-                tail_hi,
-                inv_tail: *inv_tail,
-                constant: *constant,
-                dot: select().0,
-                nibbles: select_nibbles().0,
-            };
+        QueryScorer::Rotated(scorer) => {
             let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
             let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
             Ok(hits(set, found, request, penalties, &scorer))
         }
-        PreparedQuery::Float { q } => {
-            let scorer = Float { q };
+        QueryScorer::Float(scorer) => {
             let found = run_shares(set, &scorer, config, top_k, &shares, cancel, progress)?;
             let found = merge_also(set, &scorer, request, penalties, found, also, cancel)?;
             Ok(hits(set, found, request, penalties, &scorer))
@@ -389,16 +361,8 @@ fn check_penalties(
     request: &ScanRequest<'_>,
     penalties: ScanPenalties,
 ) -> Result<(), VectorStoreError> {
-    if !request.window_penalty.is_finite() || request.window_penalty < 0.0 {
-        return Err(VectorStoreError::SearchFailed {
-            reason: "window penalty must be finite and nonnegative".to_string(),
-        });
-    }
-    if !penalties.window.is_finite() || penalties.window < 0.0 {
-        return Err(VectorStoreError::SearchFailed {
-            reason: "window penalty must be finite and nonnegative".to_string(),
-        });
-    }
+    check_window_penalty(request.window_penalty)?;
+    check_window_penalty(penalties.window)?;
     if penalties.window != request.window_penalty {
         return Err(VectorStoreError::SearchFailed {
             reason: "scan penalties must match the request's window penalty".to_string(),
@@ -407,6 +371,15 @@ fn check_penalties(
     if !penalties.alias.is_finite() || penalties.alias < 0.0 {
         return Err(VectorStoreError::SearchFailed {
             reason: "alias penalty must be finite and nonnegative".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn check_window_penalty(window_penalty: f32) -> Result<(), VectorStoreError> {
+    if !window_penalty.is_finite() || window_penalty < 0.0 {
+        return Err(VectorStoreError::SearchFailed {
+            reason: "window penalty must be finite and nonnegative".to_string(),
         });
     }
     Ok(())
@@ -590,6 +563,50 @@ pub(crate) fn scan_many(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             finish(set, &scorers, config, top_k, group_size, &shares, cancel)
+        }
+    }
+}
+
+/// Select the scan kernel once for a single query.
+enum QueryScorer<'a> {
+    Int8(Int8<'a>),
+    Int8PerVector(Int8PerVector<'a>),
+    Rotated(Rotated<'a>),
+    Float(Float<'a>),
+}
+
+impl<'a> QueryScorer<'a> {
+    fn new(query: &'a PreparedQuery) -> Self {
+        match query {
+            PreparedQuery::Int8 { q16, inv_scale } => Self::Int8(Int8 {
+                q16,
+                inv_scale: *inv_scale,
+                kernel: select().0,
+            }),
+            PreparedQuery::Int8PerVector { q16, inv_scale } => Self::Int8PerVector(Int8PerVector {
+                q16,
+                inv_scale: *inv_scale,
+                kernel: select().0,
+            }),
+            PreparedQuery::Rotated {
+                head,
+                inv_head,
+                tail_lo,
+                tail_hi,
+                inv_tail,
+                constant,
+                ..
+            } => Self::Rotated(Rotated {
+                head,
+                inv_head: *inv_head,
+                tail_lo,
+                tail_hi,
+                inv_tail: *inv_tail,
+                constant: *constant,
+                dot: select().0,
+                nibbles: select_nibbles().0,
+            }),
+            PreparedQuery::Float { q } => Self::Float(Float { q }),
         }
     }
 }
