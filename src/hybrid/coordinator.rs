@@ -104,6 +104,11 @@ pub struct HybridSearchParams {
     /// `None`, the default, ranks by the preset exactly as before. The defaults are
     /// unmeasured placeholders: [`RankingProfile`] says what calibrating them needs.
     pub ranking: Option<RankingProfile>,
+    /// The vector the semantic half searches with, in place of the query's embedding: what a
+    /// host that moved the query, toward results a user marked relevant for one, passes. The
+    /// text still decides the lexical half and the query type; neither cache is read or
+    /// written for such a search. `None`, the default, embeds the query.
+    pub query_vector: Option<Vec<f32>>,
 }
 
 impl Default for HybridSearchParams {
@@ -117,6 +122,7 @@ impl Default for HybridSearchParams {
             profile: None,
             feature_flags: None,
             ranking: None,
+            query_vector: None,
         }
     }
 }
@@ -605,7 +611,9 @@ impl HybridCoordinator {
         // very short queries. Empty queries cannot be embedded and will always
         // degrade to lexical-only; caching that would poison future lookups.
         // Single-character queries from live typing are almost never reused.
+        // A supplied vector is not in the key: its results are not the query's.
         let cacheable = setup.ranking_profile.query_cache_enabled
+            && params.query_vector.is_none()
             && setup.normalized_query.chars().count() >= MIN_CACHEABLE_QUERY_LEN;
         setup.telemetry.cache_lookup = cacheable;
 
@@ -973,11 +981,14 @@ impl HybridCoordinator {
                 None => SemanticOutcome::failed("no semantic index is configured".to_string()),
                 Some(side) => {
                     let embedding_start = std::time::Instant::now();
-                    let cached_vector = setup
-                        .ranking_profile
-                        .embedding_cache_enabled
-                        .then(|| self.embedding_cache.get(&setup.normalized_query))
-                        .flatten();
+                    let cached_vector = match &params.query_vector {
+                        Some(vector) => Some(vector.clone()),
+                        None => setup
+                            .ranking_profile
+                            .embedding_cache_enabled
+                            .then(|| self.embedding_cache.get(&setup.normalized_query))
+                            .flatten(),
+                    };
 
                     let query_vector = match cached_vector {
                         Some(vector) => Ok(vector),
@@ -4509,6 +4520,43 @@ mod tests {
             Err(SemanticSearchError::Cancelled)
         ));
         assert_eq!(coordinator.embedding_cache_stats().size, 0);
+    }
+
+    /// A supplied vector is what the semantic half searches with, and the query's text is
+    /// neither embedded nor cached on its behalf: the same text searched plainly is unchanged.
+    #[test]
+    fn a_supplied_query_vector_is_searched_in_place_of_the_query() {
+        let dir = TempDir::new("query_vector");
+        let coordinator = indexed_coordinator(&dir);
+        let cancel = CancellationToken::new();
+        let line_two = coordinator
+            .embed_passages(&[LINE_TWO], &cancel)
+            .unwrap()
+            .remove(0);
+        let semantic_only = HybridSearchParams {
+            force_mode: Some(SearchMode::SemanticOnly),
+            ..Default::default()
+        };
+        let moved = HybridSearchParams {
+            query_vector: Some(line_two),
+            ..semantic_only.clone()
+        };
+
+        let result = coordinator.search(LINE_ONE, Vec::new(), &moved).unwrap();
+        assert_eq!(result.results[0].id, 2);
+        let prepared = coordinator
+            .prepare_semantic(LINE_ONE, &moved, &NoResolver, &cancel)
+            .unwrap();
+        let split = coordinator
+            .fuse_prepared(Vec::new(), prepared, &moved, &cancel)
+            .unwrap();
+        assert_eq!(split.results[0].id, 2);
+        assert_eq!(coordinator.embedding_cache_stats().size, 0);
+
+        let plain = coordinator
+            .search(LINE_ONE, Vec::new(), &semantic_only)
+            .unwrap();
+        assert_eq!(plain.results[0].id, 1);
     }
 
     /// A passage embedded through the coordinator is the vector its line was stored with, and

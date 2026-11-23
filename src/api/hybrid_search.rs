@@ -123,6 +123,7 @@ impl OtzariaHybridEngine {
             profile: request.profile,
             feature_flags: request.feature_flags,
             ranking: request.ranking,
+            query_vector: None,
         };
 
         // The facade serves a self-built index, which resolves its own hits.
