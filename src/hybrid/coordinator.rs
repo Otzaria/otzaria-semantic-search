@@ -24,7 +24,7 @@
 use crate::cancellation::CancellationToken;
 use crate::config::feature_flags::FeatureFlags;
 use crate::config::profiles::{FusionStrategy, RankingProfile, SearchProfile};
-use crate::errors::SemanticSearchError;
+use crate::errors::{SemanticSearchError, VectorStoreError};
 use crate::hybrid::fusion::{
     best_first, normalize_bm25_adaptive, normalize_bm25_scores, normalize_semantic_with_threshold,
 };
@@ -33,6 +33,7 @@ use crate::hybrid::ranking::{
     analyze_query, compute_alpha_with, compute_phrase_match_bonus, compute_rare_term_bonus,
     QueryFeatures,
 };
+use crate::semantic::embedding::MIN_VECTOR_NORM;
 use crate::semantic::engine::SemanticEngine;
 use crate::semantic::official_index::{OfficialSemanticIndex, QueryTokenCounts, ReloadOutcome};
 use crate::semantic::oxv::occurrence::ALIAS_WINDOW;
@@ -49,6 +50,7 @@ use crate::semantic::types::{
 };
 use crate::telemetry::SearchTelemetry;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
 
@@ -104,10 +106,14 @@ pub struct HybridSearchParams {
     /// `None`, the default, ranks by the preset exactly as before. The defaults are
     /// unmeasured placeholders: [`RankingProfile`] says what calibrating them needs.
     pub ranking: Option<RankingProfile>,
-    /// The vector the semantic half searches with, in place of the query's embedding: what a
-    /// host that moved the query, toward results a user marked relevant for one, passes. The
-    /// text still decides the lexical half and the query type; neither cache is read or
-    /// written for such a search. `None`, the default, embeds the query.
+    /// A vector in the index model's embedding space, used in place of the query's embedding.
+    /// The text still determines lexical matching and the query type. A search with this
+    /// field set bypasses both caches.
+    ///
+    /// When the semantic half runs, the vector must match the index's dimension, contain
+    /// finite values, and have a norm above 1e-12. It is normalized for cosine scoring.
+    /// Invalid vectors follow the usual semantic failure path and report a
+    /// [`HybridSearchResult::fallback_reason`]. `None` uses the query text's embedding.
     pub query_vector: Option<Vec<f32>>,
 }
 
@@ -183,6 +189,55 @@ impl SemanticSide {
             Self::SelfBuilt(engine) => engine.embed_query(query),
             Self::Official(index) => index.embed_query(query),
         }
+    }
+
+    fn prepare_supplied_vector<'a>(
+        &self,
+        vector: &'a [f32],
+    ) -> Result<Cow<'a, [f32]>, SemanticSearchError> {
+        let dim = match self {
+            Self::SelfBuilt(engine) => engine.config().embedding_dim,
+            Self::Official(index) => index.identity().model.embedding_dim,
+        };
+        if vector.len() != dim as usize {
+            return Err(VectorStoreError::DimensionMismatch {
+                store_dim: dim,
+                vector_dim: u32::try_from(vector.len()).unwrap_or(u32::MAX),
+            }
+            .into());
+        }
+
+        // Accumulate in f64 so squaring finite f32 components cannot overflow.
+        let mut squared_norm = 0.0;
+        for (index, &component) in vector.iter().enumerate() {
+            if !component.is_finite() {
+                return Err(VectorStoreError::SearchFailed {
+                    reason: format!("supplied query vector component {index} is not finite"),
+                }
+                .into());
+            }
+            let component = f64::from(component);
+            squared_norm += component * component;
+        }
+        let norm = squared_norm.sqrt();
+        if norm <= f64::from(MIN_VECTOR_NORM) {
+            return Err(VectorStoreError::SearchFailed {
+                reason: "supplied query vector has no usable direction".to_string(),
+            }
+            .into());
+        }
+
+        let scale = norm.recip();
+        // A scale of one to f32 precision needs no allocation or copy.
+        if scale as f32 == 1.0 {
+            return Ok(Cow::Borrowed(vector));
+        }
+        Ok(Cow::Owned(
+            vector
+                .iter()
+                .map(|&component| (f64::from(component) * scale) as f32)
+                .collect(),
+        ))
     }
 
     fn embed_passages(
@@ -625,55 +680,55 @@ impl HybridCoordinator {
         // Hashing them prevents a cache hit after Tantivy produced a new window — and the
         // two generations, one after an index commit or a vector set reload: a
         // semantic-only search has no lexical input to change with them.
-        let inputs_hash = hash_search_inputs(
-            &params.filters,
-            &lexical_candidates,
-            &setup.ranking_profile,
-            &params.feature_flags,
-            [
-                resolver.generation(),
-                semantic_guard
-                    .as_ref()
-                    .map_or(0, SemanticSide::vectors_generation),
-            ],
-        );
-        let cache_key = crate::hybrid::cache::QueryCache::compute_key(
-            query,
-            inputs_hash,
-            &setup.requested.to_string(),
-            &format!("{:?}", params.grouping),
-            params.limit,
-            params.offset,
-        );
-        if cacheable {
-            if let Some(mut cached_result) = self.query_cache.get(cache_key) {
-                let mut telemetry_record = setup.telemetry;
-                let latency_ms = setup.started.elapsed().as_millis() as u64;
-                cached_result.latency_ms = latency_ms;
-                telemetry_record.cache_hit = true;
-                telemetry_record.search_mode = cached_result.search_mode.to_string();
-                if cached_result.search_mode != SearchMode::Hybrid {
-                    telemetry_record.fusion_strategy = "SingleSource".to_string();
-                }
-                telemetry_record.semantic_candidates = cached_result
-                    .telemetry
-                    .as_ref()
-                    .map_or(0, |record| record.semantic_candidates);
-                telemetry_record.fused_candidates = cached_result
-                    .telemetry
-                    .as_ref()
-                    .map_or(cached_result.total_count, |record| record.fused_candidates);
-                telemetry_record.latency_ms = latency_ms;
-                telemetry_record.confidence = cached_result.confidence;
-
-                if setup.ranking_profile.telemetry_enabled {
-                    self.telemetry.record_search(&telemetry_record);
-                }
-                cached_result.telemetry = (setup.ranking_profile.telemetry_enabled
-                    && setup.telemetry_per_query)
-                    .then_some(telemetry_record);
-                return Ok(cached_result);
+        let cache_key = cacheable.then(|| {
+            let inputs_hash = hash_search_inputs(
+                &params.filters,
+                &lexical_candidates,
+                &setup.ranking_profile,
+                &params.feature_flags,
+                [
+                    resolver.generation(),
+                    semantic_guard
+                        .as_ref()
+                        .map_or(0, SemanticSide::vectors_generation),
+                ],
+            );
+            crate::hybrid::cache::QueryCache::compute_key(
+                query,
+                inputs_hash,
+                &setup.requested.to_string(),
+                &format!("{:?}", params.grouping),
+                params.limit,
+                params.offset,
+            )
+        });
+        if let Some(mut cached_result) = cache_key.and_then(|key| self.query_cache.get(key)) {
+            let mut telemetry_record = setup.telemetry;
+            let latency_ms = setup.started.elapsed().as_millis() as u64;
+            cached_result.latency_ms = latency_ms;
+            telemetry_record.cache_hit = true;
+            telemetry_record.search_mode = cached_result.search_mode.to_string();
+            if cached_result.search_mode != SearchMode::Hybrid {
+                telemetry_record.fusion_strategy = "SingleSource".to_string();
             }
+            telemetry_record.semantic_candidates = cached_result
+                .telemetry
+                .as_ref()
+                .map_or(0, |record| record.semantic_candidates);
+            telemetry_record.fused_candidates = cached_result
+                .telemetry
+                .as_ref()
+                .map_or(cached_result.total_count, |record| record.fused_candidates);
+            telemetry_record.latency_ms = latency_ms;
+            telemetry_record.confidence = cached_result.confidence;
+
+            if setup.ranking_profile.telemetry_enabled {
+                self.telemetry.record_search(&telemetry_record);
+            }
+            cached_result.telemetry = (setup.ranking_profile.telemetry_enabled
+                && setup.telemetry_per_query)
+                .then_some(telemetry_record);
+            return Ok(cached_result);
         }
 
         let prepared =
@@ -682,7 +737,7 @@ impl HybridCoordinator {
             self.fuse(lexical_candidates, prepared, params, cancel)?;
 
         // §1.1 + §3.4: Only cache queries with enough substance to be reused.
-        if cacheable {
+        if let Some(cache_key) = cache_key {
             // Keep the complete telemetry record internally even when the
             // caller opted out of per-query telemetry.  A later cache hit
             // still needs the original candidate counts for aggregate stats.
@@ -980,28 +1035,26 @@ impl HybridCoordinator {
             match side {
                 None => SemanticOutcome::failed("no semantic index is configured".to_string()),
                 Some(side) => {
-                    let embedding_start = std::time::Instant::now();
-                    let cached_vector = match &params.query_vector {
-                        Some(vector) => Some(vector.clone()),
-                        None => setup
-                            .ranking_profile
-                            .embedding_cache_enabled
+                    let query_vector = if let Some(vector) = params.query_vector.as_deref() {
+                        side.prepare_supplied_vector(vector)
+                    } else {
+                        let cache_enabled = setup.ranking_profile.embedding_cache_enabled;
+                        let cached_vector = cache_enabled
                             .then(|| self.embedding_cache.get(&setup.normalized_query))
-                            .flatten(),
-                    };
-
-                    let query_vector = match cached_vector {
-                        Some(vector) => Ok(vector),
-                        None => {
+                            .flatten();
+                        if let Some(vector) = cached_vector {
+                            Ok(Cow::Owned(vector))
+                        } else {
+                            let embedding_start = std::time::Instant::now();
                             let result = side.embed_query(&setup.normalized_query);
                             setup.telemetry.embedding_latency_ms =
                                 Some(embedding_start.elapsed().as_millis() as u64);
-                            if setup.ranking_profile.embedding_cache_enabled {
+                            if cache_enabled {
                                 if let Ok(vector) = &result {
                                     fresh_embedding = Some(vector.clone());
                                 }
                             }
-                            result
+                            result.map(Cow::Owned)
                         }
                     };
                     // Embedding is the one stage nothing can interrupt, so look again
