@@ -697,6 +697,23 @@ impl SegmentSet {
         )
     }
 
+    /// Score the given physical slots against each query, in the supplied order, without
+    /// occurrence penalties. Deleted slots, stale keys and positions outside the set yield
+    /// `None`. Every live copy scores independently. Work is limited to the supplied slots.
+    pub fn score_selected_slots_many(
+        &self,
+        queries: &[&[f32]],
+        slots: &[SlotRef],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, VectorStoreError> {
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::score_selected_slots_many(&set, self.codec(), queries, slots, cancel)
+    }
+
     pub fn info(&self) -> &SetInfo {
         &self.info
     }
