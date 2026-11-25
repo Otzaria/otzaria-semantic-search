@@ -302,12 +302,31 @@ pub struct OfficialSemanticIndex {
     scan_threads: usize,
     /// Distinct books the set holds records for, counted at open.
     book_count: u32,
+    /// Opened by [`Self::open_read_only`]: every open of the set — the first and each
+    /// reload — goes through [`SegmentSet::open_without_recovery`].
+    read_only: bool,
 }
 
 impl OfficialSemanticIndex {
     /// Recover, open the set, load the model, and hold the set's identity to this
     /// installation's — see the module documentation for why in that order.
     pub fn open(config: OfficialIndexConfig) -> Result<Self, SemanticSearchError> {
+        Self::open_with(config, false)
+    }
+
+    /// [`Self::open`] for a process that only reads a set the application owns — an MCP
+    /// server or another reader beside the app. It never takes the set's lock, recovers, or
+    /// collects garbage, on the first open or on [`Self::reload_vectors`], so it can never
+    /// make an install or a compaction wait, nor remove anything an install still needs.
+    /// The reader's contract is [`SegmentSet::open_without_recovery`]'s.
+    pub fn open_read_only(config: OfficialIndexConfig) -> Result<Self, SemanticSearchError> {
+        Self::open_with(config, true)
+    }
+
+    fn open_with(
+        config: OfficialIndexConfig,
+        read_only: bool,
+    ) -> Result<Self, SemanticSearchError> {
         let OfficialIndexConfig {
             vectors_dir,
             text,
@@ -363,7 +382,11 @@ impl OfficialSemanticIndex {
         } else {
             None
         };
-        let set = SegmentSet::open(&vectors_dir)?;
+        let set = if read_only {
+            SegmentSet::open_without_recovery(&vectors_dir)?
+        } else {
+            SegmentSet::open(&vectors_dir)?
+        };
         if let Some(package) = model.passage_package.as_ref().filter(|_| separate_passage) {
             verify_passage_membership(&set, package)?;
         }
@@ -403,6 +426,7 @@ impl OfficialSemanticIndex {
             expected,
             scan_threads: scan_threads.map_or_else(default_scan_threads, NonZeroUsize::get),
             book_count,
+            read_only,
         };
         log::info!(
             "Opened the vector set at {}: generation {}, library version {}, {} live vector(s) \
@@ -680,7 +704,11 @@ impl OfficialSemanticIndex {
                 generation: from_generation,
             });
         }
-        let set = SegmentSet::open(&dir)?;
+        let set = if self.read_only {
+            SegmentSet::open_without_recovery(&dir)?
+        } else {
+            SegmentSet::open(&dir)?
+        };
         set.identity().verify_matches(&self.expected)?;
         if self.expected.model.query_max_tokens.is_some()
             && self.text_recipe != EmbeddingTextRecipe::PardesLineOrNeighbourContext
@@ -1237,6 +1265,48 @@ mod tests {
             }
             other => panic!("expected a model error, got {other:?}"),
         }
+    }
+
+    /// A reader beside the application leaves what recovery would remove (`staging/`, an
+    /// install in progress) where it is, on its first open and on a reload — which a plain
+    /// open, given the lock, removes — and opens while the application holds the lock.
+    #[test]
+    fn a_read_only_open_never_recovers_or_collects() {
+        use crate::semantic::segment_set::{TestSetLock as SetLock, TEST_STAGING_DIR};
+        let dir = TempDir::new("official_read_only");
+        let (model_path, vectors, model) = installed(&dir);
+        let staging = vectors
+            .join(TEST_STAGING_DIR)
+            .join("an-install-in-progress");
+        fs::create_dir_all(&staging).unwrap();
+
+        let mut index =
+            OfficialSemanticIndex::open_read_only(config(&vectors, &model_path, &model, "int8"))
+                .unwrap();
+        assert!(staging.is_dir(), "a read-only open must not recover");
+        let cancel = CancellationToken::new();
+        let hits = index.search(LINES[2].1, 1, None, &cancel).unwrap();
+        assert_eq!(hits[0].key, ChunkKey::of(LINES[2].1));
+
+        install(&dir, "v31", &vectors, &model_path, &model, 31);
+        fs::create_dir_all(&staging).unwrap();
+        assert!(matches!(
+            index.reload_vectors().unwrap(),
+            ReloadOutcome::Reloaded { .. }
+        ));
+        assert_eq!(index.set_info().library_version, 31);
+        assert!(staging.is_dir(), "a read-only reload must not recover");
+
+        // the application holds the lock: a reader still opens
+        let app = SetLock::take(&vectors).unwrap();
+        drop(
+            OfficialSemanticIndex::open_read_only(config(&vectors, &model_path, &model, "int8"))
+                .unwrap(),
+        );
+        drop(app);
+
+        drop(OfficialSemanticIndex::open(config(&vectors, &model_path, &model, "int8")).unwrap());
+        assert!(!staging.exists(), "a plain open, given the lock, recovers");
     }
 
     /// An install beside an open index changes nothing until it reloads; a reload opens the
