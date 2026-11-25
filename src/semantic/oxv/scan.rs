@@ -36,7 +36,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::AtomicUsize;
 
 mod slot_scores;
-pub(crate) use slot_scores::{score_slots_many, DuplicateSlots};
+pub(crate) use slot_scores::{score_selected_slots_many, score_slots_many, DuplicateSlots};
 
 /// Below this many slots a share is not worth a thread of its own.
 pub(super) const MIN_SLOTS_PER_THREAD: usize = 4096;

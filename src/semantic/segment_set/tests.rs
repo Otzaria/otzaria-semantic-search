@@ -1433,6 +1433,38 @@ fn only_the_full_scan_s_winning_copy_of_a_key_scores() {
     let queries = [positive.as_slice(), negative.as_slice()];
     let cancel = CancellationToken::new();
 
+    let missing = SlotRef {
+        slot: u32::MAX,
+        ..slots[0]
+    };
+    let requested = [slots[0], slots[1], slots[2], missing, slots[0]];
+    let selected = set
+        .score_selected_slots_many(&queries, &requested, &cancel)
+        .unwrap();
+    for (query, row) in queries.into_iter().zip(selected) {
+        for (position, book) in ["a", "b", "c"].into_iter().enumerate() {
+            let books = [book.to_owned()].into_iter().collect();
+            let hits = set
+                .scan(
+                    query,
+                    &ScanRequest {
+                        top_k: 1,
+                        books: Some(&books),
+                        threads: 1,
+                        window_penalty: 0.0,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(
+                row[position].map(f32::to_bits),
+                Some(hits[0].score.to_bits())
+            );
+        }
+        assert_eq!(row[3], None);
+        assert_eq!(row[4].map(f32::to_bits), row[0].map(f32::to_bits));
+    }
+
     for (window_penalty, winners) in [(0.0, [0, 1]), (0.04, [2, 1])] {
         let full = queries.map(|query| {
             let hits = set
