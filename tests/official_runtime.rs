@@ -124,6 +124,7 @@ fn title_of(book: &str) -> String {
 /// with the ids and the text the index holds for them now.
 struct FakeResolver {
     generation: AtomicU64,
+    generation_reads: AtomicU64,
     lines: Mutex<HashMap<(String, u32), (u64, String)>>,
 }
 
@@ -142,6 +143,7 @@ impl FakeResolver {
             .collect();
         Self {
             generation: AtomicU64::new(1),
+            generation_reads: AtomicU64::new(0),
             lines: Mutex::new(lines),
         }
     }
@@ -158,6 +160,7 @@ impl FakeResolver {
 
 impl CandidateResolver for FakeResolver {
     fn generation(&self) -> u64 {
+        self.generation_reads.fetch_add(1, Ordering::Relaxed);
         self.generation.load(Ordering::SeqCst)
     }
 
@@ -890,6 +893,134 @@ fn the_query_cache_follows_the_index_and_the_vector_set() {
         .results
         .iter()
         .all(|item| item.id != line_id + 1000 || item.semantic_score.unwrap_or(0.0) < 0.99));
+}
+
+#[test]
+fn supplied_vectors_preserve_cosine_ranking_and_bypass_warm_caches() {
+    let dir = TempDir::new("supplied_query_vector");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+    let cancel = CancellationToken::new();
+    let (text_id, book, text) = LINES[0];
+    let (vector_id, _, passage) = LINES[3];
+    let vector = coordinator
+        .embed_passages(&[passage], &cancel)
+        .unwrap()
+        .remove(0);
+    let mut ranking = RankingProfile::from_profile(SearchProfile::Balanced);
+    ranking.fusion_strategy = FusionStrategy::RRF { k: 60 };
+    ranking.semantic_threshold = 0.65;
+    ranking.alpha_override = Some(0.5);
+    let text_params = HybridSearchParams {
+        ranking: Some(ranking),
+        ..mode(SearchMode::Hybrid)
+    };
+    let lexical_candidates = || vec![lexical(text_id, book, text, 8.0)];
+    let direct = |params: &HybridSearchParams| {
+        coordinator
+            .search_cancellable(text, lexical_candidates(), params, &resolver, &cancel)
+            .unwrap()
+    };
+
+    let plain = direct(&text_params);
+    assert!(plain.results[0].semantic_score.is_some());
+    assert_eq!(plain.results[0].id, text_id);
+    assert!(direct(&text_params).telemetry.unwrap().cache_hit);
+    let generations_before = resolver.generation_reads.load(Ordering::Relaxed);
+    let embeddings_before = coordinator.embedding_cache_stats();
+    assert_eq!(embeddings_before.size, 1);
+
+    // The smaller vector would fall below the RRF threshold if its norm scaled the score.
+    // The larger vector would overflow an f32 sum of squares.
+    for scale in [1.0, 0.25, 1e30] {
+        let params = HybridSearchParams {
+            query_vector: Some(vector.iter().map(|component| component * scale).collect()),
+            ..text_params.clone()
+        };
+        let prepared = coordinator
+            .prepare_semantic(text, &params, &resolver, &cancel)
+            .unwrap();
+        let split = coordinator
+            .fuse_prepared(lexical_candidates(), prepared, &params, &cancel)
+            .unwrap();
+        for result in [direct(&params), split] {
+            assert_eq!(result.search_mode, SearchMode::Hybrid);
+            assert!(result.semantic_available);
+            assert!(result
+                .results
+                .iter()
+                .any(|item| item.id == text_id && item.lexical_score.is_some()));
+            let score = result
+                .results
+                .iter()
+                .find(|item| item.id == vector_id)
+                .and_then(|item| item.semantic_score)
+                .unwrap_or_else(|| panic!("missing match for scale {scale}"));
+            assert!((score - 1.0).abs() < 0.01, "scale {scale}: {score}");
+            let telemetry = result.telemetry.unwrap();
+            assert!(!telemetry.cache_lookup && !telemetry.cache_hit);
+            assert_eq!(telemetry.embedding_latency_ms, None);
+        }
+    }
+    assert_eq!(
+        resolver.generation_reads.load(Ordering::Relaxed),
+        generations_before
+    );
+    let embeddings_after = coordinator.embedding_cache_stats();
+    assert_eq!(embeddings_before.hits, embeddings_after.hits);
+    assert_eq!(embeddings_before.misses, embeddings_after.misses);
+    assert_eq!(embeddings_before.size, embeddings_after.size);
+    let plain_again = direct(&text_params);
+    assert_eq!(plain_again.results[0].id, text_id);
+    assert!(plain_again.telemetry.unwrap().cache_hit);
+}
+
+#[test]
+fn invalid_supplied_vectors_follow_the_semantic_failure_path() {
+    let dir = TempDir::new("invalid_query_vector");
+    let (model_path, vectors) = install(&dir);
+    let coordinator = HybridCoordinator::with_official_index(open_official(&vectors, &model_path));
+    let resolver = FakeResolver::of_the_corpus();
+    let cancel = CancellationToken::new();
+    let (line_id, book, text) = LINES[0];
+    let mut ranking = RankingProfile::from_profile(SearchProfile::Balanced);
+    ranking.alpha_override = Some(0.5);
+
+    for (vector, reason) in [
+        (vec![1.0; DIM as usize - 1], "Dimension mismatch"),
+        (vec![0.0; DIM as usize], "no usable direction"),
+        (vec![1e-20; DIM as usize], "no usable direction"),
+        (vec![f32::NAN; DIM as usize], "not finite"),
+        (vec![f32::INFINITY; DIM as usize], "not finite"),
+    ] {
+        let mut params = HybridSearchParams {
+            query_vector: Some(vector),
+            ranking: Some(ranking.clone()),
+            ..mode(SearchMode::Hybrid)
+        };
+        let lexical_candidates = || vec![lexical(line_id, book, text, 8.0)];
+        let hybrid = coordinator
+            .search_cancellable(text, lexical_candidates(), &params, &resolver, &cancel)
+            .unwrap();
+        assert_eq!(hybrid.search_mode, SearchMode::LexicalOnly);
+        assert_eq!(hybrid.results.len(), 1);
+        assert_eq!(hybrid.results[0].id, line_id);
+        assert!(!hybrid.semantic_available);
+        assert!(hybrid.fallback_reason.unwrap().contains(reason));
+
+        params.force_mode = Some(SearchMode::SemanticOnly);
+        let prepared = coordinator
+            .prepare_semantic(text, &params, &resolver, &cancel)
+            .unwrap();
+        let semantic = coordinator
+            .fuse_prepared(lexical_candidates(), prepared, &params, &cancel)
+            .unwrap();
+        assert_eq!(semantic.search_mode, SearchMode::SemanticOnly);
+        assert!(semantic.results.is_empty());
+        assert!(!semantic.semantic_available);
+        assert!(semantic.fallback_reason.unwrap().contains(reason));
+    }
 }
 
 /// The path the application takes on every keystroke: a search over the installed set,
