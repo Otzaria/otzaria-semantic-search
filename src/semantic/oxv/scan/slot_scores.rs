@@ -253,3 +253,57 @@ pub(crate) fn score_slots_many(
         })
         .collect()
 }
+
+/// Score physical slots already selected by a scan, without looking up other copies.
+pub(crate) fn score_selected_slots_many(
+    set: &ScanSet<'_>,
+    codec: &Codec,
+    queries: &[&[f32]],
+    slots: &[SlotRef],
+    cancel: &CancellationToken,
+) -> Result<Vec<Vec<Option<f32>>>, VectorStoreError> {
+    cancel.check_scan_cancelled()?;
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut vectors = Vec::with_capacity(slots.len());
+    for (index, slot) in slots.iter().enumerate() {
+        if index.is_multiple_of(SCAN_CHECK_INTERVAL) {
+            cancel.check_scan_cancelled()?;
+        }
+        vectors.push(slot_key(set, slot).map(|_| {
+            let segment = set.segments[slot.seg as usize].segment;
+            (
+                segment.vector(slot.slot),
+                segment.vector_scale(slot.slot).unwrap_or(1.0),
+            )
+        }));
+    }
+    let mut rows = Vec::with_capacity(queries.len());
+    for query in queries {
+        cancel.check_scan_cancelled()?;
+        let query = PreparedQuery::new(query, codec)?;
+        rows.push(match QueryScorer::new(&query) {
+            QueryScorer::Int8(scorer) => score_selected(&scorer, &vectors, cancel)?,
+            QueryScorer::Int8PerVector(scorer) => score_selected(&scorer, &vectors, cancel)?,
+            QueryScorer::Rotated(scorer) => score_selected(&scorer, &vectors, cancel)?,
+            QueryScorer::Float(scorer) => score_selected(&scorer, &vectors, cancel)?,
+        });
+    }
+    Ok(rows)
+}
+
+fn score_selected(
+    scorer: &impl Scorer,
+    vectors: &[Option<(&[u8], f32)>],
+    cancel: &CancellationToken,
+) -> Result<Vec<Option<f32>>, VectorStoreError> {
+    let mut row = Vec::with_capacity(vectors.len());
+    for (index, vector) in vectors.iter().enumerate() {
+        if index.is_multiple_of(SCAN_CHECK_INTERVAL) {
+            cancel.scan_checkpoint(index)?;
+        }
+        row.push(vector.map(|(vector, scale)| scorer.score(scorer.rank(vector, scale))));
+    }
+    Ok(row)
+}
