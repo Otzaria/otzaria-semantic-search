@@ -3966,6 +3966,49 @@ fn retiring_without_previous_changes_nothing() {
     assert_eq!((on_disk(&dir), generations_and_segments(&dir)), before);
 }
 
+#[test]
+fn retiring_from_an_older_session_keeps_the_fallback() {
+    let work = TempDir::new("set_retire_stale_session");
+    let dir = two_bases(&work);
+    let before = generations_and_segments(&dir);
+    let cancel = CancellationToken::new();
+
+    let stale = retire_previous_for_open_generation(&dir, 1, &cancel).unwrap();
+    assert_eq!((stale.generation, stale.retired), (2, false));
+    assert_eq!(previous_generation(&dir), 1);
+    assert_eq!(generations_and_segments(&dir), before);
+
+    let live = retire_previous_for_open_generation(&dir, 2, &cancel).unwrap();
+    assert!(live.retired);
+}
+
+#[test]
+fn retiring_checks_vector_blocks_even_if_current_opens() {
+    let work = TempDir::new("set_retire_damaged_payload");
+    let dir = two_bases(&work);
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 2);
+    let before = generations_and_segments(&dir);
+
+    let result = retire_previous_for_open_generation(&dir, 2, &CancellationToken::new());
+    assert!(is_corrupt(result));
+    assert_eq!(previous_generation(&dir), 1);
+    assert_eq!(generations_and_segments(&dir), before);
+}
+
+#[test]
+fn cancelled_retirement_keeps_the_fallback() {
+    let work = TempDir::new("set_retire_cancelled");
+    let dir = two_bases(&work);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = retire_previous_for_open_generation(&dir, 2, &cancel);
+    assert!(matches!(result, Err(SemanticSearchError::Cancelled)));
+    assert_eq!(previous_generation(&dir), 1);
+}
+
 /// `PREVIOUS` is the only generation that opens: retiring it is refused, and the set keeps
 /// serving it.
 #[test]
