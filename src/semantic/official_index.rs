@@ -783,6 +783,10 @@ impl OfficialSemanticIndex {
         self.set.info()
     }
 
+    pub(crate) fn opened_generation(&self) -> super::segment_set::OpenedGeneration {
+        self.set.opened_generation()
+    }
+
     /// The identity the set declares, which this installation accepted.
     pub fn identity(&self) -> &IndexVersion {
         self.set.identity()

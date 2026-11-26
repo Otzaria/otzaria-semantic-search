@@ -3973,12 +3973,20 @@ fn retiring_from_an_older_session_keeps_the_fallback() {
     let before = generations_and_segments(&dir);
     let cancel = CancellationToken::new();
 
-    let stale = retire_previous_for_open_generation(&dir, 1, &cancel).unwrap();
+    let opened = OpenedGeneration(files::read_pointer(&dir, PREVIOUS).unwrap().unwrap());
+    let stale = retire_previous_for_open_generation(&dir, &opened, &cancel).unwrap();
     assert_eq!((stale.generation, stale.retired), (2, false));
     assert_eq!(previous_generation(&dir), 1);
     assert_eq!(generations_and_segments(&dir), before);
 
-    let live = retire_previous_for_open_generation(&dir, 2, &cancel).unwrap();
+    let opened = SegmentSet::open(&dir).unwrap().opened_generation();
+    let mut different_set = opened.clone();
+    different_set.0.set_sha256 = "0".repeat(64);
+    let stale = retire_previous_for_open_generation(&dir, &different_set, &cancel).unwrap();
+    assert!(!stale.retired);
+    assert_eq!(previous_generation(&dir), 1);
+
+    let live = retire_previous_for_open_generation(&dir, &opened, &cancel).unwrap();
     assert!(live.retired);
 }
 
@@ -3988,10 +3996,13 @@ fn retiring_checks_vector_blocks_even_if_current_opens() {
     let dir = two_bases(&work);
     let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
     damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
-    assert_eq!(SegmentSet::open(&dir).unwrap().generation(), 2);
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    let opened = set.opened_generation();
+    drop(set);
     let before = generations_and_segments(&dir);
 
-    let result = retire_previous_for_open_generation(&dir, 2, &CancellationToken::new());
+    let result = retire_previous_for_open_generation(&dir, &opened, &CancellationToken::new());
     assert!(is_corrupt(result));
     assert_eq!(previous_generation(&dir), 1);
     assert_eq!(generations_and_segments(&dir), before);
@@ -4001,10 +4012,11 @@ fn retiring_checks_vector_blocks_even_if_current_opens() {
 fn cancelled_retirement_keeps_the_fallback() {
     let work = TempDir::new("set_retire_cancelled");
     let dir = two_bases(&work);
+    let opened = SegmentSet::open(&dir).unwrap().opened_generation();
     let cancel = CancellationToken::new();
     cancel.cancel();
 
-    let result = retire_previous_for_open_generation(&dir, 2, &cancel);
+    let result = retire_previous_for_open_generation(&dir, &opened, &cancel);
     assert!(matches!(result, Err(SemanticSearchError::Cancelled)));
     assert_eq!(previous_generation(&dir), 1);
 }

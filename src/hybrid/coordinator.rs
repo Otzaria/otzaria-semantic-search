@@ -1810,6 +1810,17 @@ impl HybridCoordinator {
         }
     }
 
+    /// The descriptor of the generation the official vector session actually opened.
+    pub fn opened_vector_generation(
+        &self,
+    ) -> Option<crate::semantic::segment_set::OpenedGeneration> {
+        let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(SemanticSide::Official(index)) => Some(index.opened_generation()),
+            _ => None,
+        }
+    }
+
     pub fn get_telemetry_snapshot(&self) -> crate::telemetry::TelemetrySnapshot {
         self.telemetry.snapshot()
     }

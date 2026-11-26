@@ -722,6 +722,10 @@ impl SegmentSet {
         self.document.generation
     }
 
+    pub(crate) fn opened_generation(&self) -> OpenedGeneration {
+        OpenedGeneration(self.pointer.clone())
+    }
+
     pub fn identity(&self) -> &IndexVersion {
         &self.document.identity
     }
@@ -1015,11 +1019,15 @@ pub fn retire_previous(dir: &Path) -> Result<RetireReport, SemanticSearchError> 
     retire_previous_impl(dir, None, &CancellationToken::default())
 }
 
+/// Identifies an opened generation even when an installation reuses generation numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedGeneration(Pointer);
+
 /// Retire the fallback only if `CURRENT` still names the generation opened by the caller.
 /// A different generation or a cancelled verification leaves `PREVIOUS` intact.
 pub fn retire_previous_for_open_generation(
     dir: &Path,
-    opened_generation: u64,
+    opened_generation: &OpenedGeneration,
     cancel: &CancellationToken,
 ) -> Result<RetireReport, SemanticSearchError> {
     retire_previous_impl(dir, Some(opened_generation), cancel)
@@ -1027,7 +1035,7 @@ pub fn retire_previous_for_open_generation(
 
 fn retire_previous_impl(
     dir: &Path,
-    opened_generation: Option<u64>,
+    opened_generation: Option<&OpenedGeneration>,
     cancel: &CancellationToken,
 ) -> Result<RetireReport, SemanticSearchError> {
     cancel.checkpoint()?;
@@ -1059,8 +1067,7 @@ fn retire_previous_impl(
         retired_generation,
         bytes_freed,
     };
-    if opened_generation
-        .is_some_and(|generation| generation != current.generation || matches!(&previous, Ok(None)))
+    if opened_generation.is_some_and(|opened| opened.0 != current || matches!(&previous, Ok(None)))
     {
         return Ok(report(false, None, 0));
     }
