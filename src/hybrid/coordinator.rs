@@ -936,6 +936,25 @@ impl HybridCoordinator {
         })
     }
 
+    /// Unpenalized scores for these physical slots, one row per query, without resolving
+    /// duplicate keys. If the set has been reloaded since `generation`, every score is
+    /// `None`.
+    pub fn score_selected_slots_many(
+        &self,
+        queries: &[&[f32]],
+        slots: &[SlotRef],
+        generation: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, SemanticSearchError> {
+        cancel.checkpoint()?;
+        self.with_official("score_selected_slots_many", |index| {
+            if index.generation() != generation {
+                return Ok(vec![vec![None; slots.len()]; queries.len()]);
+            }
+            index.score_selected_slots_many(queries, slots, cancel)
+        })
+    }
+
     /// `read` with the official index, under the read lock; a configuration error naming
     /// `operation` for a self-built index, which has no vector set to read.
     fn with_official<T>(
@@ -1787,6 +1806,17 @@ impl HybridCoordinator {
         let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(SemanticSide::Official(index)) => Some(index.set_info().clone()),
+            _ => None,
+        }
+    }
+
+    /// The descriptor of the generation the official vector session actually opened.
+    pub fn opened_vector_generation(
+        &self,
+    ) -> Option<crate::semantic::segment_set::OpenedGeneration> {
+        let guard = self.semantic.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(SemanticSide::Official(index)) => Some(index.opened_generation()),
             _ => None,
         }
     }

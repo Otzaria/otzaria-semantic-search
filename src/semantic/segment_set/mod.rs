@@ -697,12 +697,33 @@ impl SegmentSet {
         )
     }
 
+    /// Score the given physical slots against each query, in the supplied order, without
+    /// occurrence penalties. Deleted slots, stale keys and positions outside the set yield
+    /// `None`. Every live copy scores independently. Work is limited to the supplied slots.
+    pub fn score_selected_slots_many(
+        &self,
+        queries: &[&[f32]],
+        slots: &[SlotRef],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, VectorStoreError> {
+        let views = self.scan_views();
+        let set = ScanSet {
+            segments: &views,
+            reverse_links: &self.reverse,
+        };
+        scan::score_selected_slots_many(&set, self.codec(), queries, slots, cancel)
+    }
+
     pub fn info(&self) -> &SetInfo {
         &self.info
     }
 
     pub fn generation(&self) -> u64 {
         self.document.generation
+    }
+
+    pub(crate) fn opened_generation(&self) -> OpenedGeneration {
+        OpenedGeneration(self.pointer.clone())
     }
 
     pub fn identity(&self) -> &IndexVersion {
@@ -958,7 +979,7 @@ pub fn scrub(dir: &Path, cancel: &CancellationToken) -> Result<ScrubReport, Sema
 /// What [`retire_previous`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireReport {
-    /// The generation `CURRENT` names, which opened and stays live.
+    /// The generation `CURRENT` names.
     pub generation: u64,
     /// Whether `PREVIOUS` was removed. `false` when there was none: nothing changed.
     pub retired: bool,
@@ -974,8 +995,8 @@ pub struct RetireReport {
 ///
 /// For a host that has opened the set without falling back
 /// ([`SetInfo::recovered_from_previous`] `false`). Under the set's lock: `CURRENT`'s
-/// generation is opened as [`SegmentSet::open`] opens it, without falling back; `PREVIOUS`
-/// is removed and, on Unix, the removal flushed; then garbage is collected. A crash at any point
+/// generation is opened without falling back and all its block checksums are verified before
+/// removing `PREVIOUS`. On Unix, the removal is flushed; then garbage is collected. A crash at any point
 /// leaves `CURRENT` as it was, so the set opens: before the removal is durable `PREVIOUS`
 /// may still be there, and after it whatever was not yet collected goes at the next open or
 /// flip. `PREVIOUS` that does not read is no fallback and is removed alike. Without
@@ -995,6 +1016,29 @@ pub struct RetireReport {
 /// [`ArtifactError::Io`] when `PREVIOUS` cannot be removed, or its removal flushed; nothing
 /// is collected then, and `CURRENT` is as it was.
 pub fn retire_previous(dir: &Path) -> Result<RetireReport, SemanticSearchError> {
+    retire_previous_impl(dir, None, &CancellationToken::default())
+}
+
+/// Identifies an opened generation even when an installation reuses generation numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedGeneration(Pointer);
+
+/// Retire the fallback only if `CURRENT` still names the generation opened by the caller.
+/// A different generation or a cancelled verification leaves `PREVIOUS` intact.
+pub fn retire_previous_for_open_generation(
+    dir: &Path,
+    opened_generation: &OpenedGeneration,
+    cancel: &CancellationToken,
+) -> Result<RetireReport, SemanticSearchError> {
+    retire_previous_impl(dir, Some(opened_generation), cancel)
+}
+
+fn retire_previous_impl(
+    dir: &Path,
+    opened_generation: Option<&OpenedGeneration>,
+    cancel: &CancellationToken,
+) -> Result<RetireReport, SemanticSearchError> {
+    cancel.checkpoint()?;
     if !dir.is_dir() {
         // The lock would create the directory.
         return Err(nothing_installed(dir));
@@ -1017,19 +1061,28 @@ pub fn retire_previous(dir: &Path) -> Result<RetireReport, SemanticSearchError> 
         }
         (Err(reason), _) => return Err(corrupted(format!("{}: {reason}", dir.display())).into()),
     };
-    drop(SegmentSet::open_generation(dir, &current)?);
     let report = |retired, retired_generation, bytes_freed| RetireReport {
         generation: current.generation,
         retired,
         retired_generation,
         bytes_freed,
     };
+    if opened_generation.is_some_and(|opened| opened.0 != current || matches!(&previous, Ok(None)))
+    {
+        return Ok(report(false, None, 0));
+    }
+    let live = SegmentSet::open_generation(dir, &current)?;
     let retired_generation = match previous {
         Ok(None) => return Ok(report(false, None, 0)),
         Ok(pointer) => pointer.map(|pointer| pointer.generation),
         Err(_) => None,
     };
+    for segment in live.segments() {
+        segment.verify_blocks(cancel, |_| {})?;
+    }
+    drop(live);
     let before = set_bytes(dir);
+    cancel.checkpoint()?;
     files::remove_previous(dir).map_err(io_error(format!(
         "removing {}",
         dir.join(PREVIOUS).display()

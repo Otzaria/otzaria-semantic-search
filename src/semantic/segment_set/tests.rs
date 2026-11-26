@@ -1433,6 +1433,38 @@ fn only_the_full_scan_s_winning_copy_of_a_key_scores() {
     let queries = [positive.as_slice(), negative.as_slice()];
     let cancel = CancellationToken::new();
 
+    let missing = SlotRef {
+        slot: u32::MAX,
+        ..slots[0]
+    };
+    let requested = [slots[0], slots[1], slots[2], missing, slots[0]];
+    let selected = set
+        .score_selected_slots_many(&queries, &requested, &cancel)
+        .unwrap();
+    for (query, row) in queries.into_iter().zip(selected) {
+        for (position, book) in ["a", "b", "c"].into_iter().enumerate() {
+            let books = [book.to_owned()].into_iter().collect();
+            let hits = set
+                .scan(
+                    query,
+                    &ScanRequest {
+                        top_k: 1,
+                        books: Some(&books),
+                        threads: 1,
+                        window_penalty: 0.0,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(
+                row[position].map(f32::to_bits),
+                Some(hits[0].score.to_bits())
+            );
+        }
+        assert_eq!(row[3], None);
+        assert_eq!(row[4].map(f32::to_bits), row[0].map(f32::to_bits));
+    }
+
     for (window_penalty, winners) in [(0.0, [0, 1]), (0.04, [2, 1])] {
         let full = queries.map(|query| {
             let hits = set
@@ -3932,6 +3964,61 @@ fn retiring_without_previous_changes_nothing() {
         (1, false, None, 0)
     );
     assert_eq!((on_disk(&dir), generations_and_segments(&dir)), before);
+}
+
+#[test]
+fn retiring_from_an_older_session_keeps_the_fallback() {
+    let work = TempDir::new("set_retire_stale_session");
+    let dir = two_bases(&work);
+    let before = generations_and_segments(&dir);
+    let cancel = CancellationToken::new();
+
+    let opened = OpenedGeneration(files::read_pointer(&dir, PREVIOUS).unwrap().unwrap());
+    let stale = retire_previous_for_open_generation(&dir, &opened, &cancel).unwrap();
+    assert_eq!((stale.generation, stale.retired), (2, false));
+    assert_eq!(previous_generation(&dir), 1);
+    assert_eq!(generations_and_segments(&dir), before);
+
+    let opened = SegmentSet::open(&dir).unwrap().opened_generation();
+    let mut different_set = opened.clone();
+    different_set.0.set_sha256 = "0".repeat(64);
+    let stale = retire_previous_for_open_generation(&dir, &different_set, &cancel).unwrap();
+    assert!(!stale.retired);
+    assert_eq!(previous_generation(&dir), 1);
+
+    let live = retire_previous_for_open_generation(&dir, &opened, &cancel).unwrap();
+    assert!(live.retired);
+}
+
+#[test]
+fn retiring_checks_vector_blocks_even_if_current_opens() {
+    let work = TempDir::new("set_retire_damaged_payload");
+    let dir = two_bases(&work);
+    let id = info(&dir).unwrap().unwrap().segments[0].id.clone();
+    damage_last_byte(&dir.join(format!("segments/{id}.oxv")));
+    let set = SegmentSet::open(&dir).unwrap();
+    assert_eq!(set.generation(), 2);
+    let opened = set.opened_generation();
+    drop(set);
+    let before = generations_and_segments(&dir);
+
+    let result = retire_previous_for_open_generation(&dir, &opened, &CancellationToken::new());
+    assert!(is_corrupt(result));
+    assert_eq!(previous_generation(&dir), 1);
+    assert_eq!(generations_and_segments(&dir), before);
+}
+
+#[test]
+fn cancelled_retirement_keeps_the_fallback() {
+    let work = TempDir::new("set_retire_cancelled");
+    let dir = two_bases(&work);
+    let opened = SegmentSet::open(&dir).unwrap().opened_generation();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let result = retire_previous_for_open_generation(&dir, &opened, &cancel);
+    assert!(matches!(result, Err(SemanticSearchError::Cancelled)));
+    assert_eq!(previous_generation(&dir), 1);
 }
 
 /// `PREVIOUS` is the only generation that opens: retiring it is refused, and the set keeps

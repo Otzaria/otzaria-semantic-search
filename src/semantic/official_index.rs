@@ -659,6 +659,16 @@ impl OfficialSemanticIndex {
             .score_slots_many(query_vectors, slots, window_penalty, cancel)?)
     }
 
+    /// The raw scores of these physical slots, as [SegmentSet::score_selected_slots_many].
+    pub(crate) fn score_selected_slots_many(
+        &self,
+        queries: &[&[f32]],
+        slots: &[SlotRef],
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Vec<Option<f32>>>, SemanticSearchError> {
+        Ok(self.set.score_selected_slots_many(queries, slots, cancel)?)
+    }
+
     /// Each text embedded as a stored passage is, under the recipe these vectors were built
     /// with, so it compares with a query this index embeds; one vector per text, in order.
     pub fn embed_passages(
@@ -771,6 +781,10 @@ impl OfficialSemanticIndex {
     /// The open generation: its identity, segments and counts.
     pub fn set_info(&self) -> &SetInfo {
         self.set.info()
+    }
+
+    pub(crate) fn opened_generation(&self) -> super::segment_set::OpenedGeneration {
+        self.set.opened_generation()
     }
 
     /// The identity the set declares, which this installation accepted.
