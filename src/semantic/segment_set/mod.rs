@@ -1059,7 +1059,9 @@ fn retire_previous_impl(
         retired_generation,
         bytes_freed,
     };
-    if opened_generation.is_some_and(|generation| generation != current.generation) {
+    if opened_generation
+        .is_some_and(|generation| generation != current.generation || matches!(&previous, Ok(None)))
+    {
         return Ok(report(false, None, 0));
     }
     let live = SegmentSet::open_generation(dir, &current)?;
